@@ -25,6 +25,7 @@ func testBatchWriter(t *testing.T) (*BatchWriter, *DB) {
 func TestBatchWriterBasic(t *testing.T) {
 	bw, db := testBatchWriter(t)
 	s := NewStoreWithWriter(db, bw)
+	t.Cleanup(func() { s.Close() })
 
 	const n = 20
 	var wg sync.WaitGroup
@@ -207,6 +208,7 @@ func BenchmarkEnqueueDirect(b *testing.B) {
 	defer db.Close()
 
 	s := NewStore(db)
+	defer s.Close()
 	payload := json.RawMessage(`{"bench":true}`)
 
 	b.ResetTimer()
@@ -234,6 +236,7 @@ func BenchmarkEnqueueBatched(b *testing.B) {
 	defer bw.Stop()
 
 	s := NewStoreWithWriter(db, bw)
+	defer s.Close()
 	payload := json.RawMessage(`{"bench":true}`)
 
 	b.ResetTimer()

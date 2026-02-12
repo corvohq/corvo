@@ -10,6 +10,7 @@ func TestListQueues(t *testing.T) {
 
 	s.Enqueue(EnqueueRequest{Queue: "q1", Payload: json.RawMessage(`{}`)})
 	s.Enqueue(EnqueueRequest{Queue: "q2", Payload: json.RawMessage(`{}`)})
+	s.FlushAsync()
 
 	queues, err := s.ListQueues()
 	if err != nil {
@@ -24,6 +25,7 @@ func TestPauseResumeQueue(t *testing.T) {
 	s := testStore(t)
 
 	s.Enqueue(EnqueueRequest{Queue: "pr.queue", Payload: json.RawMessage(`{}`)})
+	s.FlushAsync()
 
 	// Pause
 	if err := s.PauseQueue("pr.queue"); err != nil {
@@ -69,6 +71,7 @@ func TestDeleteQueue(t *testing.T) {
 	s := testStore(t)
 
 	s.Enqueue(EnqueueRequest{Queue: "del.queue", Payload: json.RawMessage(`{}`)})
+	s.FlushAsync()
 
 	if err := s.DeleteQueue("del.queue"); err != nil {
 		t.Fatalf("DeleteQueue: %v", err)
@@ -90,6 +93,7 @@ func TestSetConcurrency(t *testing.T) {
 
 	s.Enqueue(EnqueueRequest{Queue: "conc.queue", Payload: json.RawMessage(`{}`)})
 	s.Enqueue(EnqueueRequest{Queue: "conc.queue", Payload: json.RawMessage(`{}`)})
+	s.FlushAsync()
 
 	// Set concurrency to 1
 	if err := s.SetConcurrency("conc.queue", 1); err != nil {
@@ -113,6 +117,7 @@ func TestSetAndRemoveThrottle(t *testing.T) {
 	s := testStore(t)
 
 	s.Enqueue(EnqueueRequest{Queue: "throttle.queue", Payload: json.RawMessage(`{}`)})
+	s.FlushAsync()
 
 	if err := s.SetThrottle("throttle.queue", 100, 60000); err != nil {
 		t.Fatalf("SetThrottle: %v", err)

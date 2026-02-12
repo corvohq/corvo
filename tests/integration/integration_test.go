@@ -32,6 +32,7 @@ func setup(t *testing.T) *testEnv {
 	t.Cleanup(func() { db.Close() })
 
 	s := store.NewStore(db)
+	t.Cleanup(func() { s.Close() })
 	sched := scheduler.New(db.Write, scheduler.DefaultConfig())
 	srv := server.New(s, ":0")
 	ts := httptest.NewServer(srv.Handler())

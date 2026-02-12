@@ -14,7 +14,9 @@ func testStore(t *testing.T) *Store {
 		t.Fatalf("Open() error: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
-	return NewStore(db)
+	s := NewStore(db)
+	t.Cleanup(func() { s.Close() })
+	return s
 }
 
 func TestEnqueue(t *testing.T) {
@@ -127,6 +129,9 @@ func TestEnqueueCreatesQueueRow(t *testing.T) {
 		t.Fatalf("Enqueue() error: %v", err)
 	}
 
+	// Queue row is created asynchronously
+	s.FlushAsync()
+
 	var name string
 	err = s.db.Read.QueryRow("SELECT name FROM queues WHERE name = ?", "auto.created").Scan(&name)
 	if err != nil {
@@ -146,6 +151,9 @@ func TestEnqueueUpdatesQueueStats(t *testing.T) {
 			t.Fatalf("Enqueue() error: %v", err)
 		}
 	}
+
+	// Flush async writer so stats are visible on the read connection
+	s.FlushAsync()
 
 	var enqueued int
 	s.db.Read.QueryRow("SELECT enqueued FROM queue_stats WHERE queue = ?", "stats.queue").Scan(&enqueued)
@@ -194,9 +202,6 @@ func TestFetchBasic(t *testing.T) {
 func TestFetchReturnsNilWhenEmpty(t *testing.T) {
 	s := testStore(t)
 
-	// Need to create the queue first since fetch joins on queues table
-	s.db.Write.Exec("INSERT INTO queues (name) VALUES ('empty.queue')")
-
 	fetchResult, err := s.Fetch(FetchRequest{
 		Queues:   []string{"empty.queue"},
 		WorkerID: "worker-1",
@@ -231,6 +236,7 @@ func TestFetchSkipsPausedQueue(t *testing.T) {
 	s := testStore(t)
 
 	s.Enqueue(EnqueueRequest{Queue: "paused.queue", Payload: json.RawMessage(`{}`)})
+	s.FlushAsync() // ensure queue row exists before pausing
 	s.db.Write.Exec("UPDATE queues SET paused = 1 WHERE name = 'paused.queue'")
 
 	r, err := s.Fetch(FetchRequest{Queues: []string{"paused.queue"}, WorkerID: "w", Hostname: "h"})

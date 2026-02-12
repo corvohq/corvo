@@ -9,13 +9,15 @@ import (
 
 // Ack marks a job as completed.
 func (s *Store) Ack(jobID string, result json.RawMessage) error {
-	return s.writer.ExecuteTx(func(tx *sql.Tx) error {
+	var queue string
+
+	err := s.writer.ExecuteTx(func(tx *sql.Tx) error {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 
 		var resultStr *string
 		if len(result) > 0 {
-			s := string(result)
-			resultStr = &s
+			rs := string(result)
+			resultStr = &rs
 		}
 
 		// Mark job completed
@@ -37,8 +39,7 @@ func (s *Store) Ack(jobID string, result json.RawMessage) error {
 			return fmt.Errorf("job %s is not active", jobID)
 		}
 
-		// Get queue name for stats/events
-		var queue string
+		// Get queue name for unique lock cleanup + batch logic
 		var uniqueKey, batchID sql.NullString
 		err = tx.QueryRow("SELECT queue, unique_key, batch_id FROM jobs WHERE id = ?", jobID).
 			Scan(&queue, &uniqueKey, &batchID)
@@ -61,23 +62,18 @@ func (s *Store) Ack(jobID string, result json.RawMessage) error {
 			}
 		}
 
-		// Emit event
-		_, err = tx.Exec(`INSERT INTO events (type, job_id, queue) VALUES ('completed', ?, ?)`, jobID, queue)
-		if err != nil {
-			return fmt.Errorf("insert event: %w", err)
-		}
-
-		// Update queue stats
-		_, err = tx.Exec(
-			`INSERT INTO queue_stats (queue, completed) VALUES (?, 1) ON CONFLICT(queue) DO UPDATE SET completed = completed + 1`,
-			queue,
-		)
-		if err != nil {
-			return fmt.Errorf("update queue stats: %w", err)
-		}
-
 		return nil
 	})
+
+	if err != nil {
+		return err
+	}
+
+	// Async: emit event and stats (non-critical)
+	s.async.Emit("INSERT INTO events (type, job_id, queue) VALUES ('completed', ?, ?)", jobID, queue)
+	s.async.Emit("INSERT INTO queue_stats (queue, completed) VALUES (?, 1) ON CONFLICT(queue) DO UPDATE SET completed = completed + 1", queue)
+
+	return nil
 }
 
 func (s *Store) updateBatchCounter(tx *sql.Tx, batchID, outcome string) error {

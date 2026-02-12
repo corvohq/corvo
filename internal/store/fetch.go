@@ -53,13 +53,14 @@ func (s *Store) Fetch(req FetchRequest) (*FetchResult, error) {
 		queueList := strings.Join(placeholders, ", ")
 
 		// Find the highest-priority pending job in unpaused queues,
-		// respecting concurrency limits
+		// respecting concurrency limits. Uses LEFT JOIN because
+		// queue rows are created asynchronously and may not exist yet.
 		query := fmt.Sprintf(`
-			SELECT j.id FROM jobs j
-			JOIN queues q ON q.name = j.queue
+			SELECT j.id, j.queue FROM jobs j
+			LEFT JOIN queues q ON q.name = j.queue
 			WHERE j.queue IN (%s)
 			  AND j.state = 'pending'
-			  AND q.paused = 0
+			  AND (q.paused IS NULL OR q.paused = 0)
 			  AND (q.max_concurrency IS NULL OR (
 			    SELECT COUNT(*) FROM jobs j2 WHERE j2.queue = j.queue AND j2.state = 'active'
 			  ) < q.max_concurrency)
@@ -67,8 +68,8 @@ func (s *Store) Fetch(req FetchRequest) (*FetchResult, error) {
 			LIMIT 1
 		`, queueList)
 
-		var jobID string
-		err := tx.QueryRow(query, args...).Scan(&jobID)
+		var jobID, queueName string
+		err := tx.QueryRow(query, args...).Scan(&jobID, &queueName)
 		if err == sql.ErrNoRows {
 			return nil // no job available
 		}
@@ -76,8 +77,8 @@ func (s *Store) Fetch(req FetchRequest) (*FetchResult, error) {
 			return fmt.Errorf("find pending job: %w", err)
 		}
 
-		// Check rate limit
-		rateLimited, err := s.checkRateLimit(tx, jobID)
+		// Check rate limit (pass queue directly, no extra query)
+		rateLimited, err := s.checkRateLimit(tx, queueName)
 		if err != nil {
 			return fmt.Errorf("check rate limit: %w", err)
 		}
@@ -104,20 +105,11 @@ func (s *Store) Fetch(req FetchRequest) (*FetchResult, error) {
 			return fmt.Errorf("claim job: %w", err)
 		}
 
-		// Record rate limit entry
-		var queueName string
-		tx.QueryRow("SELECT queue FROM jobs WHERE id = ?", jobID).Scan(&queueName)
+		// Record rate limit entry (use queue from initial query)
 		_, err = tx.Exec(`INSERT INTO rate_limit_window (queue, fetched_at) VALUES (?, ?)`,
 			queueName, startedAt)
 		if err != nil {
 			return fmt.Errorf("record rate limit: %w", err)
-		}
-
-		// Emit event
-		_, err = tx.Exec(`INSERT INTO events (type, job_id, queue) VALUES ('started', ?, ?)`,
-			jobID, queueName)
-		if err != nil {
-			return fmt.Errorf("insert event: %w", err)
 		}
 
 		// Update/insert worker record
@@ -136,16 +128,15 @@ func (s *Store) Fetch(req FetchRequest) (*FetchResult, error) {
 		// Read back the full job for the response
 		var payload, tags, checkpoint sql.NullString
 		var attempt, maxRetries int
-		var queue string
-		err = tx.QueryRow(`SELECT queue, payload, attempt, max_retries, tags, checkpoint FROM jobs WHERE id = ?`, jobID).
-			Scan(&queue, &payload, &attempt, &maxRetries, &tags, &checkpoint)
+		err = tx.QueryRow(`SELECT payload, attempt, max_retries, tags, checkpoint FROM jobs WHERE id = ?`, jobID).
+			Scan(&payload, &attempt, &maxRetries, &tags, &checkpoint)
 		if err != nil {
 			return fmt.Errorf("read claimed job: %w", err)
 		}
 
 		result = &FetchResult{
 			JobID:         jobID,
-			Queue:         queue,
+			Queue:         queueName,
 			Payload:       json.RawMessage(payload.String),
 			Attempt:       attempt,
 			MaxRetries:    maxRetries,
@@ -165,18 +156,17 @@ func (s *Store) Fetch(req FetchRequest) (*FetchResult, error) {
 		return nil, err
 	}
 
+	// Async: emit event after transaction succeeds (non-critical)
+	if result != nil {
+		s.async.Emit("INSERT INTO events (type, job_id, queue) VALUES ('started', ?, ?)", result.JobID, result.Queue)
+	}
+
 	return result, nil
 }
 
-func (s *Store) checkRateLimit(tx *sql.Tx, jobID string) (bool, error) {
-	var queueName string
-	err := tx.QueryRow("SELECT queue FROM jobs WHERE id = ?", jobID).Scan(&queueName)
-	if err != nil {
-		return false, err
-	}
-
+func (s *Store) checkRateLimit(tx *sql.Tx, queue string) (bool, error) {
 	var rateLimit, rateWindowMs sql.NullInt64
-	err = tx.QueryRow("SELECT rate_limit, rate_window_ms FROM queues WHERE name = ?", queueName).
+	err := tx.QueryRow("SELECT rate_limit, rate_window_ms FROM queues WHERE name = ?", queue).
 		Scan(&rateLimit, &rateWindowMs)
 	if err != nil || !rateLimit.Valid || !rateWindowMs.Valid {
 		return false, nil // no rate limit configured
@@ -187,7 +177,7 @@ func (s *Store) checkRateLimit(tx *sql.Tx, jobID string) (bool, error) {
 	err = tx.QueryRow(`
 		SELECT COUNT(*) FROM rate_limit_window
 		WHERE queue = ? AND fetched_at > strftime('%Y-%m-%dT%H:%M:%f', 'now', '-' || ? || ' seconds')
-	`, queueName, windowSeconds).Scan(&count)
+	`, queue, windowSeconds).Scan(&count)
 	if err != nil {
 		return false, err
 	}

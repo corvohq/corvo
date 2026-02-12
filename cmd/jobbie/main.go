@@ -118,6 +118,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 	slog.Info("stopping scheduler")
 	schedCancel()
 
+	slog.Info("stopping store async writer")
+	s.Close()
+
 	slog.Info("stopping batch writer")
 	bw.Stop()
 

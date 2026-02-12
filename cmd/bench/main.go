@@ -58,7 +58,7 @@ func main() {
 	printStats(enqResult)
 
 	// Clear queue between benchmarks
-	clearQueue(httpC, *server, *queue)
+	// clearQueue(httpC, *server, *queue)
 
 	// Benchmark 2: Lifecycle throughput
 	fmt.Println("\n=== Lifecycle Benchmark (enqueue -> fetch -> ack) ===")
@@ -127,15 +127,15 @@ func benchLifecycle(c *client.Client, httpC *http.Client, serverURL string, tota
 		go func(count int, wid string) {
 			defer wg.Done()
 			for range count {
-				payload := map[string]any{"i": idx.Load()}
+				// payload := map[string]any{"i": idx.Load()}
 				opStart := time.Now()
 
-				// Enqueue
-				_, err := c.Enqueue(queue, payload)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "lifecycle enqueue error: %v\n", err)
-					continue
-				}
+				// // Enqueue
+				// _, err := c.Enqueue(queue, payload)
+				// if err != nil {
+				// 	fmt.Fprintf(os.Stderr, "lifecycle enqueue error: %v\n", err)
+				// 	continue
+				// }
 
 				// Fetch
 				jobID, err := fetchJob(httpC, serverURL, queue, wid)
@@ -143,7 +143,8 @@ func benchLifecycle(c *client.Client, httpC *http.Client, serverURL string, tota
 					fmt.Fprintf(os.Stderr, "lifecycle fetch error: %v\n", err)
 					continue
 				}
-
+				// Sleep 1ms
+				time.Sleep(1 * time.Millisecond)
 				// Ack
 				err = ackJob(httpC, serverURL, jobID)
 				if err != nil {

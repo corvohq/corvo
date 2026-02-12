@@ -16,10 +16,12 @@ type FailResult struct {
 // Fail records a job failure, calculates backoff, and transitions state.
 func (s *Store) Fail(jobID string, errMsg string, backtrace string) (*FailResult, error) {
 	var result FailResult
+	var queue string
+	var eventType string
 
 	err := s.writer.ExecuteTx(func(tx *sql.Tx) error {
 		// Read current job state
-		var queue, state, retryBackoff string
+		var state, retryBackoff string
 		var attempt, maxRetries, baseDelayMs, maxDelayMs int
 		var batchID sql.NullString
 		err := tx.QueryRow(`
@@ -80,20 +82,7 @@ func (s *Store) Fail(jobID string, errMsg string, backtrace string) (*FailResult
 			result.Status = StateRetrying
 			result.NextAttemptAt = &nextAttempt
 			result.AttemptsRemaining = remaining
-
-			_, err = tx.Exec(`INSERT INTO events (type, job_id, queue) VALUES ('failed', ?, ?)`, jobID, queue)
-			if err != nil {
-				return fmt.Errorf("insert event: %w", err)
-			}
-
-			// Update queue stats
-			_, err = tx.Exec(
-				`INSERT INTO queue_stats (queue, failed) VALUES (?, 1) ON CONFLICT(queue) DO UPDATE SET failed = failed + 1`,
-				queue,
-			)
-			if err != nil {
-				return fmt.Errorf("update queue stats: %w", err)
-			}
+			eventType = "failed"
 		} else {
 			// Dead: all retries exhausted
 			failedAt := now.Format(time.RFC3339Nano)
@@ -113,20 +102,7 @@ func (s *Store) Fail(jobID string, errMsg string, backtrace string) (*FailResult
 
 			result.Status = StateDead
 			result.AttemptsRemaining = 0
-
-			_, err = tx.Exec(`INSERT INTO events (type, job_id, queue) VALUES ('dead', ?, ?)`, jobID, queue)
-			if err != nil {
-				return fmt.Errorf("insert event: %w", err)
-			}
-
-			// Update queue stats
-			_, err = tx.Exec(
-				`INSERT INTO queue_stats (queue, dead) VALUES (?, 1) ON CONFLICT(queue) DO UPDATE SET dead = dead + 1`,
-				queue,
-			)
-			if err != nil {
-				return fmt.Errorf("update queue stats: %w", err)
-			}
+			eventType = "dead"
 
 			// Update batch counter for failure
 			if batchID.Valid {
@@ -142,5 +118,14 @@ func (s *Store) Fail(jobID string, errMsg string, backtrace string) (*FailResult
 	if err != nil {
 		return nil, err
 	}
+
+	// Async: emit event and stats (non-critical)
+	s.async.Emit("INSERT INTO events (type, job_id, queue) VALUES (?, ?, ?)", eventType, jobID, queue)
+	if eventType == "failed" {
+		s.async.Emit("INSERT INTO queue_stats (queue, failed) VALUES (?, 1) ON CONFLICT(queue) DO UPDATE SET failed = failed + 1", queue)
+	} else {
+		s.async.Emit("INSERT INTO queue_stats (queue, dead) VALUES (?, 1) ON CONFLICT(queue) DO UPDATE SET dead = dead + 1", queue)
+	}
+
 	return &result, nil
 }

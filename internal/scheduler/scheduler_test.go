@@ -18,6 +18,7 @@ func testSetup(t *testing.T) (*store.Store, *Scheduler, *store.DB) {
 	t.Cleanup(func() { db.Close() })
 
 	s := store.NewStore(db)
+	t.Cleanup(func() { s.Close() })
 	sched := New(db.Write, DefaultConfig())
 	return s, sched, db
 }

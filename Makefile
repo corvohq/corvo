@@ -3,6 +3,9 @@
 BINARY := jobbie
 BUILD_DIR := bin
 
+bench:
+	CGO_ENABLED=1 go build -o $(BUILD_DIR)/bench ./cmd/bench
+
 build:
 	CGO_ENABLED=1 go build -o $(BUILD_DIR)/$(BINARY) ./cmd/jobbie
 

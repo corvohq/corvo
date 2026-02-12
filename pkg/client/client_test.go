@@ -18,6 +18,7 @@ func testClient(t *testing.T) *Client {
 	t.Cleanup(func() { db.Close() })
 
 	s := store.NewStore(db)
+	t.Cleanup(func() { s.Close() })
 	srv := server.New(s, ":0")
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)

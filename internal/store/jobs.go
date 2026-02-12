@@ -94,8 +94,10 @@ func (s *Store) GetJob(id string) (*Job, error) {
 
 // RetryJob resets a dead/cancelled/completed job back to pending.
 func (s *Store) RetryJob(id string) error {
-	return s.writer.ExecuteTx(func(tx *sql.Tx) error {
-		var state, queue string
+	var queue string
+
+	err := s.writer.ExecuteTx(func(tx *sql.Tx) error {
+		var state string
 		err := tx.QueryRow("SELECT state, queue FROM jobs WHERE id = ?", id).Scan(&state, &queue)
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("job %q not found", id)
@@ -124,17 +126,25 @@ func (s *Store) RetryJob(id string) error {
 			return fmt.Errorf("retry job: %w", err)
 		}
 
-		_, err = tx.Exec("INSERT INTO events (type, job_id, queue) VALUES ('retried', ?, ?)", id, queue)
-		return err
+		return nil
 	})
+
+	if err != nil {
+		return err
+	}
+
+	// Async: emit event (non-critical)
+	s.async.Emit("INSERT INTO events (type, job_id, queue) VALUES ('retried', ?, ?)", id, queue)
+	return nil
 }
 
 // CancelJob cancels a pending/scheduled job or marks an active job for cancellation.
 func (s *Store) CancelJob(id string) (string, error) {
 	var resultStatus string
+	var queue string
 
 	err := s.writer.ExecuteTx(func(tx *sql.Tx) error {
-		var state, queue string
+		var state string
 		err := tx.QueryRow("SELECT state, queue FROM jobs WHERE id = ?", id).Scan(&state, &queue)
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("job %q not found", id)
@@ -158,22 +168,21 @@ func (s *Store) CancelJob(id string) (string, error) {
 			return fmt.Errorf("cancel job: %w", err)
 		}
 
-		_, err = tx.Exec("INSERT INTO events (type, job_id, queue) VALUES ('cancelled', ?, ?)", id, queue)
-		return err
+		return nil
 	})
 
+	if err != nil {
+		return "", err
+	}
+
+	// Async: emit event (non-critical)
+	s.async.Emit("INSERT INTO events (type, job_id, queue) VALUES ('cancelled', ?, ?)", id, queue)
 	return resultStatus, err
 }
 
 // MoveJob moves a job to a different queue.
 func (s *Store) MoveJob(id, targetQueue string) error {
-	return s.writer.ExecuteTx(func(tx *sql.Tx) error {
-		// Ensure target queue exists
-		_, err := tx.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", targetQueue)
-		if err != nil {
-			return err
-		}
-
+	err := s.writer.ExecuteTx(func(tx *sql.Tx) error {
 		res, err := tx.Exec("UPDATE jobs SET queue = ? WHERE id = ?", targetQueue, id)
 		if err != nil {
 			return fmt.Errorf("move job: %w", err)
@@ -183,9 +192,17 @@ func (s *Store) MoveJob(id, targetQueue string) error {
 			return fmt.Errorf("job %q not found", id)
 		}
 
-		_, err = tx.Exec("INSERT INTO events (type, job_id, queue) VALUES ('moved', ?, ?)", id, targetQueue)
-		return err
+		return nil
 	})
+
+	if err != nil {
+		return err
+	}
+
+	// Async: ensure target queue exists, emit event (non-critical)
+	s.async.Emit("INSERT OR IGNORE INTO queues (name) VALUES (?)", targetQueue)
+	s.async.Emit("INSERT INTO events (type, job_id, queue) VALUES ('moved', ?, ?)", id, targetQueue)
+	return nil
 }
 
 // DeleteJob permanently removes a job.

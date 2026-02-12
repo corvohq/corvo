@@ -63,8 +63,8 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 	var scheduledAt *string
 	if req.ScheduledAt != nil {
 		state = StateScheduled
-		s := req.ScheduledAt.UTC().Format(time.RFC3339Nano)
-		scheduledAt = &s
+		sa := req.ScheduledAt.UTC().Format(time.RFC3339Nano)
+		scheduledAt = &sa
 	}
 
 	var expireAt *string
@@ -77,8 +77,8 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 
 	var tags *string
 	if len(req.Tags) > 0 {
-		s := string(req.Tags)
-		tags = &s
+		ts := string(req.Tags)
+		tags = &ts
 	}
 
 	var uniqueKey *string
@@ -92,10 +92,7 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 		// Check unique lock if unique_key is set
 		if uniqueKey != nil {
 			var existingJobID string
-			err := tx.QueryRow(
-				`SELECT job_id FROM unique_locks WHERE queue = ? AND unique_key = ? AND expires_at > strftime('%Y-%m-%dT%H:%M:%f', 'now')`,
-				req.Queue, *uniqueKey,
-			).Scan(&existingJobID)
+			err := tx.Stmt(s.stmtCheckUnique).QueryRow(req.Queue, *uniqueKey).Scan(&existingJobID)
 			if err == nil {
 				// Lock exists — return existing job
 				result.JobID = existingJobID
@@ -112,27 +109,14 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 			if req.UniquePeriod > 0 {
 				period = req.UniquePeriod
 			}
-			_, err = tx.Exec(
-				`INSERT OR REPLACE INTO unique_locks (queue, unique_key, job_id, expires_at) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%f', 'now', '+' || ? || ' seconds'))`,
-				req.Queue, *uniqueKey, jobID, period,
-			)
+			_, err = tx.Stmt(s.stmtInsertUnique).Exec(req.Queue, *uniqueKey, jobID, period)
 			if err != nil {
 				return fmt.Errorf("insert unique lock: %w", err)
 			}
 		}
 
-		// Ensure queue exists
-		_, err := tx.Exec(
-			`INSERT OR IGNORE INTO queues (name) VALUES (?)`,
-			req.Queue,
-		)
-		if err != nil {
-			return fmt.Errorf("ensure queue: %w", err)
-		}
-
-		// Insert job
-		_, err = tx.Exec(
-			`INSERT INTO jobs (id, queue, state, payload, priority, max_retries, retry_backoff, retry_base_delay_ms, retry_max_delay_ms, unique_key, tags, scheduled_at, expire_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		// Insert job (prepared statement)
+		_, err := tx.Stmt(s.stmtInsertJob).Exec(
 			jobID, req.Queue, state, string(req.Payload), priority,
 			maxRetries, backoff, baseDelayMs, maxDelayMs,
 			uniqueKey, tags, scheduledAt, expireAt,
@@ -141,29 +125,18 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 			return fmt.Errorf("insert job: %w", err)
 		}
 
-		// Emit event
-		_, err = tx.Exec(
-			`INSERT INTO events (type, job_id, queue) VALUES ('enqueued', ?, ?)`,
-			jobID, req.Queue,
-		)
-		if err != nil {
-			return fmt.Errorf("insert event: %w", err)
-		}
-
-		// Update queue stats
-		_, err = tx.Exec(
-			`INSERT INTO queue_stats (queue, enqueued) VALUES (?, 1) ON CONFLICT(queue) DO UPDATE SET enqueued = enqueued + 1`,
-			req.Queue,
-		)
-		if err != nil {
-			return fmt.Errorf("update queue stats: %w", err)
-		}
-
 		return nil
 	})
 
 	if err != nil {
 		return nil, err
+	}
+
+	// Async: ensure queue exists, emit event and stats (non-critical)
+	if !result.UniqueExisting {
+		s.async.Emit("INSERT OR IGNORE INTO queues (name) VALUES (?)", req.Queue)
+		s.async.Emit("INSERT INTO events (type, job_id, queue) VALUES ('enqueued', ?, ?)", jobID, req.Queue)
+		s.async.Emit("INSERT INTO queue_stats (queue, enqueued) VALUES (?, 1) ON CONFLICT(queue) DO UPDATE SET enqueued = enqueued + 1", req.Queue)
 	}
 
 	return result, nil
@@ -204,8 +177,8 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 		if req.Batch != nil {
 			var callbackPayload *string
 			if len(req.Batch.CallbackPayload) > 0 {
-				s := string(req.Batch.CallbackPayload)
-				callbackPayload = &s
+				cp := string(req.Batch.CallbackPayload)
+				callbackPayload = &cp
 			}
 			_, err := tx.Exec(
 				`INSERT INTO batches (id, total, pending, callback_queue, callback_payload) VALUES (?, ?, ?, ?, ?)`,
@@ -241,8 +214,8 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 
 			var tags *string
 			if len(jobReq.Tags) > 0 {
-				s := string(jobReq.Tags)
-				tags = &s
+				ts := string(jobReq.Tags)
+				tags = &ts
 			}
 
 			var batchIDPtr *string
@@ -250,13 +223,7 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 				batchIDPtr = &batchID
 			}
 
-			// Ensure queue exists
-			_, err := tx.Exec(`INSERT OR IGNORE INTO queues (name) VALUES (?)`, jobReq.Queue)
-			if err != nil {
-				return fmt.Errorf("ensure queue: %w", err)
-			}
-
-			_, err = tx.Exec(
+			_, err := tx.Exec(
 				`INSERT INTO jobs (id, queue, state, payload, priority, max_retries, retry_backoff, retry_base_delay_ms, retry_max_delay_ms, tags, batch_id) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`,
 				jobIDs[i], jobReq.Queue, string(jobReq.Payload), priority,
 				maxRetries, backoff, baseDelayMs, maxDelayMs,
@@ -265,19 +232,6 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 			if err != nil {
 				return fmt.Errorf("insert job %d: %w", i, err)
 			}
-
-			_, err = tx.Exec(`INSERT INTO events (type, job_id, queue) VALUES ('enqueued', ?, ?)`, jobIDs[i], jobReq.Queue)
-			if err != nil {
-				return fmt.Errorf("insert event %d: %w", i, err)
-			}
-
-			_, err = tx.Exec(
-				`INSERT INTO queue_stats (queue, enqueued) VALUES (?, 1) ON CONFLICT(queue) DO UPDATE SET enqueued = enqueued + 1`,
-				jobReq.Queue,
-			)
-			if err != nil {
-				return fmt.Errorf("update queue stats %d: %w", i, err)
-			}
 		}
 
 		return nil
@@ -285,6 +239,13 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 
 	if err != nil {
 		return nil, err
+	}
+
+	// Async: ensure queues exist, emit events and stats (non-critical)
+	for i, jobReq := range req.Jobs {
+		s.async.Emit("INSERT OR IGNORE INTO queues (name) VALUES (?)", jobReq.Queue)
+		s.async.Emit("INSERT INTO events (type, job_id, queue) VALUES ('enqueued', ?, ?)", jobIDs[i], jobReq.Queue)
+		s.async.Emit("INSERT INTO queue_stats (queue, enqueued) VALUES (?, 1) ON CONFLICT(queue) DO UPDATE SET enqueued = enqueued + 1", jobReq.Queue)
 	}
 
 	return &BatchEnqueueResult{JobIDs: jobIDs, BatchID: batchID}, nil

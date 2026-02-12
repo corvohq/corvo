@@ -20,6 +20,7 @@ func testServer(t *testing.T) (*Server, *store.Store) {
 	t.Cleanup(func() { db.Close() })
 
 	s := store.NewStore(db)
+	t.Cleanup(func() { s.Close() })
 	srv := New(s, ":0")
 	return srv, s
 }
