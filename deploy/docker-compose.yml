@@ -1,0 +1,13 @@
+services:
+  jobbie:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - jobbie-data:/data
+    restart: unless-stopped
+
+volumes:
+  jobbie-data:
