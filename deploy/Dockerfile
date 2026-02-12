@@ -23,4 +23,4 @@ VOLUME /data
 EXPOSE 8080
 
 ENTRYPOINT ["jobbie"]
-CMD ["server", "--data-dir", "/data", "--addr", ":8080"]
+CMD ["server", "--data-dir", "/data", "--bind", ":8080"]

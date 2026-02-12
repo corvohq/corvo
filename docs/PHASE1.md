@@ -207,24 +207,24 @@ Files: `pkg/client/client.go`, `pkg/client/worker.go`
 
 Files: `deploy/Dockerfile`, `deploy/docker-compose.yml`
 
-- [ ] Multi-stage Dockerfile (Go build with CGo enabled -> scratch/alpine runtime)
-- [ ] `docker-compose.yml` — single-node quick start with volume mount
+- [x] Multi-stage Dockerfile (Go build with CGo enabled -> scratch/alpine runtime)
+- [x] `docker-compose.yml` — single-node quick start with volume mount
 
 ### 15. Integration Tests
 
 Files: `tests/integration/`
 
-- [ ] Test helper: start server in-process, return client pointing at it
-- [ ] Full job lifecycle: enqueue -> fetch -> ack, verify completed
-- [ ] Fail + retry: enqueue -> fetch -> fail, verify retrying, wait for scheduler promotion, fetch again
-- [ ] Dead letter: exhaust retries, verify state=dead
-- [ ] Priority ordering: enqueue normal + critical, verify critical fetched first
-- [ ] Unique jobs: enqueue same unique_key twice, verify duplicate response
-- [ ] Queue pause/resume: pause queue, fetch returns nothing, resume, fetch works
-- [ ] Search: enqueue several jobs, search by various filters, verify results
-- [ ] Bulk operations: enqueue jobs, bulk retry/move/delete, verify
-- [ ] Cancellation: enqueue -> fetch -> cancel -> heartbeat returns cancel signal
-- [ ] Heartbeat + checkpoint: fetch -> checkpoint via heartbeat -> fail -> re-fetch, verify checkpoint preserved
+- [x] Test helper: start server in-process, return client pointing at it
+- [x] Full job lifecycle: enqueue -> fetch -> ack, verify completed
+- [x] Fail + retry: enqueue -> fetch -> fail, verify retrying, wait for scheduler promotion, fetch again
+- [x] Dead letter: exhaust retries, verify state=dead
+- [x] Priority ordering: enqueue normal + critical, verify critical fetched first
+- [x] Unique jobs: enqueue same unique_key twice, verify duplicate response
+- [x] Queue pause/resume: pause queue, fetch returns nothing, resume, fetch works
+- [x] Search: enqueue several jobs, search by various filters, verify results
+- [x] Bulk operations: enqueue jobs, bulk retry/move/delete, verify
+- [x] Cancellation: enqueue -> fetch -> cancel -> heartbeat returns cancel signal
+- [x] Heartbeat + checkpoint: fetch -> checkpoint via heartbeat -> fail -> re-fetch, verify checkpoint preserved
 - [ ] CLI smoke test: run CLI commands against live server
 
 ## Verification
