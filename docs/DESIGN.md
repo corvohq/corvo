@@ -811,6 +811,7 @@ No secondary index sets to maintain, no Lua scan loops. SQLite's query planner h
 - `payload LIKE` substring search: ~100ms per 100k jobs
 - `payload_jq` expressions: translated to `json_extract` at query time
 - The response includes `"duration_ms"` so users can see query cost
+- Throughput: ~5,000 jobs/sec per shard with `synchronous=FULL` (single SQLite writer). With `--shards N`, throughput scales sub-linearly — near-linear up to ~8 shards, diminishing after ~16 as disk I/O (fsync) becomes the shared bottleneck. Clustered nodes can use `synchronous=NORMAL` (Raft provides durability) for ~2x per-shard throughput. See [Sharding](#sharding) for details.
 
 ### Atomic operations via SQL transactions
 
@@ -1493,28 +1494,201 @@ Mode 1: Single node (default)
   → Good for: dev, staging, small production, single server
   → ~5,000 jobs/sec
 
-Mode 2: Clustered (automatic HA)
+Mode 2: Single node, sharded (higher throughput)
+  $ jobbie server --shards 4
+  → 4 independent SQLite databases, one write lock each
+  → Queues hashed to shards automatically, or manually pinned
+  → Good for: high-throughput single server, no HA needed
+  → Near-linear to ~8 shards, diminishing after ~16 (disk I/O ceiling)
+  → 4 shards ≈ 18,000 j/s, 8 shards ≈ 32,000 j/s (NVMe SSD)
+
+Mode 3: Clustered (automatic HA)
   $ jobbie server --cluster --peers node2:9400,node3:9400
   or in k8s: --cluster --discover=dns
   → 3-node Raft group, automatic leader election + failover
+  → Combines with --shards for HA + throughput
   → Good for: production HA, medium-to-large scale
-  → ~5,000 jobs/sec with fault tolerance (survives 1 node failure)
+  → ~5,000 jobs/sec per shard (FULL sync), ~8-10K with NORMAL sync (Raft provides durability)
 
-Mode 3: Federated clusters (horizontal scaling)
+Mode 4: Federated clusters (horizontal scaling)
   → Multiple independent Jobbie clusters, each handling a subset of queues
   → Queues are assigned to clusters; workers/producers point at the right cluster
   → No code changes — just deployment configuration
-  → Good for: high-throughput production, >5,000 jobs/sec
-  → Scales linearly: N clusters × ~5,000 jobs/sec
+  → Good for: extreme throughput beyond single-cluster sharding ceiling
+  → Scales: N clusters × shards per cluster
 
-Mode 4: Jobbie Cloud (managed)
+Mode 5: Jobbie Cloud (managed)
   → Customers configure workers with an API key + URL
   → Infrastructure is Jobbie's problem
 ```
 
+### Sharding
+
+SQLite is single-writer — even with WAL mode, only one write transaction proceeds at a time. This is the source of the ~5,000 jobs/sec ceiling. Sharding breaks through it by running multiple independent SQLite databases within a single Jobbie process, each with its own WAL and write lock.
+
+**Why this works:** queues are naturally independent. There is no cross-queue state in Jobbie — enqueue, fetch, ack, and fail all operate within a single queue. This is the exact property needed for sharding. Each shard handles a subset of queues, and they never coordinate.
+
+**Scaling limits:** sharding is sub-linear because all shards share the underlying disk. The main bottleneck is fsync — each write with `synchronous=FULL` flushes the WAL to disk, and concurrent fsyncs from multiple shards compete for disk I/O. On a good NVMe SSD:
+
+| Shards | Throughput (FULL sync) | Throughput (NORMAL sync, clustered) | Scaling efficiency |
+|--------|----------------------|-------------------------------------|-------------------|
+| 1      | ~5,000 j/s           | ~8,000-10,000 j/s                   | baseline          |
+| 4      | ~18,000 j/s          | ~32,000 j/s                         | ~90%              |
+| 8      | ~32,000 j/s          | ~55,000 j/s                         | ~80%              |
+| 16     | ~50,000 j/s          | ~80,000 j/s                         | ~60%              |
+| 32+    | diminishing          | diminishing                         | disk-bound        |
+
+These are estimates — actual throughput depends on disk hardware (NVMe >> SATA SSD), payload size, and read/write ratio.
+
+In clustered mode, Raft replicates data to multiple nodes before acknowledging writes. This means individual nodes can safely use `synchronous=NORMAL` (fsync less frequently) since durability is guaranteed by the Raft quorum, not a single node's disk. This roughly doubles per-shard throughput.
+
+For most workloads, 4-8 shards on a single node provides more than enough throughput. Beyond ~16 shards, federation (multiple clusters) is more effective than adding shards.
+
+#### Shard topology
+
+```
+Single Jobbie process, --shards 4:
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  Jobbie Server                                                       │
+│                                                                      │
+│  ┌─────────────────┐  ┌───────────────────────────────────────────┐ │
+│  │  HTTP API        │  │  Shard Router                             │ │
+│  │  (all requests)  │──│  queue name → hash → shard index          │ │
+│  └─────────────────┘  └───────┬───────┬───────┬───────┬───────────┘ │
+│                               │       │       │       │             │
+│                          ┌────┴──┐┌───┴───┐┌──┴────┐┌─┴─────┐      │
+│                          │Shard 0││Shard 1││Shard 2││Shard 3│      │
+│                          │.db    ││.db    ││.db    ││.db    │      │
+│                          │       ││       ││       ││       │      │
+│                          │~5k j/s││~5k j/s││~5k j/s││~5k j/s│      │
+│                          └───────┘└───────┘└───────┘└───────┘      │
+│                                                                      │
+│  On disk:                                                            │
+│    /data/shard-0.db  /data/shard-1.db  /data/shard-2.db  ...        │
+│                                                                      │
+│  Total throughput: ~18,000 jobs/sec (4 shards, NVMe, FULL sync)      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+#### Queue-to-shard mapping
+
+**Automatic (default):** hash the queue name to a shard index. Zero configuration.
+
+```bash
+jobbie server --shards 4
+```
+
+Queue `emails.send` → hash → shard 2. Queue `agents.research` → hash → shard 0. Deterministic and stable — the same queue always maps to the same shard.
+
+**Manual:** pin queues to specific shards for control.
+
+```yaml
+# jobbie.yaml
+shards:
+  count: 3
+  mapping:
+    - queues: ["agents.*", "llm.*"]         # AI workloads isolated on shard 0
+    - queues: ["emails.*", "notifs.*"]      # messaging on shard 1
+    - queues: ["*"]                         # everything else on shard 2
+```
+
+Manual mapping is useful when you want to isolate workloads — a burst of AI agent jobs won't affect email processing throughput.
+
+#### Job ID routing
+
+Ack, fail, and heartbeat are keyed by job ID, not queue name. The shard router needs to know which shard a job lives on without a lookup. This is solved by encoding the shard index in the job ID at generation time:
+
+```
+job_s0_01HX7Y2K3M...     ← shard 0
+job_s2_01HX7Y2K3N...     ← shard 2
+```
+
+The server generates job IDs at enqueue time and controls the format. When the ID comes back in ack/fail/heartbeat, the router extracts the shard index from the prefix and dispatches to the correct database. No API changes, no lookup tables.
+
+For unsharded mode (single shard, `--shards 1` or default), the ID format stays unchanged: `job_01HX7Y2K3M...`. The `_s{N}_` segment is only added when sharding is enabled.
+
+#### Cross-shard operations
+
+Most operations are single-queue and route to a single shard. A few operations span shards:
+
+| Operation | Single-shard? | Cross-shard handling |
+|---|---|---|
+| Enqueue | Yes (one queue) | — |
+| Fetch | Mostly (one queue set) | If queues span shards, fan out to each shard |
+| Ack / Fail | Yes (job ID encodes shard) | — |
+| Heartbeat | No (batch of job IDs) | Group by shard, issue parallel queries |
+| Search | Depends on filter | If queue filter → single shard. Otherwise → fan out, merge |
+| Queue list | No (all queues) | Fan out, merge |
+| Bulk ops | Depends on filter | Same as search |
+| Dashboard stats | No (aggregate) | Fan out, merge |
+
+Fan-out queries execute in parallel across shards and merge results. For dashboard/stats this is cheap — each shard returns a small result set. For unfiltered search across all shards, results are merged with cursor-based pagination (each shard maintains its own cursor, the router merges sorted results).
+
+#### Sharding + Raft clustering
+
+Sharding and clustering are orthogonal. A clustered Jobbie deployment with shards works as follows:
+
+```
+3-node cluster, 4 shards each:
+
+  Node 0 (leader)        Node 1 (follower)     Node 2 (follower)
+  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+  │ shard-0.db      │    │ shard-0.db      │    │ shard-0.db      │
+  │ shard-1.db      │◄──►│ shard-1.db      │◄──►│ shard-1.db      │
+  │ shard-2.db      │    │ shard-2.db      │    │ shard-2.db      │
+  │ shard-3.db      │    │ shard-3.db      │    │ shard-3.db      │
+  └─────────────────┘    └─────────────────┘    └─────────────────┘
+         ▲                                              ▲
+         └────────────── Raft consensus ────────────────┘
+```
+
+A single Raft group manages all shards. Each Raft log entry is tagged with a shard index. The FSM dispatches `Apply` calls to the correct shard's database. While the Raft log is sequential, the FSM can apply entries to different shards concurrently since they're independent databases with independent write locks.
+
+Snapshots include all shard databases. A joining node receives the full set.
+
+#### Multi-tenant sharding
+
+In multi-tenant deployments (Enterprise/Cloud), namespace is the primary shard key rather than queue name. Each tenant gets its own SQLite database:
+
+```
+/data/
+  ns_acme.db          ← tenant "acme" — their own emails.send, agents.research, etc.
+  ns_bigcorp.db       ← tenant "bigcorp" — their own emails.send, no collision
+  ns_startup.db       ← tenant "startup"
+```
+
+This provides:
+- **True tenant isolation** — separate files, separate write locks, separate WALs
+- **Parallel writes across tenants** — tenant A's burst doesn't block tenant B
+- **Noisy-neighbor protection** — each database has its own I/O and lock contention
+- **Per-tenant backup/restore** — `cp ns_acme.db backup/`
+- **Per-tenant migration** — move a tenant between clusters by copying a file
+
+Queue names only need to be unique within a namespace, which they naturally are. No collision between tenant A's `emails.send` and tenant B's `emails.send` — they live in different databases.
+
+For a large tenant that needs more throughput, sub-sharding splits their namespace across multiple databases:
+
+```
+/data/
+  ns_acme_s0.db       ← acme shard 0
+  ns_acme_s1.db       ← acme shard 1
+  ns_smallco.db       ← small tenant, single database is fine
+```
+
+Job IDs in multi-tenant mode encode the namespace and optional shard:
+
+```
+job_acme_01HX7Y2K3M...         ← tenant "acme", single shard
+job_acme_s0_01HX7Y2K3N...      ← tenant "acme", shard 0
+job_bigcorp_01HX7Y2K3P...      ← tenant "bigcorp"
+```
+
+The API layer extracts the namespace from the auth context (API key → namespace). The shard router uses the namespace to find the correct database. Workers interact with a single namespace and never see cross-tenant data.
+
 ### Federated clusters
 
-When a single Raft cluster isn't enough (~5,000 jobs/sec ceiling), scale by running multiple independent clusters. Each cluster handles a subset of queues.
+When a single cluster with sharding isn't enough, scale by running multiple independent clusters. Each cluster handles a subset of queues (or namespaces in multi-tenant mode).
 
 ```
                     ┌──────────────────────────────┐
@@ -1525,11 +1699,13 @@ When a single Raft cluster isn't enough (~5,000 jobs/sec ceiling), scale by runn
               ┌────────────┴──┐     ┌─────┴───────────┐
               │  Cluster A    │     │  Cluster B       │
               │  (3 nodes)    │     │  (3 nodes)       │
+              │  4 shards     │     │  4 shards        │
               │               │     │                  │
               │  emails.*     │     │  reports.*       │
               │  notifs.*     │     │  sync.*          │
               │               │     │  analytics.*     │
-              │  ~5,000 j/s   │     │  ~5,000 j/s      │
+              │  ~32,000 j/s  │     │  ~32,000 j/s     │
+              │  (8 shards)   │     │  (8 shards)      │
               └───────────────┘     └──────────────────┘
 ```
 
@@ -2052,6 +2228,10 @@ The boundary is clear: **OSS handles all job processing features. Cloud handles 
 - [ ] Job expiration (TTL)
 - [ ] Real-time UI updates via SSE
 - [ ] Prometheus metrics endpoint
+- [ ] Sharding: shard router, multiple SQLite databases, queue-to-shard mapping (hash + manual config)
+- [ ] Sharding: job ID format with shard index prefix (`job_s{N}_...`)
+- [ ] Sharding: cross-shard fan-out for search, queue list, dashboard stats
+- [ ] Sharding: `--shards N` server flag + `shards` config in jobbie.yaml
 - [ ] Python client library
 - [ ] Helm chart (single node)
 
@@ -2060,23 +2240,29 @@ The boundary is clear: **OSS handles all job processing features. Cloud handles 
 - [ ] Multi-node Raft clustering (bootstrap, join, remove)
 - [ ] Write proxying (follower → Raft leader)
 - [ ] Automatic failover + rejoin
-- [ ] Raft snapshots + log compaction
+- [ ] Raft snapshots + log compaction (all shards)
+- [ ] Shard-tagged Raft log entries, concurrent FSM apply across shards
 - [ ] DNS-based peer discovery for Kubernetes
 - [ ] Helm chart (clustered StatefulSet)
 - [ ] Webhooks on job lifecycle events
 - [ ] Job dependencies (job B waits for job A)
-- [ ] UI: cluster status view, Raft log monitoring
+- [ ] UI: cluster status view, Raft log monitoring, per-shard throughput
 - [ ] Rust client library
 - [ ] Haskell client library
 - [ ] OpenTelemetry integration (trace job from enqueue to complete)
 - [ ] Chaos tests (kill nodes, verify recovery)
 
-### Phase 4 — Cloud
+### Phase 4 — Enterprise + Cloud
 
-- [ ] Multi-tenancy and namespaces
-- [ ] Auth (API keys, SSO)
-- [ ] RBAC (per-queue permissions)
-- [ ] Managed infrastructure
+- [ ] Multi-tenancy: namespace-per-database (SQLite file per tenant)
+- [ ] Namespace-aware shard router (namespace as primary shard key)
+- [ ] Job ID format with namespace prefix (`job_{ns}_...`, `job_{ns}_s{N}_...`)
+- [ ] Auth (API keys → namespace mapping, SSO)
+- [ ] RBAC (per-namespace, per-queue permissions)
+- [ ] Per-tenant sub-sharding for large tenants
+- [ ] Per-tenant backup/restore (copy SQLite files)
+- [ ] Per-tenant migration between clusters
+- [ ] Managed infrastructure (Cloud)
 - [ ] Billing and usage metering
 - [ ] Audit logging
 - [ ] Extended retention + full-text search (SQLite FTS5)
