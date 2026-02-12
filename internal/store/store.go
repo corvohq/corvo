@@ -27,6 +27,11 @@ func NewStore(db *DB) *Store {
 	}
 }
 
+// NewStoreWithWriter creates a Store with a custom Writer (e.g. BatchWriter).
+func NewStoreWithWriter(db *DB, writer Writer) *Store {
+	return &Store{db: db, writer: writer}
+}
+
 // DirectWriter executes SQL directly against the SQLite write connection.
 type DirectWriter struct {
 	db *sql.DB

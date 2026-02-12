@@ -811,7 +811,7 @@ No secondary index sets to maintain, no Lua scan loops. SQLite's query planner h
 - `payload LIKE` substring search: ~100ms per 100k jobs
 - `payload_jq` expressions: translated to `json_extract` at query time
 - The response includes `"duration_ms"` so users can see query cost
-- Throughput: ~5,000 jobs/sec per shard with `synchronous=FULL` (single SQLite writer). With `--shards N`, throughput scales sub-linearly — near-linear up to ~8 shards, diminishing after ~16 as disk I/O (fsync) becomes the shared bottleneck. Clustered nodes can use `synchronous=NORMAL` (Raft provides durability) for ~2x per-shard throughput. See [Sharding](#sharding) for details.
+- Write throughput: ~2,000-5,000 jobs/sec per shard with `synchronous=FULL` via **write batching** — a background `BatchWriter` groups concurrent `ExecuteTx` calls into a single SQLite transaction, amortizing the ~4-6ms fsync cost across the entire batch. Without batching, individual writes are limited to ~145 ops/sec. With `--shards N`, throughput scales sub-linearly — near-linear up to ~8 shards, diminishing after ~16 as disk I/O (fsync) becomes the shared bottleneck. Clustered nodes can use `synchronous=NORMAL` (Raft provides durability) for ~2x per-shard throughput. See [Sharding](#sharding) for details.
 
 ### Atomic operations via SQL transactions
 

@@ -56,7 +56,7 @@ func Open(dataDir string) (*DB, error) {
 }
 
 func openConn(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_synchronous=FULL&_foreign_keys=ON&_busy_timeout=5000")
+	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_synchronous=NORMAL&_foreign_keys=ON&_busy_timeout=5000")
 	if err != nil {
 		return nil, err
 	}

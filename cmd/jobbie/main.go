@@ -81,8 +81,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("open database: %w", err)
 	}
 
-	// Create store
-	s := store.NewStore(db)
+	// Create batch writer and store
+	bw := store.NewBatchWriter(db.Write, store.DefaultBatchWriterConfig())
+	s := store.NewStoreWithWriter(db, bw)
 
 	// Start scheduler
 	sched := scheduler.New(db.Write, scheduler.DefaultConfig())
@@ -116,6 +117,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	slog.Info("stopping scheduler")
 	schedCancel()
+
+	slog.Info("stopping batch writer")
+	bw.Stop()
 
 	slog.Info("closing database")
 	if err := db.Close(); err != nil {

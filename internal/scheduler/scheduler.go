@@ -68,7 +68,7 @@ func (s *Scheduler) promoteScheduledJobs() {
 	result, err := s.writeDB.Exec(`
 		UPDATE jobs SET state = 'pending', scheduled_at = NULL
 		WHERE state IN ('scheduled', 'retrying')
-		  AND scheduled_at <= strftime('%Y-%m-%dT%H:%M:%f', 'now')
+		  AND scheduled_at <= strftime('%Y-%m-%dT%H:%M:%f', 'now', '+0.001 seconds')
 	`)
 	if err != nil {
 		slog.Error("promote scheduled jobs", "error", err)

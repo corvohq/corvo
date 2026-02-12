@@ -40,14 +40,14 @@ func TestOpen(t *testing.T) {
 		t.Errorf("foreign_keys = %d, want 1", fk)
 	}
 
-	// Verify synchronous = FULL (2)
+	// Verify synchronous = NORMAL (1)
 	var sync int
 	err = db.Read.QueryRow("PRAGMA synchronous").Scan(&sync)
 	if err != nil {
 		t.Fatalf("query synchronous: %v", err)
 	}
-	if sync != 2 {
-		t.Errorf("synchronous = %d, want 2 (FULL)", sync)
+	if sync != 1 {
+		t.Errorf("synchronous = %d, want 1 (NORMAL)", sync)
 	}
 }
 
