@@ -73,6 +73,10 @@ func testServer(t *testing.T) (*Server, *store.Store) {
 }
 
 func doRequest(srv *Server, method, path string, body interface{}) *httptest.ResponseRecorder {
+	return doRequestWithHeaders(srv, method, path, body, nil)
+}
+
+func doRequestWithHeaders(srv *Server, method, path string, body interface{}, headers map[string]string) *httptest.ResponseRecorder {
 	var reader io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
@@ -80,6 +84,9 @@ func doRequest(srv *Server, method, path string, body interface{}) *httptest.Res
 	}
 	req := httptest.NewRequest(method, path, reader)
 	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	return rr
@@ -896,6 +903,47 @@ func TestWebhookEndpoints(t *testing.T) {
 	rr = doRequest(srv, "DELETE", "/api/v1/webhooks/wh_test", nil)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("delete webhook status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAPIKeyAuthAndNamespaceIsolation(t *testing.T) {
+	srv, _ := testServer(t)
+
+	rr := doRequest(srv, "POST", "/api/v1/auth/keys", map[string]any{
+		"name":      "acme-admin",
+		"key":       "k_acme_admin",
+		"namespace": "acme",
+		"role":      "admin",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("set api key status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(srv, "GET", "/api/v1/queues", nil)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized without key, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	headers := map[string]string{"X-API-Key": "k_acme_admin"}
+	rr = doRequestWithHeaders(srv, "POST", "/api/v1/enqueue", map[string]any{
+		"queue":   "emails.send",
+		"payload": map[string]any{"x": 1},
+	}, headers)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("enqueue status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequestWithHeaders(srv, "GET", "/api/v1/queues", nil, headers)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("queues status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var queues []map[string]any
+	decodeResponse(t, rr, &queues)
+	if len(queues) == 0 {
+		t.Fatalf("expected queues")
+	}
+	if name, _ := queues[0]["name"].(string); name != "emails.send" {
+		t.Fatalf("expected visible queue name without namespace prefix, got %q", name)
 	}
 }
 

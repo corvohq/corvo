@@ -11,19 +11,29 @@ import (
 // Queue management
 
 func (s *Server) handleListQueues(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	queues, err := s.store.ListQueues()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
 		return
 	}
-	if queues == nil {
-		queues = []store.QueueInfo{}
+	filtered := make([]store.QueueInfo, 0, len(queues))
+	for _, q := range queues {
+		if !enforceNamespaceJob(principal.Namespace, q.Name) {
+			continue
+		}
+		q.Name = visibleQueue(principal.Namespace, q.Name)
+		filtered = append(filtered, q)
 	}
-	writeJSON(w, http.StatusOK, queues)
+	if filtered == nil {
+		filtered = []store.QueueInfo{}
+	}
+	writeJSON(w, http.StatusOK, filtered)
 }
 
 func (s *Server) handlePauseQueue(w http.ResponseWriter, r *http.Request) {
-	name := chi.URLParam(r, "name")
+	principal := principalFromContext(r.Context())
+	name := namespaceQueue(principal.Namespace, chi.URLParam(r, "name"))
 	if err := s.store.PauseQueue(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "QUEUE_ERROR")
 		return
@@ -32,7 +42,8 @@ func (s *Server) handlePauseQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleResumeQueue(w http.ResponseWriter, r *http.Request) {
-	name := chi.URLParam(r, "name")
+	principal := principalFromContext(r.Context())
+	name := namespaceQueue(principal.Namespace, chi.URLParam(r, "name"))
 	if err := s.store.ResumeQueue(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "QUEUE_ERROR")
 		return
@@ -41,7 +52,8 @@ func (s *Server) handleResumeQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleClearQueue(w http.ResponseWriter, r *http.Request) {
-	name := chi.URLParam(r, "name")
+	principal := principalFromContext(r.Context())
+	name := namespaceQueue(principal.Namespace, chi.URLParam(r, "name"))
 	if err := s.store.ClearQueue(name); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
 		return
@@ -50,7 +62,8 @@ func (s *Server) handleClearQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDrainQueue(w http.ResponseWriter, r *http.Request) {
-	name := chi.URLParam(r, "name")
+	principal := principalFromContext(r.Context())
+	name := namespaceQueue(principal.Namespace, chi.URLParam(r, "name"))
 	if err := s.store.DrainQueue(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "QUEUE_ERROR")
 		return
@@ -59,7 +72,8 @@ func (s *Server) handleDrainQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSetConcurrency(w http.ResponseWriter, r *http.Request) {
-	name := chi.URLParam(r, "name")
+	principal := principalFromContext(r.Context())
+	name := namespaceQueue(principal.Namespace, chi.URLParam(r, "name"))
 	var body struct {
 		Max int `json:"max"`
 	}
@@ -75,7 +89,8 @@ func (s *Server) handleSetConcurrency(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSetThrottle(w http.ResponseWriter, r *http.Request) {
-	name := chi.URLParam(r, "name")
+	principal := principalFromContext(r.Context())
+	name := namespaceQueue(principal.Namespace, chi.URLParam(r, "name"))
 	var body struct {
 		Rate     int `json:"rate"`
 		WindowMs int `json:"window_ms"`
@@ -96,7 +111,8 @@ func (s *Server) handleSetThrottle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRemoveThrottle(w http.ResponseWriter, r *http.Request) {
-	name := chi.URLParam(r, "name")
+	principal := principalFromContext(r.Context())
+	name := namespaceQueue(principal.Namespace, chi.URLParam(r, "name"))
 	if err := s.store.RemoveThrottle(name); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
 		return
@@ -105,7 +121,8 @@ func (s *Server) handleRemoveThrottle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteQueue(w http.ResponseWriter, r *http.Request) {
-	name := chi.URLParam(r, "name")
+	principal := principalFromContext(r.Context())
+	name := namespaceQueue(principal.Namespace, chi.URLParam(r, "name"))
 	if err := s.store.DeleteQueue(name); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
 		return
@@ -116,12 +133,18 @@ func (s *Server) handleDeleteQueue(w http.ResponseWriter, r *http.Request) {
 // Job management
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
 	job, err := s.store.GetJob(id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error(), "NOT_FOUND")
 		return
 	}
+	if !enforceNamespaceJob(principal.Namespace, job.Queue) {
+		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
+		return
+	}
+	job.Queue = visibleQueue(principal.Namespace, job.Queue)
 	writeJSON(w, http.StatusOK, job)
 }
 
@@ -143,7 +166,12 @@ func (s *Server) handleListJobIterations(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
+	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
+		return
+	}
 	if err := s.store.RetryJob(id); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "RETRY_ERROR")
 		return
@@ -152,7 +180,12 @@ func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
+	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
+		return
+	}
 	status, err := s.store.CancelJob(id)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "CANCEL_ERROR")
@@ -162,7 +195,12 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMoveJob(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
+	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
+		return
+	}
 	var body struct {
 		Queue string `json:"queue"`
 	}
@@ -174,6 +212,7 @@ func (s *Server) handleMoveJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "queue is required", "VALIDATION_ERROR")
 		return
 	}
+	body.Queue = namespaceQueue(principal.Namespace, body.Queue)
 	if err := s.store.MoveJob(id, body.Queue); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "MOVE_ERROR")
 		return
@@ -182,7 +221,12 @@ func (s *Server) handleMoveJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
+	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
+		return
+	}
 	if err := s.store.DeleteJob(id); err != nil {
 		writeError(w, http.StatusNotFound, err.Error(), "NOT_FOUND")
 		return
@@ -191,7 +235,12 @@ func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHoldJob(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
+	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
+		return
+	}
 	if err := s.store.HoldJob(id); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "HOLD_ERROR")
 		return
@@ -200,7 +249,12 @@ func (s *Server) handleHoldJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleApproveJob(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
+	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
+		return
+	}
 	if err := s.store.ApproveJob(id); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "APPROVE_ERROR")
 		return
@@ -209,7 +263,12 @@ func (s *Server) handleApproveJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRejectJob(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
+	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
+		return
+	}
 	if err := s.store.RejectJob(id); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "REJECT_ERROR")
 		return
@@ -218,7 +277,12 @@ func (s *Server) handleRejectJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReplayJob(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
+	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
+		return
+	}
 	var body struct {
 		From int `json:"from"`
 	}
@@ -241,10 +305,14 @@ func (s *Server) handleReplayJob(w http.ResponseWriter, r *http.Request) {
 // Search and bulk
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	var filter search.Filter
 	if err := decodeJSON(r, &filter); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
 		return
+	}
+	if filter.Queue != "" {
+		filter.Queue = namespaceQueue(principal.Namespace, filter.Queue)
 	}
 
 	result, err := s.store.SearchJobs(filter)
@@ -252,10 +320,14 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
 		return
 	}
+	for i := range result.Jobs {
+		result.Jobs[i].Queue = visibleQueue(principal.Namespace, result.Jobs[i].Queue)
+	}
 	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	var req struct {
 		store.BulkRequest
 		Async *bool `json:"async,omitempty"`
@@ -286,6 +358,12 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if req.BulkRequest.Filter != nil && req.BulkRequest.Filter.Queue != "" {
+		req.BulkRequest.Filter.Queue = namespaceQueue(principal.Namespace, req.BulkRequest.Filter.Queue)
+	}
+	if req.BulkRequest.MoveToQueue != "" {
+		req.BulkRequest.MoveToQueue = namespaceQueue(principal.Namespace, req.BulkRequest.MoveToQueue)
+	}
 	if useAsync {
 		task, err := s.bulkAsync.start(req.BulkRequest)
 		if err != nil {

@@ -79,8 +79,10 @@ func (s *Server) buildRouter() chi.Router {
 	r.Use(otelHTTPMiddleware)
 	r.Use(middleware.Recoverer)
 	r.Use(corsMiddleware)
+	r.Use(s.auditLogMiddleware)
 
 	r.Route("/api/v1", func(r chi.Router) {
+		r.Use(s.authMiddleware)
 		// Read endpoints
 		r.Get("/queues", s.handleListQueues)
 		r.Get("/jobs/{id}", s.handleGetJob)
@@ -98,6 +100,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/providers", s.handleListProviders)
 		r.Get("/approval-policies", s.handleListApprovalPolicies)
 		r.Get("/webhooks", s.handleListWebhooks)
+		r.Get("/auth/keys", s.handleListAPIKeys)
 		r.Get("/scores/summary", s.handleScoreSummary)
 		r.Get("/scores/compare", s.handleScoreCompare)
 		r.Get("/jobs/{id}/scores", s.handleListJobScores)
@@ -125,6 +128,8 @@ func (s *Server) buildRouter() chi.Router {
 			r.Delete("/approval-policies/{id}", s.handleDeleteApprovalPolicy)
 			r.Post("/webhooks", s.handleSetWebhook)
 			r.Delete("/webhooks/{id}", s.handleDeleteWebhook)
+			r.Post("/auth/keys", s.handleSetAPIKey)
+			r.Delete("/auth/keys", s.handleDeleteAPIKey)
 
 			// Queue management
 			r.Post("/queues/{name}/pause", s.handlePauseQueue)

@@ -10,6 +10,7 @@ import (
 )
 
 func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	var req store.EnqueueRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
@@ -22,6 +23,7 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 	if len(req.Payload) == 0 {
 		req.Payload = json.RawMessage(`{}`)
 	}
+	req.Queue = namespaceQueue(principal.Namespace, req.Queue)
 
 	result, err := s.store.Enqueue(req)
 	if err != nil {
@@ -38,6 +40,7 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEnqueueBatch(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	var req store.BatchEnqueueRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
@@ -55,6 +58,7 @@ func (s *Server) handleEnqueueBatch(w http.ResponseWriter, r *http.Request) {
 		if len(j.Payload) == 0 {
 			req.Jobs[i].Payload = json.RawMessage(`{}`)
 		}
+		req.Jobs[i].Queue = namespaceQueue(principal.Namespace, req.Jobs[i].Queue)
 	}
 
 	result, err := s.store.EnqueueBatch(req)
@@ -66,6 +70,7 @@ func (s *Server) handleEnqueueBatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	var req store.FetchRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
@@ -74,6 +79,9 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	if len(req.Queues) == 0 {
 		writeError(w, http.StatusBadRequest, "queues is required", "VALIDATION_ERROR")
 		return
+	}
+	for i := range req.Queues {
+		req.Queues[i] = namespaceQueue(principal.Namespace, req.Queues[i])
 	}
 
 	timeout := req.LeaseDuration
@@ -93,6 +101,7 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if result != nil {
+			result.Queue = visibleQueue(principal.Namespace, result.Queue)
 			writeJSON(w, http.StatusOK, result)
 			return
 		}
@@ -115,6 +124,7 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleFetchBatch(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	var req struct {
 		Queues        []string `json:"queues"`
 		WorkerID      string   `json:"worker_id"`
@@ -129,6 +139,9 @@ func (s *Server) handleFetchBatch(w http.ResponseWriter, r *http.Request) {
 	if len(req.Queues) == 0 {
 		writeError(w, http.StatusBadRequest, "queues is required", "VALIDATION_ERROR")
 		return
+	}
+	for i := range req.Queues {
+		req.Queues[i] = namespaceQueue(principal.Namespace, req.Queues[i])
 	}
 	if req.Count <= 0 {
 		req.Count = 1
@@ -156,6 +169,9 @@ func (s *Server) handleFetchBatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(jobs) > 0 {
+			for i := range jobs {
+				jobs[i].Queue = visibleQueue(principal.Namespace, jobs[i].Queue)
+			}
 			writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
 			return
 		}
@@ -173,7 +189,12 @@ func (s *Server) handleFetchBatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	jobID := chi.URLParam(r, "job_id")
+	if job, err := s.store.GetJob(jobID); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
+		return
+	}
 
 	var body struct {
 		Result      json.RawMessage    `json:"result"`
@@ -240,7 +261,12 @@ func (s *Server) handleAckBatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleFail(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	jobID := chi.URLParam(r, "job_id")
+	if job, err := s.store.GetJob(jobID); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
+		return
+	}
 
 	var body struct {
 		Error         string `json:"error"`
@@ -266,10 +292,17 @@ func (s *Server) handleThroughput(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
 	var req store.HeartbeatRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
 		return
+	}
+	for jobID := range req.Jobs {
+		job, err := s.store.GetJob(jobID)
+		if err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+			delete(req.Jobs, jobID)
+		}
 	}
 
 	result, err := s.store.Heartbeat(req)

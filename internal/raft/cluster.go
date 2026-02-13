@@ -1064,6 +1064,32 @@ CREATE TABLE IF NOT EXISTS webhooks (
     last_delivery_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_webhooks_enabled ON webhooks(enabled, created_at);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+    key_hash     TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    namespace    TEXT NOT NULL DEFAULT 'default',
+    role         TEXT NOT NULL DEFAULT 'readonly',
+    queue_scope  TEXT,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+    last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_enabled ON api_keys(enabled, namespace, role);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    namespace   TEXT NOT NULL DEFAULT 'default',
+    principal   TEXT,
+    role        TEXT,
+    method      TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    status_code INTEGER NOT NULL,
+    metadata    TEXT,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_ns ON audit_logs(namespace, created_at);
 `
 
 // WaitForLeader blocks until the cluster has a leader or timeout.
