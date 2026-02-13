@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -61,6 +64,8 @@ var (
 	sqliteMirrorAsync   = true
 	applyTimeout        = 10 * time.Second
 	shutdownTimeout     = 500 * time.Millisecond
+	discoverMode        string
+	discoverDNSName     string
 )
 
 func init() {
@@ -73,6 +78,8 @@ func init() {
 	serverCmd.Flags().StringVar(&nodeID, "node-id", "node-1", "Unique node ID")
 	serverCmd.Flags().BoolVar(&bootstrap, "bootstrap", true, "Bootstrap a new single-node cluster")
 	serverCmd.Flags().StringVar(&joinAddr, "join", "", "Join an existing cluster via leader address")
+	serverCmd.Flags().StringVar(&discoverMode, "discover", "", "Peer discovery mode (supported: dns)")
+	serverCmd.Flags().StringVar(&discoverDNSName, "discover-dns-name", "", "DNS name to resolve for cluster peer discovery when --discover=dns")
 	serverCmd.Flags().BoolVar(&durableMode, "durable", false, "Enable power-loss durability mode (Raft fsync per write). Significantly reduces throughput/latency performance; enable only if absolutely required.")
 	serverCmd.Flags().StringVar(&raftStore, "raft-store", "bolt", "Raft log/stable backend: bolt, badger, or pebble")
 	serverCmd.Flags().DurationVar(&shutdownTimeout, "shutdown-timeout", 500*time.Millisecond, "Graceful HTTP shutdown timeout before force-close (e.g. 500ms, 2s)")
@@ -97,6 +104,10 @@ func setupLogging() {
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
+	if discoverMode != "" && discoverMode != "dns" {
+		return fmt.Errorf("unsupported discover mode %q", discoverMode)
+	}
+
 	// Pebble is treated as rebuildable materialized state; keep Pebble fsync
 	// disabled for throughput in all modes. Durability is controlled by Raft.
 	clusteredMode := joinAddr != "" || !bootstrap
@@ -110,6 +121,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 		"node_id", nodeID,
 		"bootstrap", bootstrap,
 		"join", joinAddr,
+		"discover", discoverMode,
+		"discover_dns_name", discoverDNSName,
 		"raft_store", raftStore,
 		"scheduler_enabled", schedulerEnabled,
 		"scheduler_interval", schedulerInterval,
@@ -145,6 +158,35 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 	defer cluster.Shutdown()
 
+	joinTargets := []string{}
+	if joinAddr != "" {
+		joinTargets = append(joinTargets, joinAddr)
+	}
+	if !bootstrap && joinAddr == "" && discoverMode == "dns" {
+		targets, err := discoverDNSJoinTargets(discoverDNSName, bindAddr)
+		if err != nil {
+			return fmt.Errorf("discover dns peers: %w", err)
+		}
+		joinTargets = append(joinTargets, targets...)
+	}
+	if !bootstrap && len(joinTargets) > 0 {
+		var joined bool
+		var lastErr error
+		for _, target := range joinTargets {
+			if err := cluster.JoinCluster(target); err != nil {
+				lastErr = err
+				slog.Warn("join attempt failed", "target", target, "error", err)
+				continue
+			}
+			slog.Info("joined cluster", "target", target, "node_id", nodeID)
+			joined = true
+			break
+		}
+		if !joined && lastErr != nil {
+			return fmt.Errorf("join cluster: %w", lastErr)
+		}
+	}
+
 	if err := cluster.WaitForLeader(10 * time.Second); err != nil {
 		return fmt.Errorf("wait for leader: %w", err)
 	}
@@ -158,12 +200,6 @@ func runServer(cmd *cobra.Command, args []string) error {
 			}
 			slog.Info("initial raft snapshot complete")
 		}()
-	}
-
-	// Join workflow placeholder; full join flow requires leader-side join endpoint.
-	if joinAddr != "" && !bootstrap {
-		slog.Warn("join requested; ensure leader has added this node as a voter",
-			"join_addr", joinAddr, "node_id", nodeID, "raft_bind", raftBind)
 	}
 
 	s := store.NewStore(cluster, cluster.SQLiteReadDB())
@@ -219,4 +255,47 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	slog.Info("jobbie server stopped")
 	return nil
+}
+
+func discoverDNSJoinTargets(name, bind string) ([]string, error) {
+	if strings.TrimSpace(name) == "" {
+		return nil, fmt.Errorf("discover-dns-name is required when --discover=dns")
+	}
+	httpPort, err := resolveHTTPPort(bind)
+	if err != nil {
+		return nil, err
+	}
+	hosts, err := net.LookupHost(name)
+	if err != nil {
+		return nil, err
+	}
+	if len(hosts) == 0 {
+		return nil, fmt.Errorf("no DNS records found for %s", name)
+	}
+
+	uniq := make(map[string]struct{}, len(hosts))
+	for _, h := range hosts {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		uniq[h] = struct{}{}
+	}
+	out := make([]string, 0, len(uniq))
+	for host := range uniq {
+		out = append(out, net.JoinHostPort(host, httpPort))
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func resolveHTTPPort(bind string) (string, error) {
+	addr, err := net.ResolveTCPAddr("tcp", bind)
+	if err != nil {
+		return "", fmt.Errorf("parse bind address: %w", err)
+	}
+	if addr.Port <= 0 {
+		return "", fmt.Errorf("bind address missing valid port: %s", bind)
+	}
+	return fmt.Sprintf("%d", addr.Port), nil
 }

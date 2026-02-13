@@ -44,6 +44,20 @@ func (m mockCluster) EventLog(afterSeq uint64, limit int) ([]map[string]any, err
 	return []map[string]any{{"seq": 1, "type": "enqueued"}}, nil
 }
 
+type mockClusterWithVoter struct {
+	mockCluster
+	addErr error
+	added  []string
+}
+
+func (m *mockClusterWithVoter) AddVoter(nodeID, addr string) error {
+	if m.addErr != nil {
+		return m.addErr
+	}
+	m.added = append(m.added, nodeID+"@"+addr)
+	return nil
+}
+
 func testServer(t *testing.T) (*Server, *store.Store) {
 	t.Helper()
 	da, err := raft.NewDirectApplier(t.TempDir())
@@ -768,6 +782,63 @@ func TestBulkEndpoint(t *testing.T) {
 	}
 }
 
+func TestBulkEndpointAsyncLifecycle(t *testing.T) {
+	srv, _ := testServer(t)
+
+	var ids []string
+	for range 3 {
+		rr := doRequest(srv, "POST", "/api/v1/enqueue", map[string]interface{}{
+			"queue": "bulk.async.q", "payload": map[string]string{},
+		})
+		var r store.EnqueueResult
+		decodeResponse(t, rr, &r)
+		ids = append(ids, r.JobID)
+	}
+
+	rr := doRequest(srv, "POST", "/api/v1/jobs/bulk", map[string]any{
+		"job_ids": ids,
+		"action":  "cancel",
+		"async":   true,
+	})
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("bulk async status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var start map[string]any
+	decodeResponse(t, rr, &start)
+	taskID, _ := start["bulk_operation_id"].(string)
+	if taskID == "" {
+		t.Fatalf("missing bulk_operation_id: %v", start)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var status bulkTask
+	for {
+		rr = doRequest(srv, "GET", "/api/v1/bulk/"+taskID, nil)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("bulk status = %d, body: %s", rr.Code, rr.Body.String())
+		}
+		decodeResponse(t, rr, &status)
+		if status.Status == bulkTaskCompleted || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if status.Status != bulkTaskCompleted {
+		t.Fatalf("bulk status = %s, want completed", status.Status)
+	}
+	if status.Affected != 3 {
+		t.Fatalf("bulk affected = %d, want 3", status.Affected)
+	}
+
+	rr = doRequest(srv, "GET", "/api/v1/bulk/"+taskID+"/progress", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("bulk progress status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "bulk.async.completed") {
+		t.Fatalf("expected completed event in progress body, got: %s", rr.Body.String())
+	}
+}
+
 func TestBudgetEndpoints(t *testing.T) {
 	srv, _ := testServer(t)
 
@@ -887,6 +958,23 @@ func TestClusterEventsEndpoint(t *testing.T) {
 	decodeResponse(t, rr, &out)
 	if len(out.Events) == 0 {
 		t.Fatalf("expected events")
+	}
+}
+
+func TestClusterJoinEndpoint(t *testing.T) {
+	_, s := testServer(t)
+	cl := &mockClusterWithVoter{mockCluster: mockCluster{isLeader: true}}
+	srv := New(s, cl, ":0", nil)
+
+	rr := doRequest(srv, "POST", "/api/v1/cluster/join", map[string]any{
+		"node_id": "node-2",
+		"addr":    "127.0.0.1:9400",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("join status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	if len(cl.added) != 1 {
+		t.Fatalf("expected add voter call")
 	}
 }
 

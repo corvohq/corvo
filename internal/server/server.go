@@ -30,6 +30,7 @@ type Server struct {
 	router     chi.Router
 	uiFS       fs.FS
 	throughput *ThroughputTracker
+	bulkAsync  *asyncBulkManager
 }
 
 // ClusterInfo contains cluster state methods used by HTTP handlers/middleware.
@@ -45,7 +46,13 @@ type ClusterInfo interface {
 // New creates a new Server.
 // If uiAssets is non-nil the embedded SPA will be served at /ui/.
 func New(s *store.Store, cluster ClusterInfo, bindAddr string, uiAssets fs.FS) *Server {
-	srv := &Server{store: s, cluster: cluster, uiFS: uiAssets, throughput: NewThroughputTracker()}
+	srv := &Server{
+		store:      s,
+		cluster:    cluster,
+		uiFS:       uiAssets,
+		throughput: NewThroughputTracker(),
+		bulkAsync:  newAsyncBulkManager(s),
+	}
 	srv.router = srv.buildRouter()
 	srv.httpServer = &http.Server{
 		Addr: bindAddr,
@@ -129,7 +136,10 @@ func (s *Server) buildRouter() chi.Router {
 
 			// Bulk
 			r.Post("/jobs/bulk", s.handleBulk)
+			r.Get("/bulk/{id}", s.handleBulkStatus)
+			r.Get("/bulk/{id}/progress", s.handleBulkProgress)
 			r.Post("/admin/rebuild-sqlite", s.handleRebuildSQLite)
+			r.Post("/cluster/join", s.handleClusterJoin)
 		})
 
 	})

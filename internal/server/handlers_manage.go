@@ -256,17 +256,52 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
-	var req store.BulkRequest
+	var req struct {
+		store.BulkRequest
+		Async *bool `json:"async,omitempty"`
+	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
 		return
 	}
-	if req.Action == "" {
+	if req.BulkRequest.Action == "" {
 		writeError(w, http.StatusBadRequest, "action is required", "VALIDATION_ERROR")
 		return
 	}
 
-	result, err := s.store.BulkAction(req)
+	const asyncThreshold = 10000
+	useAsync := req.Async != nil && *req.Async
+	if !useAsync {
+		if len(req.BulkRequest.JobIDs) > asyncThreshold {
+			useAsync = true
+		} else if len(req.BulkRequest.JobIDs) == 0 && req.BulkRequest.Filter != nil {
+			count, err := s.bulkAsync.countFilter(*req.BulkRequest.Filter)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error(), "BULK_ERROR")
+				return
+			}
+			if count > asyncThreshold {
+				useAsync = true
+			}
+		}
+	}
+
+	if useAsync {
+		task, err := s.bulkAsync.start(req.BulkRequest)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "BULK_ERROR")
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"bulk_operation_id": task.ID,
+			"status":            string(task.Status),
+			"estimated_total":   task.Total,
+			"progress_url":      "/api/v1/bulk/" + task.ID + "/progress",
+		})
+		return
+	}
+
+	result, err := s.store.BulkAction(req.BulkRequest)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "BULK_ERROR")
 		return

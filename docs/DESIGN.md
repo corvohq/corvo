@@ -2347,20 +2347,20 @@ Replaced SQLite-only store with Pebble (source of truth) + Raft (consensus) + SQ
 
 ### Phase 3 — Production hardening
 
-- [ ] payload_jq filter (translate jq subset to json_extract queries)
-- [ ] Async bulk operations (>10k jobs — background processing with progress SSE)
+- [x] payload_jq filter (safe jq subset translated to SQLite `json_extract`/`json_each` queries)
+- [x] Async bulk operations (>10k jobs — background processing with progress SSE)
 - [x] Real-time UI updates via SSE (with exponential backoff reconnect)
-- [ ] Prometheus metrics endpoint
+- [x] Prometheus metrics endpoint (`GET /api/v1/metrics`)
 - [x] Web UI: dashboard, queue detail with search/filter, job detail, bulk actions
 - [x] Web UI: queues list page, dead letter view, held jobs view, cost dashboard, workers page, cluster page
 - [x] Web UI: mobile-responsive sidebar (Sheet drawer), dark mode toggle, enqueue job dialog
 - [x] Web UI: date range filters, bulk progress indicator, static asset cache headers (immutable/no-cache)
-- [ ] DNS-based peer discovery for Kubernetes
+- [x] DNS-based peer discovery for Kubernetes
 - [ ] Helm chart (single node + clustered StatefulSet)
 - [x] Admin endpoint to rebuild SQLite from Pebble
-- [ ] SQLite mirror lag / dropped-update counters
+- [x] SQLite mirror lag / dropped-update counters
 - [x] Chaos tests (kill nodes, verify recovery)
-- [ ] 3-node in-process cluster tests, leader election, failover, snapshot transfer
+- [x] 3-node in-process cluster tests, leader election, failover, snapshot transfer
 - [ ] TypeScript client library
 - [ ] Python client library
 
@@ -2370,17 +2370,17 @@ See `docs/AI.md` for full spec and `docs/PHASE2.md` for delivery plan.
 
 - [x] Token and cost tracking (`job_usage` table, usage reporting on ack/heartbeat)
 - [x] Usage summary endpoints + CLI (`jobbie usage`)
-- [ ] Budget enforcement (daily/per-job limits, hold/reject/alert actions)
-- [ ] `held` job state + approve/reject endpoints + CLI
-- [ ] Agent loop primitive (iterative jobs with server-enforced guardrails)
-- [ ] `job_iterations` table + iteration tracking
-- [ ] Agent replay from specific iteration
-- [ ] Provider-aware rate limiting (token-based sliding window)
-- [ ] Model fallback routing
-- [ ] Result schema validation (JSON Schema on ack)
+- [x] Budget enforcement (daily/per-job limits, hold/reject/alert actions)
+- [x] `held` job state + approve/reject endpoints + CLI
+- [x] Agent loop primitive (iterative jobs with server-enforced guardrails)
+- [x] `job_iterations` table + iteration tracking
+- [x] Agent replay from specific iteration
+- [x] Provider-aware rate limiting (token-based sliding window)
+- [x] Model fallback routing
+- [x] Result schema validation (JSON Schema on ack)
 - [ ] Job chaining (`then` config)
 - [ ] Semantic caching (payload hash)
-- [ ] Output scoring + aggregate queries
+- [x] Output scoring + aggregate queries
 - [x] Cost dashboard in UI
 - [x] Held jobs view in UI
 

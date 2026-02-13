@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1072,9 +1074,47 @@ func (c *Cluster) WaitForLeader(timeout time.Duration) error {
 // JoinCluster sends a join request to the given leader address.
 // The leader must call AddVoter to add this node.
 func (c *Cluster) JoinCluster(leaderAddr string) error {
-	// This would typically be done via an HTTP/RPC call to the leader
-	// For now, it's a placeholder — the server layer handles join requests
-	return fmt.Errorf("join via HTTP: POST %s/api/v1/cluster/join with node_id and addr", leaderAddr)
+	if strings.TrimSpace(leaderAddr) == "" {
+		return fmt.Errorf("leader address is required")
+	}
+	base := strings.TrimSpace(leaderAddr)
+	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+		base = "http://" + base
+	}
+	u, err := url.Parse(strings.TrimRight(base, "/"))
+	if err != nil {
+		return fmt.Errorf("parse leader address: %w", err)
+	}
+	joinURL := strings.TrimRight(u.String(), "/") + "/api/v1/cluster/join"
+
+	body, _ := json.Marshal(map[string]string{
+		"node_id": c.config.NodeID,
+		"addr":    string(c.transport.LocalAddr()),
+	})
+	timeout := c.config.ApplyTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	client := &http.Client{Timeout: timeout}
+	req, err := http.NewRequest(http.MethodPost, joinURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create join request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("join request: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode/100 != 2 {
+		var m map[string]any
+		_ = json.NewDecoder(res.Body).Decode(&m)
+		if msg, ok := m["error"].(string); ok && msg != "" {
+			return fmt.Errorf("join rejected: %s", msg)
+		}
+		return fmt.Errorf("join rejected: status %d", res.StatusCode)
+	}
+	return nil
 }
 
 // Configuration returns the current Raft cluster configuration.

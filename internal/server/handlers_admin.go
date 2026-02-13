@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -117,4 +118,44 @@ func (s *Server) handleRebuildSQLite(w http.ResponseWriter, r *http.Request) {
 		"rebuilt":     true,
 		"duration_ms": time.Since(start).Milliseconds(),
 	})
+}
+
+type clusterVoter interface {
+	AddVoter(nodeID, addr string) error
+}
+
+func (s *Server) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
+	if s.cluster == nil {
+		writeError(w, http.StatusNotImplemented, "cluster join unavailable", "UNSUPPORTED")
+		return
+	}
+	cv, ok := s.cluster.(clusterVoter)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "cluster membership unavailable", "UNSUPPORTED")
+		return
+	}
+
+	var req struct {
+		NodeID string `json:"node_id"`
+		Addr   string `json:"addr"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
+		return
+	}
+	if req.NodeID == "" || req.Addr == "" {
+		writeError(w, http.StatusBadRequest, "node_id and addr are required", "VALIDATION_ERROR")
+		return
+	}
+
+	if err := cv.AddVoter(req.NodeID, req.Addr); err != nil {
+		msg := err.Error()
+		if strings.Contains(msg, "already") || strings.Contains(msg, "exists") || strings.Contains(msg, "voter") {
+			writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "added": false, "node_id": req.NodeID, "addr": req.Addr})
+			return
+		}
+		writeError(w, http.StatusBadRequest, msg, "JOIN_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "added": true, "node_id": req.NodeID, "addr": req.Addr})
 }

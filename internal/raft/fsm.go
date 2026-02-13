@@ -32,6 +32,8 @@ type FSM struct {
 	sqliteDone   chan struct{}
 	sqliteMu     sync.Mutex
 	sqliteDrops  atomic.Uint64
+	sqliteQueued atomic.Uint64
+	sqliteDoneN  atomic.Uint64
 
 	rebuildMu       sync.Mutex
 	lastRebuildAt   time.Time
@@ -392,6 +394,7 @@ func (f *FSM) syncSQLite(fn func(db sqlExecer) error) {
 	if f.sqliteAsync {
 		select {
 		case f.sqliteQueue <- fn:
+			f.sqliteQueued.Add(1)
 			return
 		default:
 			f.sqliteDrops.Add(1)
@@ -404,6 +407,7 @@ func (f *FSM) syncSQLite(fn func(db sqlExecer) error) {
 	if err := fn(f.sqlite); err != nil {
 		slog.Error("sqlite sync failed (non-fatal)", "error", err)
 	}
+	f.sqliteDoneN.Add(1)
 }
 
 // SetSQLiteMirrorEnabled toggles synchronous SQLite materialized-view writes.
@@ -456,10 +460,20 @@ func (f *FSM) Close() {
 
 // SQLiteMirrorStatus returns internal SQLite mirror health counters.
 func (f *FSM) SQLiteMirrorStatus() map[string]any {
+	queued := f.sqliteQueued.Load()
+	done := f.sqliteDoneN.Load()
+	dropped := f.sqliteDrops.Load()
+	pending := uint64(0)
+	if queued > done+dropped {
+		pending = queued - done - dropped
+	}
 	out := map[string]any{
 		"enabled": f.sqliteMirror,
 		"async":   f.sqliteAsync,
-		"dropped": f.sqliteDrops.Load(),
+		"dropped": dropped,
+		"queued":  queued,
+		"applied": done,
+		"lag":     pending,
 	}
 	if f.sqliteQueue != nil {
 		out["queue_depth"] = len(f.sqliteQueue)
@@ -531,17 +545,20 @@ func (f *FSM) sqliteMirrorLoop() {
 			sp := fmt.Sprintf("sp%d", i)
 			if _, err := tx.Exec("SAVEPOINT " + sp); err != nil {
 				slog.Error("sqlite mirror savepoint failed", "error", err)
+				f.sqliteDoneN.Add(1)
 				continue
 			}
 			if err := fn(tx); err != nil {
 				_, _ = tx.Exec("ROLLBACK TO " + sp)
 				_, _ = tx.Exec("RELEASE " + sp)
 				slog.Error("sqlite mirror apply failed", "error", err)
+				f.sqliteDoneN.Add(1)
 				continue
 			}
 			if _, err := tx.Exec("RELEASE " + sp); err != nil {
 				slog.Error("sqlite mirror release failed", "error", err)
 			}
+			f.sqliteDoneN.Add(1)
 		}
 
 		if err := tx.Commit(); err != nil {

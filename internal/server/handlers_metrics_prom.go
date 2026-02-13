@@ -29,6 +29,20 @@ func (s *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request)
 		fmt.Fprintln(w, "# HELP jobbie_cluster_is_leader 1 when this node is leader, else 0.")
 		fmt.Fprintln(w, "# TYPE jobbie_cluster_is_leader gauge")
 		fmt.Fprintf(w, "jobbie_cluster_is_leader %d\n", leader)
+
+		status := s.cluster.ClusterStatus()
+		if mirror, ok := status["sqlite_mirror"].(map[string]any); ok {
+			if lag, ok := mirror["lag"]; ok {
+				fmt.Fprintln(w, "# HELP jobbie_sqlite_mirror_lag_updates Pending SQLite mirror updates.")
+				fmt.Fprintln(w, "# TYPE jobbie_sqlite_mirror_lag_updates gauge")
+				fmt.Fprintf(w, "jobbie_sqlite_mirror_lag_updates %v\n", lag)
+			}
+			if dropped, ok := mirror["dropped"]; ok {
+				fmt.Fprintln(w, "# HELP jobbie_sqlite_mirror_dropped_total Dropped SQLite mirror updates due to backpressure.")
+				fmt.Fprintln(w, "# TYPE jobbie_sqlite_mirror_dropped_total counter")
+				fmt.Fprintf(w, "jobbie_sqlite_mirror_dropped_total %v\n", dropped)
+			}
+		}
 	}
 
 	queues, err := s.store.ListQueues()
