@@ -199,6 +199,11 @@ func sqliteFetchJob(db sqlExecer, job store.Job, op store.FetchOp) error {
 
 	// Record rate limit entry
 	db.Exec("INSERT INTO rate_limit_window (queue, fetched_at) VALUES (?, ?)", job.Queue, startedAt)
+	// Record provider request usage for provider-aware fetch gating (RPM).
+	var provider sql.NullString
+	if err := db.QueryRow("SELECT provider FROM queues WHERE name = ?", job.Queue).Scan(&provider); err == nil && provider.Valid && provider.String != "" {
+		db.Exec("INSERT INTO provider_usage_window (provider, input_tokens, output_tokens, recorded_at) VALUES (?, 0, 0, ?)", provider.String, startedAt)
+	}
 
 	// Upsert worker
 	queuesJSON, _ := json.Marshal(op.Queues)
@@ -357,6 +362,12 @@ func sqliteInsertUsage(db sqlExecer, jobID, queue string, attempt int, phase str
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite insert job usage: %w", err)
+	}
+	if p := nullableString(usage.Provider); p != nil {
+		_, _ = db.Exec(
+			"INSERT INTO provider_usage_window (provider, input_tokens, output_tokens, recorded_at) VALUES (?, ?, ?, ?)",
+			*p, usage.InputTokens, usage.OutputTokens, createdAt,
+		)
 	}
 	return nil
 }

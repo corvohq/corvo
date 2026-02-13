@@ -40,6 +40,10 @@ func (s *Store) Fetch(req FetchRequest) (*FetchResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	allowedQueues, err = s.enforceFetchProviders(allowedQueues)
+	if err != nil {
+		return nil, err
+	}
 	if len(allowedQueues) == 0 {
 		return nil, nil
 	}
@@ -72,6 +76,10 @@ func (s *Store) FetchBatch(req FetchRequest, count int) ([]FetchResult, error) {
 	}
 
 	allowedQueues, err := s.enforceFetchBudgets(req.Queues)
+	if err != nil {
+		return nil, err
+	}
+	allowedQueues, err = s.enforceFetchProviders(allowedQueues)
 	if err != nil {
 		return nil, err
 	}

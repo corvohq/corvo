@@ -125,3 +125,63 @@ func (s *Store) SetQueueProvider(queue, provider string) error {
 	_, err = s.sqliteR.Exec("UPDATE queues SET provider = ? WHERE name = ?", providerVal, queue)
 	return err
 }
+
+func (s *Store) enforceFetchProviders(queues []string) ([]string, error) {
+	if len(queues) == 0 {
+		return queues, nil
+	}
+	now := time.Now().UTC()
+	windowStart := now.Add(-1 * time.Minute).Format(time.RFC3339Nano)
+	allowed := make([]string, 0, len(queues))
+	for _, queue := range queues {
+		ok, err := s.queueAllowedByProviderLimit(queue, windowStart)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			allowed = append(allowed, queue)
+		}
+	}
+	return allowed, nil
+}
+
+func (s *Store) queueAllowedByProviderLimit(queue, windowStart string) (bool, error) {
+	var provider sql.NullString
+	var rpmLimit, inputTPM, outputTPM sql.NullInt64
+	err := s.sqliteR.QueryRow(`
+		SELECT q.provider, p.rpm_limit, p.input_tpm_limit, p.output_tpm_limit
+		FROM queues q
+		LEFT JOIN providers p ON p.name = q.provider
+		WHERE q.name = ?`,
+		queue,
+	).Scan(&provider, &rpmLimit, &inputTPM, &outputTPM)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return true, nil
+		}
+		return false, err
+	}
+	if !provider.Valid || strings.TrimSpace(provider.String) == "" {
+		return true, nil
+	}
+
+	var reqCount, inputUsed, outputUsed int64
+	if err := s.sqliteR.QueryRow(`
+		SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+		FROM provider_usage_window
+		WHERE provider = ? AND recorded_at >= ?`,
+		provider.String, windowStart,
+	).Scan(&reqCount, &inputUsed, &outputUsed); err != nil {
+		return false, err
+	}
+	if rpmLimit.Valid && rpmLimit.Int64 > 0 && reqCount >= rpmLimit.Int64 {
+		return false, nil
+	}
+	if inputTPM.Valid && inputTPM.Int64 > 0 && inputUsed >= inputTPM.Int64 {
+		return false, nil
+	}
+	if outputTPM.Valid && outputTPM.Int64 > 0 && outputUsed >= outputTPM.Int64 {
+		return false, nil
+	}
+	return true, nil
+}

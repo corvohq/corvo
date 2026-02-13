@@ -754,8 +754,72 @@ func openMaterializedView(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("create materialized view schema: %w", err)
 	}
+	if err := ensureMaterializedViewSchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate materialized view schema: %w", err)
+	}
 
 	return db, nil
+}
+
+func ensureMaterializedViewSchema(db *sql.DB) error {
+	// Existing materialized-view DBs may predate newer AI columns.
+	// Add missing columns before creating indexes that depend on them.
+	type columnSpec struct {
+		table string
+		name  string
+		sql   string
+	}
+	columns := []columnSpec{
+		{table: "jobs", name: "result_schema", sql: "ALTER TABLE jobs ADD COLUMN result_schema TEXT"},
+		{table: "jobs", name: "parent_id", sql: "ALTER TABLE jobs ADD COLUMN parent_id TEXT REFERENCES jobs(id)"},
+		{table: "jobs", name: "chain_id", sql: "ALTER TABLE jobs ADD COLUMN chain_id TEXT"},
+		{table: "jobs", name: "chain_step", sql: "ALTER TABLE jobs ADD COLUMN chain_step INTEGER"},
+		{table: "jobs", name: "chain_config", sql: "ALTER TABLE jobs ADD COLUMN chain_config TEXT"},
+		{table: "jobs", name: "provider_error", sql: "ALTER TABLE jobs ADD COLUMN provider_error INTEGER NOT NULL DEFAULT 0"},
+		{table: "queues", name: "provider", sql: "ALTER TABLE queues ADD COLUMN provider TEXT REFERENCES providers(name)"},
+	}
+	for _, c := range columns {
+		ok, err := sqliteHasColumn(db, c.table, c.name)
+		if err != nil {
+			return err
+		}
+		if ok {
+			continue
+		}
+		if _, err := db.Exec(c.sql); err != nil {
+			return err
+		}
+	}
+	_, err := db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_id) WHERE parent_id IS NOT NULL;
+		CREATE INDEX IF NOT EXISTS idx_jobs_chain ON jobs(chain_id) WHERE chain_id IS NOT NULL;
+		CREATE INDEX IF NOT EXISTS idx_jobs_provider_error ON jobs(provider_error) WHERE provider_error = 1;
+	`)
+	return err
+}
+
+func sqliteHasColumn(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name string
+		var ctype string
+		var notNull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 const materializedViewSchema = `
@@ -806,9 +870,6 @@ CREATE INDEX IF NOT EXISTS idx_jobs_unique ON jobs(queue, unique_key) WHERE uniq
 CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_jobs_expire ON jobs(expire_at) WHERE expire_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
-CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_id) WHERE parent_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_jobs_chain ON jobs(chain_id) WHERE chain_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_jobs_provider_error ON jobs(provider_error) WHERE provider_error = 1;
 
 CREATE TABLE IF NOT EXISTS job_errors (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
