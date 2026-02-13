@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"golang.org/x/net/http2"
+
 	"github.com/user/jobbie/internal/raft"
 	"github.com/user/jobbie/internal/server"
 	"github.com/user/jobbie/internal/store"
@@ -18,6 +20,16 @@ func TestDefaultHTTPClientNoTimeout(t *testing.T) {
 	}
 	if c.Timeout != 0 {
 		t.Fatalf("timeout = %s, want 0", c.Timeout)
+	}
+	tr, ok := c.Transport.(*http2.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http2.Transport", c.Transport)
+	}
+	if tr.ReadIdleTimeout <= 0 {
+		t.Fatalf("read idle timeout = %s, want > 0", tr.ReadIdleTimeout)
+	}
+	if tr.PingTimeout <= 0 {
+		t.Fatalf("ping timeout = %s, want > 0", tr.PingTimeout)
 	}
 }
 

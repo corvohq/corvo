@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -64,12 +65,17 @@ func New(baseURL string, opts ...Option) *Client {
 }
 
 func defaultHTTPClient() *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
 	tr := &http2.Transport{
 		AllowHTTP: true,
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, network, addr)
+			return dialer.DialContext(ctx, network, addr)
 		},
+		ReadIdleTimeout: 30 * time.Second,
+		PingTimeout:     10 * time.Second,
 	}
 	return &http.Client{
 		// Streaming lifecycle RPCs are long-lived; rely on per-request contexts
@@ -260,6 +266,8 @@ type LifecycleResponse struct {
 
 type LifecycleStream struct {
 	stream *connect.BidiStreamForClient[jobbiev1.LifecycleStreamRequest, jobbiev1.LifecycleStreamResponse]
+	mu     sync.Mutex
+	closed bool
 }
 
 func (c *Client) OpenLifecycleStream(ctx context.Context) *LifecycleStream {
@@ -269,6 +277,11 @@ func (c *Client) OpenLifecycleStream(ctx context.Context) *LifecycleStream {
 func (s *LifecycleStream) Exchange(req LifecycleRequest) (*LifecycleResponse, error) {
 	if s == nil || s.stream == nil {
 		return nil, fmt.Errorf("lifecycle stream is not open")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, io.EOF
 	}
 
 	items := make([]*jobbiev1.AckBatchItem, 0, len(req.Acks))
@@ -348,6 +361,12 @@ func (s *LifecycleStream) Close() error {
 	if s == nil || s.stream == nil {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
 	return s.stream.CloseRequest()
 }
 
