@@ -28,8 +28,13 @@ type Client struct {
 type Option func(*config)
 
 type config struct {
-	httpClient *http.Client
-	useJSON    bool
+	httpClient   *http.Client
+	useJSON      bool
+	headers      map[string]string
+	bearerToken  string
+	apiKey       string
+	apiKeyHeader string
+	tokenSource  func(context.Context) (string, error)
 }
 
 // WithHTTPClient overrides the HTTP client used by Connect.
@@ -46,6 +51,39 @@ func WithProtoJSON() Option {
 	return func(cfg *config) { cfg.useJSON = true }
 }
 
+// WithHeader adds a static header to every RPC request.
+func WithHeader(key, value string) Option {
+	return func(cfg *config) {
+		if cfg.headers == nil {
+			cfg.headers = map[string]string{}
+		}
+		cfg.headers[key] = value
+	}
+}
+
+// WithBearerToken adds Authorization: Bearer <token> to every RPC request.
+func WithBearerToken(token string) Option {
+	return func(cfg *config) { cfg.bearerToken = token }
+}
+
+// WithTokenProvider adds dynamic bearer token lookup per RPC request.
+func WithTokenProvider(provider func(context.Context) (string, error)) Option {
+	return func(cfg *config) { cfg.tokenSource = provider }
+}
+
+// WithAPIKey adds API key header with default header X-API-Key.
+func WithAPIKey(key string) Option {
+	return WithAPIKeyHeader("X-API-Key", key)
+}
+
+// WithAPIKeyHeader adds API key header with a custom header name.
+func WithAPIKeyHeader(header, key string) Option {
+	return func(cfg *config) {
+		cfg.apiKeyHeader = header
+		cfg.apiKey = key
+	}
+}
+
 // New creates a worker client for a Jobbie server base URL.
 func New(baseURL string, opts ...Option) *Client {
 	cfg := config{
@@ -59,9 +97,57 @@ func New(baseURL string, opts ...Option) *Client {
 	if cfg.useJSON {
 		clientOpts = append(clientOpts, connect.WithProtoJSON())
 	}
+	cfg.httpClient = withAuthHTTPClient(cfg.httpClient, &cfg)
 
 	rpc := jobbiev1connect.NewWorkerServiceClient(cfg.httpClient, strings.TrimRight(baseURL, "/"), clientOpts...)
 	return &Client{rpc: rpc}
+}
+
+type authRoundTripper struct {
+	base http.RoundTripper
+	cfg  *config
+}
+
+func (a authRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	cloned := req.Clone(req.Context())
+	for k, v := range a.cfg.headers {
+		cloned.Header.Set(k, v)
+	}
+	if a.cfg.apiKey != "" {
+		h := a.cfg.apiKeyHeader
+		if h == "" {
+			h = "X-API-Key"
+		}
+		cloned.Header.Set(h, a.cfg.apiKey)
+	}
+	token := strings.TrimSpace(a.cfg.bearerToken)
+	if a.cfg.tokenSource != nil {
+		dyn, err := a.cfg.tokenSource(cloned.Context())
+		if err != nil {
+			return nil, err
+		}
+		token = strings.TrimSpace(dyn)
+	}
+	if token != "" {
+		cloned.Header.Set("Authorization", "Bearer "+token)
+	}
+	return a.base.RoundTrip(cloned)
+}
+
+func withAuthHTTPClient(httpClient *http.Client, cfg *config) *http.Client {
+	if httpClient == nil {
+		return httpClient
+	}
+	if len(cfg.headers) == 0 && cfg.bearerToken == "" && cfg.apiKey == "" && cfg.tokenSource == nil {
+		return httpClient
+	}
+	base := httpClient.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	cp := *httpClient
+	cp.Transport = authRoundTripper{base: base, cfg: cfg}
+	return &cp
 }
 
 func defaultHTTPClient() *http.Client {

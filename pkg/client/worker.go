@@ -88,6 +88,7 @@ type WorkerConfig struct {
 	WorkerID        string
 	Concurrency     int
 	ShutdownTimeout time.Duration // default 30s
+	ClientOptions   []ClientOption
 }
 
 // NewWorker creates a new Worker.
@@ -100,7 +101,7 @@ func NewWorker(cfg WorkerConfig) *Worker {
 	}
 	hostname, _ := os.Hostname()
 	return &Worker{
-		client:          New(cfg.URL),
+		client:          NewWithOptions(cfg.URL, cfg.ClientOptions...),
 		queues:          cfg.Queues,
 		workerID:        cfg.WorkerID,
 		hostname:        hostname,

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -14,16 +15,71 @@ import (
 type Client struct {
 	URL        string
 	HTTPClient *http.Client
+	auth       authConfig
+}
+
+type TokenProvider func(ctx context.Context) (string, error)
+
+type ClientOption func(*Client)
+
+type authConfig struct {
+	headers      map[string]string
+	bearerToken  string
+	apiKey       string
+	apiKeyHeader string
+	tokenSource  TokenProvider
+}
+
+// WithHeader adds a static header to every request.
+func WithHeader(key, value string) ClientOption {
+	return func(c *Client) {
+		if c.auth.headers == nil {
+			c.auth.headers = map[string]string{}
+		}
+		c.auth.headers[key] = value
+	}
+}
+
+// WithBearerToken adds Authorization: Bearer <token> to every request.
+func WithBearerToken(token string) ClientOption {
+	return func(c *Client) { c.auth.bearerToken = token }
+}
+
+// WithTokenProvider adds dynamic bearer token lookup per request.
+func WithTokenProvider(provider TokenProvider) ClientOption {
+	return func(c *Client) { c.auth.tokenSource = provider }
+}
+
+// WithAPIKey adds an API key header to every request. Header defaults to X-API-Key.
+func WithAPIKey(key string) ClientOption {
+	return WithAPIKeyHeader("X-API-Key", key)
+}
+
+// WithAPIKeyHeader adds an API key value using a custom header.
+func WithAPIKeyHeader(header, key string) ClientOption {
+	return func(c *Client) {
+		c.auth.apiKeyHeader = header
+		c.auth.apiKey = key
+	}
 }
 
 // New creates a new Jobbie client.
 func New(url string) *Client {
-	return &Client{
-		URL: url,
+	return NewWithOptions(url)
+}
+
+// NewWithOptions creates a new Jobbie client with optional auth/header behavior.
+func NewWithOptions(url string, opts ...ClientOption) *Client {
+	c := &Client{
+		URL: strings.TrimRight(url, "/"),
 		HTTPClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // EnqueueOption configures an enqueue request.
@@ -263,6 +319,9 @@ func (c *Client) doRequestWithContext(ctx context.Context, method, path string, 
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if err := c.applyAuthHeaders(ctx, req); err != nil {
+		return err
+	}
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -286,6 +345,31 @@ func (c *Client) doRequestWithContext(ctx context.Context, method, path string, 
 
 	if result != nil {
 		return json.Unmarshal(data, result)
+	}
+	return nil
+}
+
+func (c *Client) applyAuthHeaders(ctx context.Context, req *http.Request) error {
+	for k, v := range c.auth.headers {
+		req.Header.Set(k, v)
+	}
+	if c.auth.apiKey != "" {
+		header := c.auth.apiKeyHeader
+		if header == "" {
+			header = "X-API-Key"
+		}
+		req.Header.Set(header, c.auth.apiKey)
+	}
+	token := strings.TrimSpace(c.auth.bearerToken)
+	if c.auth.tokenSource != nil {
+		dyn, err := c.auth.tokenSource(ctx)
+		if err != nil {
+			return err
+		}
+		token = strings.TrimSpace(dyn)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	return nil
 }

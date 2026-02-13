@@ -60,13 +60,23 @@ export type BulkTask = {
   finished_at?: string;
 };
 
+export type AuthOptions = {
+  headers?: Record<string, string>;
+  bearerToken?: string;
+  apiKey?: string;
+  apiKeyHeader?: string;
+  tokenProvider?: () => Promise<string> | string;
+};
+
 export class JobbieClient {
   readonly baseURL: string;
   readonly fetchImpl: typeof fetch;
+  readonly auth: AuthOptions;
 
-  constructor(baseURL: string, fetchImpl: typeof fetch = fetch) {
+  constructor(baseURL: string, fetchImpl: typeof fetch = fetch, auth: AuthOptions = {}) {
     this.baseURL = baseURL.replace(/\/$/, "");
     this.fetchImpl = fetchImpl;
+    this.auth = auth;
   }
 
   async enqueue(queue: string, payload: unknown, extra: Record<string, unknown> = {}): Promise<EnqueueResult> {
@@ -106,10 +116,12 @@ export class JobbieClient {
   }
 
   private async request<T>(path: string, init: RequestInit): Promise<T> {
+    const authHeaders = await this.authHeaders();
     const res = await this.fetchImpl(this.baseURL + path, {
       ...init,
       headers: {
         "content-type": "application/json",
+        ...authHeaders,
         ...(init.headers || {}),
       },
     });
@@ -129,5 +141,23 @@ export class JobbieClient {
       return {} as T;
     }
     return (await res.json()) as T;
+  }
+
+  async authHeaders(): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    if (this.auth.headers) {
+      Object.assign(out, this.auth.headers);
+    }
+    if (this.auth.apiKey) {
+      out[this.auth.apiKeyHeader || "X-API-Key"] = this.auth.apiKey;
+    }
+    let token = this.auth.bearerToken || "";
+    if (this.auth.tokenProvider) {
+      token = await this.auth.tokenProvider();
+    }
+    if (token) {
+      out.Authorization = `Bearer ${token}`;
+    }
+    return out;
   }
 }

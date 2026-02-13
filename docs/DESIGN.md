@@ -1952,7 +1952,9 @@ Served by the Jobbie server as an embedded SPA (via Go's `embed.FS`). Real-time 
 
 ## Client library contract
 
-A Jobbie client library is a thin HTTP wrapper. It contains zero job lifecycle logic.
+A Jobbie client library is a thin HTTP wrapper. Worker lifecycle orchestration
+(handler registration, fetch/ack/fail loop, heartbeat, graceful drain) lives in a
+separate worker runtime package that depends on the client library.
 
 ### What a client does
 

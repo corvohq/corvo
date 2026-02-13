@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jobbie-worker"
+version = "0.1.0"
+description = "Python worker runtime for Jobbie"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["jobbie-client>=0.1.0"]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["jobbie_worker*"]

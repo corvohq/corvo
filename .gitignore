@@ -10,5 +10,6 @@ ui/dist/
 
 # SDK build artifacts
 sdk/typescript/dist/
+sdk/typescript-worker/dist/
 sdk/python/**/__pycache__/
 *.pyc
