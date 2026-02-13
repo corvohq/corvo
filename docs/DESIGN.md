@@ -110,8 +110,8 @@ Everything pgboss and Faktory Enterprise offer, in a single free OSS package:
 Write (enqueue, fetch, ack, fail, heartbeat):
   Client → HTTP/RPC → Store.Enqueue()
     → Cluster.Apply(opType, data)
-      → admission control (per-queue + global in-flight limits)
-      → applyCh (buffered pending queue)
+      → (for fetch/fetch-batch only) per-queue fetch permit limit
+      → applyCh (buffered pending queue, fail-fast when full)
       → applyLoop (group-commit batching with adaptive timer)
       → applyExecLoop → flushApplyBatch (sub-batch splitting)
         → raft.Apply(batch) → FSM.Apply():
@@ -122,12 +122,12 @@ Read (search, get job, list queues, list workers):
   Client → HTTP → Store.SearchJobs() → SQLite read (local, no Raft round-trip)
 ```
 
-- **Writes**: serialize as Op → admission control → group-commit batch → raft.Apply → FSM applies to Pebble + SQLite on all nodes
+- **Writes**: serialize as Op → bounded queue + group-commit batch → raft.Apply → FSM applies to Pebble + SQLite on all nodes
 - **Reads**: query local SQLite directly (any node)
 - **Fetch** is a write (claims a job) → goes through Raft
 - **Leader forwarding**: followers proxy write requests to the leader internally (transparent to clients)
 - **Determinism**: all timestamps pre-computed by leader (FSM never calls `time.Now()`)
-- **Backpressure**: overloaded requests are rejected with `429 Too Many Requests` and a dynamic `Retry-After` header
+- **Backpressure**: overloaded requests are rejected with `429 Too Many Requests` / `ResourceExhausted` and retry hints
 
 ### Components
 
@@ -1401,18 +1401,17 @@ type Cluster struct {
     fsm       *FSM
     applyCh   chan *applyRequest   // pending queue (buffered, ApplyMaxPending)
     applyExec chan []*applyRequest // batched pipeline (capacity 4)
-    inFlight  map[string]int      // per-key admission counters
-    inFlightN int                 // global in-flight count
+    fetchSem  map[string]chan struct{} // per-queue fetch/fetch-batch permit semaphores
     queueHist *durationHistogram  // queue wait time histogram
     applyHist *durationHistogram  // raft apply time histogram
 }
 
 func NewCluster(cfg ClusterConfig) (*Cluster, error)
-func (c *Cluster) Apply(opType OpType, data any) *OpResult  // admission + group-commit batching
+func (c *Cluster) Apply(opType OpType, data any) *OpResult  // bounded queue + group-commit batching
 func (c *Cluster) IsLeader() bool
 func (c *Cluster) LeaderAddr() string
 func (c *Cluster) SQLiteReadDB() *sql.DB  // for read queries
-func (c *Cluster) ClusterStatus() map[string]any  // includes histograms + in-flight stats
+func (c *Cluster) ClusterStatus() map[string]any  // includes histograms + queue depth
 func (c *Cluster) Shutdown() error
 ```
 
@@ -1680,15 +1679,16 @@ In async mirror mode (`--sqlite-mirror-async`, default for new deployments), SQL
 
 ## Write pipeline and backpressure
 
-All writes flow through a multi-stage pipeline that provides group-commit batching, admission control, and backpressure under load.
+All writes flow through a multi-stage pipeline that provides group-commit batching and bounded backpressure under load.
 
 ### Pipeline stages
 
 ```
 1. Cluster.Apply(opType, data)
    │
-   ├─ Admission control: per-queue and global in-flight limits
-   │  (reject with OverloadedError + Retry-After if limits exceeded)
+   ├─ Fetch lane guard (fetch/fetch-batch only):
+   │  per-queue permit semaphore (ApplyMaxFetchQueueInFly, default 32)
+   │  (reject with OverloadedError + Retry-After when saturated)
    │
    ├─ applyCh (buffered channel, capacity = ApplyMaxPending)
    │  (reject with OverloadedError if full)
@@ -1697,12 +1697,12 @@ All writes flow through a multi-stage pipeline that provides group-commit batchi
    │  Collects requests into batches, flushes on:
    │  - Batch full (ApplyBatchMax, default 512)
    │  - Adaptive timer fires (ApplyBatchMinWait → ApplyBatchWindow)
-   │  - Pressure heuristics shorten the timer under load
+   │  - Queue-depth heuristics shorten timer under pressure
    │
    ├─ applyExec channel (capacity 4, pipelining)
    │
    ├─ applyExecLoop → flushApplyBatch
-   │  - Splits large batches into sub-batches (ApplySubBatchMax, default 128)
+   │  - Splits large batches into sub-batches (ApplySubBatchMax, default 512)
    │  - Single-request batches skip multi-op marshaling
    │  - Marshals batch as single Raft log entry → raft.Apply()
    │
@@ -1711,18 +1711,14 @@ All writes flow through a multi-stage pipeline that provides group-commit batchi
       └─ SQLite mirror (sync or async)
 ```
 
-### Admission control
+### Backpressure model
 
-Each `Apply()` call acquires an admission slot before entering the pipeline. Two limits are enforced:
+Current backpressure is intentionally simple:
 
-| Limit | Default | Scope | Purpose |
-|---|---|---|---|
-| `ApplyMaxInFlight` | 96 | Per admission key (queue) | Prevent one hot queue from starving others |
-| `ApplyMaxTotalInFly` | 2048 | Global across all keys | Bound total memory and pipeline depth |
+- `ApplyMaxPending` bounds the Raft apply queue (`applyCh`). When full, `Apply()` fails fast with overloaded + retry hint.
+- `ApplyMaxFetchQueueInFly` bounds concurrent `fetch` / `fetch-batch` requests per queue before they enter the apply queue.
 
-The **admission key** is derived from the operation type. Queue-scoped operations (enqueue, fetch, pause, etc.) use `q:{queue_name}`. Operations that span multiple queues or are global use `g:*`.
-
-When a limit is hit, `Apply()` returns an `OverloadedError` with a dynamic `Retry-After` value (1–10ms) based on current backlog and in-flight ratios. The HTTP layer translates this to a `429 Too Many Requests` response.
+This protects memory and prevents fetch storms from a hot queue from fully saturating the write pipeline.
 
 ### Group-commit batching
 
@@ -1731,12 +1727,11 @@ The `applyLoop` goroutine collects incoming requests and flushes them as a singl
 The batch timer is adaptive:
 - **Low load** (few pending requests): flush quickly (`ApplyBatchMinWait`, default 100µs) for low latency
 - **Medium load** (batch size reaches `ApplyBatchExtendAt`, default 32): extend timer to `ApplyBatchWindow` (default 8ms) to collect more requests
-- **High load** (global in-flight > 75% capacity): shorten timer to flush immediately, prioritizing throughput over batching efficiency
-- **Extreme load** (global in-flight > 90%): minimum timer (20µs), near-immediate flush
+- **High load** (pending queue pressure rises): shorten timer to flush immediately, prioritizing throughput over batching efficiency
 
 ### Sub-batch splitting
 
-Large batches (> `ApplySubBatchMax`, default 128) are split into smaller sub-batches before calling `raft.Apply()`. This prevents a single massive Raft log entry from blocking the FSM for too long, keeping tail latencies bounded.
+Large batches (> `ApplySubBatchMax`, default 512) are split into smaller sub-batches before calling `raft.Apply()`. This prevents a single massive Raft log entry from blocking the FSM for too long, keeping tail latencies bounded.
 
 ### Configuration
 
@@ -1749,9 +1744,8 @@ All pipeline parameters are configurable via `ClusterConfig`:
 | `ApplyBatchMinWait` | 100µs | Initial wait for low-load latency |
 | `ApplyBatchExtendAt` | 32 | Batch size threshold to widen timer |
 | `ApplyMaxPending` | 4096 | Max pending requests in queue (backpressure) |
-| `ApplyMaxInFlight` | 96 | Max in-flight per admission key |
-| `ApplyMaxTotalInFly` | 2048 | Max in-flight globally |
-| `ApplySubBatchMax` | 128 | Max requests per raft.Apply execution |
+| `ApplyMaxFetchQueueInFly` | 32 | Max concurrent fetch/fetch-batch applies per queue |
+| `ApplySubBatchMax` | 512 | Max requests per raft.Apply execution |
 
 ### Observability
 
@@ -2108,7 +2102,7 @@ jobbie/
 │   │   ├── fsm_sqlite.go        # SQLite materialized view sync helpers
 │   │   ├── eventlog.go          # Per-job lifecycle event log (optional, Pebble-backed)
 │   │   ├── job_codec.go         # Job document encoding/decoding
-│   │   ├── cluster.go           # Raft node setup, apply pipeline, admission control
+│   │   ├── cluster.go           # Raft node setup, apply pipeline, fetch permits + backpressure
 │   │   ├── cluster_test.go      # Single + multi-node tests
 │   │   ├── config.go            # ClusterConfig struct (batch, admission, durability params)
 │   │   ├── direct.go            # Direct communication between nodes
@@ -2323,22 +2317,23 @@ Replaced SQLite-only store with Pebble (source of truth) + Raft (consensus) + SQ
 **Write pipeline + backpressure:**
 - [x] Group-commit batching (applyLoop with adaptive timer)
 - [x] Sub-batch splitting (ApplySubBatchMax)
-- [x] Admission control: per-queue and global in-flight limits
+- [x] Simplified backpressure: bounded pending queue + per-queue fetch permits
 - [x] Overload error with dynamic Retry-After (1–10ms)
 - [x] Backpressure via bounded pending queue (ApplyMaxPending)
 - [x] Latency histograms (queue time + apply time, p50/p90/p99)
 
 **Protocol + performance:**
 - [x] Connect RPC (HTTP/2 with protobuf): Enqueue, Fetch, FetchBatch, Ack, AckBatch, Fail, Heartbeat
-- [x] Bidirectional streaming: StreamLifecycle (single connection for continuous fetch/ack)
+- [x] Bidirectional streaming: StreamLifecycle (long-poll fetch + batched ack/enqueue)
 - [x] Protobuf codec for Raft ops (`store/raft_proto_codec.go`)
 - [x] OpMulti for group-commit batching
 - [x] FetchBatch + AckBatch ops
 - [x] HTTP benchmark tool (`cmd/bench/`)
+- [x] HTTP/2 stream-cap tuning (`MaxConcurrentStreams`) and bench RPC client pooling for high worker counts
 
 **Durability:**
 - [x] `pebbleNoSync=true` always (Pebble rebuilt from Raft log/snapshots)
-- [x] `raftNoSync` configurable (default: true for throughput; `--raft-sync` for power-loss safety)
+- [x] `raftNoSync` configurable via `--durable` (default fast mode; durable mode for power-loss safety)
 - [x] Early snapshot on leader startup
 - [x] Leader proxy middleware (followers proxy writes to leader, transparent to clients)
 
@@ -2347,7 +2342,7 @@ Replaced SQLite-only store with Pebble (source of truth) + Raft (consensus) + SQ
 - [x] Write proxying (follower → leader)
 - [x] Automatic failover + rejoin
 - [x] Raft snapshots + log compaction
-- [x] Cluster status endpoint with histograms + in-flight stats
+- [x] Cluster status endpoint with histograms + queue/pending pressure stats
 - [x] Event log endpoint
 
 ### Phase 3 — Production hardening
