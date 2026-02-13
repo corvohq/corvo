@@ -1,7 +1,9 @@
 package store
 
 import (
+	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -38,6 +40,24 @@ type ScoreSummaryResponse struct {
 	Queue      string                           `json:"queue,omitempty"`
 	Period     string                           `json:"period"`
 	Dimensions map[string]ScoreDimensionSummary `json:"dimensions"`
+}
+
+type ScoreCompareRequest struct {
+	Queue   string
+	Period  string
+	GroupBy string
+}
+
+type ScoreCompareGroup struct {
+	Key        string                           `json:"key"`
+	Dimensions map[string]ScoreDimensionSummary `json:"dimensions"`
+}
+
+type ScoreCompareResponse struct {
+	Queue   string              `json:"queue,omitempty"`
+	Period  string              `json:"period"`
+	GroupBy string              `json:"group_by"`
+	Groups  []ScoreCompareGroup `json:"groups"`
 }
 
 func (s *Store) AddScore(req AddScoreRequest) (*JobScore, error) {
@@ -184,4 +204,110 @@ func percentile(sorted []float64, p float64) float64 {
 		idx = len(sorted) - 1
 	}
 	return sorted[idx]
+}
+
+var scoreCompareTagKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+func (s *Store) ScoreCompare(req ScoreCompareRequest) (*ScoreCompareResponse, error) {
+	period := strings.TrimSpace(req.Period)
+	if period == "" {
+		period = "24h"
+	}
+	d, err := time.ParseDuration(period)
+	if err != nil || d <= 0 {
+		return nil, fmt.Errorf("invalid period: %q", period)
+	}
+	groupBy := strings.ToLower(strings.TrimSpace(req.GroupBy))
+	if groupBy == "" {
+		groupBy = "queue"
+	}
+	queue := strings.TrimSpace(req.Queue)
+	from := time.Now().UTC().Add(-d).Format(time.RFC3339Nano)
+
+	rows, err := s.sqliteR.Query(`
+		SELECT js.dimension, js.value, j.queue, j.tags
+		FROM job_scores js
+		JOIN jobs j ON j.id = js.job_id
+		WHERE js.created_at >= ?
+		  AND (? = '' OR j.queue = ?)
+		ORDER BY js.dimension, js.value`,
+		from, queue, queue,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	valuesByGroupByDim := map[string]map[string][]float64{}
+	for rows.Next() {
+		var dim string
+		var value float64
+		var rowQueue string
+		var tagsJSON *string
+		if err := rows.Scan(&dim, &value, &rowQueue, &tagsJSON); err != nil {
+			return nil, err
+		}
+
+		groupKey := "(unknown)"
+		switch {
+		case groupBy == "queue":
+			if strings.TrimSpace(rowQueue) != "" {
+				groupKey = strings.TrimSpace(rowQueue)
+			}
+		case strings.HasPrefix(groupBy, "tag:"):
+			tagKey := strings.TrimSpace(strings.TrimPrefix(groupBy, "tag:"))
+			if tagKey == "" || !scoreCompareTagKeyPattern.MatchString(tagKey) {
+				return nil, fmt.Errorf("invalid group_by tag key: %q", tagKey)
+			}
+			groupKey = "(none)"
+			if tagsJSON != nil && strings.TrimSpace(*tagsJSON) != "" {
+				var tags map[string]any
+				if err := json.Unmarshal([]byte(*tagsJSON), &tags); err == nil {
+					if v, ok := tags[tagKey]; ok && v != nil {
+						groupKey = fmt.Sprintf("%v", v)
+					}
+				}
+			}
+		default:
+			return nil, fmt.Errorf("unsupported group_by: %q", groupBy)
+		}
+
+		if _, ok := valuesByGroupByDim[groupKey]; !ok {
+			valuesByGroupByDim[groupKey] = map[string][]float64{}
+		}
+		valuesByGroupByDim[groupKey][dim] = append(valuesByGroupByDim[groupKey][dim], value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	resp := &ScoreCompareResponse{
+		Queue:   queue,
+		Period:  period,
+		GroupBy: groupBy,
+		Groups:  make([]ScoreCompareGroup, 0, len(valuesByGroupByDim)),
+	}
+	for groupKey, dims := range valuesByGroupByDim {
+		g := ScoreCompareGroup{
+			Key:        groupKey,
+			Dimensions: map[string]ScoreDimensionSummary{},
+		}
+		for dim, vals := range dims {
+			if len(vals) == 0 {
+				continue
+			}
+			sum := 0.0
+			for _, v := range vals {
+				sum += v
+			}
+			g.Dimensions[dim] = ScoreDimensionSummary{
+				Mean:  sum / float64(len(vals)),
+				P50:   percentile(vals, 50),
+				P5:    percentile(vals, 5),
+				Count: int64(len(vals)),
+			}
+		}
+		resp.Groups = append(resp.Groups, g)
+	}
+	return resp, nil
 }

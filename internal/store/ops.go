@@ -175,9 +175,10 @@ type HeartbeatOp struct {
 }
 
 type HeartbeatJobOp struct {
-	Progress   json.RawMessage `json:"progress,omitempty"`
-	Checkpoint json.RawMessage `json:"checkpoint,omitempty"`
-	Usage      *UsageReport    `json:"usage,omitempty"`
+	Progress    json.RawMessage `json:"progress,omitempty"`
+	Checkpoint  json.RawMessage `json:"checkpoint,omitempty"`
+	StreamDelta string          `json:"stream_delta,omitempty"`
+	Usage       *UsageReport    `json:"usage,omitempty"`
 }
 
 type RetryJobOp struct {

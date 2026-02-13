@@ -79,7 +79,9 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/usage/summary", s.handleUsageSummary)
 		r.Get("/budgets", s.handleListBudgets)
 		r.Get("/providers", s.handleListProviders)
+		r.Get("/approval-policies", s.handleListApprovalPolicies)
 		r.Get("/scores/summary", s.handleScoreSummary)
+		r.Get("/scores/compare", s.handleScoreCompare)
 		r.Get("/jobs/{id}/scores", s.handleListJobScores)
 
 		// Write endpoints (leader only when clustered)
@@ -101,6 +103,8 @@ func (s *Server) buildRouter() chi.Router {
 			r.Delete("/providers/{name}", s.handleDeleteProvider)
 			r.Post("/queues/{name}/provider", s.handleSetQueueProvider)
 			r.Post("/scores", s.handleAddScore)
+			r.Post("/approval-policies", s.handleSetApprovalPolicy)
+			r.Delete("/approval-policies/{id}", s.handleDeleteApprovalPolicy)
 
 			// Queue management
 			r.Post("/queues/{name}/pause", s.handlePauseQueue)

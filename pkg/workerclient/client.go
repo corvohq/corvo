@@ -438,9 +438,10 @@ func (c *Client) Fail(ctx context.Context, jobID, errMsg, backtrace string) (*Fa
 }
 
 type HeartbeatJobUpdate struct {
-	Progress   map[string]any
-	Checkpoint map[string]any
-	Usage      *UsageReport
+	Progress    map[string]any
+	Checkpoint  map[string]any
+	StreamDelta string
+	Usage       *UsageReport
 }
 
 // Heartbeat returns per-job status (e.g. "ok", "cancel").
@@ -458,6 +459,7 @@ func (c *Client) Heartbeat(ctx context.Context, jobs map[string]HeartbeatJobUpda
 		reqJobs[jobID] = &jobbiev1.HeartbeatJobUpdate{
 			ProgressJson:   progressJSON,
 			CheckpointJson: checkpointJSON,
+			StreamDelta:    update.StreamDelta,
 			Usage:          usageToPB(update.Usage),
 		}
 	}

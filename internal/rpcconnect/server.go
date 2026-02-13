@@ -383,6 +383,7 @@ func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[jobbiev1.He
 			}
 			jobUpdate.Checkpoint = m
 		}
+		jobUpdate.StreamDelta = update.GetStreamDelta()
 		jobUpdate.Usage = usageFromPB(update.GetUsage())
 		hbReq.Jobs[jobID] = jobUpdate
 	}

@@ -15,8 +15,9 @@ var scoresCmd = &cobra.Command{
 }
 
 var (
-	scoresQueue  string
-	scoresPeriod string
+	scoresQueue   string
+	scoresPeriod  string
+	scoresGroupBy string
 )
 
 var scoresSummaryCmd = &cobra.Command{
@@ -102,6 +103,69 @@ var scoresAddCmd = &cobra.Command{
 	},
 }
 
+var scoresCompareCmd = &cobra.Command{
+	Use:   "compare",
+	Short: "Compare score dimensions across groups",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path := "/api/v1/scores/compare"
+		q := ""
+		if scoresQueue != "" {
+			q += "queue=" + scoresQueue
+		}
+		if scoresPeriod != "" {
+			if q != "" {
+				q += "&"
+			}
+			q += "period=" + scoresPeriod
+		}
+		if scoresGroupBy != "" {
+			if q != "" {
+				q += "&"
+			}
+			q += "group_by=" + scoresGroupBy
+		}
+		if q != "" {
+			path += "?" + q
+		}
+		data, status, err := apiRequest("GET", path, nil)
+		if err != nil {
+			return err
+		}
+		exitOnError(data, status)
+		if outputJSON {
+			printJSON(data)
+			return nil
+		}
+		var out struct {
+			Groups []struct {
+				Key        string `json:"key"`
+				Dimensions map[string]struct {
+					Mean  float64 `json:"mean"`
+					P50   float64 `json:"p50"`
+					P5    float64 `json:"p5"`
+					Count int64   `json:"count"`
+				} `json:"dimensions"`
+			} `json:"groups"`
+		}
+		if err := json.Unmarshal(data, &out); err != nil {
+			return err
+		}
+		if len(out.Groups) == 0 {
+			fmt.Println("No scores")
+			return nil
+		}
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "GROUP\tDIMENSION\tMEAN\tP50\tP5\tCOUNT")
+		for _, g := range out.Groups {
+			for dim, s := range g.Dimensions {
+				fmt.Fprintf(w, "%s\t%s\t%.4f\t%.4f\t%.4f\t%d\n", g.Key, dim, s.Mean, s.P50, s.P5, s.Count)
+			}
+		}
+		w.Flush()
+		return nil
+	},
+}
+
 var scorer string
 
 var scoresJobCmd = &cobra.Command{
@@ -150,9 +214,12 @@ var scoresJobCmd = &cobra.Command{
 func init() {
 	scoresSummaryCmd.Flags().StringVar(&scoresQueue, "queue", "", "Filter by queue")
 	scoresSummaryCmd.Flags().StringVar(&scoresPeriod, "period", "24h", "Period (e.g. 24h, 7d)")
+	scoresCompareCmd.Flags().StringVar(&scoresQueue, "queue", "", "Filter by queue")
+	scoresCompareCmd.Flags().StringVar(&scoresPeriod, "period", "24h", "Period (e.g. 24h, 7d)")
+	scoresCompareCmd.Flags().StringVar(&scoresGroupBy, "group-by", "queue", "Grouping key (queue or tag:<key>)")
 	scoresAddCmd.Flags().StringVar(&scorer, "scorer", "", "Scorer identifier")
 
-	scoresCmd.AddCommand(scoresJobCmd, scoresSummaryCmd, scoresAddCmd)
-	addClientFlags(scoresCmd, scoresJobCmd, scoresSummaryCmd, scoresAddCmd)
+	scoresCmd.AddCommand(scoresJobCmd, scoresSummaryCmd, scoresCompareCmd, scoresAddCmd)
+	addClientFlags(scoresCmd, scoresJobCmd, scoresSummaryCmd, scoresCompareCmd, scoresAddCmd)
 	rootCmd.AddCommand(scoresCmd)
 }

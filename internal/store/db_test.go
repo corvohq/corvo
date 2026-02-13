@@ -64,7 +64,7 @@ func TestMigrationCreatesAllTables(t *testing.T) {
 		"jobs", "job_errors", "unique_locks", "batches",
 		"queues", "rate_limit_window", "schedules",
 		"workers", "events", "queue_stats", "schema_migrations", "job_usage", "budgets", "job_iterations",
-		"job_scores", "providers", "provider_usage_window",
+		"job_scores", "providers", "provider_usage_window", "approval_policies",
 	}
 
 	for _, table := range expectedTables {
@@ -100,8 +100,8 @@ func TestMigrationIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query migration version: %v", err)
 	}
-	if version != 7 {
-		t.Errorf("migration version = %d, want 7", version)
+	if version != 8 {
+		t.Errorf("migration version = %d, want 8", version)
 	}
 }
 
@@ -155,6 +155,7 @@ func TestMigrationCreatesIndexes(t *testing.T) {
 		"idx_job_scores_dimension",
 		"idx_provider_usage",
 		"idx_jobs_routing_target",
+		"idx_approval_policies_enabled",
 	}
 
 	for _, idx := range expectedIndexes {

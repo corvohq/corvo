@@ -117,6 +117,7 @@ func (db *DB) migrate() error {
 		{version: 5, path: "migrations/005_ai_phase2_ext.sql"},
 		{version: 6, path: "migrations/006_routing.sql"},
 		{version: 7, path: "migrations/007_agent_trace.sql"},
+		{version: 8, path: "migrations/008_approval_policies.sql"},
 	}
 
 	for _, m := range migrationsToApply {

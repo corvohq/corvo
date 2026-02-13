@@ -800,6 +800,18 @@ CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_id) WHERE parent_id IS
 CREATE INDEX IF NOT EXISTS idx_jobs_chain ON jobs(chain_id) WHERE chain_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_jobs_provider_error ON jobs(provider_error) WHERE provider_error = 1;
 CREATE INDEX IF NOT EXISTS idx_jobs_routing_target ON jobs(routing_target) WHERE routing_target IS NOT NULL;
+CREATE TABLE IF NOT EXISTS approval_policies (
+    id               TEXT PRIMARY KEY,
+    name             TEXT NOT NULL,
+    mode             TEXT NOT NULL DEFAULT 'any',
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    queue            TEXT,
+    tag_key          TEXT,
+    tag_value        TEXT,
+    trace_action_in  TEXT,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_approval_policies_enabled ON approval_policies(enabled);
 	`)
 	return err
 }
@@ -1023,6 +1035,19 @@ CREATE TABLE IF NOT EXISTS provider_usage_window (
     recorded_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_provider_usage ON provider_usage_window(provider, recorded_at);
+
+CREATE TABLE IF NOT EXISTS approval_policies (
+    id               TEXT PRIMARY KEY,
+    name             TEXT NOT NULL,
+    mode             TEXT NOT NULL DEFAULT 'any',
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    queue            TEXT,
+    tag_key          TEXT,
+    tag_value        TEXT,
+    trace_action_in  TEXT,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_approval_policies_enabled ON approval_policies(enabled);
 `
 
 // WaitForLeader blocks until the cluster has a leader or timeout.

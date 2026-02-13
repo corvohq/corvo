@@ -1300,6 +1300,11 @@ func (f *FSM) applyHeartbeatOp(op store.HeartbeatOp) *store.OpResult {
 		batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
 		// Update active key with new lease
 		batch.Set(kv.ActiveKey(job.Queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+		if update.StreamDelta != "" {
+			if err := f.appendStreamEvent(batch, jobID, job.Queue, update.StreamDelta, op.NowNs); err != nil {
+				return &store.OpResult{Err: err}
+			}
+		}
 
 		resp.Jobs[jobID] = store.HeartbeatJobResponse{Status: "ok"}
 	}

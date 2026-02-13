@@ -29,6 +29,7 @@ import { MoveDialog } from "@/components/dialogs/move-dialog";
 import { EnqueueDialog } from "@/components/dialogs/enqueue-dialog";
 import { useJobIterations } from "@/hooks/use-job-iterations";
 import { useSearch } from "@/hooks/use-search";
+import { useJobStream } from "@/hooks/use-job-stream";
 import { IterationTable } from "@/components/ai/iteration-table";
 import { ScoreSummary } from "@/components/ai/score-summary";
 import { StreamOutput } from "@/components/ai/stream-output";
@@ -78,6 +79,7 @@ export function JobDetail({ job }: { job: Job }) {
         : typeof resultObj.summary === "string"
           ? resultObj.summary
           : "";
+  const stream = useJobStream(job.id, outputText);
   const isAgentJob = !!job.agent;
 
   return (
@@ -294,13 +296,13 @@ export function JobDetail({ job }: { job: Job }) {
         </Card>
       )}
 
-      {outputText && (
+      {(stream.content || outputText) && (
         <Card>
           <CardHeader>
             <CardTitle className="text-sm">Output</CardTitle>
           </CardHeader>
           <CardContent>
-            <StreamOutput content={outputText} />
+            <StreamOutput content={stream.content} isStreaming={stream.isStreaming} />
           </CardContent>
         </Card>
       )}

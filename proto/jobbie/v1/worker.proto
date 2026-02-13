@@ -164,6 +164,7 @@ message HeartbeatJobUpdate {
   string progress_json = 1;
   string checkpoint_json = 2;
   UsageReport usage = 3;
+  string stream_delta = 4;
 }
 
 message HeartbeatRequest {

@@ -221,6 +221,7 @@ type pbHeartbeatJob struct {
 	HasProgress bool           `protobuf:"varint,4,opt,name=has_progress,json=hasProgress,proto3" json:"has_progress,omitempty"`
 	HasCP       bool           `protobuf:"varint,5,opt,name=has_cp,json=hasCp,proto3" json:"has_cp,omitempty"`
 	Usage       *pbUsageReport `protobuf:"bytes,6,opt,name=usage,proto3" json:"usage,omitempty"`
+	StreamDelta string         `protobuf:"bytes,7,opt,name=stream_delta,json=streamDelta,proto3" json:"stream_delta,omitempty"`
 }
 
 func (m *pbHeartbeatJob) Reset()         { *m = pbHeartbeatJob{} }
@@ -1178,6 +1179,7 @@ func toPBHeartbeat(op HeartbeatOp) *pbHeartbeatOp {
 			item.HasCP = true
 		}
 		item.Usage = toPBUsage(j.Usage)
+		item.StreamDelta = j.StreamDelta
 		out.Jobs = append(out.Jobs, item)
 	}
 	return out
@@ -1194,6 +1196,7 @@ func fromPBHeartbeat(op *pbHeartbeatOp) HeartbeatOp {
 			j.Checkpoint = append([]byte(nil), item.Checkpoint...)
 		}
 		j.Usage = fromPBUsage(item.Usage)
+		j.StreamDelta = item.StreamDelta
 		out.Jobs[item.JobID] = j
 	}
 	return out

@@ -44,3 +44,19 @@ func (s *Server) handleScoreSummary(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, out)
 }
+
+func (s *Server) handleScoreCompare(w http.ResponseWriter, r *http.Request) {
+	queue := r.URL.Query().Get("queue")
+	period := r.URL.Query().Get("period")
+	groupBy := r.URL.Query().Get("group_by")
+	out, err := s.store.ScoreCompare(store.ScoreCompareRequest{
+		Queue:   queue,
+		Period:  period,
+		GroupBy: groupBy,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "SCORE_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}

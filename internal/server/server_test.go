@@ -468,6 +468,10 @@ func TestProvidersAndScoresEndpoints(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("score summary status = %d, body: %s", rr.Code, rr.Body.String())
 	}
+	rr = doRequest(srv, "GET", "/api/v1/scores/compare?queue=score.q&period=24h&group_by=queue", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("score compare status = %d, body: %s", rr.Code, rr.Body.String())
+	}
 }
 
 func TestQueueEndpoints(t *testing.T) {
@@ -790,6 +794,69 @@ func TestBudgetEndpoints(t *testing.T) {
 	rr = doRequest(srv, "DELETE", "/api/v1/budgets/queue/budget.api", nil)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("delete budget status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestApprovalPolicyEndpointsAndAutoHold(t *testing.T) {
+	srv, _ := testServer(t)
+
+	rr := doRequest(srv, "POST", "/api/v1/approval-policies", map[string]any{
+		"name":            "hold-risky-action",
+		"mode":            "all",
+		"queue":           "apol.q",
+		"trace_action_in": []string{"send_email"},
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("set policy status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(srv, "GET", "/api/v1/approval-policies", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list policy status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(srv, "POST", "/api/v1/enqueue", map[string]any{
+		"queue":   "apol.q",
+		"payload": map[string]string{"task": "x"},
+		"agent": map[string]any{
+			"max_iterations": 4,
+		},
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("enqueue status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var enq store.EnqueueResult
+	decodeResponse(t, rr, &enq)
+
+	rr = doRequest(srv, "POST", "/api/v1/fetch", map[string]any{
+		"queues":    []string{"apol.q"},
+		"worker_id": "w1",
+		"hostname":  "h1",
+		"timeout":   1,
+	})
+	var f store.FetchResult
+	decodeResponse(t, rr, &f)
+	rr = doRequest(srv, "POST", "/api/v1/ack/"+f.JobID, map[string]any{
+		"agent_status": "continue",
+		"trace": map[string]any{
+			"action": "send_email",
+		},
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("ack status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(srv, "GET", "/api/v1/jobs/"+enq.JobID, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get job status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var job store.Job
+	decodeResponse(t, rr, &job)
+	if job.State != store.StateHeld {
+		t.Fatalf("job state = %s, want held", job.State)
+	}
+	if job.HoldReason == nil || *job.HoldReason == "" {
+		t.Fatalf("expected hold_reason to be set")
 	}
 }
 
