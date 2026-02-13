@@ -760,6 +760,10 @@ func openMaterializedView(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate materialized view schema: %w", err)
 	}
+	if err := ensureTextSearchSchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ensure text search schema: %w", err)
+	}
 
 	return db, nil
 }
@@ -839,6 +843,69 @@ func sqliteHasColumn(db *sql.DB, table, column string) (bool, error) {
 		}
 	}
 	return false, rows.Err()
+}
+
+func ensureTextSearchSchema(db *sql.DB) error {
+	if _, err := db.Exec(`
+CREATE VIRTUAL TABLE IF NOT EXISTS jobs_fts USING fts5(
+    job_id UNINDEXED,
+    queue,
+    state,
+    payload,
+    tags,
+    content='',
+    tokenize = 'unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS jobs_fts_insert AFTER INSERT ON jobs BEGIN
+    INSERT INTO jobs_fts(job_id, queue, state, payload, tags)
+    VALUES (new.id, new.queue, new.state, new.payload, COALESCE(new.tags, ''));
+END;
+CREATE TRIGGER IF NOT EXISTS jobs_fts_update AFTER UPDATE ON jobs BEGIN
+    DELETE FROM jobs_fts WHERE job_id = old.id;
+    INSERT INTO jobs_fts(job_id, queue, state, payload, tags)
+    VALUES (new.id, new.queue, new.state, new.payload, COALESCE(new.tags, ''));
+END;
+CREATE TRIGGER IF NOT EXISTS jobs_fts_delete AFTER DELETE ON jobs BEGIN
+    DELETE FROM jobs_fts WHERE job_id = old.id;
+END;
+`); err == nil {
+		return nil
+	} else if !strings.Contains(strings.ToLower(err.Error()), "fts5") {
+		return err
+	}
+
+	_, err := db.Exec(`
+DROP TABLE IF EXISTS jobs_search;
+CREATE TABLE jobs_search (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id   TEXT NOT NULL,
+    queue    TEXT NOT NULL,
+    state    TEXT NOT NULL,
+    payload  TEXT NOT NULL,
+    tags     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_search_queue ON jobs_search(queue);
+CREATE INDEX IF NOT EXISTS idx_jobs_search_job_id ON jobs_search(job_id);
+DROP TRIGGER IF EXISTS jobs_search_insert;
+DROP TRIGGER IF EXISTS jobs_search_update;
+DROP TRIGGER IF EXISTS jobs_search_delete;
+CREATE TRIGGER IF NOT EXISTS jobs_search_insert AFTER INSERT ON jobs BEGIN
+    DELETE FROM jobs_search WHERE job_id = new.id;
+    INSERT INTO jobs_search(job_id, queue, state, payload, tags)
+    VALUES (new.id, new.queue, new.state, new.payload, COALESCE(new.tags, ''));
+END;
+CREATE TRIGGER IF NOT EXISTS jobs_search_update AFTER UPDATE ON jobs BEGIN
+    DELETE FROM jobs_search WHERE job_id = new.id;
+    INSERT INTO jobs_search(job_id, queue, state, payload, tags)
+    VALUES (new.id, new.queue, new.state, new.payload, COALESCE(new.tags, ''));
+END;
+CREATE TRIGGER IF NOT EXISTS jobs_search_delete AFTER DELETE ON jobs BEGIN
+    DELETE FROM jobs_search WHERE job_id = old.id;
+END;
+INSERT INTO jobs_search(job_id, queue, state, payload, tags)
+SELECT id, queue, state, payload, COALESCE(tags, '') FROM jobs;
+`)
+	return err
 }
 
 const materializedViewSchema = `
@@ -1090,6 +1157,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_ns ON audit_logs(namespace, created_at);
+
 `
 
 // WaitForLeader blocks until the cluster has a leader or timeout.

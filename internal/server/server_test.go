@@ -1018,6 +1018,28 @@ func TestTenantBackupRestoreAndBilling(t *testing.T) {
 	_ = enq
 }
 
+func TestFullTextSearchEndpoint(t *testing.T) {
+	srv, _ := testServer(t)
+	rr := doRequest(srv, "POST", "/api/v1/enqueue", map[string]any{
+		"queue":   "fts.q",
+		"payload": map[string]any{"message": "hello vector world"},
+		"tags":    map[string]any{"topic": "hello"},
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("enqueue status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	rr = doRequest(srv, "GET", "/api/v1/search/fulltext?q=hello", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("fulltext status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	decodeResponse(t, rr, &body)
+	results, _ := body["results"].([]any)
+	if len(results) == 0 {
+		t.Fatalf("expected fulltext results")
+	}
+}
+
 func TestApprovalPolicyEndpointsAndAutoHold(t *testing.T) {
 	srv, _ := testServer(t)
 

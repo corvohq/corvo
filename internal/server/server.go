@@ -89,6 +89,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/jobs/{id}/iterations", s.handleListJobIterations)
 		r.Get("/jobs/{id}/stream", s.handleJobStreamSSE)
 		r.Post("/jobs/search", s.handleSearch)
+		r.Get("/search/fulltext", s.handleFullTextSearch)
 		r.Get("/workers", s.handleListWorkers)
 		r.Get("/cluster/status", s.handleClusterStatus)
 		r.Get("/cluster/events", s.handleClusterEvents)
