@@ -6,6 +6,7 @@ import { StateBadge } from "@/components/jobs/state-badge";
 import { timeAgo, truncateId } from "@/lib/utils";
 import type { Job } from "@/lib/types";
 import { Check, X, Eye } from "lucide-react";
+import { useApproveJob, useRejectJob } from "@/hooks/use-mutations";
 
 interface HeldCardProps {
   job: Job;
@@ -13,6 +14,8 @@ interface HeldCardProps {
 
 export function HeldCard({ job }: HeldCardProps) {
   const navigate = useNavigate();
+  const approve = useApproveJob();
+  const reject = useRejectJob();
 
   // Hold reason/payload would come from tags or payload
   const holdReason =
@@ -51,18 +54,16 @@ export function HeldCard({ job }: HeldCardProps) {
           <Button
             variant="default"
             size="sm"
-            onClick={() => {
-              // Future: POST /api/v1/jobs/{id}/approve
-            }}
+            disabled={approve.isPending || reject.isPending}
+            onClick={() => approve.mutate(job.id)}
           >
             <Check className="mr-1 h-3 w-3" /> Approve
           </Button>
           <Button
             variant="destructive"
             size="sm"
-            onClick={() => {
-              // Future: POST /api/v1/jobs/{id}/reject
-            }}
+            disabled={approve.isPending || reject.isPending}
+            onClick={() => reject.mutate(job.id)}
           >
             <X className="mr-1 h-3 w-3" /> Reject
           </Button>

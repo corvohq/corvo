@@ -9,6 +9,7 @@ import (
 const (
 	StatePending   = "pending"
 	StateActive    = "active"
+	StateHeld      = "held"
 	StateCompleted = "completed"
 	StateRetrying  = "retrying"
 	StateDead      = "dead"
@@ -110,6 +111,7 @@ type QueueInfo struct {
 	Queue
 	Pending   int `json:"pending"`
 	Active    int `json:"active"`
+	Held      int `json:"held"`
 	Completed int `json:"completed"`
 	Dead      int `json:"dead"`
 	Scheduled int `json:"scheduled"`

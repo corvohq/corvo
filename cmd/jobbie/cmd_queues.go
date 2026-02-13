@@ -28,15 +28,15 @@ var queuesCmd = &cobra.Command{
 		json.Unmarshal(data, &queues)
 
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "QUEUE\tPENDING\tACTIVE\tCOMPLETED\tDEAD\tPAUSED")
+		fmt.Fprintln(w, "QUEUE\tPENDING\tACTIVE\tHELD\tCOMPLETED\tDEAD\tPAUSED")
 		for _, q := range queues {
 			paused := ""
 			if p, ok := q["paused"].(bool); ok && p {
 				paused = "yes"
 			}
-			fmt.Fprintf(w, "%s\t%.0f\t%.0f\t%.0f\t%.0f\t%s\n",
+			fmt.Fprintf(w, "%s\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%s\n",
 				q["name"],
-				q["pending"], q["active"], q["completed"], q["dead"],
+				q["pending"], q["active"], q["held"], q["completed"], q["dead"],
 				paused,
 			)
 		}

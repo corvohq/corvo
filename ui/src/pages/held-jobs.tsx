@@ -2,7 +2,6 @@ import { useSearch } from "@/hooks/use-search";
 import { HeldCard } from "@/components/ai/held-card";
 
 export default function HeldJobs() {
-  // "held" state doesn't exist in the backend yet — this will return empty
   const { data: searchResult, isLoading } = useSearch({
     state: ["held"],
     limit: 50,

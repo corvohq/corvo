@@ -405,6 +405,45 @@ func TestJobEndpoints(t *testing.T) {
 	}
 }
 
+func TestHeldJobEndpoints(t *testing.T) {
+	srv, _ := testServer(t)
+
+	rr := doRequest(srv, "POST", "/api/v1/enqueue", map[string]interface{}{
+		"queue": "held.q", "payload": map[string]string{"k": "v"},
+	})
+	var enqResult store.EnqueueResult
+	decodeResponse(t, rr, &enqResult)
+
+	rr = doRequest(srv, "POST", "/api/v1/jobs/"+enqResult.JobID+"/hold", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("hold status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(srv, "POST", "/api/v1/jobs/"+enqResult.JobID+"/approve", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("approve status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(srv, "POST", "/api/v1/jobs/"+enqResult.JobID+"/hold", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("hold(2) status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	rr = doRequest(srv, "POST", "/api/v1/jobs/"+enqResult.JobID+"/reject", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("reject status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(srv, "GET", "/api/v1/jobs/"+enqResult.JobID, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get job status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var job store.Job
+	decodeResponse(t, rr, &job)
+	if job.State != store.StateDead {
+		t.Fatalf("job state = %s, want %s", job.State, store.StateDead)
+	}
+}
+
 func TestSearchEndpoint(t *testing.T) {
 	srv, _ := testServer(t)
 

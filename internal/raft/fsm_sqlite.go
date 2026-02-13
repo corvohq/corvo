@@ -338,6 +338,7 @@ func sqliteBulkAction(db sqlExecer, op store.BulkActionOp) error {
 		args[i] = id
 	}
 	inClause := strings.Join(placeholders, ", ")
+	nowStr := time.Unix(0, int64(op.NowNs)).UTC().Format(time.RFC3339Nano)
 
 	switch op.Action {
 	case "retry":
@@ -364,6 +365,20 @@ func sqliteBulkAction(db sqlExecer, op store.BulkActionOp) error {
 		priArgs = append(priArgs, args...)
 		db.Exec(fmt.Sprintf(`UPDATE jobs SET priority = ?
 			WHERE id IN (%s) AND state IN ('pending', 'scheduled')`, inClause), priArgs...)
+	case "hold":
+		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'held', worker_id = NULL, hostname = NULL,
+			lease_expires_at = NULL, scheduled_at = NULL
+			WHERE id IN (%s) AND state IN ('pending', 'active', 'scheduled', 'retrying')`, inClause), args...)
+	case "approve":
+		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'pending', worker_id = NULL, hostname = NULL,
+			lease_expires_at = NULL, scheduled_at = NULL
+			WHERE id IN (%s) AND state = 'held'`, inClause), args...)
+	case "reject":
+		rejArgs := []any{nowStr}
+		rejArgs = append(rejArgs, args...)
+		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'dead', failed_at = ?, worker_id = NULL, hostname = NULL,
+			lease_expires_at = NULL, scheduled_at = NULL
+			WHERE id IN (%s) AND state = 'held'`, inClause), rejArgs...)
 	}
 	return nil
 }
