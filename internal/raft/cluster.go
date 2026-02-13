@@ -778,6 +778,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     progress        TEXT,
     checkpoint      TEXT,
     result          TEXT,
+    result_schema   TEXT,
+    parent_id       TEXT REFERENCES jobs(id),
+    chain_id        TEXT,
+    chain_step      INTEGER,
+    chain_config    TEXT,
+    provider_error  INTEGER NOT NULL DEFAULT 0,
     agent_max_iterations INTEGER,
     agent_max_cost_usd REAL,
     agent_iteration_timeout TEXT,
@@ -800,6 +806,9 @@ CREATE INDEX IF NOT EXISTS idx_jobs_unique ON jobs(queue, unique_key) WHERE uniq
 CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_jobs_expire ON jobs(expire_at) WHERE expire_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_id) WHERE parent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_jobs_chain ON jobs(chain_id) WHERE chain_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_jobs_provider_error ON jobs(provider_error) WHERE provider_error = 1;
 
 CREATE TABLE IF NOT EXISTS job_errors (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -836,6 +845,7 @@ CREATE TABLE IF NOT EXISTS queues (
     max_concurrency INTEGER,
     rate_limit      INTEGER,
     rate_window_ms  INTEGER,
+    provider        TEXT REFERENCES providers(name),
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
 );
 
@@ -917,6 +927,32 @@ CREATE TABLE IF NOT EXISTS job_iterations (
     created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
 );
 CREATE INDEX IF NOT EXISTS idx_job_iterations_job ON job_iterations(job_id, iteration);
+
+CREATE TABLE IF NOT EXISTS job_scores (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id     TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    dimension  TEXT NOT NULL,
+    value      REAL NOT NULL,
+    scorer     TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_job_scores_job ON job_scores(job_id);
+CREATE INDEX IF NOT EXISTS idx_job_scores_dimension ON job_scores(dimension, created_at);
+
+CREATE TABLE IF NOT EXISTS providers (
+    name             TEXT PRIMARY KEY,
+    rpm_limit        INTEGER,
+    input_tpm_limit  INTEGER,
+    output_tpm_limit INTEGER,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+);
+CREATE TABLE IF NOT EXISTS provider_usage_window (
+    provider      TEXT NOT NULL,
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    recorded_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_provider_usage ON provider_usage_window(provider, recorded_at);
 `
 
 // WaitForLeader blocks until the cluster has a leader or timeout.

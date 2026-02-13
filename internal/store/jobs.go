@@ -10,9 +10,11 @@ import (
 // GetJob returns a job with its error history from local SQLite.
 func (s *Store) GetJob(id string) (*Job, error) {
 	var j Job
-	var payload, tags, progress, checkpoint, result sql.NullString
+	var payload, tags, progress, checkpoint, result, resultSchema, chainConfig sql.NullString
 	var agentIterTimeout, holdReason sql.NullString
-	var uniqueKey, batchID, workerID, hostname sql.NullString
+	var uniqueKey, batchID, workerID, hostname, parentID, chainID sql.NullString
+	var chainStep sql.NullInt64
+	var providerError int
 	var agentMaxIterations sql.NullInt64
 	var agentIteration sql.NullInt64
 	var agentMaxCostUSD sql.NullFloat64
@@ -25,6 +27,7 @@ func (s *Store) GetJob(id string) (*Job, error) {
 			retry_backoff, retry_base_delay_ms, retry_max_delay_ms,
 			unique_key, batch_id, worker_id, hostname,
 			tags, progress, checkpoint, result,
+			result_schema, parent_id, chain_id, chain_step, chain_config, provider_error,
 			agent_max_iterations, agent_max_cost_usd, agent_iteration_timeout, agent_iteration, agent_total_cost_usd,
 			hold_reason,
 			lease_expires_at, scheduled_at, expire_at,
@@ -35,6 +38,7 @@ func (s *Store) GetJob(id string) (*Job, error) {
 		&j.RetryBackoff, &j.RetryBaseDelay, &j.RetryMaxDelay,
 		&uniqueKey, &batchID, &workerID, &hostname,
 		&tags, &progress, &checkpoint, &result,
+		&resultSchema, &parentID, &chainID, &chainStep, &chainConfig, &providerError,
 		&agentMaxIterations, &agentMaxCostUSD, &agentIterTimeout, &agentIteration, &agentTotalCostUSD,
 		&holdReason,
 		&leaseExpiresAt, &scheduledAt, &expireAt,
@@ -64,6 +68,23 @@ func (s *Store) GetJob(id string) (*Job, error) {
 	if result.Valid {
 		j.Result = json.RawMessage(result.String)
 	}
+	if resultSchema.Valid {
+		j.ResultSchema = json.RawMessage(resultSchema.String)
+	}
+	if parentID.Valid {
+		j.ParentID = &parentID.String
+	}
+	if chainID.Valid {
+		j.ChainID = &chainID.String
+	}
+	if chainStep.Valid {
+		v := int(chainStep.Int64)
+		j.ChainStep = &v
+	}
+	if chainConfig.Valid {
+		j.ChainConfig = json.RawMessage(chainConfig.String)
+	}
+	j.ProviderError = providerError == 1
 	if agentIteration.Valid {
 		j.Agent = &AgentState{
 			Iteration: int(agentIteration.Int64),

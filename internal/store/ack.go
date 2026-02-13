@@ -27,6 +27,10 @@ func (s *Store) AckWithUsage(jobID string, result json.RawMessage, usage *UsageR
 }
 
 func (s *Store) AckJob(req AckRequest) error {
+	if err := s.validateAckResultSchema(req.JobID, req.Result); err != nil {
+		return err
+	}
+
 	normUsage := normalizeUsage(req.Usage)
 	if normUsage != nil {
 		exceeded, action, err := s.evaluatePerJobBudget(req.JobID, normUsage.CostUSD)
@@ -66,6 +70,9 @@ func (s *Store) AckBatch(acks []AckOp) (int, error) {
 		return 0, nil
 	}
 	for i := range acks {
+		if err := s.validateAckResultSchema(acks[i].JobID, acks[i].Result); err != nil {
+			return 0, err
+		}
 		acks[i].Usage = normalizeUsage(acks[i].Usage)
 		if acks[i].Usage == nil {
 			continue

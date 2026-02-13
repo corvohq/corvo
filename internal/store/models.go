@@ -83,9 +83,15 @@ type Job struct {
 	Progress       json.RawMessage `json:"progress,omitempty"`
 	Checkpoint     json.RawMessage `json:"checkpoint,omitempty"`
 	Result         json.RawMessage `json:"result,omitempty"`
+	ResultSchema   json.RawMessage `json:"result_schema,omitempty"`
 	LeaseExpiresAt *time.Time      `json:"lease_expires_at,omitempty"`
 	ScheduledAt    *time.Time      `json:"scheduled_at,omitempty"`
 	ExpireAt       *time.Time      `json:"expire_at,omitempty"`
+	ParentID       *string         `json:"parent_id,omitempty"`
+	ChainID        *string         `json:"chain_id,omitempty"`
+	ChainStep      *int            `json:"chain_step,omitempty"`
+	ChainConfig    json.RawMessage `json:"chain_config,omitempty"`
+	ProviderError  bool            `json:"provider_error,omitempty"`
 	CreatedAt      time.Time       `json:"created_at"`
 	StartedAt      *time.Time      `json:"started_at,omitempty"`
 	CompletedAt    *time.Time      `json:"completed_at,omitempty"`
@@ -112,21 +118,22 @@ type Queue struct {
 	MaxConcurrency *int      `json:"max_concurrency,omitempty"`
 	RateLimit      *int      `json:"rate_limit,omitempty"`
 	RateWindowMs   *int      `json:"rate_window_ms,omitempty"`
+	Provider       *string   `json:"provider,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 }
 
 // QueueInfo is a queue plus live job counts.
 type QueueInfo struct {
 	Queue
-	Pending        int        `json:"pending"`
-	Active         int        `json:"active"`
-	Held           int        `json:"held"`
-	Completed      int        `json:"completed"`
-	Dead           int        `json:"dead"`
-	Scheduled      int        `json:"scheduled"`
-	Retrying       int        `json:"retrying"`
-	Enqueued       int        `json:"enqueued"`
-	Failed         int        `json:"failed"`
+	Pending         int        `json:"pending"`
+	Active          int        `json:"active"`
+	Held            int        `json:"held"`
+	Completed       int        `json:"completed"`
+	Dead            int        `json:"dead"`
+	Scheduled       int        `json:"scheduled"`
+	Retrying        int        `json:"retrying"`
+	Enqueued        int        `json:"enqueued"`
+	Failed          int        `json:"failed"`
 	OldestPendingAt *time.Time `json:"oldest_pending_at,omitempty"`
 }
 

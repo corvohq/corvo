@@ -916,6 +916,7 @@ func (f *FSM) applyAckOp(op store.AckOp) *store.OpResult {
 	}
 
 	job.State = nextState
+	job.ProviderError = false
 	if len(op.Result) > 0 {
 		job.Result = op.Result
 	}
@@ -1046,6 +1047,7 @@ func (f *FSM) applyAckBatchOp(op store.AckBatchOp) *store.OpResult {
 		}
 
 		job.State = store.StateCompleted
+		job.ProviderError = false
 		job.CompletedAt = &now
 		if len(ack.Result) > 0 {
 			job.Result = ack.Result
@@ -1181,6 +1183,7 @@ func (f *FSM) applyFailOp(op store.FailOp) *store.OpResult {
 		job.State = store.StateRetrying
 		job.FailedAt = &now
 		job.ScheduledAt = &nextAttempt
+		job.ProviderError = op.ProviderError
 		job.WorkerID = nil
 		job.Hostname = nil
 		job.LeaseExpiresAt = nil
@@ -1195,6 +1198,7 @@ func (f *FSM) applyFailOp(op store.FailOp) *store.OpResult {
 	} else {
 		job.State = store.StateDead
 		job.FailedAt = &now
+		job.ProviderError = op.ProviderError
 		job.WorkerID = nil
 		job.Hostname = nil
 		job.LeaseExpiresAt = nil
@@ -1344,6 +1348,7 @@ func (f *FSM) applyRetryJobOp(op store.RetryJobOp) *store.OpResult {
 	createdNs := uint64(now.UnixNano())
 
 	job.State = store.StatePending
+	job.ProviderError = false
 	job.Attempt = 0
 	job.FailedAt = nil
 	job.CompletedAt = nil
@@ -2503,6 +2508,7 @@ func jobToDoc(op store.EnqueueOp) store.Job {
 		State:          op.State,
 		Payload:        op.Payload,
 		Checkpoint:     op.Checkpoint,
+		ResultSchema:   op.ResultSchema,
 		Priority:       op.Priority,
 		MaxRetries:     op.MaxRetries,
 		RetryBackoff:   op.Backoff,
@@ -2523,6 +2529,18 @@ func jobToDoc(op store.EnqueueOp) store.Job {
 	}
 	if op.ExpireAt != nil {
 		j.ExpireAt = op.ExpireAt
+	}
+	if op.ParentID != "" {
+		j.ParentID = &op.ParentID
+	}
+	if op.ChainID != "" {
+		j.ChainID = &op.ChainID
+	}
+	if op.ChainStep != nil {
+		j.ChainStep = op.ChainStep
+	}
+	if len(op.ChainConfig) > 0 {
+		j.ChainConfig = op.ChainConfig
 	}
 	return j
 }

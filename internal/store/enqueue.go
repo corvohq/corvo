@@ -10,6 +10,7 @@ type EnqueueRequest struct {
 	Queue          string          `json:"queue"`
 	Payload        json.RawMessage `json:"payload"`
 	Checkpoint     json.RawMessage `json:"checkpoint,omitempty"`
+	ResultSchema   json.RawMessage `json:"result_schema,omitempty"`
 	Priority       string          `json:"priority"`
 	UniqueKey      string          `json:"unique_key,omitempty"`
 	UniquePeriod   int             `json:"unique_period,omitempty"` // seconds
@@ -21,6 +22,10 @@ type EnqueueRequest struct {
 	ExpireAfter    string          `json:"expire_after,omitempty"` // e.g. "1h"
 	Tags           json.RawMessage `json:"tags,omitempty"`
 	Agent          *AgentConfig    `json:"agent,omitempty"`
+	ParentID       string          `json:"parent_id,omitempty"`
+	ChainID        string          `json:"chain_id,omitempty"`
+	ChainStep      *int            `json:"chain_step,omitempty"`
+	ChainConfig    json.RawMessage `json:"chain_config,omitempty"`
 }
 
 // EnqueueResult is the response from enqueuing a job.
@@ -32,6 +37,10 @@ type EnqueueResult struct {
 
 // Enqueue inserts a new job into the store via Raft consensus.
 func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
+	if err := validateResultSchemaDoc(req.ResultSchema); err != nil {
+		return nil, err
+	}
+
 	now := time.Now()
 	jobID := NewJobID()
 	priority := PriorityFromString(req.Priority)
@@ -92,6 +101,11 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 		CreatedAt:    now.UTC(),
 		NowNs:        uint64(now.UnixNano()),
 		Agent:        normalizeAgentConfig(req.Agent),
+		ResultSchema: req.ResultSchema,
+		ParentID:     req.ParentID,
+		ChainID:      req.ChainID,
+		ChainStep:    req.ChainStep,
+		ChainConfig:  req.ChainConfig,
 	}
 
 	return applyOpResult[EnqueueResult](s, OpEnqueue, op)
@@ -125,6 +139,9 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 
 	jobs := make([]EnqueueOp, len(req.Jobs))
 	for i, jobReq := range req.Jobs {
+		if err := validateResultSchemaDoc(jobReq.ResultSchema); err != nil {
+			return nil, err
+		}
 		priority := PriorityFromString(jobReq.Priority)
 		maxRetries := 3
 		if jobReq.MaxRetries != nil {
@@ -148,20 +165,25 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 		}
 
 		jobs[i] = EnqueueOp{
-			JobID:       NewJobID(),
-			Queue:       jobReq.Queue,
-			State:       StatePending,
-			Payload:     jobReq.Payload,
-			Checkpoint:  jobReq.Checkpoint,
-			Priority:    priority,
-			MaxRetries:  maxRetries,
-			Backoff:     backoff,
-			BaseDelayMs: baseDelayMs,
-			MaxDelayMs:  maxDelayMs,
-			Tags:        jobReq.Tags,
-			CreatedAt:   now.UTC(),
-			NowNs:       uint64(now.UnixNano()),
-			Agent:       normalizeAgentConfig(jobReq.Agent),
+			JobID:        NewJobID(),
+			Queue:        jobReq.Queue,
+			State:        StatePending,
+			Payload:      jobReq.Payload,
+			Checkpoint:   jobReq.Checkpoint,
+			Priority:     priority,
+			MaxRetries:   maxRetries,
+			Backoff:      backoff,
+			BaseDelayMs:  baseDelayMs,
+			MaxDelayMs:   maxDelayMs,
+			Tags:         jobReq.Tags,
+			CreatedAt:    now.UTC(),
+			NowNs:        uint64(now.UnixNano()),
+			Agent:        normalizeAgentConfig(jobReq.Agent),
+			ResultSchema: jobReq.ResultSchema,
+			ParentID:     jobReq.ParentID,
+			ChainID:      jobReq.ChainID,
+			ChainStep:    jobReq.ChainStep,
+			ChainConfig:  jobReq.ChainConfig,
 		}
 	}
 

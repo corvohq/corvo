@@ -12,13 +12,14 @@ type FailResult struct {
 }
 
 // Fail records a job failure via Raft consensus.
-func (s *Store) Fail(jobID string, errMsg string, backtrace string) (*FailResult, error) {
+func (s *Store) Fail(jobID string, errMsg string, backtrace string, providerError bool) (*FailResult, error) {
 	now := time.Now()
 	op := FailOp{
-		JobID:     jobID,
-		Error:     errMsg,
-		Backtrace: backtrace,
-		NowNs:     uint64(now.UnixNano()),
+		JobID:         jobID,
+		Error:         errMsg,
+		Backtrace:     backtrace,
+		ProviderError: providerError,
+		NowNs:         uint64(now.UnixNano()),
 	}
 
 	return applyOpResult[FailResult](s, OpFail, op)

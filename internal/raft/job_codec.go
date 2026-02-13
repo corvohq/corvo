@@ -56,6 +56,15 @@ type pbJobDoc struct {
 	HasAgent              bool    `protobuf:"varint,41,opt,name=has_agent,json=hasAgent,proto3" json:"has_agent,omitempty"`
 	HoldReason            string  `protobuf:"bytes,42,opt,name=hold_reason,json=holdReason,proto3" json:"hold_reason,omitempty"`
 	HasHoldReason         bool    `protobuf:"varint,43,opt,name=has_hold_reason,json=hasHoldReason,proto3" json:"has_hold_reason,omitempty"`
+	ResultSchema          []byte  `protobuf:"bytes,44,opt,name=result_schema,json=resultSchema,proto3" json:"result_schema,omitempty"`
+	ParentID              string  `protobuf:"bytes,45,opt,name=parent_id,json=parentId,proto3" json:"parent_id,omitempty"`
+	HasParentID           bool    `protobuf:"varint,46,opt,name=has_parent_id,json=hasParentId,proto3" json:"has_parent_id,omitempty"`
+	ChainID               string  `protobuf:"bytes,47,opt,name=chain_id,json=chainId,proto3" json:"chain_id,omitempty"`
+	HasChainID            bool    `protobuf:"varint,48,opt,name=has_chain_id,json=hasChainId,proto3" json:"has_chain_id,omitempty"`
+	ChainStep             int32   `protobuf:"varint,49,opt,name=chain_step,json=chainStep,proto3" json:"chain_step,omitempty"`
+	HasChainStep          bool    `protobuf:"varint,50,opt,name=has_chain_step,json=hasChainStep,proto3" json:"has_chain_step,omitempty"`
+	ChainConfig           []byte  `protobuf:"bytes,51,opt,name=chain_config,json=chainConfig,proto3" json:"chain_config,omitempty"`
+	ProviderError         bool    `protobuf:"varint,52,opt,name=provider_error,json=providerError,proto3" json:"provider_error,omitempty"`
 }
 
 func (m *pbJobDoc) Reset()         { *m = pbJobDoc{} }
@@ -78,7 +87,9 @@ func encodeJobDoc(job store.Job) ([]byte, error) {
 		Progress:       append([]byte(nil), job.Progress...),
 		Checkpoint:     append([]byte(nil), job.Checkpoint...),
 		Result:         append([]byte(nil), job.Result...),
+		ResultSchema:   append([]byte(nil), job.ResultSchema...),
 		CreatedAtNs:    job.CreatedAt.UnixNano(),
+		ProviderError:  job.ProviderError,
 	}
 	if job.UniqueKey != nil {
 		p.HasUniqueKey = true
@@ -132,6 +143,21 @@ func encodeJobDoc(job store.Job) ([]byte, error) {
 		p.HasHoldReason = true
 		p.HoldReason = *job.HoldReason
 	}
+	if job.ParentID != nil {
+		p.HasParentID = true
+		p.ParentID = *job.ParentID
+	}
+	if job.ChainID != nil {
+		p.HasChainID = true
+		p.ChainID = *job.ChainID
+	}
+	if job.ChainStep != nil {
+		p.HasChainStep = true
+		p.ChainStep = int32(*job.ChainStep)
+	}
+	if len(job.ChainConfig) > 0 {
+		p.ChainConfig = append([]byte(nil), job.ChainConfig...)
+	}
 	wire, err := oldproto.Marshal(p)
 	if err != nil {
 		return nil, err
@@ -160,7 +186,9 @@ func decodeJobDoc(data []byte, out *store.Job) error {
 			Progress:       append([]byte(nil), p.Progress...),
 			Checkpoint:     append([]byte(nil), p.Checkpoint...),
 			Result:         append([]byte(nil), p.Result...),
+			ResultSchema:   append([]byte(nil), p.ResultSchema...),
 			CreatedAt:      time.Unix(0, p.CreatedAtNs).UTC(),
+			ProviderError:  p.ProviderError,
 		}
 		if p.HasUniqueKey {
 			v := p.UniqueKey
@@ -214,6 +242,21 @@ func decodeJobDoc(data []byte, out *store.Job) error {
 		if p.HasHoldReason {
 			v := p.HoldReason
 			out.HoldReason = &v
+		}
+		if p.HasParentID {
+			v := p.ParentID
+			out.ParentID = &v
+		}
+		if p.HasChainID {
+			v := p.ChainID
+			out.ChainID = &v
+		}
+		if p.HasChainStep {
+			v := int(p.ChainStep)
+			out.ChainStep = &v
+		}
+		if len(p.ChainConfig) > 0 {
+			out.ChainConfig = append([]byte(nil), p.ChainConfig...)
 		}
 		return nil
 	}

@@ -93,6 +93,7 @@ type EnqueueOp struct {
 	State        string          `json:"state"`
 	Payload      json.RawMessage `json:"payload"`
 	Checkpoint   json.RawMessage `json:"checkpoint,omitempty"`
+	ResultSchema json.RawMessage `json:"result_schema,omitempty"`
 	Priority     int             `json:"priority"`
 	MaxRetries   int             `json:"max_retries"`
 	Backoff      string          `json:"backoff"`
@@ -107,6 +108,10 @@ type EnqueueOp struct {
 	NowNs        uint64          `json:"now_ns"`
 	BatchID      string          `json:"batch_id,omitempty"`
 	Agent        *AgentState     `json:"agent,omitempty"`
+	ParentID     string          `json:"parent_id,omitempty"`
+	ChainID      string          `json:"chain_id,omitempty"`
+	ChainStep    *int            `json:"chain_step,omitempty"`
+	ChainConfig  json.RawMessage `json:"chain_config,omitempty"`
 }
 
 type EnqueueBatchOp struct {
@@ -155,10 +160,11 @@ type AckBatchOp struct {
 }
 
 type FailOp struct {
-	JobID     string `json:"job_id"`
-	Error     string `json:"error"`
-	Backtrace string `json:"backtrace,omitempty"`
-	NowNs     uint64 `json:"now_ns"`
+	JobID         string `json:"job_id"`
+	Error         string `json:"error"`
+	Backtrace     string `json:"backtrace,omitempty"`
+	ProviderError bool   `json:"provider_error,omitempty"`
+	NowNs         uint64 `json:"now_ns"`
 }
 
 type HeartbeatOp struct {

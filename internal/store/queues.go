@@ -15,7 +15,7 @@ func (s *Store) ListQueues() ([]QueueInfo, error) {
 			SELECT name FROM queues
 		)
 		SELECT
-			aq.name, COALESCE(q.paused, 0), q.max_concurrency, q.rate_limit, q.rate_window_ms,
+			aq.name, COALESCE(q.paused, 0), q.max_concurrency, q.rate_limit, q.rate_window_ms, q.provider,
 			COALESCE(SUM(CASE WHEN j.state = 'pending' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.state = 'active' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.state = 'held' THEN 1 ELSE 0 END), 0),
@@ -40,9 +40,10 @@ func (s *Store) ListQueues() ([]QueueInfo, error) {
 	for rows.Next() {
 		var qi QueueInfo
 		var maxConc, rateLimit, rateWindow sql.NullInt64
+		var provider sql.NullString
 		var oldestPending sql.NullString
 		err := rows.Scan(
-			&qi.Name, &qi.Paused, &maxConc, &rateLimit, &rateWindow,
+			&qi.Name, &qi.Paused, &maxConc, &rateLimit, &rateWindow, &provider,
 			&qi.Pending, &qi.Active, &qi.Held, &qi.Completed, &qi.Dead, &qi.Scheduled, &qi.Retrying,
 			&qi.Enqueued,
 			&oldestPending,
@@ -61,6 +62,10 @@ func (s *Store) ListQueues() ([]QueueInfo, error) {
 		if rateWindow.Valid {
 			v := int(rateWindow.Int64)
 			qi.RateWindowMs = &v
+		}
+		if provider.Valid && provider.String != "" {
+			v := provider.String
+			qi.Provider = &v
 		}
 		if oldestPending.Valid {
 			if t, err := time.Parse(time.RFC3339Nano, oldestPending.String); err == nil {

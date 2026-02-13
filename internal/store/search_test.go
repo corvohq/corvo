@@ -36,7 +36,7 @@ func TestSearchJobsByState(t *testing.T) {
 
 	// Fetch and fail one to make it dead
 	r, _ := s.Fetch(store.FetchRequest{Queues: []string{"search.state"}, WorkerID: "w", Hostname: "h"})
-	s.Fail(r.JobID, "err", "")
+	s.Fail(r.JobID, "err", "", false)
 
 	result, err := s.SearchJobs(search.Filter{Queue: "search.state", State: []string{"pending"}})
 	if err != nil {

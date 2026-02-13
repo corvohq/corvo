@@ -348,7 +348,7 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 }
 
 func (s *Server) Fail(ctx context.Context, req *connect.Request[jobbiev1.FailRequest]) (*connect.Response[jobbiev1.FailResponse], error) {
-	result, err := s.store.Fail(req.Msg.GetJobId(), req.Msg.GetError(), req.Msg.GetBacktrace())
+	result, err := s.store.Fail(req.Msg.GetJobId(), req.Msg.GetError(), req.Msg.GetBacktrace(), false)
 	if err != nil {
 		return nil, mapStoreError(err)
 	}

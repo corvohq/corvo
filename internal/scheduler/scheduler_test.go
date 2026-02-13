@@ -67,7 +67,7 @@ func TestPromoteRetryingJobs(t *testing.T) {
 		RetryBackoff: "none",
 	})
 	s.Fetch(store.FetchRequest{Queues: []string{"retry.queue"}, WorkerID: "w", Hostname: "h"})
-	s.Fail(result.JobID, "err", "")
+	s.Fail(result.JobID, "err", "", false)
 
 	// With backoff=none, scheduled_at should be ~now
 	// Run scheduler to promote

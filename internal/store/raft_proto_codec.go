@@ -119,6 +119,12 @@ type pbEnqueueOp struct {
 	AgentIteration        int32   `protobuf:"varint,24,opt,name=agent_iteration,json=agentIteration,proto3" json:"agent_iteration,omitempty"`
 	AgentTotalCostUsd     float64 `protobuf:"fixed64,25,opt,name=agent_total_cost_usd,json=agentTotalCostUsd,proto3" json:"agent_total_cost_usd,omitempty"`
 	HasAgent              bool    `protobuf:"varint,26,opt,name=has_agent,json=hasAgent,proto3" json:"has_agent,omitempty"`
+	ResultSchema          []byte  `protobuf:"bytes,27,opt,name=result_schema,json=resultSchema,proto3" json:"result_schema,omitempty"`
+	ParentID              string  `protobuf:"bytes,28,opt,name=parent_id,json=parentId,proto3" json:"parent_id,omitempty"`
+	ChainID               string  `protobuf:"bytes,29,opt,name=chain_id,json=chainId,proto3" json:"chain_id,omitempty"`
+	ChainStep             int32   `protobuf:"varint,30,opt,name=chain_step,json=chainStep,proto3" json:"chain_step,omitempty"`
+	HasChainStep          bool    `protobuf:"varint,31,opt,name=has_chain_step,json=hasChainStep,proto3" json:"has_chain_step,omitempty"`
+	ChainConfig           []byte  `protobuf:"bytes,32,opt,name=chain_config,json=chainConfig,proto3" json:"chain_config,omitempty"`
 }
 
 func (m *pbEnqueueOp) Reset()         { *m = pbEnqueueOp{} }
@@ -195,10 +201,11 @@ func (m *pbAckBatchOp) String() string { return oldproto.CompactTextString(m) }
 func (*pbAckBatchOp) ProtoMessage()    {}
 
 type pbFailOp struct {
-	JobID     string `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	Error     string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
-	Backtrace string `protobuf:"bytes,3,opt,name=backtrace,proto3" json:"backtrace,omitempty"`
-	NowNs     uint64 `protobuf:"varint,4,opt,name=now_ns,json=nowNs,proto3" json:"now_ns,omitempty"`
+	JobID         string `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Error         string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	Backtrace     string `protobuf:"bytes,3,opt,name=backtrace,proto3" json:"backtrace,omitempty"`
+	NowNs         uint64 `protobuf:"varint,4,opt,name=now_ns,json=nowNs,proto3" json:"now_ns,omitempty"`
+	ProviderError bool   `protobuf:"varint,5,opt,name=provider_error,json=providerError,proto3" json:"provider_error,omitempty"`
 }
 
 func (m *pbFailOp) Reset()         { *m = pbFailOp{} }
@@ -929,6 +936,14 @@ func toPBEnqueue(op EnqueueOp) *pbEnqueueOp {
 		NowNs:        op.NowNs,
 		BatchID:      op.BatchID,
 		Checkpoint:   append([]byte(nil), op.Checkpoint...),
+		ResultSchema: append([]byte(nil), op.ResultSchema...),
+		ParentID:     op.ParentID,
+		ChainID:      op.ChainID,
+		ChainConfig:  append([]byte(nil), op.ChainConfig...),
+	}
+	if op.ChainStep != nil {
+		p.HasChainStep = true
+		p.ChainStep = int32(*op.ChainStep)
 	}
 	if op.ScheduledAt != nil {
 		p.HasScheduledAt = true
@@ -967,6 +982,14 @@ func fromPBEnqueue(op *pbEnqueueOp) EnqueueOp {
 		NowNs:        op.NowNs,
 		BatchID:      op.BatchID,
 		Checkpoint:   append([]byte(nil), op.Checkpoint...),
+		ResultSchema: append([]byte(nil), op.ResultSchema...),
+		ParentID:     op.ParentID,
+		ChainID:      op.ChainID,
+		ChainConfig:  append([]byte(nil), op.ChainConfig...),
+	}
+	if op.HasChainStep {
+		v := int(op.ChainStep)
+		out.ChainStep = &v
 	}
 	if op.HasScheduledAt {
 		t := time.Unix(0, op.ScheduledAtNs).UTC()
@@ -1110,19 +1133,21 @@ func fromPBAckBatch(op *pbAckBatchOp) AckBatchOp {
 
 func toPBFail(op FailOp) *pbFailOp {
 	return &pbFailOp{
-		JobID:     op.JobID,
-		Error:     op.Error,
-		Backtrace: op.Backtrace,
-		NowNs:     op.NowNs,
+		JobID:         op.JobID,
+		Error:         op.Error,
+		Backtrace:     op.Backtrace,
+		NowNs:         op.NowNs,
+		ProviderError: op.ProviderError,
 	}
 }
 
 func fromPBFail(op *pbFailOp) FailOp {
 	return FailOp{
-		JobID:     op.JobID,
-		Error:     op.Error,
-		Backtrace: op.Backtrace,
-		NowNs:     op.NowNs,
+		JobID:         op.JobID,
+		Error:         op.Error,
+		Backtrace:     op.Backtrace,
+		NowNs:         op.NowNs,
+		ProviderError: op.ProviderError,
 	}
 }
 

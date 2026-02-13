@@ -36,6 +36,22 @@ var seedDemoCmd = &cobra.Command{
 		}); err != nil {
 			return err
 		}
+		if err := postOK("/api/v1/providers", map[string]any{
+			"name":             "anthropic",
+			"rpm_limit":        4000,
+			"input_tpm_limit":  400000,
+			"output_tpm_limit": 80000,
+		}); err != nil {
+			return err
+		}
+		if err := postOK("/api/v1/providers", map[string]any{
+			"name":            "openai",
+			"rpm_limit":       10000,
+			"input_tpm_limit": 2000000,
+		}); err != nil {
+			return err
+		}
+		_ = postOK("/api/v1/queues/agents.research/provider", map[string]any{"provider": "anthropic"})
 		if err := postOK("/api/v1/budgets", map[string]any{
 			"scope":       "queue",
 			"target":      agentQueue,
@@ -227,6 +243,20 @@ var seedDemoCmd = &cobra.Command{
 					return err
 				}
 			}
+		}
+		if agentEnq.JobID != "" {
+			_ = postOK("/api/v1/scores", map[string]any{
+				"job_id":    agentEnq.JobID,
+				"dimension": "relevance",
+				"value":     0.94,
+				"scorer":    "auto:seed",
+			})
+			_ = postOK("/api/v1/scores", map[string]any{
+				"job_id":    agentEnq.JobID,
+				"dimension": "grounding",
+				"value":     0.89,
+				"scorer":    "auto:seed",
+			})
 		}
 
 		// Agent job forced to held by guardrail.

@@ -241,15 +241,16 @@ func (s *Server) handleFail(w http.ResponseWriter, r *http.Request) {
 	jobID := chi.URLParam(r, "job_id")
 
 	var body struct {
-		Error     string `json:"error"`
-		Backtrace string `json:"backtrace"`
+		Error         string `json:"error"`
+		Backtrace     string `json:"backtrace"`
+		ProviderError bool   `json:"provider_error"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
 		return
 	}
 
-	result, err := s.store.Fail(jobID, body.Error, body.Backtrace)
+	result, err := s.store.Fail(jobID, body.Error, body.Backtrace, body.ProviderError)
 	if err != nil {
 		writeStoreError(w, err, http.StatusBadRequest, "FAIL_ERROR")
 		return

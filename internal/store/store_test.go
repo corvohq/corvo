@@ -431,7 +431,7 @@ func TestFailWithRetry(t *testing.T) {
 	})
 	s.Fetch(store.FetchRequest{Queues: []string{"fail.queue"}, WorkerID: "w", Hostname: "h"})
 
-	result, err := s.Fail(enqResult.JobID, "something broke", "stack trace here")
+	result, err := s.Fail(enqResult.JobID, "something broke", "stack trace here", false)
 	if err != nil {
 		t.Fatalf("Fail() error: %v", err)
 	}
@@ -463,7 +463,7 @@ func TestFailDead(t *testing.T) {
 	})
 	s.Fetch(store.FetchRequest{Queues: []string{"dead.queue"}, WorkerID: "w", Hostname: "h"})
 
-	result, err := s.Fail(enqResult.JobID, "fatal error", "")
+	result, err := s.Fail(enqResult.JobID, "fatal error", "", false)
 	if err != nil {
 		t.Fatalf("Fail() error: %v", err)
 	}
