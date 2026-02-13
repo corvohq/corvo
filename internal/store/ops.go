@@ -138,6 +138,7 @@ type FetchBatchOp struct {
 type AckOp struct {
 	JobID  string          `json:"job_id"`
 	Result json.RawMessage `json:"result,omitempty"`
+	Usage  *UsageReport    `json:"usage,omitempty"`
 	NowNs  uint64          `json:"now_ns"`
 }
 
@@ -161,6 +162,7 @@ type HeartbeatOp struct {
 type HeartbeatJobOp struct {
 	Progress   json.RawMessage `json:"progress,omitempty"`
 	Checkpoint json.RawMessage `json:"checkpoint,omitempty"`
+	Usage      *UsageReport    `json:"usage,omitempty"`
 }
 
 type RetryJobOp struct {

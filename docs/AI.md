@@ -1174,10 +1174,10 @@ These features are additive and can be built incrementally after the core MVP fr
 
 ### Phase 2a — AI foundations (after core MVP)
 
-- [ ] `job_usage` table + usage reporting on ack and heartbeat
-- [ ] Usage summary endpoints (`/api/v1/usage/summary`)
+- [x] `job_usage` table + usage reporting on ack and heartbeat
+- [x] Usage summary endpoints (`/api/v1/usage/summary`)
 - [ ] Cost dashboard in UI
-- [ ] CLI: `jobbie usage`
+- [x] CLI: `jobbie usage`
 - [ ] `held` job state + approve/reject endpoints
 - [ ] Held jobs view in UI
 - [ ] CLI: `jobbie held`, `jobbie approve`, `jobbie reject`

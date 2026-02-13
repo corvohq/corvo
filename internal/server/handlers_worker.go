@@ -175,11 +175,12 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	jobID := chi.URLParam(r, "job_id")
 
 	var body struct {
-		Result json.RawMessage `json:"result"`
+		Result json.RawMessage    `json:"result"`
+		Usage  *store.UsageReport `json:"usage"`
 	}
 	decodeJSON(r, &body)
 
-	if err := s.store.Ack(jobID, body.Result); err != nil {
+	if err := s.store.AckWithUsage(jobID, body.Result, body.Usage); err != nil {
 		writeStoreError(w, err, http.StatusBadRequest, "ACK_ERROR")
 		return
 	}
@@ -189,8 +190,9 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAckBatch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Acks []struct {
-			JobID  string          `json:"job_id"`
-			Result json.RawMessage `json:"result"`
+			JobID  string             `json:"job_id"`
+			Result json.RawMessage    `json:"result"`
+			Usage  *store.UsageReport `json:"usage"`
 		} `json:"acks"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
@@ -211,6 +213,7 @@ func (s *Server) handleAckBatch(w http.ResponseWriter, r *http.Request) {
 		acks = append(acks, store.AckOp{
 			JobID:  ack.JobID,
 			Result: ack.Result,
+			Usage:  ack.Usage,
 		})
 	}
 

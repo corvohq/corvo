@@ -106,36 +106,46 @@ func (db *DB) migrate() error {
 		return fmt.Errorf("get current migration version: %w", err)
 	}
 
-	// For now we only have migration 001
-	if current >= 1 {
-		slog.Debug("migrations up to date", "version", current)
-		return nil
+	migrationsToApply := []struct {
+		version int
+		path    string
+	}{
+		{version: 1, path: "migrations/001_initial.sql"},
+		{version: 2, path: "migrations/002_job_usage.sql"},
 	}
 
-	sqlBytes, err := migrations.ReadFile("migrations/001_initial.sql")
-	if err != nil {
-		return fmt.Errorf("read migration 001: %w", err)
+	for _, m := range migrationsToApply {
+		if current >= m.version {
+			continue
+		}
+		sqlBytes, err := migrations.ReadFile(m.path)
+		if err != nil {
+			return fmt.Errorf("read migration %03d: %w", m.version, err)
+		}
+
+		tx, err := db.Write.Begin()
+		if err != nil {
+			return fmt.Errorf("begin migration %03d tx: %w", m.version, err)
+		}
+
+		if _, err := tx.Exec(string(sqlBytes)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("execute migration %03d: %w", m.version, err)
+		}
+
+		if _, err := tx.Exec("INSERT INTO schema_migrations (version) VALUES (?)", m.version); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("record migration %03d: %w", m.version, err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration %03d: %w", m.version, err)
+		}
+		current = m.version
+		slog.Info("applied migration", "version", m.version)
 	}
 
-	tx, err := db.Write.Begin()
-	if err != nil {
-		return fmt.Errorf("begin migration tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.Exec(string(sqlBytes)); err != nil {
-		return fmt.Errorf("execute migration 001: %w", err)
-	}
-
-	if _, err := tx.Exec("INSERT INTO schema_migrations (version) VALUES (?)", 1); err != nil {
-		return fmt.Errorf("record migration 001: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit migration 001: %w", err)
-	}
-
-	slog.Info("applied migration", "version", 1)
+	slog.Debug("migrations up to date", "version", current)
 	return nil
 }
 

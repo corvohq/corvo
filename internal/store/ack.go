@@ -8,10 +8,16 @@ import (
 
 // Ack marks a job as completed via Raft consensus.
 func (s *Store) Ack(jobID string, result json.RawMessage) error {
+	return s.AckWithUsage(jobID, result, nil)
+}
+
+// AckWithUsage marks a job completed and records optional usage metadata.
+func (s *Store) AckWithUsage(jobID string, result json.RawMessage, usage *UsageReport) error {
 	now := time.Now()
 	op := AckOp{
 		JobID:  jobID,
 		Result: result,
+		Usage:  normalizeUsage(usage),
 		NowNs:  uint64(now.UnixNano()),
 	}
 
@@ -23,6 +29,9 @@ func (s *Store) Ack(jobID string, result json.RawMessage) error {
 func (s *Store) AckBatch(acks []AckOp) (int, error) {
 	if len(acks) == 0 {
 		return 0, nil
+	}
+	for i := range acks {
+		acks[i].Usage = normalizeUsage(acks[i].Usage)
 	}
 	now := uint64(time.Now().UnixNano())
 	op := AckBatchOp{

@@ -62,8 +62,15 @@ Files: `internal/raft/cluster.go`, `internal/store/*`, `internal/rpcconnect/*`, 
   - [x] Remove remaining JSON marshalling in enqueue/lifecycle apply path where possible
   - [x] Keep Connect JSON as debug fallback only
 - [x] Admission and fairness:
-  - Add per-client fairness keying (in addition to queue/global)
+  - Simplify apply admission to bounded pending queue (`ApplyMaxPending`) + overload retry hints
+  - Add per-queue fetch permit limits (`ApplyMaxFetchQueueInFly`) to contain fetch storms
   - Keep overload signaling (`429` / `ResourceExhausted`) with retry hints
+- [x] Fetch-path protocol/runtime scaling:
+  - Increased server HTTP/2 `MaxConcurrentStreams` for high worker counts
+  - Bench now supports pooled RPC clients and worker/queue topology shaping (`-workers`, `-worker-queues`)
+- [x] Long-poll fetch alignment:
+  - Added long-poll behavior to HTTP `fetch/batch`
+  - Added long-poll behavior to Connect RPC `Fetch`, `FetchBatch`, and stream lifecycle fetch leg
 - [ ] Batch control tuning:
   - [x] Validate adaptive wait + sub-batch split settings under c10/c50/c100/c200
   - [ ] Reduce c200 p99 spikes without sacrificing c10 throughput
@@ -82,8 +89,9 @@ Benchmark gates:
 Files: `docs/AI.md`, `internal/store/*`, `internal/server/*`, `pkg/client/*`, `cmd/jobbie/*`, UI files
 
 - [ ] Usage accounting:
-  - `job_usage` storage + usage reporting via ack/heartbeat
-  - Usage summary API + CLI (`jobbie usage`)
+  - [x] `job_usage` storage + usage reporting via ack/heartbeat
+  - [x] Usage summary API (`GET /api/v1/usage/summary`)
+  - [x] Usage summary CLI (`jobbie usage`)
 - [ ] Budget enforcement:
   - Budget table + checks on fetch/ack paths
   - Queue/namespace/per-job budget APIs + CLI (`jobbie budget`)
@@ -123,7 +131,7 @@ Exit criteria:
 
 - [x] Weekly benchmark run and update `docs/BENCHMARKS.md`
 - [x] Regression suite on every durability/perf change: `go test ./... -count=1`
-- [ ] Add targeted chaos test cases for restart/recovery and overload pressure
+- [x] Add targeted chaos test cases for restart/recovery and overload pressure
 - [ ] For each AI/platform feature PR: include before/after bench snippet for c10 and c50 unary enqueue + lifecycle
 
 ## Recent Progress Notes
@@ -137,5 +145,12 @@ Exit criteria:
   - Removed JSON bridge conversion in protobuf dispatch path (`applyTypedViaJSON`)
 - [x] Overload pressure regression coverage:
   - Added `internal/raft/cluster_test.go` burst test to assert overload errors include retry hints under constrained admission
-- [x] Admission key refinement for high concurrency:
-  - Sharded ack/fail/retry/cancel/move/delete admission keys by job-id prefix to reduce global-key contention at high worker counts
+- [x] Restart/recovery chaos coverage:
+  - Added `internal/raft/cluster_test.go` restart tests for no-snapshot log replay recovery and post-snapshot recovery
+- [x] Backpressure model simplification:
+  - Removed complex per-key/global admission counters from the hot path
+  - Kept bounded apply queue backpressure and queue-scoped fetch permits
+- [x] AI usage accounting foundation:
+  - Added `job_usage` migration + summary query path in store
+  - Wired usage payloads through HTTP and Connect ack/ack-batch/heartbeat APIs
+  - Added protobuf usage fields and dual-mode compatibility via regenerated RPC stubs

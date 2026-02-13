@@ -9,6 +9,7 @@ import (
 type HeartbeatJobUpdate struct {
 	Progress   map[string]interface{} `json:"progress,omitempty"`
 	Checkpoint map[string]interface{} `json:"checkpoint,omitempty"`
+	Usage      *UsageReport           `json:"usage,omitempty"`
 }
 
 // HeartbeatRequest contains the batched heartbeat data for all active jobs on a worker.
@@ -42,6 +43,7 @@ func (s *Store) Heartbeat(req HeartbeatRequest) (*HeartbeatResponse, error) {
 		jobs[jobID] = HeartbeatJobOp{
 			Progress:   progress,
 			Checkpoint: checkpoint,
+			Usage:      normalizeUsage(update.Usage),
 		}
 	}
 

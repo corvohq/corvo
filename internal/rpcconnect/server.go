@@ -170,7 +170,7 @@ func (s *Server) Ack(ctx context.Context, req *connect.Request[jobbiev1.AckReque
 	if resultJSON == "" {
 		resultJSON = `{}`
 	}
-	if err := s.store.Ack(req.Msg.GetJobId(), json.RawMessage(resultJSON)); err != nil {
+	if err := s.store.AckWithUsage(req.Msg.GetJobId(), json.RawMessage(resultJSON), usageFromPB(req.Msg.GetUsage())); err != nil {
 		return nil, mapStoreError(err)
 	}
 	return connect.NewResponse(&jobbiev1.AckResponse{}), nil
@@ -194,6 +194,7 @@ func (s *Server) AckBatch(ctx context.Context, req *connect.Request[jobbiev1.Ack
 		acks = append(acks, store.AckOp{
 			JobID:  jobID,
 			Result: json.RawMessage(resultJSON),
+			Usage:  usageFromPB(item.GetUsage()),
 		})
 	}
 
@@ -274,6 +275,7 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 				acks = append(acks, store.AckOp{
 					JobID:  jobID,
 					Result: json.RawMessage(resultJSON),
+					Usage:  usageFromPB(item.GetUsage()),
 				})
 			}
 			if len(acks) > 0 {
@@ -368,6 +370,7 @@ func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[jobbiev1.He
 			}
 			jobUpdate.Checkpoint = m
 		}
+		jobUpdate.Usage = usageFromPB(update.GetUsage())
 		hbReq.Jobs[jobID] = jobUpdate
 	}
 
@@ -384,4 +387,19 @@ func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[jobbiev1.He
 		resp.Jobs[jobID] = &jobbiev1.HeartbeatJobResponse{Status: status.Status}
 	}
 	return connect.NewResponse(resp), nil
+}
+
+func usageFromPB(in *jobbiev1.UsageReport) *store.UsageReport {
+	if in == nil {
+		return nil
+	}
+	return &store.UsageReport{
+		InputTokens:         in.GetInputTokens(),
+		OutputTokens:        in.GetOutputTokens(),
+		CacheCreationTokens: in.GetCacheCreationTokens(),
+		CacheReadTokens:     in.GetCacheReadTokens(),
+		Model:               strings.TrimSpace(in.GetModel()),
+		Provider:            strings.TrimSpace(in.GetProvider()),
+		CostUSD:             in.GetCostUsd(),
+	}
 }
