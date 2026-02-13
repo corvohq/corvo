@@ -355,3 +355,104 @@ func TestClusterOverloadPressureReturnsRetryHint(t *testing.T) {
 		t.Fatalf("expected at least one successful enqueue")
 	}
 }
+
+func TestClusterRestartRecoveryWithoutSnapshot(t *testing.T) {
+	dataDir := t.TempDir()
+	raftBind := testRaftAddr(t)
+	cfg := DefaultClusterConfig()
+	cfg.NodeID = "node-restart-nosnap"
+	cfg.DataDir = dataDir
+	cfg.RaftBind = raftBind
+	cfg.Bootstrap = true
+	cfg.SnapshotThreshold = 1_000_000 // keep this run in log-replay path
+	cfg.SnapshotInterval = 10 * time.Minute
+
+	c1, err := NewCluster(cfg)
+	if err != nil {
+		t.Fatalf("NewCluster(initial): %v", err)
+	}
+	if err := c1.WaitForLeader(5 * time.Second); err != nil {
+		t.Fatalf("WaitForLeader(initial): %v", err)
+	}
+
+	s1 := store.NewStore(c1, c1.SQLiteReadDB())
+	const jobs = 64
+	for i := 0; i < jobs; i++ {
+		_, err := s1.Enqueue(store.EnqueueRequest{
+			Queue:   "raft.restart.nosnap",
+			Payload: json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
+		})
+		if err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+	waitForJobCount(t, c1.SQLiteReadDB(), jobs, 5*time.Second)
+	c1.Shutdown()
+
+	c2, err := NewCluster(cfg)
+	if err != nil {
+		t.Fatalf("NewCluster(restart): %v", err)
+	}
+	defer c2.Shutdown()
+	if err := c2.WaitForLeader(5 * time.Second); err != nil {
+		t.Fatalf("WaitForLeader(restart): %v", err)
+	}
+
+	waitForJobCount(t, c2.SQLiteReadDB(), jobs, 5*time.Second)
+	s2 := store.NewStore(c2, c2.SQLiteReadDB())
+	_, err = s2.Enqueue(store.EnqueueRequest{
+		Queue:   "raft.restart.nosnap",
+		Payload: json.RawMessage(`{"after":"restart"}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue after restart: %v", err)
+	}
+	waitForJobCount(t, c2.SQLiteReadDB(), jobs+1, 5*time.Second)
+}
+
+func TestClusterRestartRecoveryAfterSnapshot(t *testing.T) {
+	dataDir := t.TempDir()
+	raftBind := testRaftAddr(t)
+	cfg := DefaultClusterConfig()
+	cfg.NodeID = "node-restart-snap"
+	cfg.DataDir = dataDir
+	cfg.RaftBind = raftBind
+	cfg.Bootstrap = true
+	cfg.SnapshotThreshold = 1_000_000
+	cfg.SnapshotInterval = 10 * time.Minute
+
+	c1, err := NewCluster(cfg)
+	if err != nil {
+		t.Fatalf("NewCluster(initial): %v", err)
+	}
+	if err := c1.WaitForLeader(5 * time.Second); err != nil {
+		t.Fatalf("WaitForLeader(initial): %v", err)
+	}
+
+	s1 := store.NewStore(c1, c1.SQLiteReadDB())
+	const jobs = 96
+	for i := 0; i < jobs; i++ {
+		_, err := s1.Enqueue(store.EnqueueRequest{
+			Queue:   "raft.restart.snap",
+			Payload: json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
+		})
+		if err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+	waitForJobCount(t, c1.SQLiteReadDB(), jobs, 5*time.Second)
+	if err := c1.Raft().Snapshot().Error(); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	c1.Shutdown()
+
+	c2, err := NewCluster(cfg)
+	if err != nil {
+		t.Fatalf("NewCluster(restart): %v", err)
+	}
+	defer c2.Shutdown()
+	if err := c2.WaitForLeader(5 * time.Second); err != nil {
+		t.Fatalf("WaitForLeader(restart): %v", err)
+	}
+	waitForJobCount(t, c2.SQLiteReadDB(), jobs, 8*time.Second)
+}
