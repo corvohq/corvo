@@ -11,6 +11,16 @@ import (
 	"github.com/user/jobbie/internal/store"
 )
 
+func TestDefaultHTTPClientNoTimeout(t *testing.T) {
+	c := defaultHTTPClient()
+	if c == nil {
+		t.Fatal("defaultHTTPClient returned nil")
+	}
+	if c.Timeout != 0 {
+		t.Fatalf("timeout = %s, want 0", c.Timeout)
+	}
+}
+
 func testWorkerClient(t *testing.T, opts ...Option) (*Client, *store.Store) {
 	t.Helper()
 

@@ -72,7 +72,9 @@ func defaultHTTPClient() *http.Client {
 		},
 	}
 	return &http.Client{
-		Timeout:   60 * time.Second,
+		// Streaming lifecycle RPCs are long-lived; rely on per-request contexts
+		// instead of a global client timeout that can terminate active streams.
+		Timeout:   0,
 		Transport: tr,
 	}
 }
