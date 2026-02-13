@@ -2349,14 +2349,17 @@ Replaced SQLite-only store with Pebble (source of truth) + Raft (consensus) + SQ
 
 - [ ] payload_jq filter (translate jq subset to json_extract queries)
 - [ ] Async bulk operations (>10k jobs — background processing with progress SSE)
-- [ ] Real-time UI updates via SSE
+- [x] Real-time UI updates via SSE (with exponential backoff reconnect)
 - [ ] Prometheus metrics endpoint
-- [ ] Web UI: dashboard, queue detail with search/filter, job detail, bulk actions
+- [x] Web UI: dashboard, queue detail with search/filter, job detail, bulk actions
+- [x] Web UI: queues list page, dead letter view, held jobs view, cost dashboard, workers page, cluster page
+- [x] Web UI: mobile-responsive sidebar (Sheet drawer), dark mode toggle, enqueue job dialog
+- [x] Web UI: date range filters, bulk progress indicator, static asset cache headers (immutable/no-cache)
 - [ ] DNS-based peer discovery for Kubernetes
 - [ ] Helm chart (single node + clustered StatefulSet)
-- [ ] Admin endpoint to rebuild SQLite from Pebble
+- [x] Admin endpoint to rebuild SQLite from Pebble
 - [ ] SQLite mirror lag / dropped-update counters
-- [ ] Chaos tests (kill nodes, verify recovery)
+- [x] Chaos tests (kill nodes, verify recovery)
 - [ ] 3-node in-process cluster tests, leader election, failover, snapshot transfer
 - [ ] TypeScript client library
 - [ ] Python client library
@@ -2378,8 +2381,8 @@ See `docs/AI.md` for full spec and `docs/PHASE2.md` for delivery plan.
 - [ ] Job chaining (`then` config)
 - [ ] Semantic caching (payload hash)
 - [ ] Output scoring + aggregate queries
-- [ ] Cost dashboard in UI
-- [ ] Held jobs view in UI
+- [x] Cost dashboard in UI
+- [x] Held jobs view in UI
 
 ### Phase 5 — Ecosystem + polish
 
