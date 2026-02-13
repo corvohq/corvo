@@ -124,8 +124,11 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 		return nil, fmt.Errorf("open pebble: %w", err)
 	}
 
-	// Open SQLite materialized view
-	sqlitePath := filepath.Join(cfg.DataDir, "jobbie.db")
+	// Open SQLite materialized view.
+	sqlitePath := strings.TrimSpace(cfg.SQLitePath)
+	if sqlitePath == "" {
+		sqlitePath = filepath.Join(cfg.DataDir, "jobbie.db")
+	}
 	sqliteDB, err := openMaterializedView(sqlitePath)
 	if err != nil {
 		pdb.Close()

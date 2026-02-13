@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -80,6 +81,7 @@ var (
 	rateLimitReadBurst  float64 = 4000
 	rateLimitWriteRPS   float64 = 1000
 	rateLimitWriteBurst float64 = 2000
+	raftShards          int     = 1
 )
 
 func init() {
@@ -109,6 +111,7 @@ func init() {
 	serverCmd.Flags().Float64Var(&rateLimitReadBurst, "rate-limit-read-burst", 4000, "Per-client read burst tokens")
 	serverCmd.Flags().Float64Var(&rateLimitWriteRPS, "rate-limit-write-rps", 1000, "Per-client sustained write requests/sec")
 	serverCmd.Flags().Float64Var(&rateLimitWriteBurst, "rate-limit-write-burst", 2000, "Per-client write burst tokens")
+	serverCmd.Flags().IntVar(&raftShards, "raft-shards", 1, "Number of in-process Raft shard groups for static queue sharding")
 
 	rootCmd.AddCommand(serverCmd)
 }
@@ -130,8 +133,14 @@ func setupLogging() {
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
+	if raftShards < 1 {
+		return fmt.Errorf("raft-shards must be >= 1")
+	}
 	if discoverMode != "" && discoverMode != "dns" {
 		return fmt.Errorf("unsupported discover mode %q", discoverMode)
+	}
+	if raftShards > 1 && (joinAddr != "" || discoverMode != "") {
+		return fmt.Errorf("multi-raft sharding currently does not support join/discovery")
 	}
 
 	// Pebble is treated as rebuildable materialized state; keep Pebble fsync
@@ -164,6 +173,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		"otel_enabled", otelEnabled,
 		"otel_endpoint", otelEndpoint,
 		"data_dir", dataDir,
+		"raft_shards", raftShards,
 	)
 
 	otelShutdown, err := observability.InitTracer(otelEnabled, "jobbie-server", otelEndpoint)
@@ -190,9 +200,33 @@ func runServer(cmd *cobra.Command, args []string) error {
 	clusterCfg.Bootstrap = bootstrap
 	clusterCfg.JoinAddr = joinAddr
 
-	cluster, err := raftcluster.NewCluster(clusterCfg)
-	if err != nil {
-		return fmt.Errorf("start raft cluster: %w", err)
+	type clusterRuntime interface {
+		store.Applier
+		SQLiteReadDB() *sql.DB
+		Shutdown() error
+		WaitForLeader(timeout time.Duration) error
+		JoinCluster(leaderAddr string) error
+		IsLeader() bool
+		SnapshotAfterFirstApply(timeout time.Duration) error
+		LeaderAddr() string
+		ClusterStatus() map[string]any
+		State() string
+		EventLog(afterSeq uint64, limit int) ([]map[string]any, error)
+		RebuildSQLiteFromPebble() error
+	}
+	var cluster clusterRuntime
+	if raftShards == 1 {
+		single, err := raftcluster.NewCluster(clusterCfg)
+		if err != nil {
+			return fmt.Errorf("start raft cluster: %w", err)
+		}
+		cluster = single
+	} else {
+		multi, err := raftcluster.NewMultiCluster(clusterCfg, raftShards)
+		if err != nil {
+			return fmt.Errorf("start multi-raft cluster: %w", err)
+		}
+		cluster = multi
 	}
 	defer cluster.Shutdown()
 
@@ -207,7 +241,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		}
 		joinTargets = append(joinTargets, targets...)
 	}
-	if !bootstrap && len(joinTargets) > 0 {
+	if raftShards == 1 && !bootstrap && len(joinTargets) > 0 {
 		var joined bool
 		var lastErr error
 		for _, target := range joinTargets {
