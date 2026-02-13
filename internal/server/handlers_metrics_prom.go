@@ -92,6 +92,9 @@ func (s *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request)
 	for _, state := range []string{"pending", "active", "held", "completed", "dead", "scheduled", "retrying"} {
 		fmt.Fprintf(w, "jobbie_jobs{state=\"%s\"} %d\n", state, totalByState[state])
 	}
+	if s.reqMetrics != nil {
+		fmt.Fprint(w, s.reqMetrics.renderPrometheus())
+	}
 }
 
 func promLabelEscape(s string) string {

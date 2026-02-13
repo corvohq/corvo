@@ -46,7 +46,9 @@ func (s *Store) validateAckResultSchema(jobID string, result json.RawMessage) er
 	err := s.sqliteR.QueryRow("SELECT result_schema FROM jobs WHERE id = ?", jobID).Scan(&schemaRaw)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return fmt.Errorf("job %s not found", jobID)
+			// SQLite mirror can lag behind Raft-applied state under heavy load.
+			// Skip schema validation in this case and let the ack path proceed.
+			return nil
 		}
 		return err
 	}

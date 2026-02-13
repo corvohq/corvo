@@ -4,6 +4,23 @@ How Jobbie separates OSS from paid features, enforces licensing, and ships a sin
 
 ---
 
+## Current status
+
+Implemented now:
+
+- License validation (`internal/enterprise/license.go`) with Ed25519-signed JWT verification.
+- Runtime enterprise feature gating in server/router.
+- OIDC bearer-token auth and SAML trusted-header mode (licensed `sso` feature).
+- Custom RBAC roles + key-role bindings (licensed `rbac` feature).
+- API key expiry (`expires_at`) enforcement.
+
+Still planned:
+
+- Full browser/session-based SSO UX flow.
+- Encryption at rest, advanced alerting/analytics, and cross-region replication.
+
+---
+
 ## Guiding principle
 
 **OSS = everything a single team needs to run in production.**
@@ -32,7 +49,7 @@ Everything that touches job processing:
 - CLI
 - Cron / scheduled jobs
 - Basic webhooks (fire-and-forget POST on job lifecycle events)
-- API key auth with queue-scoped globs and three built-in roles (see [AUTH.md](./AUTH.md))
+- API key auth with queue-scoped globs and four built-in roles (see [AUTH.md](./AUTH.md))
 - Basic health indicators in the UI
 
 ### Cloud (managed hosting — priced by throughput)
@@ -217,7 +234,7 @@ Signed JWT (Ed25519):
 }
 ```
 
-Signed with our private key (stays on the signing server). Verified with a public key embedded in the binary.
+Signed with our private key (stays on the signing server). Verified with an Ed25519 public key supplied to the server (`--license-public-key` or `JOBBIE_LICENSE_PUBLIC_KEY`).
 
 ### Properties
 

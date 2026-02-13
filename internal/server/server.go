@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/user/jobbie/internal/enterprise"
 	"github.com/user/jobbie/internal/rpcconnect"
 	"github.com/user/jobbie/internal/store"
 	"go.opentelemetry.io/otel"
@@ -36,6 +37,53 @@ type Server struct {
 	bulkAsync   *asyncBulkManager
 	webhookStop chan struct{}
 	webhookDone chan struct{}
+	license     *enterprise.License
+	oidcAuth    *oidcAuthenticator
+	samlAuth    *samlHeaderAuthenticator
+	reqMetrics  *requestMetrics
+	rateLimiter *rateLimiter
+}
+
+// Option mutates server behavior.
+type Option func(*Server) error
+
+// WithEnterpriseLicense enables enterprise feature checks.
+func WithEnterpriseLicense(lic *enterprise.License) Option {
+	return func(s *Server) error {
+		s.license = lic
+		return nil
+	}
+}
+
+// WithOIDCAuth enables OIDC bearer-token auth.
+func WithOIDCAuth(cfg OIDCConfig) Option {
+	return func(s *Server) error {
+		if strings.TrimSpace(cfg.IssuerURL) == "" || strings.TrimSpace(cfg.ClientID) == "" {
+			return fmt.Errorf("oidc issuer_url and client_id are required")
+		}
+		auth, err := newOIDCAuthenticator(context.Background(), cfg)
+		if err != nil {
+			return err
+		}
+		s.oidcAuth = auth
+		return nil
+	}
+}
+
+// WithSAMLHeaderAuth enables trusted-proxy SAML header auth mode.
+func WithSAMLHeaderAuth(cfg SAMLHeaderConfig) Option {
+	return func(s *Server) error {
+		s.samlAuth = newSAMLHeaderAuthenticator(cfg)
+		return nil
+	}
+}
+
+// WithRateLimit configures server-side per-client request rate limiting.
+func WithRateLimit(cfg RateLimitConfig) Option {
+	return func(s *Server) error {
+		s.rateLimiter = newRateLimiter(cfg)
+		return nil
+	}
 }
 
 // ClusterInfo contains cluster state methods used by HTTP handlers/middleware.
@@ -50,7 +98,7 @@ type ClusterInfo interface {
 
 // New creates a new Server.
 // If uiAssets is non-nil the embedded SPA will be served at /ui/.
-func New(s *store.Store, cluster ClusterInfo, bindAddr string, uiAssets fs.FS) *Server {
+func New(s *store.Store, cluster ClusterInfo, bindAddr string, uiAssets fs.FS, opts ...Option) *Server {
 	srv := &Server{
 		store:       s,
 		cluster:     cluster,
@@ -59,6 +107,16 @@ func New(s *store.Store, cluster ClusterInfo, bindAddr string, uiAssets fs.FS) *
 		bulkAsync:   newAsyncBulkManager(s),
 		webhookStop: make(chan struct{}),
 		webhookDone: make(chan struct{}),
+		reqMetrics:  newRequestMetrics(),
+		rateLimiter: newRateLimiter(RateLimitConfig{Enabled: true}),
+	}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		if err := opt(srv); err != nil {
+			slog.Warn("server option ignored", "error", err)
+		}
 	}
 	srv.router = srv.buildRouter()
 	srv.httpServer = &http.Server{
@@ -75,6 +133,8 @@ func (s *Server) buildRouter() chi.Router {
 
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
+	r.Use(s.rateLimitMiddleware)
+	r.Use(s.requestMetricsMiddleware)
 	r.Use(structuredLogger)
 	r.Use(otelHTTPMiddleware)
 	r.Use(middleware.Recoverer)
@@ -102,6 +162,8 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/approval-policies", s.handleListApprovalPolicies)
 		r.Get("/webhooks", s.handleListWebhooks)
 		r.Get("/auth/keys", s.handleListAPIKeys)
+		r.Get("/auth/roles", s.requireEnterpriseFeature("rbac", s.handleListAuthRoles))
+		r.Get("/auth/keys/{key_hash}/roles", s.requireEnterpriseFeature("rbac", s.handleListAPIKeyRoles))
 		r.Get("/billing/summary", s.handleBillingSummary)
 		r.Get("/scores/summary", s.handleScoreSummary)
 		r.Get("/scores/compare", s.handleScoreCompare)
@@ -132,6 +194,10 @@ func (s *Server) buildRouter() chi.Router {
 			r.Delete("/webhooks/{id}", s.handleDeleteWebhook)
 			r.Post("/auth/keys", s.handleSetAPIKey)
 			r.Delete("/auth/keys", s.handleDeleteAPIKey)
+			r.Post("/auth/roles", s.requireEnterpriseFeature("rbac", s.handleSetAuthRole))
+			r.Delete("/auth/roles/{name}", s.requireEnterpriseFeature("rbac", s.handleDeleteAuthRole))
+			r.Post("/auth/keys/{key_hash}/roles", s.requireEnterpriseFeature("rbac", s.handleAssignAPIKeyRole))
+			r.Delete("/auth/keys/{key_hash}/roles/{role}", s.requireEnterpriseFeature("rbac", s.handleUnassignAPIKeyRole))
 			r.Get("/admin/backup", s.handleTenantBackup)
 			r.Post("/admin/restore", s.handleTenantRestore)
 
@@ -247,6 +313,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	case <-s.webhookDone:
 	case <-ctx.Done():
 	}
+	if s.rateLimiter != nil {
+		s.rateLimiter.close()
+	}
 	return s.httpServer.Shutdown(ctx)
 }
 
@@ -261,6 +330,9 @@ func (s *Server) Close() error {
 	select {
 	case <-s.webhookDone:
 	default:
+	}
+	if s.rateLimiter != nil {
+		s.rateLimiter.close()
 	}
 	return s.httpServer.Close()
 }
@@ -355,9 +427,61 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, X-Jobbie-Namespace")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) requireEnterpriseFeature(feature string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.license == nil || !s.license.HasFeature(feature) {
+			writeError(w, http.StatusForbidden, "enterprise feature not enabled: "+feature, "LICENSE_ERROR")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) requestMetricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		route := r.URL.Path
+		if rctx := chi.RouteContext(r.Context()); rctx != nil {
+			if pat := strings.TrimSpace(rctx.RoutePattern()); pat != "" {
+				route = pat
+			}
+		}
+		counter := s.reqMetrics.begin(r.Method, route)
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		next.ServeHTTP(ww, r)
+		route = r.URL.Path
+		if rctx := chi.RouteContext(r.Context()); rctx != nil {
+			if pat := strings.TrimSpace(rctx.RoutePattern()); pat != "" {
+				route = pat
+			}
+		}
+		s.reqMetrics.finish(counter, ww.Status(), time.Since(start))
+	})
+}
+
+func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.rateLimiter == nil || !isRateLimitedPath(r.URL.Path) || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		key := rateLimitClientKey(r)
+		isWrite := isWriteMethod(r.Method)
+		if !s.rateLimiter.allow(key, isWrite, time.Now()) {
+			if s.reqMetrics != nil {
+				s.reqMetrics.incThrottled(r.Method, r.URL.Path)
+			}
+			w.Header().Set("Retry-After", "1")
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded", "RATE_LIMITED")
 			return
 		}
 		next.ServeHTTP(w, r)

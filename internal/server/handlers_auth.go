@@ -18,6 +18,7 @@ func (s *Server) handleSetAPIKey(w http.ResponseWriter, r *http.Request) {
 		Namespace  string `json:"namespace,omitempty"`
 		Role       string `json:"role,omitempty"`
 		QueueScope string `json:"queue_scope,omitempty"`
+		ExpiresAt  string `json:"expires_at,omitempty"`
 		Enabled    *bool  `json:"enabled,omitempty"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
@@ -28,7 +29,7 @@ func (s *Server) handleSetAPIKey(w http.ResponseWriter, r *http.Request) {
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
-	key, err := s.upsertAPIKey(req.Name, req.Key, req.Namespace, req.Role, req.QueueScope, enabled)
+	key, err := s.upsertAPIKey(req.Name, req.Key, req.Namespace, req.Role, req.QueueScope, req.ExpiresAt, enabled)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "AUTH_ERROR")
 		return

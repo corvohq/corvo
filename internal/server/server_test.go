@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/user/jobbie/internal/enterprise"
 	"github.com/user/jobbie/internal/raft"
 	jobbiev1 "github.com/user/jobbie/internal/rpcconnect/gen/jobbie/v1"
 	"github.com/user/jobbie/internal/rpcconnect/gen/jobbie/v1/jobbiev1connect"
@@ -104,6 +105,44 @@ func TestHealthz(t *testing.T) {
 	rr := doRequest(srv, "GET", "/healthz", nil)
 	if rr.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+}
+
+func TestRateLimitMiddlewareDeniesBurst(t *testing.T) {
+	_, s := testServer(t)
+	srv := New(s, nil, ":0", nil, WithRateLimit(RateLimitConfig{
+		Enabled:    true,
+		ReadRPS:    0.0001,
+		ReadBurst:  1,
+		WriteRPS:   0.0001,
+		WriteBurst: 1,
+	}))
+	rr := doRequest(srv, "GET", "/api/v1/queues", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("first request status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	rr = doRequest(srv, "GET", "/api/v1/queues", nil)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPrometheusMetricsIncludeHTTPSeries(t *testing.T) {
+	srv, _ := testServer(t)
+	_ = doRequest(srv, "GET", "/api/v1/queues", nil)
+	rr := doRequest(srv, "GET", "/api/v1/metrics", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	for _, needle := range []string{
+		"jobbie_http_requests_total",
+		"jobbie_http_request_duration_seconds_bucket",
+		"jobbie_http_requests_in_flight",
+	} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("metrics missing %q", needle)
+		}
 	}
 }
 
@@ -249,6 +288,96 @@ func TestFetchAndAckEndpoints(t *testing.T) {
 	})
 	if rr.Code != http.StatusOK {
 		t.Fatalf("ack status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAPIKeyBearerHeader(t *testing.T) {
+	srv, _ := testServer(t)
+	rr := doRequest(srv, "POST", "/api/v1/auth/keys", map[string]any{
+		"name": "admin",
+		"key":  "k_admin_bearer",
+		"role": "admin",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("create key status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	headers := map[string]string{"Authorization": "Bearer k_admin_bearer"}
+	rr = doRequestWithHeaders(srv, "GET", "/api/v1/queues", nil, headers)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("queues status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAPIKeyExpiry(t *testing.T) {
+	srv, _ := testServer(t)
+	rr := doRequest(srv, "POST", "/api/v1/auth/keys", map[string]any{
+		"name":       "expired",
+		"key":        "k_expired",
+		"role":       "admin",
+		"expires_at": time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano),
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("create key status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	headers := map[string]string{"X-API-Key": "k_expired"}
+	rr = doRequestWithHeaders(srv, "GET", "/api/v1/queues", nil, headers)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("queues status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCustomRBACRolePermissions(t *testing.T) {
+	_, s := testServer(t)
+	lic := &enterprise.License{Features: map[string]struct{}{"rbac": {}}}
+	srv := New(s, nil, ":0", nil, WithEnterpriseLicense(lic))
+
+	rr := doRequest(srv, "POST", "/api/v1/auth/keys", map[string]any{
+		"name": "admin",
+		"key":  "k_admin_rbac",
+		"role": "admin",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("create admin key status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	adminHeaders := map[string]string{"X-API-Key": "k_admin_rbac"}
+
+	rr = doRequestWithHeaders(srv, "POST", "/api/v1/auth/keys", map[string]any{
+		"name": "custom",
+		"key":  "k_custom_rbac",
+		"role": "custom",
+	}, adminHeaders)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("create custom key status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequestWithHeaders(srv, "POST", "/api/v1/auth/roles", map[string]any{
+		"name": "queue-reader",
+		"permissions": []map[string]any{
+			{"resource": "queues", "actions": []string{"read"}},
+		},
+	}, adminHeaders)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("create role status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequestWithHeaders(srv, "POST", "/api/v1/auth/keys/"+hashAPIKey("k_custom_rbac")+"/roles", map[string]any{
+		"role": "queue-reader",
+	}, adminHeaders)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("assign role status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	customHeaders := map[string]string{"X-API-Key": "k_custom_rbac"}
+	rr = doRequestWithHeaders(srv, "GET", "/api/v1/queues", nil, customHeaders)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("custom read status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	rr = doRequestWithHeaders(srv, "POST", "/api/v1/enqueue", map[string]any{
+		"queue":   "rbac.q",
+		"payload": map[string]any{"ok": true},
+	}, customHeaders)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("custom write status = %d body=%s", rr.Code, rr.Body.String())
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/user/jobbie/internal/enterprise"
 	"github.com/user/jobbie/internal/observability"
 	raftcluster "github.com/user/jobbie/internal/raft"
 	"github.com/user/jobbie/internal/scheduler"
@@ -69,6 +70,16 @@ var (
 	discoverDNSName     string
 	otelEnabled         bool
 	otelEndpoint        string
+	licenseKey          string
+	licensePublicKey    string
+	oidcIssuerURL       string
+	oidcClientID        string
+	samlHeaderAuth      bool
+	rateLimitEnabled            = true
+	rateLimitReadRPS    float64 = 2000
+	rateLimitReadBurst  float64 = 4000
+	rateLimitWriteRPS   float64 = 1000
+	rateLimitWriteBurst float64 = 2000
 )
 
 func init() {
@@ -88,6 +99,16 @@ func init() {
 	serverCmd.Flags().DurationVar(&shutdownTimeout, "shutdown-timeout", 500*time.Millisecond, "Graceful HTTP shutdown timeout before force-close (e.g. 500ms, 2s)")
 	serverCmd.Flags().BoolVar(&otelEnabled, "otel-enabled", false, "Enable OpenTelemetry tracing")
 	serverCmd.Flags().StringVar(&otelEndpoint, "otel-endpoint", "", "OTLP HTTP endpoint (host:port) for traces; if empty uses stdout exporter")
+	serverCmd.Flags().StringVar(&licenseKey, "license-key", "", "Enterprise license token (or set JOBBIE_LICENSE_KEY)")
+	serverCmd.Flags().StringVar(&licensePublicKey, "license-public-key", "", "Base64 Ed25519 public key for license validation (or set JOBBIE_LICENSE_PUBLIC_KEY)")
+	serverCmd.Flags().StringVar(&oidcIssuerURL, "oidc-issuer-url", "", "OIDC issuer URL (enterprise sso feature)")
+	serverCmd.Flags().StringVar(&oidcClientID, "oidc-client-id", "", "OIDC client/audience ID (enterprise sso feature)")
+	serverCmd.Flags().BoolVar(&samlHeaderAuth, "saml-header-auth", false, "Enable trusted SAML header auth mode (enterprise sso feature)")
+	serverCmd.Flags().BoolVar(&rateLimitEnabled, "rate-limit-enabled", true, "Enable server-side per-client request rate limiting")
+	serverCmd.Flags().Float64Var(&rateLimitReadRPS, "rate-limit-read-rps", 2000, "Per-client sustained read requests/sec")
+	serverCmd.Flags().Float64Var(&rateLimitReadBurst, "rate-limit-read-burst", 4000, "Per-client read burst tokens")
+	serverCmd.Flags().Float64Var(&rateLimitWriteRPS, "rate-limit-write-rps", 1000, "Per-client sustained write requests/sec")
+	serverCmd.Flags().Float64Var(&rateLimitWriteBurst, "rate-limit-write-burst", 2000, "Per-client write burst tokens")
 
 	rootCmd.AddCommand(serverCmd)
 }
@@ -237,7 +258,61 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if sub, err := fs.Sub(uiassets.Assets, "dist"); err == nil {
 		uiFS = sub
 	}
-	srv := server.New(s, cluster, bindAddr, uiFS)
+	opts := []server.Option{}
+	var lic *enterprise.License
+	lk := strings.TrimSpace(licenseKey)
+	if lk == "" {
+		lk = strings.TrimSpace(os.Getenv("JOBBIE_LICENSE_KEY"))
+	}
+	lpk := strings.TrimSpace(licensePublicKey)
+	if lpk == "" {
+		lpk = strings.TrimSpace(os.Getenv("JOBBIE_LICENSE_PUBLIC_KEY"))
+	}
+	if lk != "" {
+		if lpk == "" {
+			slog.Warn("license key provided but no public key configured; enterprise features disabled")
+		} else {
+			pub, err := enterprise.ParsePublicKey(lpk)
+			if err != nil {
+				slog.Warn("invalid license public key; enterprise features disabled", "error", err)
+			} else {
+				lic, err = enterprise.Validate(lk, pub, time.Now().UTC())
+				if err != nil {
+					slog.Warn("license validation failed; enterprise features disabled", "error", err)
+				} else {
+					opts = append(opts, server.WithEnterpriseLicense(lic))
+					features := lic.FeatureList()
+					sort.Strings(features)
+					slog.Info("enterprise license enabled", "tier", lic.Tier, "customer", lic.Customer, "features", features)
+				}
+			}
+		}
+	}
+	if strings.TrimSpace(oidcIssuerURL) != "" || strings.TrimSpace(oidcClientID) != "" {
+		if lic == nil || !lic.HasFeature("sso") {
+			slog.Warn("oidc config ignored; enterprise sso feature is not enabled")
+		} else {
+			opts = append(opts, server.WithOIDCAuth(server.OIDCConfig{
+				IssuerURL: strings.TrimSpace(oidcIssuerURL),
+				ClientID:  strings.TrimSpace(oidcClientID),
+			}))
+		}
+	}
+	if samlHeaderAuth {
+		if lic == nil || !lic.HasFeature("sso") {
+			slog.Warn("saml header auth ignored; enterprise sso feature is not enabled")
+		} else {
+			opts = append(opts, server.WithSAMLHeaderAuth(server.SAMLHeaderConfig{Enabled: true}))
+		}
+	}
+	opts = append(opts, server.WithRateLimit(server.RateLimitConfig{
+		Enabled:    rateLimitEnabled,
+		ReadRPS:    rateLimitReadRPS,
+		ReadBurst:  rateLimitReadBurst,
+		WriteRPS:   rateLimitWriteRPS,
+		WriteBurst: rateLimitWriteBurst,
+	}))
+	srv := server.New(s, cluster, bindAddr, uiFS, opts...)
 	go func() {
 		if err := srv.Start(); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTP server error", "error", err)

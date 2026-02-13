@@ -788,6 +788,7 @@ func ensureMaterializedViewSchema(db *sql.DB) error {
 		{table: "jobs", name: "routing_index", sql: "ALTER TABLE jobs ADD COLUMN routing_index INTEGER NOT NULL DEFAULT 0"},
 		{table: "job_iterations", name: "trace", sql: "ALTER TABLE job_iterations ADD COLUMN trace TEXT"},
 		{table: "queues", name: "provider", sql: "ALTER TABLE queues ADD COLUMN provider TEXT REFERENCES providers(name)"},
+		{table: "api_keys", name: "expires_at", sql: "ALTER TABLE api_keys ADD COLUMN expires_at TEXT"},
 	}
 	for _, c := range columns {
 		ok, err := sqliteHasColumn(db, c.table, c.name)
@@ -818,6 +819,19 @@ CREATE TABLE IF NOT EXISTS approval_policies (
     created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
 );
 CREATE INDEX IF NOT EXISTS idx_approval_policies_enabled ON approval_policies(enabled);
+CREATE TABLE IF NOT EXISTS auth_roles (
+    name        TEXT PRIMARY KEY,
+    permissions TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+    updated_at  TEXT
+);
+CREATE TABLE IF NOT EXISTS auth_key_roles (
+    key_hash   TEXT NOT NULL,
+    role_name  TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+    PRIMARY KEY(key_hash, role_name)
+);
+CREATE INDEX IF NOT EXISTS idx_auth_key_roles_role ON auth_key_roles(role_name);
 	`)
 	return err
 }
@@ -1139,10 +1153,26 @@ CREATE TABLE IF NOT EXISTS api_keys (
     role         TEXT NOT NULL DEFAULT 'readonly',
     queue_scope  TEXT,
     enabled      INTEGER NOT NULL DEFAULT 1,
+    expires_at   TEXT,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
     last_used_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_enabled ON api_keys(enabled, namespace, role);
+
+CREATE TABLE IF NOT EXISTS auth_roles (
+    name        TEXT PRIMARY KEY,
+    permissions TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+    updated_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS auth_key_roles (
+    key_hash   TEXT NOT NULL,
+    role_name  TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+    PRIMARY KEY(key_hash, role_name)
+);
+CREATE INDEX IF NOT EXISTS idx_auth_key_roles_role ON auth_key_roles(role_name);
 
 CREATE TABLE IF NOT EXISTS audit_logs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

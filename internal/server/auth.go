@@ -22,6 +22,7 @@ type authPrincipal struct {
 	Namespace  string
 	Role       string
 	QueueScope string
+	Roles      []string
 }
 
 type ctxKey string
@@ -68,6 +69,22 @@ func (s *Server) resolvePrincipal(r *http.Request) (authPrincipal, int, string, 
 	if s.store == nil || s.store.ReadDB() == nil {
 		return defaults, 0, "", ""
 	}
+	if s.oidcAuth != nil {
+		if p, ok := s.resolveOIDCPrincipal(r); ok {
+			if !s.isAuthorized(p, r.Method, r.URL.Path) {
+				return authPrincipal{}, http.StatusForbidden, "FORBIDDEN", "insufficient role permissions"
+			}
+			return p, 0, "", ""
+		}
+	}
+	if s.samlAuth != nil {
+		if p, ok := s.resolveSAMLPrincipal(r); ok {
+			if !s.isAuthorized(p, r.Method, r.URL.Path) {
+				return authPrincipal{}, http.StatusForbidden, "FORBIDDEN", "insufficient role permissions"
+			}
+			return p, 0, "", ""
+		}
+	}
 	db := s.store.ReadDB()
 	var keyCount int
 	if err := db.QueryRow("SELECT COUNT(*) FROM api_keys WHERE enabled = 1").Scan(&keyCount); err != nil {
@@ -83,15 +100,22 @@ func (s *Server) resolvePrincipal(r *http.Request) (authPrincipal, int, string, 
 
 	apiKey := strings.TrimSpace(r.Header.Get("X-API-Key"))
 	if apiKey == "" {
+		authz := strings.TrimSpace(r.Header.Get("Authorization"))
+		if strings.HasPrefix(strings.ToLower(authz), "bearer ") {
+			apiKey = strings.TrimSpace(authz[len("Bearer "):])
+		}
+	}
+	if apiKey == "" {
 		return authPrincipal{}, http.StatusUnauthorized, "UNAUTHORIZED", "missing API key"
 	}
 	h := hashAPIKey(apiKey)
 	var p authPrincipal
 	var enabled int
+	var expiresAt sql.NullString
 	err := db.QueryRow(`
-		SELECT key_hash, name, namespace, role, queue_scope, enabled
+		SELECT key_hash, name, namespace, role, queue_scope, enabled, expires_at
 		FROM api_keys WHERE key_hash = ?
-	`, h).Scan(&p.KeyHash, &p.Name, &p.Namespace, &p.Role, &p.QueueScope, &enabled)
+	`, h).Scan(&p.KeyHash, &p.Name, &p.Namespace, &p.Role, &p.QueueScope, &enabled, &expiresAt)
 	if err == sql.ErrNoRows || enabled == 0 {
 		return authPrincipal{}, http.StatusUnauthorized, "UNAUTHORIZED", "invalid API key"
 	}
@@ -104,11 +128,38 @@ func (s *Server) resolvePrincipal(r *http.Request) (authPrincipal, int, string, 
 	if strings.TrimSpace(p.Role) == "" {
 		p.Role = "readonly"
 	}
-	if !isRoleAllowed(p.Role, r.Method, r.URL.Path) {
+	if expiresAt.Valid {
+		ts := strings.TrimSpace(expiresAt.String)
+		if ts != "" {
+			if exp, err := time.Parse(time.RFC3339Nano, ts); err == nil && time.Now().UTC().After(exp.UTC()) {
+				return authPrincipal{}, http.StatusUnauthorized, "UNAUTHORIZED", "expired API key"
+			}
+		}
+	}
+	p.Roles = s.listAssignedRoles(p.KeyHash)
+	if !s.isAuthorized(p, r.Method, r.URL.Path) {
 		return authPrincipal{}, http.StatusForbidden, "FORBIDDEN", "insufficient role permissions"
 	}
 	_, _ = db.Exec("UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?", time.Now().UTC().Format(time.RFC3339Nano), p.KeyHash)
 	return p, 0, "", ""
+}
+
+func (s *Server) isAuthorized(p authPrincipal, method, path string) bool {
+	if isRoleAllowed(p.Role, method, path) {
+		return true
+	}
+	if s.license == nil || !s.license.HasFeature("rbac") {
+		return false
+	}
+	if len(p.Roles) == 0 {
+		return false
+	}
+	resource, action := permissionForRoute(method, path)
+	if resource == "" || action == "" {
+		return false
+	}
+	perms := s.listPermissionsForRoles(p.Roles)
+	return permissionAllows(perms, resource, action)
 }
 
 func isRoleAllowed(role, method, path string) bool {
@@ -215,7 +266,7 @@ func (w *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 func (s *Server) listAPIKeys() ([]map[string]any, error) {
 	rows, err := s.store.ReadDB().Query(`
-		SELECT key_hash, name, namespace, role, queue_scope, enabled, created_at, last_used_at
+		SELECT key_hash, name, namespace, role, queue_scope, enabled, created_at, last_used_at, expires_at
 		FROM api_keys ORDER BY created_at DESC
 	`)
 	if err != nil {
@@ -229,7 +280,8 @@ func (s *Server) listAPIKeys() ([]map[string]any, error) {
 		var enabled int
 		var createdAt string
 		var lastUsed sql.NullString
-		if err := rows.Scan(&keyHash, &name, &ns, &role, &scope, &enabled, &createdAt, &lastUsed); err != nil {
+		var expiresAt sql.NullString
+		if err := rows.Scan(&keyHash, &name, &ns, &role, &scope, &enabled, &createdAt, &lastUsed, &expiresAt); err != nil {
 			return nil, err
 		}
 		item := map[string]any{
@@ -246,12 +298,15 @@ func (s *Server) listAPIKeys() ([]map[string]any, error) {
 		if lastUsed.Valid {
 			item["last_used_at"] = lastUsed.String
 		}
+		if expiresAt.Valid {
+			item["expires_at"] = expiresAt.String
+		}
 		out = append(out, item)
 	}
 	return out, rows.Err()
 }
 
-func (s *Server) upsertAPIKey(name, key, namespace, role, queueScope string, enabled bool) (string, error) {
+func (s *Server) upsertAPIKey(name, key, namespace, role, queueScope, expiresAt string, enabled bool) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "", fmt.Errorf("name is required")
@@ -265,17 +320,24 @@ func (s *Server) upsertAPIKey(name, key, namespace, role, queueScope string, ena
 	if strings.TrimSpace(role) == "" {
 		role = "readonly"
 	}
+	expiresAt = strings.TrimSpace(expiresAt)
+	if expiresAt != "" {
+		if _, err := time.Parse(time.RFC3339Nano, expiresAt); err != nil {
+			return "", fmt.Errorf("expires_at must be RFC3339 timestamp")
+		}
+	}
 	h := hashAPIKey(key)
 	_, err := s.store.ReadDB().Exec(`
-		INSERT INTO api_keys (key_hash, name, namespace, role, queue_scope, enabled, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO api_keys (key_hash, name, namespace, role, queue_scope, enabled, created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))
 		ON CONFLICT(key_hash) DO UPDATE SET
 			name = excluded.name,
 			namespace = excluded.namespace,
 			role = excluded.role,
 			queue_scope = excluded.queue_scope,
-			enabled = excluded.enabled
-	`, h, name, namespace, role, strings.TrimSpace(queueScope), boolToInt(enabled), time.Now().UTC().Format(time.RFC3339Nano))
+			enabled = excluded.enabled,
+			expires_at = excluded.expires_at
+	`, h, name, namespace, role, strings.TrimSpace(queueScope), boolToInt(enabled), time.Now().UTC().Format(time.RFC3339Nano), strings.TrimSpace(expiresAt))
 	if err != nil {
 		return "", err
 	}

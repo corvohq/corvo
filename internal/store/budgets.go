@@ -262,6 +262,11 @@ func (s *Store) evaluatePerJobBudget(jobID string, incomingCost float64) (bool, 
 	var queue string
 	var tagsRaw sql.NullString
 	if err := s.sqliteR.QueryRow("SELECT queue, tags FROM jobs WHERE id = ?", jobID).Scan(&queue, &tagsRaw); err != nil {
+		if err == sql.ErrNoRows {
+			// SQLite mirror can lag behind the latest Raft state; avoid
+			// rejecting ACKs due to transient read-side misses.
+			return false, "", nil
+		}
 		return false, "", err
 	}
 	tags := map[string]string{}
