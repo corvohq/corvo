@@ -39,7 +39,7 @@ Files: `internal/raft/*`, `internal/server/*`, `cmd/jobbie/main.go`, `docs/DESIG
 - [x] Deterministic pre-snapshot recovery:
   - On startup without snapshot, ensure FSM local state cannot replay on top of stale Pebble
   - Add regression test coverage for no-snapshot recovery guard
-- [ ] Snapshot policy hardening:
+- [x] Snapshot policy hardening:
   - Trigger first snapshot after meaningful apply index (not empty snapshot)
   - Tune threshold/interval defaults for faster safe checkpoints
 - [x] SQLite mirror safety net:

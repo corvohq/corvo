@@ -97,6 +97,12 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 	if cfg.RaftStore == "" {
 		cfg.RaftStore = "bolt"
 	}
+	if cfg.SnapshotThreshold == 0 {
+		cfg.SnapshotThreshold = 2048
+	}
+	if cfg.SnapshotInterval <= 0 {
+		cfg.SnapshotInterval = 1 * time.Minute
+	}
 	cfg.RaftStore = strings.ToLower(cfg.RaftStore)
 
 	// Ensure directories exist
@@ -139,8 +145,8 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 	// Raft config
 	raftConfig := raft.DefaultConfig()
 	raftConfig.LocalID = raft.ServerID(cfg.NodeID)
-	raftConfig.SnapshotThreshold = 8192
-	raftConfig.SnapshotInterval = 2 * time.Minute
+	raftConfig.SnapshotThreshold = cfg.SnapshotThreshold
+	raftConfig.SnapshotInterval = cfg.SnapshotInterval
 
 	// Transport
 	transport, err := newTCPTransport(cfg.RaftBind, cfg.RaftAdvertise)
@@ -230,6 +236,8 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 		"sqlite_mirror", cfg.SQLiteMirror,
 		"sqlite_mirror_async", cfg.SQLiteMirrorAsync,
 		"lifecycle_events", cfg.LifecycleEvents,
+		"snapshot_threshold", cfg.SnapshotThreshold,
+		"snapshot_interval", cfg.SnapshotInterval,
 		"apply_batch_max", cfg.ApplyBatchMax,
 		"apply_batch_min_wait", cfg.ApplyBatchMinWait,
 		"apply_batch_extend_at", cfg.ApplyBatchExtendAt,
@@ -1115,6 +1123,8 @@ func (c *Cluster) ClusterStatus() map[string]any {
 		"sqlite_mirror_enabled":    c.config.SQLiteMirror,
 		"sqlite_mirror_async":      c.config.SQLiteMirrorAsync,
 		"lifecycle_events":         c.config.LifecycleEvents,
+		"snapshot_threshold":       c.config.SnapshotThreshold,
+		"snapshot_interval":        c.config.SnapshotInterval.String(),
 		"apply_batch_max":          c.config.ApplyBatchMax,
 		"apply_batch_min_wait":     c.config.ApplyBatchMinWait.String(),
 		"apply_batch_extend_at":    c.config.ApplyBatchExtendAt,

@@ -15,6 +15,8 @@ type ClusterConfig struct {
 	SQLiteMirrorAsync  bool          // Apply SQLite mirror writes asynchronously in background batches
 	Bootstrap          bool          // Bootstrap as single-node cluster
 	JoinAddr           string        // Address of existing leader to join
+	SnapshotThreshold  uint64        // Raft log entries between snapshots
+	SnapshotInterval   time.Duration // Periodic snapshot check interval
 	ApplyTimeout       time.Duration // Timeout for raft.Apply (default 10s)
 	ApplyBatchMax      int           // Max ops per Raft group-commit batch
 	ApplyBatchWindow   time.Duration // Max time to wait before flushing a partial batch
@@ -36,6 +38,8 @@ func DefaultClusterConfig() ClusterConfig {
 		RaftStore:          "bolt",
 		SQLiteMirror:       true,
 		Bootstrap:          true,
+		SnapshotThreshold:  2048,
+		SnapshotInterval:   1 * time.Minute,
 		ApplyTimeout:       10 * time.Second,
 		ApplyBatchMax:      512,
 		ApplyBatchWindow:   8 * time.Millisecond,
