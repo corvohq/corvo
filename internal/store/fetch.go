@@ -3,7 +3,6 @@ package store
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -104,9 +103,6 @@ func (s *Store) FetchBatch(req FetchRequest, count int) ([]FetchResult, error) {
 		NowNs:         uint64(now.UnixNano()),
 		RandomSeed:    fetchSeedCounter.Add(1),
 	}
-	if ids, err := s.localPeekPendingCandidates(allowedQueues, count); err == nil && len(ids) > 0 {
-		op.CandidateJobIDs = ids
-	}
 
 	result := s.applyOp(OpFetchBatch, op)
 	if result.Err != nil {
@@ -120,57 +116,6 @@ func (s *Store) FetchBatch(req FetchRequest, count int) ([]FetchResult, error) {
 		return nil, fmt.Errorf("unexpected fetch batch result type: %T", result.Data)
 	}
 	return jobs, nil
-}
-
-// localPeekPendingCandidates uses the local SQLite mirror to find pending jobs
-// quickly, then delegates authoritative claim/validation to Raft FSM.
-func (s *Store) localPeekPendingCandidates(queues []string, count int) ([]string, error) {
-	if s.sqliteR == nil || len(queues) == 0 || count <= 0 {
-		return nil, nil
-	}
-	args := make([]any, 0, len(queues)+1)
-	holders := make([]string, 0, len(queues))
-	for _, q := range queues {
-		if strings.TrimSpace(q) == "" {
-			continue
-		}
-		holders = append(holders, "?")
-		args = append(args, q)
-	}
-	if len(holders) == 0 {
-		return nil, nil
-	}
-	args = append(args, count)
-	query := `
-		SELECT id
-		FROM jobs
-		WHERE state = 'pending'
-		  AND queue IN (` + strings.Join(holders, ",") + `)
-		ORDER BY priority ASC, created_at ASC
-		LIMIT ?
-	`
-	rows, err := s.sqliteR.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make([]string, 0, count)
-	seen := make(map[string]struct{}, count)
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			continue
-		}
-		if id == "" {
-			continue
-		}
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		out = append(out, id)
-	}
-	return out, nil
 }
 
 func marshalQueues(queues []string) string {

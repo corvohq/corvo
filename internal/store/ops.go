@@ -141,11 +141,8 @@ type FetchBatchOp struct {
 	Hostname      string   `json:"hostname"`
 	LeaseDuration int      `json:"lease_duration"`
 	Count         int      `json:"count"`
-	// CandidateJobIDs are optional locally-peeked pending jobs to claim first.
-	// FSM still validates state/limits and falls back to queue scans as needed.
-	CandidateJobIDs []string `json:"candidate_job_ids,omitempty"`
-	NowNs           uint64   `json:"now_ns"`
-	RandomSeed      uint64   `json:"random_seed"`
+	NowNs         uint64   `json:"now_ns"`
+	RandomSeed    uint64   `json:"random_seed"`
 }
 
 type AckOp struct {
