@@ -245,18 +245,25 @@ var seedDemoCmd = &cobra.Command{
 			}
 		}
 		if agentEnq.JobID != "" {
-			_ = postOK("/api/v1/scores", map[string]any{
+			if err := waitForJobVisible(agentEnq.JobID, 2*time.Second); err != nil {
+				return err
+			}
+			if err := postOKWithRetry("/api/v1/scores", map[string]any{
 				"job_id":    agentEnq.JobID,
 				"dimension": "relevance",
 				"value":     0.94,
 				"scorer":    "auto:seed",
-			})
-			_ = postOK("/api/v1/scores", map[string]any{
+			}, 20, 100*time.Millisecond); err != nil {
+				return err
+			}
+			if err := postOKWithRetry("/api/v1/scores", map[string]any{
 				"job_id":    agentEnq.JobID,
 				"dimension": "grounding",
 				"value":     0.89,
 				"scorer":    "auto:seed",
-			})
+			}, 20, 100*time.Millisecond); err != nil {
+				return err
+			}
 		}
 
 		// Agent job forced to held by guardrail.
@@ -333,6 +340,38 @@ func postDecode(path string, body any, out any) error {
 		return fmt.Errorf("decode POST %s response: %w", path, err)
 	}
 	return nil
+}
+
+func postOKWithRetry(path string, body any, attempts int, backoff time.Duration) error {
+	if attempts <= 1 {
+		return postOK(path, body)
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if err := postOK(path, body); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		time.Sleep(backoff)
+	}
+	return lastErr
+}
+
+func waitForJobVisible(jobID string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	path := "/api/v1/jobs/" + jobID
+	for time.Now().Before(deadline) {
+		data, status, err := apiRequest("GET", path, nil)
+		if err == nil && status == 200 {
+			return nil
+		}
+		if err == nil && status >= 500 {
+			return fmt.Errorf("GET %s failed (%d): %s", path, status, string(data))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("job %s not visible in time", jobID)
 }
 
 func fetchOne(queue string) (string, error) {

@@ -60,6 +60,7 @@ var (
 	sqliteMirrorEnabled = true
 	sqliteMirrorAsync   = true
 	applyTimeout        = 10 * time.Second
+	shutdownTimeout     = 500 * time.Millisecond
 )
 
 func init() {
@@ -74,6 +75,7 @@ func init() {
 	serverCmd.Flags().StringVar(&joinAddr, "join", "", "Join an existing cluster via leader address")
 	serverCmd.Flags().BoolVar(&durableMode, "durable", false, "Enable power-loss durability mode (Raft fsync per write). Significantly reduces throughput/latency performance; enable only if absolutely required.")
 	serverCmd.Flags().StringVar(&raftStore, "raft-store", "bolt", "Raft log/stable backend: bolt, badger, or pebble")
+	serverCmd.Flags().DurationVar(&shutdownTimeout, "shutdown-timeout", 500*time.Millisecond, "Graceful HTTP shutdown timeout before force-close (e.g. 500ms, 2s)")
 
 	rootCmd.AddCommand(serverCmd)
 }
@@ -119,6 +121,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		"raft_nosync", raftNoSync,
 		"pebble_nosync", pebbleNoSync,
 		"raft_apply_timeout", applyTimeout,
+		"shutdown_timeout", shutdownTimeout,
 		"data_dir", dataDir,
 	)
 
@@ -199,7 +202,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	// Graceful shutdown sequence
 	slog.Info("stopping HTTP server")
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("HTTP shutdown error; forcing close", "error", err)
