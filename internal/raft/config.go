@@ -29,6 +29,7 @@ type ClusterConfig struct {
 }
 
 // DefaultClusterConfig returns a ClusterConfig with sensible defaults.
+// Tuned to support 10-20K concurrent lifecycle streams.
 func DefaultClusterConfig() ClusterConfig {
 	return ClusterConfig{
 		NodeID:                  "node-1",
@@ -37,16 +38,16 @@ func DefaultClusterConfig() ClusterConfig {
 		RaftStore:               "bolt",
 		SQLiteMirror:            true,
 		Bootstrap:               true,
-		SnapshotThreshold:       2048,
+		SnapshotThreshold:       4096,
 		SnapshotInterval:        1 * time.Minute,
 		ApplyTimeout:            10 * time.Second,
-		ApplyBatchMax:           512,
+		ApplyBatchMax:           1024,
 		ApplyBatchWindow:        8 * time.Millisecond,
 		ApplyBatchMinWait:       100 * time.Microsecond,
-		ApplyBatchExtendAt:      32,
-		ApplyMaxPending:         4096,
-		ApplyMaxFetchQueueInFly: 32,
-		ApplySubBatchMax:        512,
+		ApplyBatchExtendAt:      64,
+		ApplyMaxPending:         16384,
+		ApplyMaxFetchQueueInFly: 64,
+		ApplySubBatchMax:        1024,
 		LifecycleEvents:         false,
 	}
 }

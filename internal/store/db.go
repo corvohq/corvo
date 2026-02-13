@@ -7,8 +7,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 //go:embed migrations/*.sql
@@ -41,12 +42,17 @@ func Open(dataDir string) (*DB, error) {
 		return nil, fmt.Errorf("open write connection: %w", err)
 	}
 	writeDB.SetMaxOpenConns(1)
+	writeDB.SetMaxIdleConns(1)
 
 	readDB, err := openConn(dbPath)
 	if err != nil {
 		writeDB.Close()
 		return nil, fmt.Errorf("open read connection: %w", err)
 	}
+	// Keep read-side CGo/pure-sqlite pressure bounded under high stream load.
+	readDB.SetMaxOpenConns(64)
+	readDB.SetMaxIdleConns(32)
+	readDB.SetConnMaxLifetime(5 * time.Minute)
 
 	eventsDB, err := openConn(eventsPath)
 	if err != nil {
@@ -55,6 +61,7 @@ func Open(dataDir string) (*DB, error) {
 		return nil, fmt.Errorf("open events connection: %w", err)
 	}
 	eventsDB.SetMaxOpenConns(1)
+	eventsDB.SetMaxIdleConns(1)
 
 	db := &DB{Write: writeDB, Read: readDB, EventsWrite: eventsDB}
 
@@ -79,9 +86,20 @@ func Open(dataDir string) (*DB, error) {
 }
 
 func openConn(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_synchronous=NORMAL&_foreign_keys=ON&_busy_timeout=5000")
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
+	}
+	for _, pragma := range []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA synchronous=NORMAL",
+		"PRAGMA foreign_keys=ON",
+		"PRAGMA busy_timeout=5000",
+	} {
+		if _, err := db.Exec(pragma); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("apply sqlite pragma %q: %w", pragma, err)
+		}
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()

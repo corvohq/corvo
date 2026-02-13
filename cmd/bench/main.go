@@ -315,9 +315,33 @@ func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total
 	var idx atomic.Int64
 	var overloads atomic.Int64
 	var wg sync.WaitGroup
+	var completedMu sync.Mutex
+	completedIDs := make(map[string]struct{}, total)
 	var rpcClients []*workerclient.Client
 	if protocol != "http" {
 		rpcClients = newRPCClientPool(serverURL, workers*concurrency)
+	}
+	isCompleted := func(id string) bool {
+		completedMu.Lock()
+		_, ok := completedIDs[id]
+		completedMu.Unlock()
+		return ok
+	}
+	markCompleted := func(id string) bool {
+		completedMu.Lock()
+		if _, ok := completedIDs[id]; ok {
+			completedMu.Unlock()
+			return false
+		}
+		completedIDs[id] = struct{}{}
+		completedMu.Unlock()
+		return true
+	}
+	completedCount := func() int {
+		completedMu.Lock()
+		n := len(completedIDs)
+		completedMu.Unlock()
+		return n
 	}
 
 	totalStreams := workers * concurrency
@@ -408,10 +432,15 @@ func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total
 
 			pendingOrder := make([]string, 0, ackBatchSize*2)
 			pendingStart := make(map[string]time.Time, ackBatchSize*2)
+			ackMisses := make(map[string]int, ackBatchSize*2)
 			var requestID uint64 = 1
 
-			remaining := count
-			for remaining > 0 || len(pendingOrder) > 0 {
+			for {
+				doneNow := completedCount()
+				if doneNow >= total && len(pendingOrder) == 0 {
+					break
+				}
+
 				ackN := ackBatchSize
 				if ackN > len(pendingOrder) {
 					ackN = len(pendingOrder)
@@ -425,12 +454,13 @@ func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total
 					})
 				}
 
-				fetchN := 0
-				if remaining > 0 {
-					fetchN = fetchBatchSize
-					if fetchN > remaining {
-						fetchN = remaining
-					}
+				remainingToComplete := total - doneNow
+				fetchN := fetchBatchSize
+				if fetchN > remainingToComplete {
+					fetchN = remainingToComplete
+				}
+				if fetchN < 0 {
+					fetchN = 0
 				}
 
 				frameStart := time.Now()
@@ -439,7 +469,7 @@ func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total
 					Queues:       []string{wq},
 					WorkerID:     wid,
 					Hostname:     "bench-host",
-					LeaseSeconds: 1,
+					LeaseSeconds: 30,
 					FetchCount:   fetchN,
 					Acks:         acks,
 				})
@@ -459,14 +489,18 @@ func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total
 					time.Sleep(2 * time.Millisecond)
 					continue
 				}
-				overloadedFrame := false
 				if resp.Error != "" {
 					if isOverloadMsg(resp.Error) {
 						overloads.Add(1)
-						overloadedFrame = true
 					} else {
-						fmt.Fprintf(os.Stderr, "lifecycle stream frame error: %s\n", resp.Error)
+						streamErrs++
+						if streamErrs <= 3 || streamErrs%1000 == 0 {
+							fmt.Fprintf(os.Stderr, "lifecycle stream frame error: %s\n", resp.Error)
+						}
 					}
+					// Backoff on ALL errors to avoid amplification.
+					// ACK IDs stay in pendingOrder for retry after delay.
+					time.Sleep(overloadBackoff(overloads.Load()))
 				}
 
 				acked := resp.Acked
@@ -476,8 +510,16 @@ func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total
 				now := time.Now()
 				for i := 0; i < acked; i++ {
 					id := ackIDs[i]
+					if isCompleted(id) {
+						continue
+					}
 					started, ok := pendingStart[id]
 					if !ok {
+						continue
+					}
+					if !markCompleted(id) {
+						delete(pendingStart, id)
+						delete(ackMisses, id)
 						continue
 					}
 					pos := idx.Add(1) - 1
@@ -486,11 +528,38 @@ func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total
 					}
 					lats[pos] = now.Sub(started)
 					delete(pendingStart, id)
+					delete(ackMisses, id)
 				}
 				pendingOrder = pendingOrder[acked:]
 
+				// If some ACKs are repeatedly skipped with no frame error,
+				// treat them as stale and drop them so the benchmark can
+				// re-fetch the underlying jobs instead of deadlocking.
+				if resp.Error == "" && acked < len(ackIDs) {
+					drop := map[string]struct{}{}
+					for _, id := range ackIDs[acked:] {
+						ackMisses[id]++
+						if ackMisses[id] < 3 {
+							continue
+						}
+						drop[id] = struct{}{}
+						delete(pendingStart, id)
+						delete(ackMisses, id)
+					}
+					if len(drop) > 0 {
+						filtered := pendingOrder[:0]
+						for _, id := range pendingOrder {
+							if _, ok := drop[id]; ok {
+								continue
+							}
+							filtered = append(filtered, id)
+						}
+						pendingOrder = filtered
+					}
+				}
+
 				for _, fetched := range resp.Jobs {
-					if remaining <= 0 {
+					if completedCount() >= total {
 						break
 					}
 					if workDuration > 0 {
@@ -499,12 +568,14 @@ func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total
 					if fetched.JobID == "" {
 						continue
 					}
+					if isCompleted(fetched.JobID) {
+						continue
+					}
+					if _, pending := pendingStart[fetched.JobID]; pending {
+						continue
+					}
 					pendingOrder = append(pendingOrder, fetched.JobID)
 					pendingStart[fetched.JobID] = frameStart
-					remaining--
-				}
-				if overloadedFrame {
-					time.Sleep(overloadBackoff(overloads.Load()))
 				}
 			}
 		}(n, workerID, workerQueue)

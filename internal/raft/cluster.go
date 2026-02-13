@@ -740,9 +740,23 @@ func (c *Cluster) Shutdown() error {
 // openMaterializedView opens a SQLite database for the materialized view.
 // It creates tables if they don't exist and configures WAL mode.
 func openMaterializedView(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_synchronous=NORMAL&_foreign_keys=ON&_busy_timeout=5000")
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
+	}
+	db.SetMaxOpenConns(64)
+	db.SetMaxIdleConns(32)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	for _, pragma := range []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA synchronous=NORMAL",
+		"PRAGMA foreign_keys=ON",
+		"PRAGMA busy_timeout=5000",
+	} {
+		if _, err := db.Exec(pragma); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("apply sqlite pragma %q: %w", pragma, err)
+		}
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()

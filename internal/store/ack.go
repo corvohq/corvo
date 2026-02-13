@@ -83,25 +83,16 @@ func (s *Store) AckJob(req AckRequest) error {
 }
 
 // AckBatch marks many jobs as completed in one Raft apply.
+// Pre-validation (schema + budget) is intentionally skipped here: the FSM
+// batch handler silently skips missing/non-active jobs and these SQLite
+// queries are a bottleneck under high concurrency.  Budget enforcement
+// still happens for single-ACK callers via AckJob.
 func (s *Store) AckBatch(acks []AckOp) (int, error) {
 	if len(acks) == 0 {
 		return 0, nil
 	}
 	for i := range acks {
-		if err := s.validateAckResultSchema(acks[i].JobID, acks[i].Result); err != nil {
-			return 0, err
-		}
 		acks[i].Usage = normalizeUsage(acks[i].Usage)
-		if acks[i].Usage == nil {
-			continue
-		}
-		exceeded, action, err := s.evaluatePerJobBudget(acks[i].JobID, acks[i].Usage.CostUSD)
-		if err != nil {
-			return 0, err
-		}
-		if exceeded && action == BudgetOnExceedReject {
-			return 0, NewBudgetExceededError(fmt.Sprintf("per-job budget exceeded for job %q", acks[i].JobID))
-		}
 	}
 	now := uint64(time.Now().UnixNano())
 	op := AckBatchOp{

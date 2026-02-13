@@ -745,14 +745,28 @@ func (f *FSM) findPendingJobForQueue(queue string, claimed map[string]struct{}) 
 		}
 		val, closer, err := f.pebble.Get(kv.JobKey(id))
 		if err != nil {
+			// Orphaned pending key — auto-clean.
+			k := make([]byte, len(key))
+			copy(k, key)
+			_ = f.pebble.Delete(k, pebble.NoSync)
 			continue
 		}
 		var doc store.Job
 		if err := decodeJobDoc(val, &doc); err != nil {
 			closer.Close()
+			k := make([]byte, len(key))
+			copy(k, key)
+			_ = f.pebble.Delete(k, pebble.NoSync)
 			continue
 		}
 		closer.Close()
+		if doc.State != store.StatePending {
+			// Job is no longer pending (completed/cancelled) — auto-clean orphan.
+			k := make([]byte, len(key))
+			copy(k, key)
+			_ = f.pebble.Delete(k, pebble.NoSync)
+			continue
+		}
 		if !f.dependenciesSatisfied(doc) {
 			continue
 		}
@@ -1181,6 +1195,136 @@ func (f *FSM) applyAckBatchOp(op store.AckBatchOp) *store.OpResult {
 	})
 
 	return &store.OpResult{Data: acked}
+}
+
+// applyMultiAckBatch merges multiple AckBatch ops from a single raft.Apply
+// into one Pebble batch commit, reducing write amplification under high
+// concurrency.
+func (f *FSM) applyMultiAckBatch(ops []*store.DecodedRaftOp) *store.OpResult {
+	results := make([]*store.OpResult, len(ops))
+	if len(ops) == 0 {
+		return &store.OpResult{Data: results}
+	}
+
+	batch := f.pebble.NewBatch()
+	defer batch.Close()
+
+	type sqliteAck struct {
+		job           store.Job
+		ack           store.AckOp
+		callbackJobID string
+	}
+	var allSqliteAcks []sqliteAck
+	totalAcked := 0
+
+	for i, sub := range ops {
+		op := sub.AckBatch
+		if op == nil || len(op.Acks) == 0 {
+			results[i] = &store.OpResult{Data: 0}
+			continue
+		}
+		now := time.Unix(0, int64(op.NowNs))
+		acked := 0
+
+		for _, ack := range op.Acks {
+			if ack.JobID == "" {
+				continue
+			}
+			jobVal, closer, err := f.pebble.Get(kv.JobKey(ack.JobID))
+			if err != nil {
+				continue
+			}
+			var job store.Job
+			if err := decodeJobDoc(jobVal, &job); err != nil {
+				closer.Close()
+				continue
+			}
+			closer.Close()
+			if job.State != store.StateActive {
+				continue
+			}
+
+			job.State = store.StateCompleted
+			job.ProviderError = false
+			job.CompletedAt = &now
+			if len(ack.Result) > 0 {
+				job.Result = ack.Result
+			}
+			job.WorkerID = nil
+			job.Hostname = nil
+			job.LeaseExpiresAt = nil
+
+			jobData, _ := encodeJobDoc(job)
+			batch.Set(kv.JobKey(ack.JobID), jobData, f.writeOpts)
+			batch.Delete(kv.ActiveKey(job.Queue, ack.JobID), f.writeOpts)
+			if job.UniqueKey != nil {
+				batch.Delete(kv.UniqueKey(job.Queue, *job.UniqueKey), f.writeOpts)
+			}
+
+			callbackJobID := ""
+			if job.BatchID != nil {
+				callbackJobID = f.updateBatchPebble(batch, *job.BatchID, "success", op.NowNs)
+			}
+			if err := f.appendLifecycleEvent(batch, "completed", ack.JobID, job.Queue, op.NowNs); err != nil {
+				results[i] = &store.OpResult{Err: err}
+				break
+			}
+			allSqliteAcks = append(allSqliteAcks, sqliteAck{
+				job:           job,
+				ack:           store.AckOp{JobID: ack.JobID, Result: ack.Result, NowNs: op.NowNs},
+				callbackJobID: callbackJobID,
+			})
+			acked++
+		}
+		if results[i] == nil {
+			results[i] = &store.OpResult{Data: acked}
+		}
+		totalAcked += acked
+	}
+
+	if totalAcked == 0 {
+		return &store.OpResult{Data: results}
+	}
+	if err := f.appendLifecycleCursor(batch); err != nil {
+		errResult := &store.OpResult{Err: err}
+		for i := range results {
+			results[i] = errResult
+		}
+		return &store.OpResult{Data: results}
+	}
+
+	if err := batch.Commit(f.writeOpts); err != nil {
+		errResult := &store.OpResult{Err: fmt.Errorf("pebble commit multi ack batch: %w", err)}
+		for i := range results {
+			results[i] = errResult
+		}
+		return &store.OpResult{Data: results}
+	}
+
+	f.syncSQLite(func(db sqlExecer) error {
+		tx, ok := db.(*sql.DB)
+		if !ok {
+			for _, a := range allSqliteAcks {
+				if err := sqliteAckJob(db, a.job, a.ack, a.callbackJobID); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		sqlTx, err := tx.Begin()
+		if err != nil {
+			return err
+		}
+		for _, a := range allSqliteAcks {
+			if err := sqliteAckJob(sqlTx, a.job, a.ack, a.callbackJobID); err != nil {
+				_ = sqlTx.Rollback()
+				return err
+			}
+		}
+		return sqlTx.Commit()
+	})
+
+	return &store.OpResult{Data: results}
 }
 
 // --- Fail ---

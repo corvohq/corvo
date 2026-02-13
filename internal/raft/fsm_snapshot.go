@@ -205,14 +205,20 @@ func restoreFromSnapshot(pdb *pebble.DB, sqliteDB *sql.DB, rc io.Reader) error {
 	sqlitePath := filepath.Join(tmpDir, "sqlite", "jobbie.db")
 	if _, err := os.Stat(sqlitePath); err == nil {
 		// Read the tables from the backup and apply to current DB
-		backupDB, err := sql.Open("sqlite3", sqlitePath)
+		backupDB, err := sql.Open("sqlite", sqlitePath)
 		if err != nil {
 			return fmt.Errorf("open backup sqlite: %w", err)
 		}
 		defer backupDB.Close()
 
 		// Get all table names from backup
-		rows, err := backupDB.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name != 'schema_migrations'")
+		rows, err := backupDB.Query(`
+			SELECT name FROM sqlite_master
+			WHERE type='table'
+			  AND name NOT LIKE 'sqlite_%'
+			  AND name != 'schema_migrations'
+			  AND name NOT LIKE 'jobs_fts%'
+		`)
 		if err != nil {
 			return fmt.Errorf("list backup tables: %w", err)
 		}

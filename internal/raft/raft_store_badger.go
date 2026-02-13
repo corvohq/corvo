@@ -125,17 +125,31 @@ func (s *badgerRaftStore) DeleteRange(min, max uint64) error {
 	if min > max {
 		return nil
 	}
-	return s.db.Update(func(txn *badger.Txn) error {
-		for i := min; i <= max; i++ {
-			if err := txn.Delete(logKey(i)); err != nil && err != badger.ErrKeyNotFound {
-				return err
-			}
-			if i == ^uint64(0) {
-				break
-			}
+	// Split into sub-transactions to stay under Badger's ~6.5MB txn limit.
+	const batchSize uint64 = 256
+	for start := min; start <= max; start += batchSize {
+		end := start + batchSize - 1
+		if end > max || end < start { // overflow guard
+			end = max
 		}
-		return nil
-	})
+		if err := s.db.Update(func(txn *badger.Txn) error {
+			for i := start; i <= end; i++ {
+				if err := txn.Delete(logKey(i)); err != nil && err != badger.ErrKeyNotFound {
+					return err
+				}
+				if i == ^uint64(0) {
+					break
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if end == max || end == ^uint64(0) {
+			break
+		}
+	}
+	return nil
 }
 
 func (s *badgerRaftStore) Set(key []byte, val []byte) error {

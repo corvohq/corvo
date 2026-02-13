@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -26,9 +27,40 @@ func mapStoreError(err error) error {
 	return connect.NewError(connect.CodeInvalidArgument, err)
 }
 
+// StreamConfig controls per-stream rate limiting and circuit-breaking.
+type StreamConfig struct {
+	MaxFramesPerSec int           // Max frames/sec per stream; 0 = unlimited (default 500)
+	StrikeLimit     int           // Consecutive errors before closing stream (default 10)
+	StrikeDelay     time.Duration // Progressive delay per strike (default 5ms)
+	MaxOpenStreams  int           // Max concurrently open lifecycle streams (default 4096)
+	MaxInFlight     int           // Max concurrently processing lifecycle frames (default 2048)
+	AcquireTimeout  time.Duration // Max wait to acquire in-flight slot; <=0 blocks until available
+}
+
+func (c StreamConfig) withDefaults() StreamConfig {
+	if c.MaxFramesPerSec <= 0 {
+		c.MaxFramesPerSec = 500
+	}
+	if c.StrikeLimit <= 0 {
+		c.StrikeLimit = 10
+	}
+	if c.StrikeDelay <= 0 {
+		c.StrikeDelay = 5 * time.Millisecond
+	}
+	// 0 means unlimited. In-flight frame gating is the primary overload
+	// control; hard stream caps can trigger reconnect storms.
+	if c.MaxInFlight <= 0 {
+		c.MaxInFlight = 2048
+	}
+	return c
+}
+
 // Server implements the Connect WorkerService API.
 type Server struct {
-	store *store.Store
+	store     *store.Store
+	streamCfg StreamConfig
+	frameSem  chan struct{}
+	openCount atomic.Int64
 }
 
 func longPollTimeout(lease int) time.Duration {
@@ -63,8 +95,19 @@ func waitForFetch(ctx context.Context, timeout time.Duration, poll func() (bool,
 }
 
 // NewHandler creates a Connect HTTP handler for worker lifecycle RPCs.
-func NewHandler(s *store.Store) (string, http.Handler) {
-	return jobbiev1connect.NewWorkerServiceHandler(&Server{store: s})
+func NewHandler(s *store.Store, opts ...func(*Server)) (string, http.Handler) {
+	srv := &Server{store: s}
+	for _, o := range opts {
+		o(srv)
+	}
+	srv.streamCfg = srv.streamCfg.withDefaults()
+	srv.frameSem = make(chan struct{}, srv.streamCfg.MaxInFlight)
+	return jobbiev1connect.NewWorkerServiceHandler(srv)
+}
+
+// WithStreamConfig sets the per-stream rate limit / circuit-break config.
+func WithStreamConfig(cfg StreamConfig) func(*Server) {
+	return func(s *Server) { s.streamCfg = cfg }
 }
 
 func (s *Server) Enqueue(ctx context.Context, req *connect.Request[jobbiev1.EnqueueRequest]) (*connect.Response[jobbiev1.EnqueueResponse], error) {
@@ -217,7 +260,35 @@ func (s *Server) AckBatch(ctx context.Context, req *connect.Request[jobbiev1.Ack
 }
 
 func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream[jobbiev1.LifecycleStreamRequest, jobbiev1.LifecycleStreamResponse]) error {
+	cfg := s.streamCfg
+	if n := s.openCount.Add(1); cfg.MaxOpenStreams > 0 && n > int64(cfg.MaxOpenStreams) {
+		s.openCount.Add(-1)
+		return connect.NewError(connect.CodeResourceExhausted, fmt.Errorf("too many open lifecycle streams"))
+	}
+	defer s.openCount.Add(-1)
+
+	minInterval := time.Second / time.Duration(cfg.MaxFramesPerSec)
+	var lastFrame time.Time
+	var strikes int
+
 	for {
+		// Per-stream frame rate limiting.
+		if !lastFrame.IsZero() {
+			if elapsed := time.Since(lastFrame); elapsed < minInterval {
+				time.Sleep(minInterval - elapsed)
+			}
+		}
+		lastFrame = time.Now()
+
+		// Progressive delay when consecutive errors accumulate.
+		if strikes > 0 {
+			delay := time.Duration(strikes) * cfg.StrikeDelay
+			if delay > 500*time.Millisecond {
+				delay = 500 * time.Millisecond
+			}
+			time.Sleep(delay)
+		}
+
 		req, err := stream.Receive()
 		if err != nil {
 			if err == io.EOF {
@@ -228,55 +299,45 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 		resp := &jobbiev1.LifecycleStreamResponse{
 			RequestId: req.GetRequestId(),
 		}
-
-		if n := int(req.GetFetchCount()); n > 0 {
-			fetchReq := store.FetchRequest{
-				Queues:        req.GetQueues(),
-				WorkerID:      req.GetWorkerId(),
-				Hostname:      req.GetHostname(),
-				LeaseDuration: int(req.GetLeaseDuration()),
+		frameHadError := false
+		acquired := false
+		if cfg.AcquireTimeout <= 0 {
+			select {
+			case s.frameSem <- struct{}{}:
+				acquired = true
+			case <-ctx.Done():
+				return nil
 			}
-			var jobs []store.FetchResult
-			err := waitForFetch(ctx, longPollTimeout(fetchReq.LeaseDuration), func() (bool, error) {
-				r, err := s.store.FetchBatch(fetchReq, n)
-				if err != nil {
-					return false, err
+		} else {
+			acquireTimer := time.NewTimer(cfg.AcquireTimeout)
+			select {
+			case s.frameSem <- struct{}{}:
+				acquired = true
+			case <-ctx.Done():
+				acquireTimer.Stop()
+				return nil
+			case <-acquireTimer.C:
+				frameHadError = true
+				resp.Error = "OVERLOADED: lifecycle stream saturated"
+			}
+			if !acquireTimer.Stop() {
+				select {
+				case <-acquireTimer.C:
+				default:
 				}
-				jobs = r
-				return len(jobs) > 0, nil
-			})
-			if err != nil {
-				if store.IsOverloadedError(err) {
-					resp.Error = "OVERLOADED: fetch: " + err.Error()
-				} else {
-					resp.Error = "fetch: " + err.Error()
-				}
-			} else {
-				respJobs := make([]*jobbiev1.FetchBatchJob, 0, len(jobs))
-				for _, j := range jobs {
-					respJobs = append(respJobs, &jobbiev1.FetchBatchJob{
-						JobId:          j.JobID,
-						Queue:          j.Queue,
-						PayloadJson:    string(j.Payload),
-						Attempt:        int32(j.Attempt),
-						MaxRetries:     int32(j.MaxRetries),
-						LeaseDuration:  int32(j.LeaseDuration),
-						CheckpointJson: string(j.Checkpoint),
-						TagsJson:       string(j.Tags),
-						Agent:          agentStateToPB(j.Agent),
-					})
-				}
-				resp.Jobs = respJobs
 			}
 		}
 
-		if len(req.GetAcks()) > 0 {
+		// Process ACKs before fetch: ACKs are time-sensitive (lease
+		// expiry) and must not be delayed by a fetch long-poll.
+		if acquired && len(req.GetAcks()) > 0 {
 			acks := make([]store.AckOp, 0, len(req.GetAcks()))
 			for _, item := range req.GetAcks() {
 				jobID := strings.TrimSpace(item.GetJobId())
 				if jobID == "" {
 					if resp.Error == "" {
 						resp.Error = "ack: job_id is required"
+						frameHadError = true
 					}
 					continue
 				}
@@ -293,6 +354,7 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 			if len(acks) > 0 {
 				acked, err := s.store.AckBatch(acks)
 				if err != nil {
+					frameHadError = true
 					if resp.Error == "" {
 						if store.IsOverloadedError(err) {
 							resp.Error = "OVERLOADED: ack: " + err.Error()
@@ -306,13 +368,63 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 			}
 		}
 
-		if len(req.GetEnqueues()) > 0 {
+		if acquired {
+			if n := int(req.GetFetchCount()); n > 0 {
+				fetchReq := store.FetchRequest{
+					Queues:        req.GetQueues(),
+					WorkerID:      req.GetWorkerId(),
+					Hostname:      req.GetHostname(),
+					LeaseDuration: int(req.GetLeaseDuration()),
+				}
+				// Lifecycle streams need a short bounded poll:
+				// - too short (no wait) spins hot on empty queues
+				// - too long (lease-length wait) delays ACK turns
+				// Keep frame wait small and independent of lease duration.
+				const lifecyclePollTimeout = 100 * time.Millisecond
+				var jobs []store.FetchResult
+				err := waitForFetch(ctx, lifecyclePollTimeout, func() (bool, error) {
+					r, err := s.store.FetchBatch(fetchReq, n)
+					if err != nil {
+						return false, err
+					}
+					jobs = r
+					return len(jobs) > 0, nil
+				})
+				if err != nil {
+					frameHadError = true
+					if store.IsOverloadedError(err) {
+						resp.Error = "OVERLOADED: fetch: " + err.Error()
+					} else {
+						resp.Error = "fetch: " + err.Error()
+					}
+				} else {
+					respJobs := make([]*jobbiev1.FetchBatchJob, 0, len(jobs))
+					for _, j := range jobs {
+						respJobs = append(respJobs, &jobbiev1.FetchBatchJob{
+							JobId:          j.JobID,
+							Queue:          j.Queue,
+							PayloadJson:    string(j.Payload),
+							Attempt:        int32(j.Attempt),
+							MaxRetries:     int32(j.MaxRetries),
+							LeaseDuration:  int32(j.LeaseDuration),
+							CheckpointJson: string(j.Checkpoint),
+							TagsJson:       string(j.Tags),
+							Agent:          agentStateToPB(j.Agent),
+						})
+					}
+					resp.Jobs = respJobs
+				}
+			}
+		}
+
+		if acquired && len(req.GetEnqueues()) > 0 {
 			jobs := make([]store.EnqueueRequest, 0, len(req.GetEnqueues()))
 			for _, item := range req.GetEnqueues() {
 				queue := strings.TrimSpace(item.GetQueue())
 				if queue == "" {
 					if resp.Error == "" {
 						resp.Error = "enqueue: queue is required"
+						frameHadError = true
 					}
 					continue
 				}
@@ -329,6 +441,7 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 			if len(jobs) > 0 {
 				enq, err := s.store.EnqueueBatch(store.BatchEnqueueRequest{Jobs: jobs})
 				if err != nil {
+					frameHadError = true
 					if resp.Error == "" {
 						if store.IsOverloadedError(err) {
 							resp.Error = "OVERLOADED: enqueue: " + err.Error()
@@ -340,6 +453,21 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 					resp.EnqueuedJobIds = append(resp.EnqueuedJobIds, enq.JobIDs...)
 				}
 			}
+		}
+		if acquired {
+			<-s.frameSem
+		}
+
+		// Strike tracking: consecutive hard errors trigger progressive delay.
+		// Overload is treated as transient and should not close the stream.
+		if frameHadError {
+			if strings.HasPrefix(resp.Error, "OVERLOADED:") {
+				strikes = 0
+			} else {
+				strikes++
+			}
+		} else {
+			strikes = 0
 		}
 
 		if err := stream.Send(resp); err != nil {

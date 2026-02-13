@@ -14,7 +14,7 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/user/jobbie/internal/store"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // FSM implements the raft.FSM interface. It applies log entries to both
@@ -351,6 +351,19 @@ func (f *FSM) applyMultiDecoded(ops []*store.DecodedRaftOp) *store.OpResult {
 	}
 	if allEnqueueBatch {
 		return f.applyMultiEnqueueBatch(enqueueBatches)
+	}
+
+	// Fast path: merge all AckBatch ops into a single combined batch so
+	// they share one Pebble commit instead of N separate commits.
+	allAckBatch := true
+	for _, sub := range ops {
+		if sub.Type != store.OpAckBatch || sub.AckBatch == nil {
+			allAckBatch = false
+			break
+		}
+	}
+	if allAckBatch {
+		return f.applyMultiAckBatch(ops)
 	}
 
 	results := make([]*store.OpResult, 0, len(ops))

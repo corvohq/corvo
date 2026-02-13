@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"net/http"
 	"strconv"
 	"strings"
@@ -20,46 +21,60 @@ func (s *Server) handleFullTextSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	rows, err := s.store.ReadDB().Query(`
+	queryFTS := `
 		SELECT j.id, j.queue, j.state, j.payload, COALESCE(j.tags, ''), j.created_at
 		FROM jobs_fts f
 		JOIN jobs j ON j.id = f.job_id
 		WHERE jobs_fts MATCH ?
 		ORDER BY rank
 		LIMIT ?
-	`, q, limit)
-	if err != nil {
-		rows, err = s.store.ReadDB().Query(`
+	`
+	queryFallback := `
 			SELECT j.id, j.queue, j.state, j.payload, COALESCE(j.tags, ''), j.created_at
-			FROM jobs_search s
-			JOIN jobs j ON j.id = s.job_id
-			WHERE s.payload LIKE '%' || ? || '%' OR s.tags LIKE '%' || ? || '%' OR s.queue LIKE '%' || ? || '%'
+			FROM jobs j
+			WHERE j.payload LIKE '%' || ? || '%' OR COALESCE(j.tags, '') LIKE '%' || ? || '%' OR j.queue LIKE '%' || ? || '%'
 			ORDER BY j.created_at DESC
 			LIMIT ?
-		`, q, q, q, limit)
+	`
+	readRows := func(rows *sql.Rows) []map[string]any {
+		defer rows.Close()
+		results := []map[string]any{}
+		for rows.Next() {
+			var id, queue, state, payload, tags, createdAt string
+			if err := rows.Scan(&id, &queue, &state, &payload, &tags, &createdAt); err != nil {
+				continue
+			}
+			if !enforceNamespaceJob(principal.Namespace, queue) {
+				continue
+			}
+			results = append(results, map[string]any{
+				"id":         id,
+				"queue":      visibleQueue(principal.Namespace, queue),
+				"state":      state,
+				"payload":    payload,
+				"tags":       tags,
+				"created_at": createdAt,
+			})
+		}
+		return results
+	}
+
+	rows, err := s.store.ReadDB().Query(queryFTS, q, limit)
+	if err != nil {
+		rows, err = s.store.ReadDB().Query(queryFallback, q, q, q, limit)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error(), "SEARCH_ERROR")
 			return
 		}
+		writeJSON(w, http.StatusOK, map[string]any{"q": q, "results": readRows(rows)})
+		return
 	}
-	defer rows.Close()
-	results := []map[string]any{}
-	for rows.Next() {
-		var id, queue, state, payload, tags, createdAt string
-		if err := rows.Scan(&id, &queue, &state, &payload, &tags, &createdAt); err != nil {
-			continue
+	results := readRows(rows)
+	if len(results) == 0 {
+		rows, err = s.store.ReadDB().Query(queryFallback, q, q, q, limit)
+		if err == nil {
+			results = readRows(rows)
 		}
-		if !enforceNamespaceJob(principal.Namespace, queue) {
-			continue
-		}
-		results = append(results, map[string]any{
-			"id":         id,
-			"queue":      visibleQueue(principal.Namespace, queue),
-			"state":      state,
-			"payload":    payload,
-			"tags":       tags,
-			"created_at": createdAt,
-		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"q": q, "results": results})
 }

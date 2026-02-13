@@ -122,7 +122,7 @@ func New(s *store.Store, cluster ClusterInfo, bindAddr string, uiAssets fs.FS, o
 	srv.httpServer = &http.Server{
 		Addr: bindAddr,
 		Handler: h2c.NewHandler(srv.router, &http2.Server{
-			MaxConcurrentStreams: 4096,
+			MaxConcurrentStreams: 2048,
 		}),
 	}
 	return srv
