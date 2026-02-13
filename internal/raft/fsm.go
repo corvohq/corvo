@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -30,6 +31,13 @@ type FSM struct {
 	sqliteStop   chan struct{}
 	sqliteDone   chan struct{}
 	sqliteMu     sync.Mutex
+	sqliteDrops  atomic.Uint64
+
+	rebuildMu       sync.Mutex
+	lastRebuildAt   time.Time
+	lastRebuildDur  time.Duration
+	lastRebuildErr  string
+	lastRebuildGood bool
 }
 
 // NewFSM creates a new FSM with the given Pebble and SQLite databases.
@@ -380,6 +388,7 @@ func (f *FSM) syncSQLite(fn func(db sqlExecer) error) {
 		case f.sqliteQueue <- fn:
 			return
 		default:
+			f.sqliteDrops.Add(1)
 			slog.Warn("sqlite mirror queue full; dropping mirror update")
 			return
 		}
@@ -437,6 +446,56 @@ func (f *FSM) SetPebbleNoSync(noSync bool) {
 // Close flushes background workers.
 func (f *FSM) Close() {
 	f.SetSQLiteMirrorAsync(false)
+}
+
+// SQLiteMirrorStatus returns internal SQLite mirror health counters.
+func (f *FSM) SQLiteMirrorStatus() map[string]any {
+	out := map[string]any{
+		"enabled": f.sqliteMirror,
+		"async":   f.sqliteAsync,
+		"dropped": f.sqliteDrops.Load(),
+	}
+	if f.sqliteQueue != nil {
+		out["queue_depth"] = len(f.sqliteQueue)
+		out["queue_capacity"] = cap(f.sqliteQueue)
+	} else {
+		out["queue_depth"] = 0
+		out["queue_capacity"] = 0
+	}
+	return out
+}
+
+func (f *FSM) setRebuildStatus(err error, startedAt time.Time, dur time.Duration) {
+	f.rebuildMu.Lock()
+	defer f.rebuildMu.Unlock()
+	f.lastRebuildAt = startedAt
+	f.lastRebuildDur = dur
+	f.lastRebuildGood = err == nil
+	if err != nil {
+		f.lastRebuildErr = err.Error()
+	} else {
+		f.lastRebuildErr = ""
+	}
+}
+
+// SQLiteRebuildStatus returns last rebuild metadata.
+func (f *FSM) SQLiteRebuildStatus() map[string]any {
+	f.rebuildMu.Lock()
+	defer f.rebuildMu.Unlock()
+	out := map[string]any{
+		"ran": false,
+	}
+	if f.lastRebuildAt.IsZero() {
+		return out
+	}
+	out["ran"] = true
+	out["last_started_at"] = f.lastRebuildAt.UTC().Format(time.RFC3339Nano)
+	out["last_duration_ms"] = f.lastRebuildDur.Milliseconds()
+	out["last_success"] = f.lastRebuildGood
+	if f.lastRebuildErr != "" {
+		out["last_error"] = f.lastRebuildErr
+	}
+	return out
 }
 
 func (f *FSM) sqliteMirrorLoop() {

@@ -331,12 +331,19 @@ func sqliteBulkAction(db sqlExecer, op store.BulkActionOp) error {
 
 // RebuildSQLiteFromPebble rebuilds the materialized SQLite view from Pebble.
 func (f *FSM) RebuildSQLiteFromPebble() error {
+	startedAt := time.Now()
+	var retErr error
+	defer func() {
+		f.setRebuildStatus(retErr, startedAt, time.Since(startedAt))
+	}()
+
 	f.sqliteMu.Lock()
 	defer f.sqliteMu.Unlock()
 
 	tx, err := f.sqlite.Begin()
 	if err != nil {
-		return fmt.Errorf("begin sqlite rebuild tx: %w", err)
+		retErr = fmt.Errorf("begin sqlite rebuild tx: %w", err)
+		return retErr
 	}
 	defer tx.Rollback()
 
@@ -351,7 +358,8 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 		"DELETE FROM queues",
 	} {
 		if _, err := tx.Exec(stmt); err != nil {
-			return fmt.Errorf("sqlite rebuild clear (%s): %w", stmt, err)
+			retErr = fmt.Errorf("sqlite rebuild clear (%s): %w", stmt, err)
+			return retErr
 		}
 	}
 
@@ -360,7 +368,8 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 
 	iter, err := f.pebble.NewIter(nil)
 	if err != nil {
-		return fmt.Errorf("create pebble iter: %w", err)
+		retErr = fmt.Errorf("create pebble iter: %w", err)
+		return retErr
 	}
 	defer iter.Close()
 
@@ -393,7 +402,8 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 				continue
 			}
 			if err := sqliteUpsertJobDoc(tx, job); err != nil {
-				return err
+				retErr = err
+				return retErr
 			}
 			if job.Queue != "" {
 				queueSeen[job.Queue] = struct{}{}
@@ -414,7 +424,8 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 				doc.Attempt = int(attempt)
 			}
 			if err := sqliteInsertJobErrorDoc(tx, doc); err != nil {
-				return err
+				retErr = err
+				return retErr
 			}
 		case bytes.HasPrefix(key, []byte(kv.PrefixBatch)):
 			var b store.Batch
@@ -425,7 +436,8 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 				b.ID = string(key[len(kv.PrefixBatch):])
 			}
 			if err := sqliteUpsertBatchDoc(tx, b); err != nil {
-				return err
+				retErr = err
+				return retErr
 			}
 		case bytes.HasPrefix(key, []byte(kv.PrefixWorker)):
 			var w store.Worker
@@ -436,7 +448,8 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 				w.ID = string(key[len(kv.PrefixWorker):])
 			}
 			if err := sqliteUpsertWorkerDoc(tx, w); err != nil {
-				return err
+				retErr = err
+				return retErr
 			}
 		case bytes.HasPrefix(key, []byte(kv.PrefixSchedule)):
 			var s store.Schedule
@@ -447,7 +460,8 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 				s.ID = string(key[len(kv.PrefixSchedule):])
 			}
 			if err := sqliteUpsertScheduleDoc(tx, s); err != nil {
-				return err
+				retErr = err
+				return retErr
 			}
 		case bytes.HasPrefix(key, []byte(kv.PrefixUnique)):
 			queue, uniqueKey, ok := parseUniqueKey(key)
@@ -460,7 +474,8 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 				"INSERT OR REPLACE INTO unique_locks (queue, unique_key, job_id, expires_at) VALUES (?, ?, ?, ?)",
 				queue, uniqueKey, jobID, expiresAt,
 			); err != nil {
-				return fmt.Errorf("upsert unique lock: %w", err)
+				retErr = fmt.Errorf("upsert unique lock: %w", err)
+				return retErr
 			}
 			queueSeen[queue] = struct{}{}
 		case bytes.HasPrefix(key, []byte(kv.PrefixRateLimit)):
@@ -473,18 +488,21 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 				"INSERT INTO rate_limit_window (queue, fetched_at) VALUES (?, ?)",
 				queue, fetchedAt,
 			); err != nil {
-				return fmt.Errorf("insert rate limit row: %w", err)
+				retErr = fmt.Errorf("insert rate limit row: %w", err)
+				return retErr
 			}
 			queueSeen[queue] = struct{}{}
 		}
 	}
 	if err := iter.Error(); err != nil {
-		return fmt.Errorf("iterate pebble: %w", err)
+		retErr = fmt.Errorf("iterate pebble: %w", err)
+		return retErr
 	}
 
 	for name := range queueSeen {
 		if _, err := tx.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", name); err != nil {
-			return fmt.Errorf("insert queue name: %w", err)
+			retErr = fmt.Errorf("insert queue name: %w", err)
+			return retErr
 		}
 	}
 	for name, q := range queueCfg {
@@ -492,12 +510,14 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 			"UPDATE queues SET paused = ?, max_concurrency = ?, rate_limit = ?, rate_window_ms = ? WHERE name = ?",
 			boolToInt(q.Paused), q.MaxConcurrency, q.RateLimit, q.RateWindowMs, name,
 		); err != nil {
-			return fmt.Errorf("update queue config: %w", err)
+			retErr = fmt.Errorf("update queue config: %w", err)
+			return retErr
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit sqlite rebuild tx: %w", err)
+		retErr = fmt.Errorf("commit sqlite rebuild tx: %w", err)
+		return retErr
 	}
 	return nil
 }

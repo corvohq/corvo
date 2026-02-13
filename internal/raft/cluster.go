@@ -26,6 +26,7 @@ type Cluster struct {
 	fsm       *FSM
 	transport *raft.NetworkTransport
 	logStore  raftStore
+	snapshot  raft.SnapshotStore
 	config    ClusterConfig
 	applyCh   chan *applyRequest
 	applyExec chan []*applyRequest
@@ -206,6 +207,7 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 		fsm:       fsm,
 		transport: transport,
 		logStore:  logStore,
+		snapshot:  snapshotStore,
 		config:    cfg,
 		applyCh:   make(chan *applyRequest, cfg.ApplyMaxPending),
 		applyExec: make(chan []*applyRequest, 4),
@@ -397,12 +399,28 @@ func admissionKey(opType store.OpType, data any) string {
 			return "q:" + first
 		}
 	case store.OpFetch:
-		if op, ok := data.(store.FetchOp); ok && len(op.Queues) > 0 {
-			return "q:" + op.Queues[0]
+		if op, ok := data.(store.FetchOp); ok {
+			if op.WorkerID != "" {
+				return "w:" + op.WorkerID
+			}
+			if len(op.Queues) > 0 {
+				return "q:" + op.Queues[0]
+			}
 		}
 	case store.OpFetchBatch:
-		if op, ok := data.(store.FetchBatchOp); ok && len(op.Queues) > 0 {
-			return "q:" + op.Queues[0]
+		if op, ok := data.(store.FetchBatchOp); ok {
+			if op.WorkerID != "" {
+				return "w:" + op.WorkerID
+			}
+			if len(op.Queues) > 0 {
+				return "q:" + op.Queues[0]
+			}
+		}
+	case store.OpHeartbeat:
+		if op, ok := data.(store.HeartbeatOp); ok && len(op.Jobs) > 0 {
+			// Heartbeats are worker-originated and can burst; worker-scoped
+			// admission keeps one worker from starving others.
+			return "w:hb"
 		}
 	case store.OpPauseQueue, store.OpResumeQueue, store.OpClearQueue, store.OpDeleteQueue, store.OpRemoveThrottle:
 		if op, ok := data.(store.QueueOp); ok && op.Queue != "" {
@@ -1109,8 +1127,36 @@ func (c *Cluster) ClusterStatus() map[string]any {
 		"apply_sub_batch_max":      c.config.ApplySubBatchMax,
 		"queue_time_hist":          c.queueHist.snapshot(),
 		"apply_time_hist":          c.applyHist.snapshot(),
+		"snapshot":                 c.snapshotStatus(),
+		"sqlite_mirror":            c.fsm.SQLiteMirrorStatus(),
+		"sqlite_rebuild":           c.fsm.SQLiteRebuildStatus(),
 		"nodes":                    serverMaps,
 	}
+}
+
+func (c *Cluster) snapshotStatus() map[string]any {
+	if c.snapshot == nil {
+		return map[string]any{"count": 0}
+	}
+	list, err := c.snapshot.List()
+	if err != nil {
+		return map[string]any{
+			"count": 0,
+			"error": err.Error(),
+		}
+	}
+	out := map[string]any{
+		"count": len(list),
+	}
+	if len(list) == 0 {
+		return out
+	}
+	latest := list[0]
+	out["latest_id"] = latest.ID
+	out["latest_index"] = latest.Index
+	out["latest_term"] = latest.Term
+	out["latest_size"] = latest.Size
+	return out
 }
 
 // EventLog returns events after afterSeq (exclusive), up to limit entries.

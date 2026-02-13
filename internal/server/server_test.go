@@ -25,9 +25,17 @@ type mockCluster struct {
 	leaderAddr string
 }
 
-func (m mockCluster) IsLeader() bool                 { return m.isLeader }
-func (m mockCluster) LeaderAddr() string             { return m.leaderAddr }
-func (m mockCluster) ClusterStatus() map[string]any  { return map[string]any{"mode": "cluster"} }
+func (m mockCluster) IsLeader() bool     { return m.isLeader }
+func (m mockCluster) LeaderAddr() string { return m.leaderAddr }
+func (m mockCluster) ClusterStatus() map[string]any {
+	return map[string]any{
+		"mode":          "cluster",
+		"sqlite_mirror": map[string]any{"enabled": true},
+		"sqlite_rebuild": map[string]any{
+			"ran": false,
+		},
+	}
+}
 func (m mockCluster) State() string                  { return "follower" }
 func (m mockCluster) RebuildSQLiteFromPebble() error { return nil }
 func (m mockCluster) EventLog(afterSeq uint64, limit int) ([]map[string]any, error) {
@@ -87,6 +95,23 @@ func TestRebuildSQLiteEndpointCluster(t *testing.T) {
 	decodeResponse(t, rr, &body)
 	if body["status"] != "ok" {
 		t.Fatalf("status body = %v", body["status"])
+	}
+}
+
+func TestClusterStatusIncludesSQLiteStats(t *testing.T) {
+	_, s := testServer(t)
+	srv := New(s, mockCluster{isLeader: true}, ":0")
+	rr := doRequest(srv, "GET", "/api/v1/cluster/status", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	decodeResponse(t, rr, &body)
+	if _, ok := body["sqlite_mirror"]; !ok {
+		t.Fatalf("missing sqlite_mirror in cluster status")
+	}
+	if _, ok := body["sqlite_rebuild"]; !ok {
+		t.Fatalf("missing sqlite_rebuild in cluster status")
 	}
 }
 
