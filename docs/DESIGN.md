@@ -2388,21 +2388,21 @@ See `docs/AI.md` for full spec and `docs/PHASE2.md` for delivery plan.
 
 ### Phase 5 — Ecosystem + polish
 
-- [ ] Webhooks on job lifecycle events
-- [ ] Job dependencies (job B waits for job A)
-- [ ] OpenTelemetry integration (trace job from enqueue to complete)
-- [ ] Rust client library
-- [ ] Haskell client library
-- [ ] Streaming progress deltas via SSE (for LLM agent output)
+- [x] Webhooks on job lifecycle events
+- [x] Job dependencies (job B waits for job A)
+- [x] OpenTelemetry integration (trace job from enqueue to complete)
+- [x] Rust client library
+- [x] Haskell client library
+- [x] Streaming progress deltas via SSE (for LLM agent output)
 
 ### Phase 6 — Enterprise + Cloud
 
-- [ ] Multi-tenancy (namespace isolation)
-- [ ] Auth (API keys → namespace mapping, SSO)
-- [ ] RBAC (per-namespace, per-queue permissions)
-- [ ] Per-tenant backup/restore
-- [ ] Managed infrastructure (Cloud)
-- [ ] Billing and usage metering
-- [ ] Audit logging
-- [ ] Extended retention + full-text search (SQLite FTS5)
-- [ ] Terraform provider
+- [x] Multi-tenancy (namespace isolation)
+- [x] Auth (API keys → namespace mapping, SSO)
+- [x] RBAC (per-namespace, per-queue permissions)
+- [x] Per-tenant backup/restore
+- [x] Managed infrastructure (Cloud)
+- [x] Billing and usage metering
+- [x] Audit logging
+- [x] Extended retention + full-text search (SQLite FTS5)
+- [x] Terraform provider
