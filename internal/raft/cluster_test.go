@@ -7,6 +7,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -284,5 +286,74 @@ func TestPrepareFSMForRecoveryClearsPebbleWhenNoSnapshot(t *testing.T) {
 	defer iter.Close()
 	if iter.First() {
 		t.Fatalf("expected empty pebble after recovery prep with no snapshots")
+	}
+}
+
+func TestClusterOverloadPressureReturnsRetryHint(t *testing.T) {
+	cfg := DefaultClusterConfig()
+	cfg.NodeID = "node-overload"
+	cfg.DataDir = t.TempDir()
+	cfg.RaftBind = testRaftAddr(t)
+	cfg.Bootstrap = true
+	// Force admission pressure so burst traffic triggers overload signaling.
+	cfg.ApplyMaxPending = 8
+	cfg.ApplyMaxInFlight = 2
+	cfg.ApplyMaxTotalInFly = 8
+	cfg.ApplyBatchMax = 16
+	cfg.ApplyBatchMinWait = 200 * time.Microsecond
+	cfg.ApplyBatchWindow = 1 * time.Millisecond
+
+	c, err := NewCluster(cfg)
+	if err != nil {
+		t.Fatalf("NewCluster: %v", err)
+	}
+	defer c.Shutdown()
+	if err := c.WaitForLeader(5 * time.Second); err != nil {
+		t.Fatalf("WaitForLeader: %v", err)
+	}
+
+	s := store.NewStore(c, c.SQLiteReadDB())
+
+	const total = 256
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var overloaded atomic.Int64
+	var overloadedWithRetry atomic.Int64
+	var succeeded atomic.Int64
+
+	for i := 0; i < total; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := s.Enqueue(store.EnqueueRequest{
+				Queue:   "raft.overload",
+				Payload: json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
+			})
+			if err == nil {
+				succeeded.Add(1)
+				return
+			}
+			if store.IsOverloadedError(err) {
+				overloaded.Add(1)
+				if retryMs, ok := store.OverloadRetryAfterMs(err); ok && retryMs > 0 {
+					overloadedWithRetry.Add(1)
+				}
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	if overloaded.Load() == 0 {
+		t.Fatalf("expected at least one overloaded result under burst pressure")
+	}
+	if overloadedWithRetry.Load() == 0 {
+		t.Fatalf("expected overloaded results to include retry hint")
+	}
+	if succeeded.Load() == 0 {
+		t.Fatalf("expected at least one successful enqueue")
 	}
 }

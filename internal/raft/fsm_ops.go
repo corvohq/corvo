@@ -1129,7 +1129,10 @@ func (f *FSM) applyHeartbeat(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyHeartbeatOp(op)
+}
 
+func (f *FSM) applyHeartbeatOp(op store.HeartbeatOp) *store.OpResult {
 	now := time.Unix(0, int64(op.NowNs))
 	leaseExpiresNs := op.NowNs + 60*1_000_000_000
 	leaseExp := time.Unix(0, int64(leaseExpiresNs))
@@ -1214,7 +1217,10 @@ func (f *FSM) applyRetryJob(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyRetryJobOp(op)
+}
 
+func (f *FSM) applyRetryJobOp(op store.RetryJobOp) *store.OpResult {
 	jobVal, closer, err := f.pebble.Get(kv.JobKey(op.JobID))
 	if err != nil {
 		return &store.OpResult{Err: fmt.Errorf("job %q not found", op.JobID)}
@@ -1270,7 +1276,10 @@ func (f *FSM) applyCancelJob(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyCancelJobOp(op)
+}
 
+func (f *FSM) applyCancelJobOp(op store.CancelJobOp) *store.OpResult {
 	jobVal, closer, err := f.pebble.Get(kv.JobKey(op.JobID))
 	if err != nil {
 		return &store.OpResult{Err: fmt.Errorf("job %q not found", op.JobID)}
@@ -1324,7 +1333,10 @@ func (f *FSM) applyMoveJob(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyMoveJobOp(op)
+}
 
+func (f *FSM) applyMoveJobOp(op store.MoveJobOp) *store.OpResult {
 	jobVal, closer, err := f.pebble.Get(kv.JobKey(op.JobID))
 	if err != nil {
 		return &store.OpResult{Err: fmt.Errorf("job %q not found", op.JobID)}
@@ -1402,7 +1414,10 @@ func (f *FSM) applyDeleteJob(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyDeleteJobOp(op)
+}
 
+func (f *FSM) applyDeleteJobOp(op store.DeleteJobOp) *store.OpResult {
 	jobVal, closer, err := f.pebble.Get(kv.JobKey(op.JobID))
 	if err != nil {
 		return &store.OpResult{Err: fmt.Errorf("job %q not found", op.JobID)}
@@ -1451,6 +1466,10 @@ func (f *FSM) applyPauseQueue(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyPauseQueueOp(op)
+}
+
+func (f *FSM) applyPauseQueueOp(op store.QueueOp) *store.OpResult {
 	return f.setQueuePaused(op.Queue, true)
 }
 
@@ -1459,6 +1478,10 @@ func (f *FSM) applyResumeQueue(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyResumeQueueOp(op)
+}
+
+func (f *FSM) applyResumeQueueOp(op store.QueueOp) *store.OpResult {
 	return f.setQueuePaused(op.Queue, false)
 }
 
@@ -1491,7 +1514,10 @@ func (f *FSM) applyClearQueue(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyClearQueueOp(op)
+}
 
+func (f *FSM) applyClearQueueOp(op store.QueueOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
 	defer batch.Close()
 
@@ -1517,7 +1543,10 @@ func (f *FSM) applyDeleteQueue(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyDeleteQueueOp(op)
+}
 
+func (f *FSM) applyDeleteQueueOp(op store.QueueOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
 	defer batch.Close()
 
@@ -1549,7 +1578,10 @@ func (f *FSM) applySetConcurrency(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applySetConcurrencyOp(op)
+}
 
+func (f *FSM) applySetConcurrencyOp(op store.SetConcurrencyOp) *store.OpResult {
 	qc := f.getOrCreateQueueConfig(op.Queue)
 	if op.Max <= 0 {
 		qc.MaxConcurrency = nil
@@ -1582,7 +1614,10 @@ func (f *FSM) applySetThrottle(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applySetThrottleOp(op)
+}
 
+func (f *FSM) applySetThrottleOp(op store.SetThrottleOp) *store.OpResult {
 	qc := f.getOrCreateQueueConfig(op.Queue)
 	qc.RateLimit = &op.Rate
 	qc.RateWindowMs = &op.WindowMs
@@ -1611,7 +1646,10 @@ func (f *FSM) applyRemoveThrottle(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyRemoveThrottleOp(op)
+}
 
+func (f *FSM) applyRemoveThrottleOp(op store.QueueOp) *store.OpResult {
 	qc := f.getOrCreateQueueConfig(op.Queue)
 	qc.RateLimit = nil
 	qc.RateWindowMs = nil
@@ -1636,7 +1674,10 @@ func (f *FSM) applyPromote(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyPromoteOp(op)
+}
 
+func (f *FSM) applyPromoteOp(op store.PromoteOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
 	defer batch.Close()
 
@@ -1750,7 +1791,10 @@ func (f *FSM) applyReclaim(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyReclaimOp(op)
+}
 
+func (f *FSM) applyReclaimOp(op store.ReclaimOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
 	defer batch.Close()
 
@@ -1862,7 +1906,10 @@ func (f *FSM) applyBulkAction(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyBulkActionOp(op)
+}
 
+func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
 	defer batch.Close()
 
@@ -2003,7 +2050,10 @@ func (f *FSM) applyCleanUnique(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyCleanUniqueOp(op)
+}
 
+func (f *FSM) applyCleanUniqueOp(op store.CleanUniqueOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
 	defer batch.Close()
 
@@ -2053,7 +2103,10 @@ func (f *FSM) applyCleanRateLimit(data json.RawMessage) *store.OpResult {
 	if err := json.Unmarshal(data, &op); err != nil {
 		return &store.OpResult{Err: err}
 	}
+	return f.applyCleanRateLimitOp(op)
+}
 
+func (f *FSM) applyCleanRateLimitOp(op store.CleanRateLimitOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
 	defer batch.Close()
 

@@ -58,18 +58,18 @@ Exit criteria:
 
 Files: `internal/raft/cluster.go`, `internal/store/*`, `internal/rpcconnect/*`, `cmd/bench/main.go`, `docs/BENCHMARKS.md`
 
-- [ ] Finish protobuf-first hot path:
-  - Remove remaining JSON marshalling in enqueue/lifecycle apply path where possible
-  - Keep Connect JSON as debug fallback only
+- [x] Finish protobuf-first hot path:
+  - [x] Remove remaining JSON marshalling in enqueue/lifecycle apply path where possible
+  - [x] Keep Connect JSON as debug fallback only
 - [x] Admission and fairness:
   - Add per-client fairness keying (in addition to queue/global)
   - Keep overload signaling (`429` / `ResourceExhausted`) with retry hints
 - [ ] Batch control tuning:
-  - Validate adaptive wait + sub-batch split settings under c10/c50/c100/c200
-  - Reduce c200 p99 spikes without sacrificing c10 throughput
+  - [x] Validate adaptive wait + sub-batch split settings under c10/c50/c100/c200
+  - [ ] Reduce c200 p99 spikes without sacrificing c10 throughput
 - [ ] Bench stability:
-  - Fix RPC stream EOF churn in high-concurrency lifecycle benchmark runs
-  - Make bench output aggregate overloads/errors instead of spam
+  - [x] Fix RPC stream EOF churn in high-concurrency lifecycle benchmark runs
+  - [ ] Make bench output aggregate overloads/errors instead of spam
 
 Benchmark gates:
 - [ ] Unary enqueue (`rpc`, batch=1): >=20k ops/sec at c10 in fast mode
@@ -125,3 +125,15 @@ Exit criteria:
 - [x] Regression suite on every durability/perf change: `go test ./... -count=1`
 - [ ] Add targeted chaos test cases for restart/recovery and overload pressure
 - [ ] For each AI/platform feature PR: include before/after bench snippet for c10 and c50 unary enqueue + lifecycle
+
+## Recent Progress Notes
+
+- [x] Worker client stream hardening:
+  - Removed global HTTP client timeout for long-lived lifecycle streams
+  - Added HTTP/2 keepalive/read-idle transport settings
+  - Serialized lifecycle stream `Exchange`/`Close` to avoid client-side race/EOF churn
+- [x] FSM typed decode expansion:
+  - Protobuf decode now dispatches directly to typed handlers for heartbeat/retry/cancel/move/delete/queue-control/promote/reclaim/bulk/cleanup ops
+  - Removed JSON bridge conversion in protobuf dispatch path (`applyTypedViaJSON`)
+- [x] Overload pressure regression coverage:
+  - Added `internal/raft/cluster_test.go` burst test to assert overload errors include retry hints under constrained admission

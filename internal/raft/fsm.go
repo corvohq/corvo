@@ -163,100 +163,92 @@ func (f *FSM) applyDecoded(op *store.DecodedRaftOp) *store.OpResult {
 		return &store.OpResult{Err: fmt.Errorf("fail op missing payload")}
 	case store.OpHeartbeat:
 		if op.Heartbeat != nil {
-			return f.applyTypedViaJSON(*op.Heartbeat, f.applyHeartbeat)
+			return f.applyHeartbeatOp(*op.Heartbeat)
 		}
 		return &store.OpResult{Err: fmt.Errorf("heartbeat op missing payload")}
 	case store.OpRetryJob:
 		if op.RetryJob != nil {
-			return f.applyTypedViaJSON(*op.RetryJob, f.applyRetryJob)
+			return f.applyRetryJobOp(*op.RetryJob)
 		}
 		return &store.OpResult{Err: fmt.Errorf("retry op missing payload")}
 	case store.OpCancelJob:
 		if op.CancelJob != nil {
-			return f.applyTypedViaJSON(*op.CancelJob, f.applyCancelJob)
+			return f.applyCancelJobOp(*op.CancelJob)
 		}
 		return &store.OpResult{Err: fmt.Errorf("cancel op missing payload")}
 	case store.OpMoveJob:
 		if op.MoveJob != nil {
-			return f.applyTypedViaJSON(*op.MoveJob, f.applyMoveJob)
+			return f.applyMoveJobOp(*op.MoveJob)
 		}
 		return &store.OpResult{Err: fmt.Errorf("move op missing payload")}
 	case store.OpDeleteJob:
 		if op.DeleteJob != nil {
-			return f.applyTypedViaJSON(*op.DeleteJob, f.applyDeleteJob)
+			return f.applyDeleteJobOp(*op.DeleteJob)
 		}
 		return &store.OpResult{Err: fmt.Errorf("delete op missing payload")}
 	case store.OpPauseQueue:
 		if op.PauseQueue != nil {
-			return f.applyTypedViaJSON(*op.PauseQueue, f.applyPauseQueue)
+			return f.applyPauseQueueOp(*op.PauseQueue)
 		}
 		return &store.OpResult{Err: fmt.Errorf("pause queue op missing payload")}
 	case store.OpResumeQueue:
 		if op.ResumeQueue != nil {
-			return f.applyTypedViaJSON(*op.ResumeQueue, f.applyResumeQueue)
+			return f.applyResumeQueueOp(*op.ResumeQueue)
 		}
 		return &store.OpResult{Err: fmt.Errorf("resume queue op missing payload")}
 	case store.OpClearQueue:
 		if op.ClearQueue != nil {
-			return f.applyTypedViaJSON(*op.ClearQueue, f.applyClearQueue)
+			return f.applyClearQueueOp(*op.ClearQueue)
 		}
 		return &store.OpResult{Err: fmt.Errorf("clear queue op missing payload")}
 	case store.OpDeleteQueue:
 		if op.DeleteQueue != nil {
-			return f.applyTypedViaJSON(*op.DeleteQueue, f.applyDeleteQueue)
+			return f.applyDeleteQueueOp(*op.DeleteQueue)
 		}
 		return &store.OpResult{Err: fmt.Errorf("delete queue op missing payload")}
 	case store.OpSetConcurrency:
 		if op.SetConc != nil {
-			return f.applyTypedViaJSON(*op.SetConc, f.applySetConcurrency)
+			return f.applySetConcurrencyOp(*op.SetConc)
 		}
 		return &store.OpResult{Err: fmt.Errorf("set concurrency op missing payload")}
 	case store.OpSetThrottle:
 		if op.SetThrottle != nil {
-			return f.applyTypedViaJSON(*op.SetThrottle, f.applySetThrottle)
+			return f.applySetThrottleOp(*op.SetThrottle)
 		}
 		return &store.OpResult{Err: fmt.Errorf("set throttle op missing payload")}
 	case store.OpRemoveThrottle:
 		if op.RemoveThr != nil {
-			return f.applyTypedViaJSON(*op.RemoveThr, f.applyRemoveThrottle)
+			return f.applyRemoveThrottleOp(*op.RemoveThr)
 		}
 		return &store.OpResult{Err: fmt.Errorf("remove throttle op missing payload")}
 	case store.OpPromote:
 		if op.Promote != nil {
-			return f.applyTypedViaJSON(*op.Promote, f.applyPromote)
+			return f.applyPromoteOp(*op.Promote)
 		}
 		return &store.OpResult{Err: fmt.Errorf("promote op missing payload")}
 	case store.OpReclaim:
 		if op.Reclaim != nil {
-			return f.applyTypedViaJSON(*op.Reclaim, f.applyReclaim)
+			return f.applyReclaimOp(*op.Reclaim)
 		}
 		return &store.OpResult{Err: fmt.Errorf("reclaim op missing payload")}
 	case store.OpBulkAction:
 		if op.BulkAction != nil {
-			return f.applyTypedViaJSON(*op.BulkAction, f.applyBulkAction)
+			return f.applyBulkActionOp(*op.BulkAction)
 		}
 		return &store.OpResult{Err: fmt.Errorf("bulk action op missing payload")}
 	case store.OpCleanUnique:
 		if op.CleanUnique != nil {
-			return f.applyTypedViaJSON(*op.CleanUnique, f.applyCleanUnique)
+			return f.applyCleanUniqueOp(*op.CleanUnique)
 		}
 		return &store.OpResult{Err: fmt.Errorf("clean unique op missing payload")}
 	case store.OpCleanRateLimit:
 		if op.CleanRate != nil {
-			return f.applyTypedViaJSON(*op.CleanRate, f.applyCleanRateLimit)
+			return f.applyCleanRateLimitOp(*op.CleanRate)
 		}
 		return &store.OpResult{Err: fmt.Errorf("clean rate op missing payload")}
 	default:
 		return &store.OpResult{Err: fmt.Errorf("unknown op type: %d", op.Type)}
 	}
-}
-
-func (f *FSM) applyTypedViaJSON(v any, fn func(json.RawMessage) *store.OpResult) *store.OpResult {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return &store.OpResult{Err: fmt.Errorf("marshal typed op: %w", err)}
-	}
-	return fn(raw)
 }
 
 func (f *FSM) applyMulti(data json.RawMessage) *store.OpResult {
