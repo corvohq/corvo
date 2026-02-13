@@ -145,6 +145,12 @@ func (s *Server) mountUI(r chi.Router) {
 		f, err := s.uiFS.Open(path)
 		if err == nil {
 			f.Close()
+			// Set cache headers: hashed assets get long-lived cache, index.html always revalidates.
+			if strings.HasPrefix(path, "assets/") {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			} else if path == "index.html" {
+				w.Header().Set("Cache-Control", "no-cache")
+			}
 			// Serve via file server (with /ui/ prefix stripped).
 			http.StripPrefix("/ui/", fileServer).ServeHTTP(w, r)
 			return
@@ -158,6 +164,7 @@ func (s *Server) mountUI(r chi.Router) {
 		}
 		f.Close()
 
+		w.Header().Set("Cache-Control", "no-cache")
 		r.URL.Path = "/ui/index.html"
 		http.StripPrefix("/ui/", fileServer).ServeHTTP(w, r)
 	})

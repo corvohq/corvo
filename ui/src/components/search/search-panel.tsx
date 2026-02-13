@@ -129,6 +129,36 @@ export function SearchPanel({ filter, onFilterChange, onReset }: SearchPanelProp
               }
             />
           </div>
+
+          <div>
+            <label className="mb-1 block text-xs text-muted-foreground">Created after</label>
+            <input
+              type="datetime-local"
+              className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm"
+              value={filter.created_after ? filter.created_after.slice(0, 16) : ""}
+              onChange={(e) =>
+                onFilterChange({
+                  ...filter,
+                  created_after: e.target.value ? new Date(e.target.value).toISOString() : undefined,
+                })
+              }
+            />
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs text-muted-foreground">Created before</label>
+            <input
+              type="datetime-local"
+              className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm"
+              value={filter.created_before ? filter.created_before.slice(0, 16) : ""}
+              onChange={(e) =>
+                onFilterChange({
+                  ...filter,
+                  created_before: e.target.value ? new Date(e.target.value).toISOString() : undefined,
+                })
+              }
+            />
+          </div>
         </div>
       )}
 

@@ -113,3 +113,21 @@ export function useDeleteQueue() {
     onError: (e) => toast.error(`Delete failed: ${e.message}`),
   });
 }
+
+export interface EnqueueRequest {
+  queue: string;
+  payload?: unknown;
+  priority?: string;
+  max_retries?: number;
+  scheduled_at?: string;
+  unique_key?: string;
+}
+
+export function useEnqueueJob() {
+  const invalidate = useInvalidate();
+  return useMutation({
+    mutationFn: (req: EnqueueRequest) => post("/enqueue", req),
+    onSuccess: () => { invalidate(); toast.success("Job enqueued"); },
+    onError: (e) => toast.error(`Enqueue failed: ${e.message}`),
+  });
+}

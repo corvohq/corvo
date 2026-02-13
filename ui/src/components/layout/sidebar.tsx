@@ -1,8 +1,10 @@
 import { NavLink } from "react-router-dom";
 import { cn } from "@/lib/utils";
+import { Sheet, SheetContent } from "@/components/ui/sheet";
 import {
   LayoutDashboard,
   Layers,
+  ListOrdered,
   Skull,
   HandMetal,
   DollarSign,
@@ -12,6 +14,7 @@ import {
 
 const navItems = [
   { to: "/ui", icon: LayoutDashboard, label: "Dashboard", end: true },
+  { to: "/ui/queues", icon: ListOrdered, label: "Queues" },
   { to: "/ui/dead-letter", icon: Skull, label: "Dead Letter" },
   { to: "/ui/held", icon: HandMetal, label: "Held Jobs" },
   { to: "/ui/cost", icon: DollarSign, label: "Cost" },
@@ -19,11 +22,16 @@ const navItems = [
   { to: "/ui/cluster", icon: Network, label: "Cluster" },
 ];
 
-export function Sidebar() {
+interface SidebarProps {
+  mobileOpen: boolean;
+  onMobileOpenChange: (open: boolean) => void;
+}
+
+function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
   return (
-    <aside className="flex h-full w-56 flex-col border-r bg-sidebar">
+    <>
       <div className="flex h-14 items-center border-b px-4">
-        <NavLink to="/ui" className="flex items-center gap-2">
+        <NavLink to="/ui" className="flex items-center gap-2" onClick={onNavigate}>
           <Layers className="h-5 w-5" />
           <span className="text-lg font-bold tracking-tight">Jobbie</span>
         </NavLink>
@@ -34,6 +42,7 @@ export function Sidebar() {
             key={item.to}
             to={item.to}
             end={item.end}
+            onClick={onNavigate}
             className={({ isActive }) =>
               cn(
                 "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors",
@@ -48,6 +57,24 @@ export function Sidebar() {
           </NavLink>
         ))}
       </nav>
-    </aside>
+    </>
+  );
+}
+
+export function Sidebar({ mobileOpen, onMobileOpenChange }: SidebarProps) {
+  return (
+    <>
+      {/* Desktop sidebar */}
+      <aside className="hidden h-full w-56 flex-col border-r bg-sidebar md:flex">
+        <SidebarContent />
+      </aside>
+
+      {/* Mobile sidebar (sheet) */}
+      <Sheet open={mobileOpen} onOpenChange={onMobileOpenChange}>
+        <SheetContent side="left" className="w-56 bg-sidebar p-0">
+          <SidebarContent onNavigate={() => onMobileOpenChange(false)} />
+        </SheetContent>
+      </Sheet>
+    </>
   );
 }

@@ -1,16 +1,21 @@
+import { useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 import { QueueTable } from "@/components/queues/queue-table";
 import { WorkerTable } from "@/components/workers/worker-table";
 import { ClusterPanel } from "@/components/cluster/cluster-panel";
 import { StateBadge } from "@/components/jobs/state-badge";
+import { EnqueueDialog } from "@/components/dialogs/enqueue-dialog";
 import { useQueues } from "@/hooks/use-queues";
 import { useWorkers } from "@/hooks/use-workers";
 import { useCluster } from "@/hooks/use-cluster";
 import { useSearch } from "@/hooks/use-search";
 import { timeAgo, truncateId } from "@/lib/utils";
 import { useNavigate } from "react-router-dom";
+import { Plus } from "lucide-react";
 
 export default function Dashboard() {
+  const [enqueueOpen, setEnqueueOpen] = useState(false);
   const { data: queues, isLoading: queuesLoading } = useQueues();
   const { data: workers, isLoading: workersLoading } = useWorkers();
   const { data: cluster } = useCluster();
@@ -24,7 +29,13 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-bold">Dashboard</h1>
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">Dashboard</h1>
+        <Button size="sm" onClick={() => setEnqueueOpen(true)}>
+          <Plus className="mr-1 h-4 w-4" /> Enqueue Job
+        </Button>
+      </div>
+      <EnqueueDialog open={enqueueOpen} onOpenChange={setEnqueueOpen} />
 
       {/* Summary stats */}
       {queues && (

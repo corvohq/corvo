@@ -4,6 +4,7 @@ import { Toaster } from "sonner";
 import { Shell } from "@/components/layout/shell";
 import { useSSE } from "@/hooks/use-events";
 import Dashboard from "@/pages/dashboard";
+import QueuesPage from "@/pages/queues-page";
 import QueueDetail from "@/pages/queue-detail";
 import JobDetailPage from "@/pages/job-detail-page";
 import DeadLetter from "@/pages/dead-letter";
@@ -35,6 +36,7 @@ export default function App() {
           <Routes>
             <Route element={<Shell />}>
               <Route path="/ui" element={<Dashboard />} />
+              <Route path="/ui/queues" element={<QueuesPage />} />
               <Route path="/ui/queues/:name" element={<QueueDetail />} />
               <Route path="/ui/jobs/:id" element={<JobDetailPage />} />
               <Route path="/ui/dead-letter" element={<DeadLetter />} />
