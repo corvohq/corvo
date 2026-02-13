@@ -30,6 +30,8 @@ type Filter struct {
 	UniqueKey       string            `json:"unique_key,omitempty"`
 	BatchID         string            `json:"batch_id,omitempty"`
 	WorkerID        string            `json:"worker_id,omitempty"`
+	ParentID        string            `json:"parent_id,omitempty"`
+	ChainID         string            `json:"chain_id,omitempty"`
 	HasErrors       *bool             `json:"has_errors,omitempty"`
 	ErrorContains   string            `json:"error_contains,omitempty"`
 	JobIDPrefix     string            `json:"job_id_prefix,omitempty"`
@@ -112,6 +114,14 @@ func BuildQuery(f Filter) (query string, countQuery string, args []interface{}, 
 		conditions = append(conditions, "j.worker_id = ?")
 		queryArgs = append(queryArgs, f.WorkerID)
 	}
+	if f.ParentID != "" {
+		conditions = append(conditions, "j.parent_id = ?")
+		queryArgs = append(queryArgs, f.ParentID)
+	}
+	if f.ChainID != "" {
+		conditions = append(conditions, "j.chain_id = ?")
+		queryArgs = append(queryArgs, f.ChainID)
+	}
 
 	if f.HasErrors != nil && *f.HasErrors {
 		conditions = append(conditions, "j.id IN (SELECT DISTINCT job_id FROM job_errors)")
@@ -169,7 +179,7 @@ func BuildQuery(f Filter) (query string, countQuery string, args []interface{}, 
 	// Build main query
 	query = fmt.Sprintf(`
 		SELECT j.id, j.queue, j.state, j.payload, j.priority, j.attempt, j.max_retries,
-			j.unique_key, j.batch_id, j.worker_id, j.tags,
+			j.unique_key, j.batch_id, j.worker_id, j.tags, j.parent_id, j.chain_id, j.chain_step,
 			j.created_at, j.started_at, j.completed_at, j.failed_at
 		FROM jobs j
 		%s

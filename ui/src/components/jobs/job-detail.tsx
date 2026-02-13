@@ -28,6 +28,7 @@ import { useState } from "react";
 import { MoveDialog } from "@/components/dialogs/move-dialog";
 import { EnqueueDialog } from "@/components/dialogs/enqueue-dialog";
 import { useJobIterations } from "@/hooks/use-job-iterations";
+import { useSearch } from "@/hooks/use-search";
 import { IterationTable } from "@/components/ai/iteration-table";
 import { ScoreSummary } from "@/components/ai/score-summary";
 import { StreamOutput } from "@/components/ai/stream-output";
@@ -38,6 +39,20 @@ export function JobDetail({ job }: { job: Job }) {
   const deleteJob = useDeleteJob();
   const replayJob = useReplayJob();
   const { data: iterations = [], isLoading: isIterationsLoading } = useJobIterations(job.id);
+  const chainID = job.chain_id || "";
+  const { data: chainResult, isLoading: isChainLoading } = useSearch(
+    { chain_id: chainID, limit: 200, order: "asc", sort: "created_at" },
+    !!chainID,
+  );
+  const chainJobs =
+    (chainResult?.jobs || []).filter((j) => j.id !== job.id).sort((a, b) => {
+      const aStep = a.chain_step ?? Number.MAX_SAFE_INTEGER;
+      const bStep = b.chain_step ?? Number.MAX_SAFE_INTEGER;
+      if (aStep !== bStep) {
+        return aStep - bStep;
+      }
+      return a.id.localeCompare(b.id);
+    });
   const [moveOpen, setMoveOpen] = useState(false);
   const [cloneOpen, setCloneOpen] = useState(false);
 
@@ -183,6 +198,25 @@ export function JobDetail({ job }: { job: Job }) {
                 <dd className="font-mono text-xs">{job.batch_id}</dd>
               </div>
             )}
+            {job.parent_id && (
+              <div>
+                <dt className="text-muted-foreground">Parent</dt>
+                <dd className="font-mono text-xs">
+                  <Link to={`/ui/jobs/${job.parent_id}`} className="text-primary hover:underline">
+                    {job.parent_id}
+                  </Link>
+                </dd>
+              </div>
+            )}
+            {job.chain_id && (
+              <div>
+                <dt className="text-muted-foreground">Chain</dt>
+                <dd className="font-mono text-xs">
+                  {job.chain_id}
+                  {job.chain_step != null ? ` (step ${job.chain_step})` : ""}
+                </dd>
+              </div>
+            )}
             <div>
               <dt className="text-muted-foreground">Created</dt>
               <dd>{timeAgo(job.created_at)}</dd>
@@ -285,6 +319,41 @@ export function JobDetail({ job }: { job: Job }) {
                 replaying={replayJob.isPending}
                 onReplay={(from) => replayJob.mutate({ id: job.id, from })}
               />
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {job.chain_id && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Chain</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {isChainLoading ? (
+              <p className="py-2 text-sm text-muted-foreground">Loading chain jobs...</p>
+            ) : chainJobs.length === 0 ? (
+              <p className="py-2 text-sm text-muted-foreground">No linked chain jobs found.</p>
+            ) : (
+              <div className="space-y-2">
+                {chainJobs.map((j) => (
+                  <div
+                    key={j.id}
+                    className="flex items-center justify-between rounded border px-3 py-2"
+                  >
+                    <div className="min-w-0">
+                      <Link to={`/ui/jobs/${j.id}`} className="font-mono text-xs text-primary hover:underline">
+                        {j.id}
+                      </Link>
+                      <p className="text-xs text-muted-foreground">
+                        {j.queue}
+                        {j.chain_step != null ? ` · step ${j.chain_step}` : ""}
+                      </p>
+                    </div>
+                    <StateBadge state={j.state} />
+                  </div>
+                ))}
+              </div>
             )}
           </CardContent>
         </Card>

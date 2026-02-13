@@ -31,6 +31,9 @@ type JobSummary struct {
 	BatchID     *string         `json:"batch_id,omitempty"`
 	WorkerID    *string         `json:"worker_id,omitempty"`
 	Tags        json.RawMessage `json:"tags,omitempty"`
+	ParentID    *string         `json:"parent_id,omitempty"`
+	ChainID     *string         `json:"chain_id,omitempty"`
+	ChainStep   *int            `json:"chain_step,omitempty"`
 	CreatedAt   *string         `json:"created_at,omitempty"`
 	StartedAt   *string         `json:"started_at,omitempty"`
 	CompletedAt *string         `json:"completed_at,omitempty"`
@@ -63,11 +66,12 @@ func (s *Store) SearchJobs(filter search.Filter) (*SearchResult, error) {
 	for rows.Next() {
 		var j JobSummary
 		var payload sql.NullString
-		var uniqueKey, batchID, workerID, tags sql.NullString
+		var uniqueKey, batchID, workerID, tags, parentID, chainID sql.NullString
+		var chainStep sql.NullInt64
 		var createdAt, startedAt, completedAt, failedAt sql.NullString
 		err := rows.Scan(
 			&j.ID, &j.Queue, &j.State, &payload, &j.Priority, &j.Attempt, &j.MaxRetries,
-			&uniqueKey, &batchID, &workerID, &tags,
+			&uniqueKey, &batchID, &workerID, &tags, &parentID, &chainID, &chainStep,
 			&createdAt, &startedAt, &completedAt, &failedAt,
 		)
 		if err != nil {
@@ -87,6 +91,16 @@ func (s *Store) SearchJobs(filter search.Filter) (*SearchResult, error) {
 		}
 		if tags.Valid {
 			j.Tags = json.RawMessage(tags.String)
+		}
+		if parentID.Valid {
+			j.ParentID = &parentID.String
+		}
+		if chainID.Valid {
+			j.ChainID = &chainID.String
+		}
+		if chainStep.Valid {
+			s := int(chainStep.Int64)
+			j.ChainStep = &s
 		}
 		if createdAt.Valid {
 			j.CreatedAt = &createdAt.String

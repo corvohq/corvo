@@ -94,6 +94,22 @@ func TestBuildQueryPagination(t *testing.T) {
 	}
 }
 
+func TestBuildQueryWithChainFilters(t *testing.T) {
+	query, _, args, _, _ := BuildQuery(Filter{ParentID: "job_parent", ChainID: "chain_123"})
+	if !strings.Contains(query, "j.parent_id = ?") {
+		t.Error("query should filter on parent_id")
+	}
+	if !strings.Contains(query, "j.chain_id = ?") {
+		t.Error("query should filter on chain_id")
+	}
+	if args[0] != "job_parent" {
+		t.Errorf("first arg = %v, want job_parent", args[0])
+	}
+	if args[1] != "chain_123" {
+		t.Errorf("second arg = %v, want chain_123", args[1])
+	}
+}
+
 func TestCursorEncodeDecode(t *testing.T) {
 	encoded := EncodeCursor(42)
 	decoded := DecodeCursor(encoded)

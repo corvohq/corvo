@@ -17,6 +17,9 @@ export interface Job {
   progress?: { current?: number; total?: number; message?: string };
   checkpoint?: unknown;
   result?: unknown;
+  parent_id?: string;
+  chain_id?: string;
+  chain_step?: number;
   lease_expires_at?: string;
   scheduled_at?: string;
   expire_at?: string;
@@ -97,6 +100,9 @@ export interface SearchFilter {
   job_id_prefix?: string;
   batch_id?: string;
   worker_id?: string;
+  parent_id?: string;
+  chain_id?: string;
+  chain_step?: number;
   unique_key?: string;
   has_errors?: boolean;
   attempt_min?: number;
