@@ -161,9 +161,10 @@ func (m *pbFetchBatchOp) String() string { return oldproto.CompactTextString(m) 
 func (*pbFetchBatchOp) ProtoMessage()    {}
 
 type pbAckOp struct {
-	JobID  string `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	Result []byte `protobuf:"bytes,2,opt,name=result,proto3" json:"result,omitempty"`
-	NowNs  uint64 `protobuf:"varint,3,opt,name=now_ns,json=nowNs,proto3" json:"now_ns,omitempty"`
+	JobID  string         `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Result []byte         `protobuf:"bytes,2,opt,name=result,proto3" json:"result,omitempty"`
+	Usage  *pbUsageReport `protobuf:"bytes,3,opt,name=usage,proto3" json:"usage,omitempty"`
+	NowNs  uint64         `protobuf:"varint,4,opt,name=now_ns,json=nowNs,proto3" json:"now_ns,omitempty"`
 }
 
 func (m *pbAckOp) Reset()         { *m = pbAckOp{} }
@@ -191,11 +192,12 @@ func (m *pbFailOp) String() string { return oldproto.CompactTextString(m) }
 func (*pbFailOp) ProtoMessage()    {}
 
 type pbHeartbeatJob struct {
-	JobID       string `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	Progress    []byte `protobuf:"bytes,2,opt,name=progress,proto3" json:"progress,omitempty"`
-	Checkpoint  []byte `protobuf:"bytes,3,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
-	HasProgress bool   `protobuf:"varint,4,opt,name=has_progress,json=hasProgress,proto3" json:"has_progress,omitempty"`
-	HasCP       bool   `protobuf:"varint,5,opt,name=has_cp,json=hasCp,proto3" json:"has_cp,omitempty"`
+	JobID       string         `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Progress    []byte         `protobuf:"bytes,2,opt,name=progress,proto3" json:"progress,omitempty"`
+	Checkpoint  []byte         `protobuf:"bytes,3,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
+	HasProgress bool           `protobuf:"varint,4,opt,name=has_progress,json=hasProgress,proto3" json:"has_progress,omitempty"`
+	HasCP       bool           `protobuf:"varint,5,opt,name=has_cp,json=hasCp,proto3" json:"has_cp,omitempty"`
+	Usage       *pbUsageReport `protobuf:"bytes,6,opt,name=usage,proto3" json:"usage,omitempty"`
 }
 
 func (m *pbHeartbeatJob) Reset()         { *m = pbHeartbeatJob{} }
@@ -210,6 +212,20 @@ type pbHeartbeatOp struct {
 func (m *pbHeartbeatOp) Reset()         { *m = pbHeartbeatOp{} }
 func (m *pbHeartbeatOp) String() string { return oldproto.CompactTextString(m) }
 func (*pbHeartbeatOp) ProtoMessage()    {}
+
+type pbUsageReport struct {
+	InputTokens         int64   `protobuf:"varint,1,opt,name=input_tokens,json=inputTokens,proto3" json:"input_tokens,omitempty"`
+	OutputTokens        int64   `protobuf:"varint,2,opt,name=output_tokens,json=outputTokens,proto3" json:"output_tokens,omitempty"`
+	CacheCreationTokens int64   `protobuf:"varint,3,opt,name=cache_creation_tokens,json=cacheCreationTokens,proto3" json:"cache_creation_tokens,omitempty"`
+	CacheReadTokens     int64   `protobuf:"varint,4,opt,name=cache_read_tokens,json=cacheReadTokens,proto3" json:"cache_read_tokens,omitempty"`
+	Model               string  `protobuf:"bytes,5,opt,name=model,proto3" json:"model,omitempty"`
+	Provider            string  `protobuf:"bytes,6,opt,name=provider,proto3" json:"provider,omitempty"`
+	CostUsd             float64 `protobuf:"fixed64,7,opt,name=cost_usd,json=costUsd,proto3" json:"cost_usd,omitempty"`
+}
+
+func (m *pbUsageReport) Reset()         { *m = pbUsageReport{} }
+func (m *pbUsageReport) String() string { return oldproto.CompactTextString(m) }
+func (*pbUsageReport) ProtoMessage()    {}
 
 type pbRetryJobOp struct {
 	JobID string `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
@@ -964,6 +980,7 @@ func toPBAck(op AckOp) *pbAckOp {
 	return &pbAckOp{
 		JobID:  op.JobID,
 		Result: append([]byte(nil), op.Result...),
+		Usage:  toPBUsage(op.Usage),
 		NowNs:  op.NowNs,
 	}
 }
@@ -972,6 +989,7 @@ func fromPBAck(op *pbAckOp) AckOp {
 	return AckOp{
 		JobID:  op.JobID,
 		Result: append([]byte(nil), op.Result...),
+		Usage:  fromPBUsage(op.Usage),
 		NowNs:  op.NowNs,
 	}
 }
@@ -1022,6 +1040,7 @@ func toPBHeartbeat(op HeartbeatOp) *pbHeartbeatOp {
 			item.Checkpoint = append([]byte(nil), j.Checkpoint...)
 			item.HasCP = true
 		}
+		item.Usage = toPBUsage(j.Usage)
 		out.Jobs = append(out.Jobs, item)
 	}
 	return out
@@ -1037,9 +1056,40 @@ func fromPBHeartbeat(op *pbHeartbeatOp) HeartbeatOp {
 		if item.HasCP {
 			j.Checkpoint = append([]byte(nil), item.Checkpoint...)
 		}
+		j.Usage = fromPBUsage(item.Usage)
 		out.Jobs[item.JobID] = j
 	}
 	return out
+}
+
+func toPBUsage(u *UsageReport) *pbUsageReport {
+	if u == nil {
+		return nil
+	}
+	return &pbUsageReport{
+		InputTokens:         u.InputTokens,
+		OutputTokens:        u.OutputTokens,
+		CacheCreationTokens: u.CacheCreationTokens,
+		CacheReadTokens:     u.CacheReadTokens,
+		Model:               u.Model,
+		Provider:            u.Provider,
+		CostUsd:             u.CostUSD,
+	}
+}
+
+func fromPBUsage(u *pbUsageReport) *UsageReport {
+	if u == nil {
+		return nil
+	}
+	return &UsageReport{
+		InputTokens:         u.InputTokens,
+		OutputTokens:        u.OutputTokens,
+		CacheCreationTokens: u.CacheCreationTokens,
+		CacheReadTokens:     u.CacheReadTokens,
+		Model:               u.Model,
+		Provider:            u.Provider,
+		CostUSD:             u.CostUsd,
+	}
 }
 
 func toPBRetryJob(op RetryJobOp) *pbRetryJobOp {

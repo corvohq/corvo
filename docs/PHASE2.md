@@ -89,8 +89,9 @@ Benchmark gates:
 Files: `docs/AI.md`, `internal/store/*`, `internal/server/*`, `pkg/client/*`, `cmd/jobbie/*`, UI files
 
 - [ ] Usage accounting:
-  - `job_usage` storage + usage reporting via ack/heartbeat
-  - Usage summary API + CLI (`jobbie usage`)
+  - [x] `job_usage` storage + usage reporting via ack/heartbeat
+  - [x] Usage summary API (`GET /api/v1/usage/summary`)
+  - [x] Usage summary CLI (`jobbie usage`)
 - [ ] Budget enforcement:
   - Budget table + checks on fetch/ack paths
   - Queue/namespace/per-job budget APIs + CLI (`jobbie budget`)
@@ -149,3 +150,7 @@ Exit criteria:
 - [x] Backpressure model simplification:
   - Removed complex per-key/global admission counters from the hot path
   - Kept bounded apply queue backpressure and queue-scoped fetch permits
+- [x] AI usage accounting foundation:
+  - Added `job_usage` migration + summary query path in store
+  - Wired usage payloads through HTTP and Connect ack/ack-batch/heartbeat APIs
+  - Added protobuf usage fields and dual-mode compatibility via regenerated RPC stubs

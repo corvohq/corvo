@@ -194,6 +194,10 @@ func (c *Client) FetchBatch(ctx context.Context, req FetchRequest, count int) ([
 }
 
 func (c *Client) Ack(ctx context.Context, jobID string, result json.RawMessage) error {
+	return c.AckWithUsage(ctx, jobID, result, nil)
+}
+
+func (c *Client) AckWithUsage(ctx context.Context, jobID string, result json.RawMessage, usage *UsageReport) error {
 	if jobID == "" {
 		return fmt.Errorf("job_id is required")
 	}
@@ -204,6 +208,7 @@ func (c *Client) Ack(ctx context.Context, jobID string, result json.RawMessage) 
 	_, err := c.rpc.Ack(ctx, connect.NewRequest(&jobbiev1.AckRequest{
 		JobId:      jobID,
 		ResultJson: resultJSON,
+		Usage:      usageToPB(usage),
 	}))
 	return err
 }
@@ -211,6 +216,7 @@ func (c *Client) Ack(ctx context.Context, jobID string, result json.RawMessage) 
 type AckBatchItem struct {
 	JobID  string
 	Result json.RawMessage
+	Usage  *UsageReport
 }
 
 func (c *Client) AckBatch(ctx context.Context, items []AckBatchItem) (int, error) {
@@ -230,6 +236,7 @@ func (c *Client) AckBatch(ctx context.Context, items []AckBatchItem) (int, error
 		reqItems = append(reqItems, &jobbiev1.AckBatchItem{
 			JobId:      jobID,
 			ResultJson: resultJSON,
+			Usage:      usageToPB(item.Usage),
 		})
 	}
 
@@ -297,6 +304,7 @@ func (s *LifecycleStream) Exchange(req LifecycleRequest) (*LifecycleResponse, er
 		items = append(items, &jobbiev1.AckBatchItem{
 			JobId:      jobID,
 			ResultJson: resultJSON,
+			Usage:      usageToPB(ack.Usage),
 		})
 	}
 	enqueues := make([]*jobbiev1.LifecycleEnqueueItem, 0, len(req.Enqueues))
@@ -399,6 +407,7 @@ func (c *Client) Fail(ctx context.Context, jobID, errMsg, backtrace string) (*Fa
 type HeartbeatJobUpdate struct {
 	Progress   map[string]any
 	Checkpoint map[string]any
+	Usage      *UsageReport
 }
 
 // Heartbeat returns per-job status (e.g. "ok", "cancel").
@@ -416,6 +425,7 @@ func (c *Client) Heartbeat(ctx context.Context, jobs map[string]HeartbeatJobUpda
 		reqJobs[jobID] = &jobbiev1.HeartbeatJobUpdate{
 			ProgressJson:   progressJSON,
 			CheckpointJson: checkpointJSON,
+			Usage:          usageToPB(update.Usage),
 		}
 	}
 
@@ -448,4 +458,29 @@ func fromProtoTime(ts *timestamppb.Timestamp) *time.Time {
 	}
 	t := ts.AsTime()
 	return &t
+}
+
+type UsageReport struct {
+	InputTokens         int64
+	OutputTokens        int64
+	CacheCreationTokens int64
+	CacheReadTokens     int64
+	Model               string
+	Provider            string
+	CostUSD             float64
+}
+
+func usageToPB(u *UsageReport) *jobbiev1.UsageReport {
+	if u == nil {
+		return nil
+	}
+	return &jobbiev1.UsageReport{
+		InputTokens:         u.InputTokens,
+		OutputTokens:        u.OutputTokens,
+		CacheCreationTokens: u.CacheCreationTokens,
+		CacheReadTokens:     u.CacheReadTokens,
+		Model:               strings.TrimSpace(u.Model),
+		Provider:            strings.TrimSpace(u.Provider),
+		CostUsd:             u.CostUSD,
+	}
 }

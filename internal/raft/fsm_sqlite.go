@@ -154,6 +154,9 @@ func sqliteAckJob(db sqlExecer, job store.Job, op store.AckOp, callbackJobID str
 	if job.BatchID != nil {
 		sqliteUpdateBatch(db, *job.BatchID, "success", callbackJobID)
 	}
+	if err := sqliteInsertUsage(db, op.JobID, job.Queue, job.Attempt, "ack", op.Usage, now); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -239,6 +242,15 @@ func sqliteHeartbeat(db sqlExecer, op store.HeartbeatOp, leaseExp time.Time, wor
 			db.Exec("UPDATE jobs SET lease_expires_at = ? WHERE id = ? AND state = 'active'",
 				leaseStr, jobID)
 		}
+		if update.Usage != nil {
+			var queue string
+			var attempt int
+			if err := db.QueryRow("SELECT queue, attempt FROM jobs WHERE id = ? AND state = 'active'", jobID).Scan(&queue, &attempt); err == nil {
+				if err := sqliteInsertUsage(db, jobID, queue, attempt, "heartbeat", update.Usage, now.UTC().Format(time.RFC3339Nano)); err != nil {
+					return err
+				}
+			}
+		}
 	}
 
 	if workerID != "" {
@@ -247,6 +259,33 @@ func sqliteHeartbeat(db sqlExecer, op store.HeartbeatOp, leaseExp time.Time, wor
 	}
 
 	return nil
+}
+
+func sqliteInsertUsage(db sqlExecer, jobID, queue string, attempt int, phase string, usage *store.UsageReport, createdAt string) error {
+	if usage == nil || usage.IsZero() {
+		return nil
+	}
+	_, err := db.Exec(`INSERT INTO job_usage (
+		job_id, queue, attempt, phase,
+		input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+		model, provider, cost_usd, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		jobID, queue, attempt, phase,
+		usage.InputTokens, usage.OutputTokens, usage.CacheCreationTokens, usage.CacheReadTokens,
+		nullableString(usage.Model), nullableString(usage.Provider), usage.CostUSD, createdAt,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite insert job usage: %w", err)
+	}
+	return nil
+}
+
+func nullableString(s string) *string {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
 }
 
 func sqliteRetryJob(db sqlExecer, jobID string) error {

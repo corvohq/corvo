@@ -2370,8 +2370,8 @@ Replaced SQLite-only store with Pebble (source of truth) + Raft (consensus) + SQ
 
 See `docs/AI.md` for full spec and `docs/PHASE2.md` for delivery plan.
 
-- [ ] Token and cost tracking (`job_usage` table, usage reporting on ack/heartbeat)
-- [ ] Usage summary endpoints + CLI (`jobbie usage`)
+- [x] Token and cost tracking (`job_usage` table, usage reporting on ack/heartbeat)
+- [x] Usage summary endpoints + CLI (`jobbie usage`)
 - [ ] Budget enforcement (daily/per-job limits, hold/reject/alert actions)
 - [ ] `held` job state + approve/reject endpoints + CLI
 - [ ] Agent loop primitive (iterative jobs with server-enforced guardrails)

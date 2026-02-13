@@ -69,6 +69,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/workers", s.handleListWorkers)
 		r.Get("/cluster/status", s.handleClusterStatus)
 		r.Get("/cluster/events", s.handleClusterEvents)
+		r.Get("/usage/summary", s.handleUsageSummary)
 
 		// Write endpoints (leader only when clustered)
 		r.Group(func(r chi.Router) {

@@ -70,9 +70,20 @@ message FetchBatchResponse {
   repeated FetchBatchJob jobs = 1;
 }
 
+message UsageReport {
+  int64 input_tokens = 1;
+  int64 output_tokens = 2;
+  int64 cache_creation_tokens = 3;
+  int64 cache_read_tokens = 4;
+  string model = 5;
+  string provider = 6;
+  double cost_usd = 7;
+}
+
 message AckRequest {
   string job_id = 1;
   string result_json = 2;
+  UsageReport usage = 3;
 }
 
 message AckResponse {}
@@ -80,6 +91,7 @@ message AckResponse {}
 message AckBatchItem {
   string job_id = 1;
   string result_json = 2;
+  UsageReport usage = 3;
 }
 
 message AckBatchRequest {
@@ -129,6 +141,7 @@ message FailResponse {
 message HeartbeatJobUpdate {
   string progress_json = 1;
   string checkpoint_json = 2;
+  UsageReport usage = 3;
 }
 
 message HeartbeatRequest {

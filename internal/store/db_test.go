@@ -63,7 +63,7 @@ func TestMigrationCreatesAllTables(t *testing.T) {
 	expectedTables := []string{
 		"jobs", "job_errors", "unique_locks", "batches",
 		"queues", "rate_limit_window", "schedules",
-		"workers", "events", "queue_stats", "schema_migrations",
+		"workers", "events", "queue_stats", "schema_migrations", "job_usage",
 	}
 
 	for _, table := range expectedTables {
@@ -93,14 +93,14 @@ func TestMigrationIsIdempotent(t *testing.T) {
 	}
 	defer db2.Close()
 
-	// Verify migration version is still 1
+	// Verify migration version is still latest
 	var version int
 	err = db2.Read.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version)
 	if err != nil {
 		t.Fatalf("query migration version: %v", err)
 	}
-	if version != 1 {
-		t.Errorf("migration version = %d, want 1", version)
+	if version != 2 {
+		t.Errorf("migration version = %d, want 2", version)
 	}
 }
 
@@ -140,6 +140,10 @@ func TestMigrationCreatesIndexes(t *testing.T) {
 		"idx_job_errors_job",
 		"idx_rate_limit",
 		"idx_events_created",
+		"idx_job_usage_job",
+		"idx_job_usage_provider",
+		"idx_job_usage_model",
+		"idx_job_usage_queue",
 	}
 
 	for _, idx := range expectedIndexes {
