@@ -753,6 +753,9 @@ func (f *FSM) findPendingJobForQueue(queue string, claimed map[string]struct{}) 
 			continue
 		}
 		closer.Close()
+		if !f.dependenciesSatisfied(doc) {
+			continue
+		}
 
 		pk := make([]byte, len(key))
 		copy(pk, key)
@@ -821,6 +824,9 @@ func (f *FSM) findAppendJobForQueue(queue string, claimed map[string]struct{}) (
 			_ = f.pebble.Delete(k, pebble.NoSync)
 			continue
 		}
+		if !f.dependenciesSatisfied(doc) {
+			continue
+		}
 		ak := make([]byte, len(key))
 		copy(ak, key)
 		return id, ak, doc, true
@@ -835,6 +841,65 @@ func (f *FSM) findPendingOrAppendJobForQueue(queue string, claimed map[string]st
 	}
 	jobID, appendKey, job, ok = f.findAppendJobForQueue(queue, claimed)
 	return jobID, nil, appendKey, job, ok
+}
+
+func (f *FSM) dependenciesSatisfied(job store.Job) bool {
+	deps := chainDependsOn(job.ChainConfig)
+	if len(deps) == 0 {
+		return true
+	}
+	for _, depID := range deps {
+		val, closer, err := f.pebble.Get(kv.JobKey(depID))
+		if err != nil {
+			return false
+		}
+		var dep store.Job
+		if err := decodeJobDoc(val, &dep); err != nil {
+			closer.Close()
+			return false
+		}
+		closer.Close()
+		if dep.State != store.StateCompleted {
+			return false
+		}
+	}
+	return true
+}
+
+func chainDependsOn(chainCfg json.RawMessage) []string {
+	if len(chainCfg) == 0 {
+		return nil
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(chainCfg, &doc); err != nil {
+		return nil
+	}
+	raw, ok := doc["depends_on"]
+	if !ok {
+		return nil
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(list))
+	seen := map[string]struct{}{}
+	for _, item := range list {
+		id, ok := item.(string)
+		if !ok {
+			continue
+		}
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
 
 // --- Ack ---

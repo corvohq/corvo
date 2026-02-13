@@ -27,6 +27,7 @@ type EnqueueRequest struct {
 	ChainID        string          `json:"chain_id,omitempty"`
 	ChainStep      *int            `json:"chain_step,omitempty"`
 	ChainConfig    json.RawMessage `json:"chain_config,omitempty"`
+	DependsOn      []string        `json:"depends_on,omitempty"`
 	Routing        *RoutingConfig  `json:"routing,omitempty"`
 }
 
@@ -107,7 +108,7 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 		ParentID:     req.ParentID,
 		ChainID:      req.ChainID,
 		ChainStep:    req.ChainStep,
-		ChainConfig:  req.ChainConfig,
+		ChainConfig:  mergeDependsOnChainConfig(req.ChainConfig, req.DependsOn),
 		Routing:      normalizeRoutingConfig(req.Routing),
 	}
 
@@ -186,7 +187,7 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 			ParentID:     jobReq.ParentID,
 			ChainID:      jobReq.ChainID,
 			ChainStep:    jobReq.ChainStep,
-			ChainConfig:  jobReq.ChainConfig,
+			ChainConfig:  mergeDependsOnChainConfig(jobReq.ChainConfig, jobReq.DependsOn),
 			Routing:      normalizeRoutingConfig(jobReq.Routing),
 		}
 	}
@@ -206,6 +207,35 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 	}
 
 	return applyOpResult[BatchEnqueueResult](s, OpEnqueueBatch, op)
+}
+
+func mergeDependsOnChainConfig(chainCfg json.RawMessage, dependsOn []string) json.RawMessage {
+	if len(dependsOn) == 0 {
+		return chainCfg
+	}
+	uniq := make([]string, 0, len(dependsOn))
+	seen := map[string]struct{}{}
+	for _, id := range dependsOn {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		uniq = append(uniq, id)
+	}
+	if len(uniq) == 0 {
+		return chainCfg
+	}
+	cfg := map[string]any{}
+	if len(chainCfg) > 0 {
+		_ = json.Unmarshal(chainCfg, &cfg)
+	}
+	cfg["depends_on"] = uniq
+	out, _ := json.Marshal(cfg)
+	return out
 }
 
 func normalizeAgentConfig(cfg *AgentConfig) *AgentState {

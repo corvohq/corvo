@@ -747,3 +747,46 @@ func TestFullJobLifecycle(t *testing.T) {
 		t.Errorf("final state = %q, want %q", job.State, store.StateCompleted)
 	}
 }
+
+func TestFetchRespectsDependsOn(t *testing.T) {
+	s := testStore(t)
+
+	root, err := s.Enqueue(store.EnqueueRequest{
+		Queue:   "deps.queue",
+		Payload: json.RawMessage(`{"id":"root"}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue root: %v", err)
+	}
+	child, err := s.Enqueue(store.EnqueueRequest{
+		Queue:     "deps.queue",
+		Payload:   json.RawMessage(`{"id":"child"}`),
+		DependsOn: []string{root.JobID},
+	})
+	if err != nil {
+		t.Fatalf("enqueue child: %v", err)
+	}
+
+	first, err := s.Fetch(store.FetchRequest{
+		Queues: []string{"deps.queue"}, WorkerID: "w1", Hostname: "h1",
+	})
+	if err != nil {
+		t.Fatalf("fetch first: %v", err)
+	}
+	if first == nil || first.JobID != root.JobID {
+		t.Fatalf("expected root first, got %#v", first)
+	}
+	if err := s.Ack(first.JobID, json.RawMessage(`{"ok":true}`)); err != nil {
+		t.Fatalf("ack root: %v", err)
+	}
+
+	second, err := s.Fetch(store.FetchRequest{
+		Queues: []string{"deps.queue"}, WorkerID: "w2", Hostname: "h2",
+	})
+	if err != nil {
+		t.Fatalf("fetch second: %v", err)
+	}
+	if second == nil || second.JobID != child.JobID {
+		t.Fatalf("expected dependent child, got %#v", second)
+	}
+}
