@@ -45,7 +45,7 @@ func testWorkerClient(t *testing.T, opts ...Option) (*Client, *store.Store) {
 	s := store.NewStore(da, da.SQLiteDB())
 	t.Cleanup(func() { s.Close() })
 
-	srv := server.New(s, nil, ":0")
+	srv := server.New(s, nil, ":0", nil)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 

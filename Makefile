@@ -1,13 +1,16 @@
-.PHONY: build run test perf lint clean
+.PHONY: build run test perf lint clean ui ui-dev
 
 BINARY := jobbie
 BUILD_DIR := bin
 
+ui:
+	cd ui && npm install && npm run build
+
+build: ui
+	CGO_ENABLED=1 go build -o $(BUILD_DIR)/$(BINARY) ./cmd/jobbie
+
 bench:
 	CGO_ENABLED=1 go build -o $(BUILD_DIR)/bench ./cmd/bench
-
-build:
-	CGO_ENABLED=1 go build -o $(BUILD_DIR)/$(BINARY) ./cmd/jobbie
 
 run: build
 	./$(BUILD_DIR)/$(BINARY) server
@@ -22,4 +25,7 @@ lint:
 	golangci-lint run ./...
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD_DIR) ui/dist ui/node_modules
+
+ui-dev:
+	cd ui && npm run dev

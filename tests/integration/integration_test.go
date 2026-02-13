@@ -35,7 +35,7 @@ func setup(t *testing.T) *testEnv {
 	s := store.NewStore(da, da.SQLiteDB())
 	t.Cleanup(func() { s.Close() })
 	sched := scheduler.New(s, nil, scheduler.DefaultConfig())
-	srv := server.New(s, nil, ":0")
+	srv := server.New(s, nil, ":0", nil)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 

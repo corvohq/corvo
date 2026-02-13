@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -27,6 +28,7 @@ type Server struct {
 	cluster    ClusterInfo
 	httpServer *http.Server
 	router     chi.Router
+	uiFS       fs.FS
 }
 
 // ClusterInfo contains cluster state methods used by HTTP handlers/middleware.
@@ -40,8 +42,9 @@ type ClusterInfo interface {
 }
 
 // New creates a new Server.
-func New(s *store.Store, cluster ClusterInfo, bindAddr string) *Server {
-	srv := &Server{store: s, cluster: cluster}
+// If uiAssets is non-nil the embedded SPA will be served at /ui/.
+func New(s *store.Store, cluster ClusterInfo, bindAddr string, uiAssets fs.FS) *Server {
+	srv := &Server{store: s, cluster: cluster, uiFS: uiAssets}
 	srv.router = srv.buildRouter()
 	srv.httpServer = &http.Server{
 		Addr: bindAddr,
@@ -69,6 +72,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/workers", s.handleListWorkers)
 		r.Get("/cluster/status", s.handleClusterStatus)
 		r.Get("/cluster/events", s.handleClusterEvents)
+		r.Get("/events", s.handleSSE)
 
 		// Write endpoints (leader only when clustered)
 		r.Group(func(r chi.Router) {
@@ -116,7 +120,51 @@ func (s *Server) buildRouter() chi.Router {
 
 	r.Get("/healthz", s.handleHealthz)
 
+	// Embedded UI SPA
+	if s.uiFS != nil {
+		s.mountUI(r)
+	}
+
 	return r
+}
+
+// mountUI serves the embedded SPA. Static assets are served directly;
+// any other /ui/* path gets index.html for client-side routing.
+func (s *Server) mountUI(r chi.Router) {
+	fileServer := http.FileServer(http.FS(s.uiFS))
+
+	r.Get("/ui/*", func(w http.ResponseWriter, r *http.Request) {
+		// Strip /ui/ prefix and check if the file exists.
+		path := strings.TrimPrefix(r.URL.Path, "/ui/")
+		if path == "" {
+			path = "index.html"
+		}
+
+		// Try to open the file. If it exists, serve it.
+		f, err := s.uiFS.Open(path)
+		if err == nil {
+			f.Close()
+			// Serve via file server (with /ui/ prefix stripped).
+			http.StripPrefix("/ui/", fileServer).ServeHTTP(w, r)
+			return
+		}
+
+		// File not found — serve index.html for SPA routing.
+		f, err = s.uiFS.Open("index.html")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		f.Close()
+
+		r.URL.Path = "/ui/index.html"
+		http.StripPrefix("/ui/", fileServer).ServeHTTP(w, r)
+	})
+
+	// Redirect bare /ui to /ui/
+	r.Get("/ui", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/ui/", http.StatusMovedPermanently)
+	})
 }
 
 // Start begins listening for HTTP requests.

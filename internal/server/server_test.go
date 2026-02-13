@@ -52,7 +52,7 @@ func testServer(t *testing.T) (*Server, *store.Store) {
 
 	s := store.NewStore(da, da.SQLiteDB())
 	t.Cleanup(func() { s.Close() })
-	srv := New(s, nil, ":0")
+	srv := New(s, nil, ":0", nil)
 	return srv, s
 }
 
@@ -86,7 +86,7 @@ func TestHealthz(t *testing.T) {
 
 func TestRebuildSQLiteEndpointCluster(t *testing.T) {
 	_, s := testServer(t)
-	srv := New(s, mockCluster{isLeader: true}, ":0")
+	srv := New(s, mockCluster{isLeader: true}, ":0", nil)
 	rr := doRequest(srv, "POST", "/api/v1/admin/rebuild-sqlite", nil)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, body: %s", rr.Code, rr.Body.String())
@@ -100,7 +100,7 @@ func TestRebuildSQLiteEndpointCluster(t *testing.T) {
 
 func TestClusterStatusIncludesSQLiteStats(t *testing.T) {
 	_, s := testServer(t)
-	srv := New(s, mockCluster{isLeader: true}, ":0")
+	srv := New(s, mockCluster{isLeader: true}, ":0", nil)
 	rr := doRequest(srv, "GET", "/api/v1/cluster/status", nil)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, body: %s", rr.Code, rr.Body.String())
@@ -469,7 +469,7 @@ func TestClusterEventsEndpoint(t *testing.T) {
 	}
 	t.Cleanup(func() { da.Close() })
 	s := store.NewStore(da, da.SQLiteDB())
-	srv := New(s, mockCluster{isLeader: true}, ":0")
+	srv := New(s, mockCluster{isLeader: true}, ":0", nil)
 	rr := doRequest(srv, "GET", "/api/v1/cluster/events?limit=10", nil)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("cluster events status = %d, body: %s", rr.Code, rr.Body.String())
@@ -523,7 +523,7 @@ func TestWriteProxyToLeader(t *testing.T) {
 	followerSrv := New(followerStore, mockCluster{
 		isLeader:   false,
 		leaderAddr: leaderURL.String(),
-	}, ":0")
+	}, ":0", nil)
 	followerTS := httptest.NewServer(followerSrv.Handler())
 	defer followerTS.Close()
 

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/user/jobbie/internal/scheduler"
 	"github.com/user/jobbie/internal/server"
 	"github.com/user/jobbie/internal/store"
+	uiassets "github.com/user/jobbie/ui"
 )
 
 var (
@@ -174,7 +176,12 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 
 	// Start HTTP server
-	srv := server.New(s, cluster, bindAddr)
+	// Mount embedded UI assets (dist/ subdirectory of the embed.FS).
+	var uiFS fs.FS
+	if sub, err := fs.Sub(uiassets.Assets, "dist"); err == nil {
+		uiFS = sub
+	}
+	srv := server.New(s, cluster, bindAddr, uiFS)
 	go func() {
 		if err := srv.Start(); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTP server error", "error", err)
