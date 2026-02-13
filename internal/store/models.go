@@ -212,6 +212,7 @@ type JobIteration struct {
 	Iteration           int             `json:"iteration"`
 	Status              string          `json:"status"`
 	Checkpoint          json.RawMessage `json:"checkpoint,omitempty"`
+	Trace               json.RawMessage `json:"trace,omitempty"`
 	HoldReason          *string         `json:"hold_reason,omitempty"`
 	Result              json.RawMessage `json:"result,omitempty"`
 	InputTokens         int64           `json:"input_tokens,omitempty"`

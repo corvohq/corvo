@@ -11,6 +11,7 @@ type AckRequest struct {
 	JobID       string
 	Result      json.RawMessage
 	Checkpoint  json.RawMessage
+	Trace       json.RawMessage
 	Usage       *UsageReport
 	AgentStatus string
 	HoldReason  string
@@ -54,6 +55,7 @@ func (s *Store) AckJob(req AckRequest) error {
 		JobID:       req.JobID,
 		Result:      req.Result,
 		Checkpoint:  req.Checkpoint,
+		Trace:       req.Trace,
 		Usage:       normUsage,
 		AgentStatus: status,
 		HoldReason:  strings.TrimSpace(req.HoldReason),

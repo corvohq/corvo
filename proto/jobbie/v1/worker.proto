@@ -90,6 +90,7 @@ message AckRequest {
   string checkpoint_json = 4;
   string agent_status = 5;
   string hold_reason = 6;
+  string trace_json = 7;
 }
 
 message AckResponse {}

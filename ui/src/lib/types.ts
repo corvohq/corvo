@@ -182,6 +182,7 @@ export interface JobIteration {
   iteration: number;
   status: "continue" | "done" | "hold" | string;
   checkpoint?: unknown;
+  trace?: unknown;
   hold_reason?: string;
   result?: unknown;
   input_tokens?: number;

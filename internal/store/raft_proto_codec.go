@@ -186,6 +186,7 @@ type pbAckOp struct {
 	Checkpoint  []byte         `protobuf:"bytes,5,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
 	AgentStatus string         `protobuf:"bytes,6,opt,name=agent_status,json=agentStatus,proto3" json:"agent_status,omitempty"`
 	HoldReason  string         `protobuf:"bytes,7,opt,name=hold_reason,json=holdReason,proto3" json:"hold_reason,omitempty"`
+	Trace       []byte         `protobuf:"bytes,8,opt,name=trace,proto3" json:"trace,omitempty"`
 }
 
 func (m *pbAckOp) Reset()         { *m = pbAckOp{} }
@@ -1111,6 +1112,7 @@ func toPBAck(op AckOp) *pbAckOp {
 		Checkpoint:  append([]byte(nil), op.Checkpoint...),
 		AgentStatus: op.AgentStatus,
 		HoldReason:  op.HoldReason,
+		Trace:       append([]byte(nil), op.Trace...),
 	}
 }
 
@@ -1123,6 +1125,7 @@ func fromPBAck(op *pbAckOp) AckOp {
 		Checkpoint:  append([]byte(nil), op.Checkpoint...),
 		AgentStatus: op.AgentStatus,
 		HoldReason:  op.HoldReason,
+		Trace:       append([]byte(nil), op.Trace...),
 	}
 }
 

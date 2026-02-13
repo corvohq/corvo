@@ -780,6 +780,7 @@ func ensureMaterializedViewSchema(db *sql.DB) error {
 		{table: "jobs", name: "routing", sql: "ALTER TABLE jobs ADD COLUMN routing TEXT"},
 		{table: "jobs", name: "routing_target", sql: "ALTER TABLE jobs ADD COLUMN routing_target TEXT"},
 		{table: "jobs", name: "routing_index", sql: "ALTER TABLE jobs ADD COLUMN routing_index INTEGER NOT NULL DEFAULT 0"},
+		{table: "job_iterations", name: "trace", sql: "ALTER TABLE job_iterations ADD COLUMN trace TEXT"},
 		{table: "queues", name: "provider", sql: "ALTER TABLE queues ADD COLUMN provider TEXT REFERENCES providers(name)"},
 	}
 	for _, c := range columns {
@@ -799,7 +800,6 @@ CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_id) WHERE parent_id IS
 CREATE INDEX IF NOT EXISTS idx_jobs_chain ON jobs(chain_id) WHERE chain_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_jobs_provider_error ON jobs(provider_error) WHERE provider_error = 1;
 CREATE INDEX IF NOT EXISTS idx_jobs_routing_target ON jobs(routing_target) WHERE routing_target IS NOT NULL;
-		CREATE INDEX IF NOT EXISTS idx_jobs_routing_target ON jobs(routing_target) WHERE routing_target IS NOT NULL;
 	`)
 	return err
 }
@@ -984,6 +984,7 @@ CREATE TABLE IF NOT EXISTS job_iterations (
     iteration             INTEGER NOT NULL,
     status                TEXT NOT NULL,
     checkpoint            TEXT,
+    trace                 TEXT,
     hold_reason           TEXT,
     result                TEXT,
     input_tokens          INTEGER NOT NULL DEFAULT 0,

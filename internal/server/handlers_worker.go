@@ -178,6 +178,7 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Result      json.RawMessage    `json:"result"`
 		Checkpoint  json.RawMessage    `json:"checkpoint"`
+		Trace       json.RawMessage    `json:"trace"`
 		Usage       *store.UsageReport `json:"usage"`
 		AgentStatus string             `json:"agent_status"`
 		HoldReason  string             `json:"hold_reason"`
@@ -188,6 +189,7 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 		JobID:       jobID,
 		Result:      body.Result,
 		Checkpoint:  body.Checkpoint,
+		Trace:       body.Trace,
 		Usage:       body.Usage,
 		AgentStatus: body.AgentStatus,
 		HoldReason:  body.HoldReason,

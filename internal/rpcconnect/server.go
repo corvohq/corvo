@@ -177,6 +177,7 @@ func (s *Server) Ack(ctx context.Context, req *connect.Request[jobbiev1.AckReque
 		JobID:       req.Msg.GetJobId(),
 		Result:      json.RawMessage(resultJSON),
 		Checkpoint:  json.RawMessage(strings.TrimSpace(req.Msg.GetCheckpointJson())),
+		Trace:       json.RawMessage(strings.TrimSpace(req.Msg.GetTraceJson())),
 		Usage:       usageFromPB(req.Msg.GetUsage()),
 		AgentStatus: req.Msg.GetAgentStatus(),
 		HoldReason:  req.Msg.GetHoldReason(),

@@ -214,7 +214,7 @@ func (s *Store) ReplayFromIteration(id string, from int) (*EnqueueResult, error)
 
 func (s *Store) ListJobIterations(id string) ([]JobIteration, error) {
 	rows, err := s.sqliteR.Query(`
-		SELECT id, job_id, iteration, status, checkpoint, hold_reason, result,
+		SELECT id, job_id, iteration, status, checkpoint, trace, hold_reason, result,
 			input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
 			model, provider, cost_usd, created_at
 		FROM job_iterations
@@ -229,11 +229,11 @@ func (s *Store) ListJobIterations(id string) ([]JobIteration, error) {
 	out := make([]JobIteration, 0, 16)
 	for rows.Next() {
 		var it JobIteration
-		var checkpoint, holdReason, result sql.NullString
+		var checkpoint, trace, holdReason, result sql.NullString
 		var model, provider sql.NullString
 		var createdAt string
 		if err := rows.Scan(
-			&it.ID, &it.JobID, &it.Iteration, &it.Status, &checkpoint, &holdReason, &result,
+			&it.ID, &it.JobID, &it.Iteration, &it.Status, &checkpoint, &trace, &holdReason, &result,
 			&it.InputTokens, &it.OutputTokens, &it.CacheCreationTokens, &it.CacheReadTokens,
 			&model, &provider, &it.CostUSD, &createdAt,
 		); err != nil {
@@ -241,6 +241,9 @@ func (s *Store) ListJobIterations(id string) ([]JobIteration, error) {
 		}
 		if checkpoint.Valid {
 			it.Checkpoint = json.RawMessage(checkpoint.String)
+		}
+		if trace.Valid {
+			it.Trace = json.RawMessage(trace.String)
 		}
 		if holdReason.Valid {
 			it.HoldReason = &holdReason.String

@@ -214,6 +214,7 @@ type AckOptions struct {
 	JobID       string
 	Result      json.RawMessage
 	Checkpoint  json.RawMessage
+	Trace       json.RawMessage
 	Usage       *UsageReport
 	AgentStatus string
 	HoldReason  string
@@ -229,6 +230,7 @@ func (c *Client) AckWithOptions(ctx context.Context, req AckOptions) error {
 		resultJSON = `{}`
 	}
 	checkpointJSON := strings.TrimSpace(string(req.Checkpoint))
+	traceJSON := strings.TrimSpace(string(req.Trace))
 	_, err := c.rpc.Ack(ctx, connect.NewRequest(&jobbiev1.AckRequest{
 		JobId:          jobID,
 		ResultJson:     resultJSON,
@@ -236,6 +238,7 @@ func (c *Client) AckWithOptions(ctx context.Context, req AckOptions) error {
 		CheckpointJson: checkpointJSON,
 		AgentStatus:    req.AgentStatus,
 		HoldReason:     req.HoldReason,
+		TraceJson:      traceJSON,
 	}))
 	return err
 }

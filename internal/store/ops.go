@@ -149,6 +149,7 @@ type AckOp struct {
 	JobID       string          `json:"job_id"`
 	Result      json.RawMessage `json:"result,omitempty"`
 	Checkpoint  json.RawMessage `json:"checkpoint,omitempty"`
+	Trace       json.RawMessage `json:"trace,omitempty"`
 	Usage       *UsageReport    `json:"usage,omitempty"`
 	AgentStatus string          `json:"agent_status,omitempty"`
 	HoldReason  string          `json:"hold_reason,omitempty"`

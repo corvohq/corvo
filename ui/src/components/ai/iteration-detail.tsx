@@ -1,6 +1,7 @@
 interface IterationDetailProps {
   iteration: {
     checkpoint?: unknown;
+    trace?: unknown;
     result?: unknown;
     hold_reason?: string;
   };
@@ -31,6 +32,18 @@ export function IterationDetail({ iteration }: IterationDetailProps) {
           </pre>
         </div>
       )}
+      {iteration.trace != null && (
+        <div>
+          <h4 className="mb-1 text-xs font-medium text-muted-foreground">
+            Trace
+          </h4>
+          <pre className="overflow-auto rounded bg-muted p-2 text-xs whitespace-pre-wrap">
+            {typeof iteration.trace === "string"
+              ? iteration.trace
+              : JSON.stringify(iteration.trace, null, 2)}
+          </pre>
+        </div>
+      )}
       {iteration.hold_reason && (
         <div>
           <h4 className="mb-1 text-xs font-medium text-muted-foreground">
@@ -41,9 +54,12 @@ export function IterationDetail({ iteration }: IterationDetailProps) {
           </p>
         </div>
       )}
-      {!iteration.checkpoint && !iteration.result && !iteration.hold_reason && (
+      {!iteration.checkpoint &&
+        !iteration.trace &&
+        !iteration.result &&
+        !iteration.hold_reason && (
         <p className="text-xs text-muted-foreground">No detail available</p>
-      )}
+        )}
     </div>
   );
 }

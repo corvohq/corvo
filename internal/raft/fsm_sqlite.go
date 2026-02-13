@@ -401,13 +401,17 @@ func sqliteInsertJobIteration(db sqlExecer, job store.Job, op store.AckOp, statu
 	if job.Agent == nil {
 		return nil
 	}
-	var checkpoint, holdReason, result *string
+	var checkpoint, trace, holdReason, result *string
 	if len(op.Checkpoint) > 0 {
 		s := string(op.Checkpoint)
 		checkpoint = &s
 	} else if len(job.Checkpoint) > 0 {
 		s := string(job.Checkpoint)
 		checkpoint = &s
+	}
+	if len(op.Trace) > 0 {
+		s := string(op.Trace)
+		trace = &s
 	}
 	if op.HoldReason != "" {
 		holdReason = &op.HoldReason
@@ -431,11 +435,11 @@ func sqliteInsertJobIteration(db sqlExecer, job store.Job, op store.AckOp, statu
 		costUSD = op.Usage.CostUSD
 	}
 	_, err := db.Exec(`INSERT INTO job_iterations (
-		job_id, iteration, status, checkpoint, hold_reason, result,
+		job_id, iteration, status, checkpoint, trace, hold_reason, result,
 		input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
 		model, provider, cost_usd, created_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		job.ID, job.Agent.Iteration, status, checkpoint, holdReason, result,
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		job.ID, job.Agent.Iteration, status, checkpoint, trace, holdReason, result,
 		inputTokens, outputTokens, cacheCreate, cacheRead, model, provider, costUSD, createdAt,
 	)
 	if err != nil {

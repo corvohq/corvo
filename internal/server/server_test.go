@@ -652,6 +652,12 @@ func TestJobIterationsEndpoint(t *testing.T) {
 	rr = doRequest(srv, "POST", "/api/v1/ack/"+f1.JobID, map[string]any{
 		"agent_status": "continue",
 		"checkpoint":   map[string]any{"step": 1},
+		"trace": map[string]any{
+			"model": "claude-sonnet",
+			"tool_calls": []map[string]any{
+				{"name": "search", "args": map[string]any{"q": "jobbie"}},
+			},
+		},
 		"usage": map[string]any{
 			"cost_usd": 0.12,
 		},
@@ -699,6 +705,9 @@ func TestJobIterationsEndpoint(t *testing.T) {
 	}
 	if out.Iterations[0].Status != "continue" {
 		t.Fatalf("iteration 1 status = %s, want continue", out.Iterations[0].Status)
+	}
+	if string(out.Iterations[0].Trace) == "" {
+		t.Fatalf("iteration 1 trace should be present")
 	}
 	if out.Iterations[1].Status != "done" {
 		t.Fatalf("iteration 2 status = %s, want done", out.Iterations[1].Status)
