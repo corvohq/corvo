@@ -93,6 +93,29 @@ Latest run (2026-02-12):
 - `TestPerfE2EEnqueueHTTP`: `15,329.0 ops/sec` (`total=4000`, `c=10`)
 - `TestPerfE2ELifecycleRPC`: `27,833.5 ops/sec` (`total=3000`, `c=10`)
 
+## High-Concurrency Validation (Latest)
+
+Date: 2026-02-12
+
+Server profile:
+- `--durable=false`
+- `--raft-store badger`
+- admission keying includes job-sharded buckets for ack/fail/retry/cancel/move/delete paths
+
+Command:
+- `./bin/bench -server http://127.0.0.1:18080 -protocol rpc -jobs 10000 -enqueue-batch-size 1 -concurrency {10|200}`
+
+Results (sequential runs):
+
+| Concurrency | Enqueue ops/sec | Enqueue p99 | Lifecycle ops/sec | Lifecycle p99 | Overloaded (enqueue/lifecycle) |
+|-------------|----------------:|------------:|------------------:|--------------:|-------------------------------:|
+| 10          | 22,723.9        | 1.569ms     | 33,833.4          | 23.927ms      | 0 / 0                          |
+| 200         | 23,050.7        | 19.97ms     | 2,128.4           | 212.363ms     | 448 / 246                      |
+
+Notes:
+- c200 enqueue tail improved materially with admission sharding and bounded overload behavior.
+- c200 lifecycle p99 remains elevated under heavy overload/retry pressure and stays an active tuning item.
+
 Thresholds are intentionally loose and env-configurable for machine stability:
 - `JOBBIE_PERF_E2E_ENQ_TOTAL`
 - `JOBBIE_PERF_E2E_ENQ_CONCURRENCY`

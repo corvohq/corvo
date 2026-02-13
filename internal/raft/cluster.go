@@ -301,6 +301,9 @@ func clearPebbleAll(pdb *pebble.DB) error {
 // Apply submits an operation to the Raft cluster and returns the result.
 func (c *Cluster) Apply(opType store.OpType, data any) *store.OpResult {
 	key := admissionKey(opType, data)
+	if c.shouldShedLoad() {
+		return c.overloadedResult("raft apply overloaded: system under pressure")
+	}
 	if !c.tryAcquireAdmission(key) {
 		return c.overloadedResult(fmt.Sprintf("raft apply overloaded for key %q: too many in-flight requests", key))
 	}
@@ -329,6 +332,20 @@ func (c *Cluster) Apply(opType store.OpType, data any) *store.OpResult {
 		c.releaseAdmission(key)
 		return &store.OpResult{Err: fmt.Errorf("raft cluster stopping")}
 	}
+}
+
+func (c *Cluster) shouldShedLoad() bool {
+	backlog := len(c.applyCh)
+	c.admitMu.Lock()
+	inFlight := c.inFlightN
+	c.admitMu.Unlock()
+	if c.config.ApplyMaxPending > 0 && backlog >= (c.config.ApplyMaxPending*3)/4 {
+		return true
+	}
+	if c.config.ApplyMaxTotalInFly > 0 && inFlight >= (c.config.ApplyMaxTotalInFly*9)/10 {
+		return true
+	}
+	return false
 }
 
 func (c *Cluster) tryAcquireAdmission(key string) bool {
@@ -424,6 +441,38 @@ func admissionKey(opType store.OpType, data any) string {
 				return "q:" + op.Queues[0]
 			}
 		}
+	case store.OpAck:
+		if op, ok := data.(store.AckOp); ok && op.JobID != "" {
+			return shardKey("j:", op.JobID)
+		}
+	case store.OpAckBatch:
+		if op, ok := data.(store.AckBatchOp); ok {
+			for _, ack := range op.Acks {
+				if ack.JobID != "" {
+					return shardKey("j:", ack.JobID)
+				}
+			}
+		}
+	case store.OpFail:
+		if op, ok := data.(store.FailOp); ok && op.JobID != "" {
+			return shardKey("j:", op.JobID)
+		}
+	case store.OpRetryJob:
+		if op, ok := data.(store.RetryJobOp); ok && op.JobID != "" {
+			return shardKey("j:", op.JobID)
+		}
+	case store.OpCancelJob:
+		if op, ok := data.(store.CancelJobOp); ok && op.JobID != "" {
+			return shardKey("j:", op.JobID)
+		}
+	case store.OpMoveJob:
+		if op, ok := data.(store.MoveJobOp); ok && op.JobID != "" {
+			return shardKey("j:", op.JobID)
+		}
+	case store.OpDeleteJob:
+		if op, ok := data.(store.DeleteJobOp); ok && op.JobID != "" {
+			return shardKey("j:", op.JobID)
+		}
 	case store.OpHeartbeat:
 		if op, ok := data.(store.HeartbeatOp); ok && len(op.Jobs) > 0 {
 			// Heartbeats are worker-originated but currently don't carry worker ID.
@@ -449,6 +498,13 @@ func admissionKey(opType store.OpType, data any) string {
 		}
 	}
 	return "g:*"
+}
+
+func shardKey(prefix, id string) string {
+	if len(id) >= 6 {
+		return prefix + id[:6]
+	}
+	return prefix + id
 }
 
 func (c *Cluster) applyLoop() {

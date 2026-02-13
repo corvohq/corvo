@@ -137,3 +137,5 @@ Exit criteria:
   - Removed JSON bridge conversion in protobuf dispatch path (`applyTypedViaJSON`)
 - [x] Overload pressure regression coverage:
   - Added `internal/raft/cluster_test.go` burst test to assert overload errors include retry hints under constrained admission
+- [x] Admission key refinement for high concurrency:
+  - Sharded ack/fail/retry/cancel/move/delete admission keys by job-id prefix to reduce global-key contention at high worker counts

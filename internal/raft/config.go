@@ -45,9 +45,11 @@ func DefaultClusterConfig() ClusterConfig {
 		ApplyBatchWindow:   8 * time.Millisecond,
 		ApplyBatchMinWait:  100 * time.Microsecond,
 		ApplyBatchExtendAt: 32,
-		ApplyMaxPending:    4096,
-		ApplyMaxInFlight:   96,
-		ApplyMaxTotalInFly: 2048,
+		// Keep pending queue bounded to avoid long-tail queueing under extreme
+		// burst concurrency; prefer explicit overload signaling + retry hints.
+		ApplyMaxPending:    1024,
+		ApplyMaxInFlight:   64,
+		ApplyMaxTotalInFly: 512,
 		ApplySubBatchMax:   128,
 		LifecycleEvents:    false,
 	}
