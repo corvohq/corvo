@@ -20,6 +20,8 @@ import (
 	"github.com/user/jobbie/pkg/workerclient"
 )
 
+const streamsPerRPCClient = 200
+
 type benchResult struct {
 	lats    []time.Duration
 	elapsed time.Duration
@@ -41,6 +43,8 @@ func main() {
 	protocol := flag.String("protocol", "rpc", "benchmark transport: rpc, http, or matrix")
 	jobs := flag.Int("jobs", 10000, "total number of jobs to process")
 	concurrency := flag.Int("concurrency", 10, "number of concurrent goroutines")
+	workers := flag.Int("workers", 1, "number of logical workers for lifecycle benchmark (total lifecycle streams = workers * concurrency)")
+	workerQueues := flag.Bool("worker-queues", false, "use a distinct queue per worker for enqueue+lifecycle benchmarks")
 	repeats := flag.Int("repeats", 1, "number of benchmark repeats per protocol")
 	repeatPause := flag.Duration("repeat-pause", 0, "pause between repeats (e.g. 500ms)")
 	queue := flag.String("queue", "bench.q", "queue name")
@@ -55,6 +59,8 @@ func main() {
 	fmt.Printf("  protocol:    %s\n", *protocol)
 	fmt.Printf("  jobs:        %d\n", *jobs)
 	fmt.Printf("  concurrency: %d\n", *concurrency)
+	fmt.Printf("  workers:     %d\n", *workers)
+	fmt.Printf("  worker-queues: %t\n", *workerQueues)
 	fmt.Printf("  repeats:     %d\n", *repeats)
 	fmt.Printf("  queue:       %s\n\n", *queue)
 	fmt.Printf("  enqueue-batch: %d\n", *enqueueBatchSize)
@@ -83,16 +89,16 @@ func main() {
 		enqRuns := make([]runSummary, 0, *repeats)
 		lcRuns := make([]runSummary, 0, *repeats)
 		for i := 1; i <= *repeats; i++ {
-			clearQueue(httpC, *server, *queue)
+			clearBenchQueues(httpC, *server, *queue, *workers, *workerQueues)
 			if *repeats > 1 {
 				fmt.Printf("\n-- Run %d/%d --\n", i, *repeats)
 			}
 			fmt.Println("=== Enqueue Benchmark ===")
-			enqResult := benchEnqueue(mode, *server, *jobs, *concurrency, *queue, *enqueueBatchSize)
+			enqResult := benchEnqueue(mode, *server, *jobs, *concurrency, *workers, *queue, *enqueueBatchSize, *workerQueues)
 			enqRuns = append(enqRuns, printStats(enqResult))
 
-			fmt.Println("\n=== Lifecycle Benchmark (enqueue -> fetch -> ack) ===")
-			lcResult := benchLifecycle(mode, httpC, *server, *jobs, *concurrency, *queue, *fetchBatchSize, *ackBatchSize, *workDuration)
+			fmt.Println("\n=== Processing Benchmark (fetch -> ack) ===")
+			lcResult := benchLifecycle(mode, httpC, *server, *jobs, *workers, *concurrency, *queue, *fetchBatchSize, *ackBatchSize, *workDuration, *workerQueues)
 			lcRuns = append(lcRuns, printStats(lcResult))
 
 			if i < *repeats && *repeatPause > 0 {
@@ -119,14 +125,19 @@ func main() {
 	}
 }
 
-func benchEnqueue(protocol, serverURL string, total, concurrency int, queue string, enqueueBatchSize int) benchResult {
+func benchEnqueue(protocol, serverURL string, total, concurrency, workers int, queue string, enqueueBatchSize int, workerQueues bool) benchResult {
 	if enqueueBatchSize <= 0 {
 		enqueueBatchSize = 1
 	}
 	lats := make([]time.Duration, total)
 	var idx atomic.Int64
+	var queueRR atomic.Int64
 	var overloads atomic.Int64
 	var wg sync.WaitGroup
+	var rpcClients []*workerclient.Client
+	if protocol != "http" {
+		rpcClients = newRPCClientPool(serverURL, concurrency)
+	}
 
 	perWorker := total / concurrency
 	remainder := total % concurrency
@@ -144,8 +155,12 @@ func benchEnqueue(protocol, serverURL string, total, concurrency int, queue stri
 			if protocol == "http" && enqueueBatchSize == 1 {
 				c := client.New(serverURL)
 				for range count {
+					targetQueue := queue
+					if workerQueues {
+						targetQueue = workerQueueName(queue, workers, int(queueRR.Add(1)-1)%max(workers, 1))
+					}
 					opStart := time.Now()
-					_, err := c.Enqueue(queue, map[string]any{})
+					_, err := c.Enqueue(targetQueue, map[string]any{})
 					if err != nil {
 						if isOverloadErr(err) {
 							overloads.Add(1)
@@ -173,7 +188,11 @@ func benchEnqueue(protocol, serverURL string, total, concurrency int, queue stri
 					}
 					jobs := make([]client.BatchJob, 0, n)
 					for range n {
-						jobs = append(jobs, client.BatchJob{Queue: queue, Payload: map[string]any{}})
+						targetQueue := queue
+						if workerQueues {
+							targetQueue = workerQueueName(queue, workers, int(queueRR.Add(1)-1)%max(workers, 1))
+						}
+						jobs = append(jobs, client.BatchJob{Queue: targetQueue, Payload: map[string]any{}})
 					}
 					opStart := time.Now()
 					resp, err := c.EnqueueBatch(client.BatchRequest{Jobs: jobs})
@@ -199,7 +218,7 @@ func benchEnqueue(protocol, serverURL string, total, concurrency int, queue stri
 				return
 			}
 
-			wc := workerclient.New(serverURL)
+			wc := rpcClients[i%len(rpcClients)]
 			ctx := context.Background()
 			stream := wc.OpenLifecycleStream(ctx)
 			defer stream.Close()
@@ -214,8 +233,12 @@ func benchEnqueue(protocol, serverURL string, total, concurrency int, queue stri
 				}
 				enqueues := make([]workerclient.LifecycleEnqueueItem, 0, n)
 				for range n {
+					targetQueue := queue
+					if workerQueues {
+						targetQueue = workerQueueName(queue, workers, int(queueRR.Add(1)-1)%max(workers, 1))
+					}
 					enqueues = append(enqueues, workerclient.LifecycleEnqueueItem{
-						Queue:   queue,
+						Queue:   targetQueue,
 						Payload: json.RawMessage(`{}`),
 					})
 				}
@@ -273,31 +296,49 @@ func benchEnqueue(protocol, serverURL string, total, concurrency int, queue stri
 	return benchResult{lats: lats[:actual], elapsed: elapsed}
 }
 
-func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total, concurrency int, queue string, fetchBatchSize, ackBatchSize int, workDuration time.Duration) benchResult {
+func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total, workers, concurrency int, queue string, fetchBatchSize, ackBatchSize int, workDuration time.Duration, workerQueues bool) benchResult {
+	// This benchmark measures worker processing latency and throughput:
+	// fetch -> optional work-duration sleep -> ack.
 	if fetchBatchSize <= 0 {
 		fetchBatchSize = 1
 	}
 	if ackBatchSize <= 0 {
 		ackBatchSize = 1
 	}
+	if workers <= 0 {
+		workers = 1
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
 	lats := make([]time.Duration, total)
 	var idx atomic.Int64
 	var overloads atomic.Int64
 	var wg sync.WaitGroup
+	var rpcClients []*workerclient.Client
+	if protocol != "http" {
+		rpcClients = newRPCClientPool(serverURL, workers*concurrency)
+	}
 
-	perWorker := total / concurrency
-	remainder := total % concurrency
+	totalStreams := workers * concurrency
+	perStream := total / totalStreams
+	remainder := total % totalStreams
 
 	start := time.Now()
 
-	for i := range concurrency {
-		n := perWorker
+	for i := range totalStreams {
+		n := perStream
 		if i < remainder {
 			n++
 		}
-		workerID := fmt.Sprintf("bench-worker-%d", i)
+		workerIdx := i / concurrency
+		workerID := fmt.Sprintf("bench-worker-%d", workerIdx)
+		workerQueue := queue
+		if workerQueues {
+			workerQueue = workerQueueName(queue, workers, workerIdx)
+		}
 		wg.Add(1)
-		go func(count int, wid string) {
+		go func(count int, wid, wq string) {
 			defer wg.Done()
 			if protocol == "http" {
 				remaining := count
@@ -339,7 +380,7 @@ func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total
 					if fetchN > remaining {
 						fetchN = remaining
 					}
-					fetched, err := fetchJobs(httpC, serverURL, queue, wid, fetchN)
+					fetched, err := fetchJobs(httpC, serverURL, wq, wid, fetchN)
 					if err != nil {
 						if isOverloadErr(err) {
 							overloads.Add(1)
@@ -359,7 +400,7 @@ func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total
 				}
 				return
 			}
-			wc := workerclient.New(serverURL)
+			wc := rpcClients[i%len(rpcClients)]
 			ctx := context.Background()
 			stream := wc.OpenLifecycleStream(ctx)
 			defer stream.Close()
@@ -395,7 +436,7 @@ func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total
 				frameStart := time.Now()
 				resp, err := stream.Exchange(workerclient.LifecycleRequest{
 					RequestID:    requestID,
-					Queues:       []string{queue},
+					Queues:       []string{wq},
 					WorkerID:     wid,
 					Hostname:     "bench-host",
 					LeaseSeconds: 1,
@@ -418,13 +459,14 @@ func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total
 					time.Sleep(2 * time.Millisecond)
 					continue
 				}
+				overloadedFrame := false
 				if resp.Error != "" {
 					if isOverloadMsg(resp.Error) {
 						overloads.Add(1)
-						time.Sleep(overloadBackoff(overloads.Load()))
-						continue
+						overloadedFrame = true
+					} else {
+						fmt.Fprintf(os.Stderr, "lifecycle stream frame error: %s\n", resp.Error)
 					}
-					fmt.Fprintf(os.Stderr, "lifecycle stream frame error: %s\n", resp.Error)
 				}
 
 				acked := resp.Acked
@@ -439,6 +481,9 @@ func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total
 						continue
 					}
 					pos := idx.Add(1) - 1
+					if pos >= int64(total) {
+						break
+					}
 					lats[pos] = now.Sub(started)
 					delete(pendingStart, id)
 				}
@@ -458,8 +503,11 @@ func benchLifecycle(protocol string, httpC *http.Client, serverURL string, total
 					pendingStart[fetched.JobID] = frameStart
 					remaining--
 				}
+				if overloadedFrame {
+					time.Sleep(overloadBackoff(overloads.Load()))
+				}
 			}
-		}(n, workerID)
+		}(n, workerID, workerQueue)
 	}
 
 	wg.Wait()
@@ -589,6 +637,38 @@ func clearQueue(httpC *http.Client, serverURL, queue string) {
 		return // queue may not exist yet
 	}
 	resp.Body.Close()
+}
+
+func clearBenchQueues(httpC *http.Client, serverURL, baseQueue string, workers int, workerQueues bool) {
+	if !workerQueues || workers <= 1 {
+		clearQueue(httpC, serverURL, baseQueue)
+		return
+	}
+	for i := 0; i < workers; i++ {
+		clearQueue(httpC, serverURL, workerQueueName(baseQueue, workers, i))
+	}
+}
+
+func workerQueueName(base string, workers, idx int) string {
+	if workers <= 1 {
+		return base
+	}
+	return fmt.Sprintf("%s.w%d", base, idx)
+}
+
+func newRPCClientPool(serverURL string, totalStreams int) []*workerclient.Client {
+	if totalStreams <= 0 {
+		totalStreams = 1
+	}
+	n := (totalStreams + streamsPerRPCClient - 1) / streamsPerRPCClient
+	if n < 1 {
+		n = 1
+	}
+	clients := make([]*workerclient.Client, 0, n)
+	for range n {
+		clients = append(clients, workerclient.New(serverURL))
+	}
+	return clients
 }
 
 func summarize(r benchResult) runSummary {

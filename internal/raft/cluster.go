@@ -30,9 +30,8 @@ type Cluster struct {
 	config    ClusterConfig
 	applyCh   chan *applyRequest
 	applyExec chan []*applyRequest
-	admitMu   sync.Mutex
-	inFlight  map[string]int
-	inFlightN int
+	fetchMu   sync.Mutex
+	fetchSem  map[string]chan struct{}
 	queueHist *durationHistogram
 	applyHist *durationHistogram
 	stopCh    chan struct{}
@@ -43,7 +42,6 @@ type Cluster struct {
 type applyRequest struct {
 	opType store.OpType
 	data   any
-	key    string
 	enqAt  time.Time
 	respCh chan *store.OpResult
 }
@@ -82,11 +80,8 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 	if cfg.ApplyMaxPending <= 0 {
 		cfg.ApplyMaxPending = cfg.ApplyBatchMax * 16
 	}
-	if cfg.ApplyMaxInFlight <= 0 {
-		cfg.ApplyMaxInFlight = 256
-	}
-	if cfg.ApplyMaxTotalInFly <= 0 {
-		cfg.ApplyMaxTotalInFly = cfg.ApplyMaxInFlight * 16
+	if cfg.ApplyMaxFetchQueueInFly <= 0 {
+		cfg.ApplyMaxFetchQueueInFly = 32
 	}
 	if cfg.ApplySubBatchMax <= 0 {
 		cfg.ApplySubBatchMax = 128
@@ -217,7 +212,7 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 		config:    cfg,
 		applyCh:   make(chan *applyRequest, cfg.ApplyMaxPending),
 		applyExec: make(chan []*applyRequest, 4),
-		inFlight:  make(map[string]int),
+		fetchSem:  make(map[string]chan struct{}),
 		queueHist: newDurationHistogram(),
 		applyHist: newDurationHistogram(),
 		stopCh:    make(chan struct{}),
@@ -243,8 +238,7 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 		"apply_batch_extend_at", cfg.ApplyBatchExtendAt,
 		"apply_batch_window", cfg.ApplyBatchWindow,
 		"apply_max_pending", cfg.ApplyMaxPending,
-		"apply_max_inflight", cfg.ApplyMaxInFlight,
-		"apply_max_total_inflight", cfg.ApplyMaxTotalInFly,
+		"apply_max_fetch_queue_inflight", cfg.ApplyMaxFetchQueueInFly,
 		"apply_sub_batch_max", cfg.ApplySubBatchMax,
 		"bootstrap", cfg.Bootstrap,
 	)
@@ -300,80 +294,81 @@ func clearPebbleAll(pdb *pebble.DB) error {
 
 // Apply submits an operation to the Raft cluster and returns the result.
 func (c *Cluster) Apply(opType store.OpType, data any) *store.OpResult {
-	key := admissionKey(opType, data)
-	if c.shouldShedLoad() {
-		return c.overloadedResult("raft apply overloaded: system under pressure")
+	releaseFetch, err := c.acquireFetchQueuePermit(opType, data)
+	if err != nil {
+		return &store.OpResult{Err: err}
 	}
-	if !c.tryAcquireAdmission(key) {
-		return c.overloadedResult(fmt.Sprintf("raft apply overloaded for key %q: too many in-flight requests", key))
+	if releaseFetch != nil {
+		defer releaseFetch()
 	}
+
 	req := &applyRequest{
 		opType: opType,
 		data:   data,
-		key:    key,
 		enqAt:  time.Now(),
 		respCh: make(chan *store.OpResult, 1),
 	}
 	select {
 	case c.applyCh <- req:
 	default:
-		c.releaseAdmission(key)
 		return c.overloadedResult("raft apply overloaded: pending queue is full")
 	case <-c.stopCh:
-		c.releaseAdmission(key)
 		return &store.OpResult{Err: fmt.Errorf("raft cluster stopping")}
 	}
 
 	select {
 	case res := <-req.respCh:
-		c.releaseAdmission(key)
 		return res
 	case <-c.stopCh:
-		c.releaseAdmission(key)
 		return &store.OpResult{Err: fmt.Errorf("raft cluster stopping")}
 	}
 }
 
-func (c *Cluster) shouldShedLoad() bool {
-	backlog := len(c.applyCh)
-	c.admitMu.Lock()
-	inFlight := c.inFlightN
-	c.admitMu.Unlock()
-	if c.config.ApplyMaxPending > 0 && backlog >= (c.config.ApplyMaxPending*3)/4 {
-		return true
+func fetchQueueForOp(opType store.OpType, data any) string {
+	switch opType {
+	case store.OpFetch:
+		if op, ok := data.(store.FetchOp); ok && len(op.Queues) > 0 {
+			return op.Queues[0]
+		}
+	case store.OpFetchBatch:
+		if op, ok := data.(store.FetchBatchOp); ok && len(op.Queues) > 0 {
+			return op.Queues[0]
+		}
 	}
-	if c.config.ApplyMaxTotalInFly > 0 && inFlight >= (c.config.ApplyMaxTotalInFly*9)/10 {
-		return true
-	}
-	return false
+	return ""
 }
 
-func (c *Cluster) tryAcquireAdmission(key string) bool {
-	c.admitMu.Lock()
-	defer c.admitMu.Unlock()
-	if c.inFlightN >= c.config.ApplyMaxTotalInFly {
-		return false
+func (c *Cluster) acquireFetchQueuePermit(opType store.OpType, data any) (func(), error) {
+	queue := fetchQueueForOp(opType, data)
+	if queue == "" || c.config.ApplyMaxFetchQueueInFly <= 0 {
+		return nil, nil
 	}
-	if c.inFlight[key] >= c.config.ApplyMaxInFlight {
-		return false
+	sem := c.fetchSemaphore(queue)
+	select {
+	case sem <- struct{}{}:
+		return func() {
+			<-sem
+		}, nil
+	default:
+		return nil, store.NewOverloadedErrorRetry(
+			fmt.Sprintf("raft apply overloaded for fetch queue %q", queue),
+			2+retryJitterMs(6),
+		)
+	case <-c.stopCh:
+		return nil, fmt.Errorf("raft cluster stopping")
 	}
-	c.inFlight[key]++
-	c.inFlightN++
-	return true
 }
 
-func (c *Cluster) releaseAdmission(key string) {
-	c.admitMu.Lock()
-	defer c.admitMu.Unlock()
-	n := c.inFlight[key]
-	if n <= 1 {
-		delete(c.inFlight, key)
-	} else {
-		c.inFlight[key] = n - 1
+func (c *Cluster) fetchSemaphore(queue string) chan struct{} {
+	c.fetchMu.Lock()
+	defer c.fetchMu.Unlock()
+	sem, ok := c.fetchSem[queue]
+	if ok {
+		return sem
 	}
-	if c.inFlightN > 0 {
-		c.inFlightN--
-	}
+	sem = make(chan struct{}, c.config.ApplyMaxFetchQueueInFly)
+	c.fetchSem[queue] = sem
+	return sem
 }
 
 func (c *Cluster) overloadedResult(msg string) *store.OpResult {
@@ -382,129 +377,32 @@ func (c *Cluster) overloadedResult(msg string) *store.OpResult {
 
 func (c *Cluster) overloadRetryAfterMs() int {
 	backlog := len(c.applyCh)
-	c.admitMu.Lock()
-	inFlight := c.inFlightN
-	c.admitMu.Unlock()
-	score := 1
-	if c.config.ApplyMaxPending > 0 {
-		score += (backlog * 8) / c.config.ApplyMaxPending
+	pendingLimit := c.config.ApplyMaxPending
+	if pendingLimit <= 0 {
+		pendingLimit = 1
 	}
-	if c.config.ApplyMaxTotalInFly > 0 {
-		score += (inFlight * 8) / c.config.ApplyMaxTotalInFly
-	}
+	score := 1 + (backlog*8)/pendingLimit
 	switch {
 	case score >= 12:
-		return 10
+		return 10 + retryJitterMs(3)
 	case score >= 8:
-		return 5
+		return 5 + retryJitterMs(3)
 	case score >= 5:
-		return 2
+		return 2 + retryJitterMs(2)
 	default:
-		return 1
+		return 1 + retryJitterMs(2)
 	}
 }
 
-func admissionKey(opType store.OpType, data any) string {
-	switch opType {
-	case store.OpEnqueue:
-		if op, ok := data.(store.EnqueueOp); ok && op.Queue != "" {
-			return "q:" + op.Queue
-		}
-	case store.OpEnqueueBatch:
-		if op, ok := data.(store.EnqueueBatchOp); ok && len(op.Jobs) > 0 {
-			first := op.Jobs[0].Queue
-			if first == "" {
-				return "g:*"
-			}
-			for i := 1; i < len(op.Jobs); i++ {
-				if op.Jobs[i].Queue != first {
-					return "g:*"
-				}
-			}
-			return "q:" + first
-		}
-	case store.OpFetch:
-		if op, ok := data.(store.FetchOp); ok {
-			if op.WorkerID != "" {
-				return "w:" + op.WorkerID
-			}
-			if len(op.Queues) > 0 {
-				return "q:" + op.Queues[0]
-			}
-		}
-	case store.OpFetchBatch:
-		if op, ok := data.(store.FetchBatchOp); ok {
-			if op.WorkerID != "" {
-				return "w:" + op.WorkerID
-			}
-			if len(op.Queues) > 0 {
-				return "q:" + op.Queues[0]
-			}
-		}
-	case store.OpAck:
-		if op, ok := data.(store.AckOp); ok && op.JobID != "" {
-			return shardKey("j:", op.JobID)
-		}
-	case store.OpAckBatch:
-		if op, ok := data.(store.AckBatchOp); ok {
-			for _, ack := range op.Acks {
-				if ack.JobID != "" {
-					return shardKey("j:", ack.JobID)
-				}
-			}
-		}
-	case store.OpFail:
-		if op, ok := data.(store.FailOp); ok && op.JobID != "" {
-			return shardKey("j:", op.JobID)
-		}
-	case store.OpRetryJob:
-		if op, ok := data.(store.RetryJobOp); ok && op.JobID != "" {
-			return shardKey("j:", op.JobID)
-		}
-	case store.OpCancelJob:
-		if op, ok := data.(store.CancelJobOp); ok && op.JobID != "" {
-			return shardKey("j:", op.JobID)
-		}
-	case store.OpMoveJob:
-		if op, ok := data.(store.MoveJobOp); ok && op.JobID != "" {
-			return shardKey("j:", op.JobID)
-		}
-	case store.OpDeleteJob:
-		if op, ok := data.(store.DeleteJobOp); ok && op.JobID != "" {
-			return shardKey("j:", op.JobID)
-		}
-	case store.OpHeartbeat:
-		if op, ok := data.(store.HeartbeatOp); ok && len(op.Jobs) > 0 {
-			// Heartbeats are worker-originated but currently don't carry worker ID.
-			// Use the first job key as a stable enough shard to avoid one global
-			// heartbeat bucket causing cross-worker contention.
-			for jobID := range op.Jobs {
-				if jobID != "" {
-					return "hb:" + jobID
-				}
-			}
-		}
-	case store.OpPauseQueue, store.OpResumeQueue, store.OpClearQueue, store.OpDeleteQueue, store.OpRemoveThrottle:
-		if op, ok := data.(store.QueueOp); ok && op.Queue != "" {
-			return "q:" + op.Queue
-		}
-	case store.OpSetConcurrency:
-		if op, ok := data.(store.SetConcurrencyOp); ok && op.Queue != "" {
-			return "q:" + op.Queue
-		}
-	case store.OpSetThrottle:
-		if op, ok := data.(store.SetThrottleOp); ok && op.Queue != "" {
-			return "q:" + op.Queue
-		}
+func retryJitterMs(span int) int {
+	if span <= 0 {
+		return 0
 	}
-	return "g:*"
-}
-
-func shardKey(prefix, id string) string {
-	if len(id) >= 6 {
-		return prefix + id[:6]
+	n := time.Now().UnixNano()
+	if n < 0 {
+		n = -n
 	}
-	return prefix + id
+	return int(n % int64(span))
 }
 
 func (c *Cluster) applyLoop() {
@@ -570,9 +468,6 @@ func (c *Cluster) applyLoop() {
 	}
 
 	chooseWait := func(backlog int) time.Duration {
-		c.admitMu.Lock()
-		inFlight := c.inFlightN
-		c.admitMu.Unlock()
 		wait := minWindow
 		switch {
 		case backlog >= maxBatch:
@@ -583,15 +478,6 @@ func (c *Cluster) applyLoop() {
 			wait = minWindow / 4
 		case backlog > 0:
 			wait = minWindow / 2
-		}
-		// Under heavy global pressure, bias toward immediate group commits.
-		if c.config.ApplyMaxTotalInFly > 0 {
-			if inFlight >= (c.config.ApplyMaxTotalInFly*3)/4 && wait > 20*time.Microsecond {
-				wait /= 2
-			}
-			if inFlight >= (c.config.ApplyMaxTotalInFly*9)/10 {
-				wait = 20 * time.Microsecond
-			}
 		}
 		if wait < 20*time.Microsecond {
 			wait = 20 * time.Microsecond
@@ -646,14 +532,6 @@ func (c *Cluster) applyLoop() {
 					resetTimer(time.Until(deadline))
 				}
 				extended = true
-			}
-			// If pressure rises, shorten the timer immediately.
-			if timerActive {
-				target := firstAt.Add(chooseWait(len(c.applyCh)))
-				if target.Before(deadline) {
-					deadline = target
-					resetTimer(time.Until(deadline))
-				}
 			}
 			if len(batch) >= maxBatch {
 				flush()
@@ -1166,42 +1044,36 @@ func (c *Cluster) ClusterStatus() map[string]any {
 		serverMaps = append(serverMaps, m)
 	}
 
-	c.admitMu.Lock()
-	inFlightNow := c.inFlightN
-	c.admitMu.Unlock()
-
 	return map[string]any{
-		"mode":                     "cluster",
-		"state":                    c.State(),
-		"leader_id":                c.LeaderID(),
-		"leader_addr":              c.LeaderAddr(),
-		"node_id":                  c.config.NodeID,
-		"applied_index":            stats["applied_index"],
-		"commit_index":             stats["commit_index"],
-		"raft_nosync":              c.config.RaftNoSync,
-		"raft_store":               c.config.RaftStore,
-		"pebble_nosync":            c.config.PebbleNoSync,
-		"sqlite_mirror_enabled":    c.config.SQLiteMirror,
-		"sqlite_mirror_async":      c.config.SQLiteMirrorAsync,
-		"lifecycle_events":         c.config.LifecycleEvents,
-		"snapshot_threshold":       c.config.SnapshotThreshold,
-		"snapshot_interval":        c.config.SnapshotInterval.String(),
-		"apply_batch_max":          c.config.ApplyBatchMax,
-		"apply_batch_min_wait":     c.config.ApplyBatchMinWait.String(),
-		"apply_batch_extend_at":    c.config.ApplyBatchExtendAt,
-		"apply_batch_window":       c.config.ApplyBatchWindow.String(),
-		"apply_max_pending":        c.config.ApplyMaxPending,
-		"apply_max_inflight":       c.config.ApplyMaxInFlight,
-		"apply_max_total_inflight": c.config.ApplyMaxTotalInFly,
-		"apply_inflight_now":       inFlightNow,
-		"apply_pending_now":        len(c.applyCh),
-		"apply_sub_batch_max":      c.config.ApplySubBatchMax,
-		"queue_time_hist":          c.queueHist.snapshot(),
-		"apply_time_hist":          c.applyHist.snapshot(),
-		"snapshot":                 c.snapshotStatus(),
-		"sqlite_mirror":            c.fsm.SQLiteMirrorStatus(),
-		"sqlite_rebuild":           c.fsm.SQLiteRebuildStatus(),
-		"nodes":                    serverMaps,
+		"mode":                           "cluster",
+		"state":                          c.State(),
+		"leader_id":                      c.LeaderID(),
+		"leader_addr":                    c.LeaderAddr(),
+		"node_id":                        c.config.NodeID,
+		"applied_index":                  stats["applied_index"],
+		"commit_index":                   stats["commit_index"],
+		"raft_nosync":                    c.config.RaftNoSync,
+		"raft_store":                     c.config.RaftStore,
+		"pebble_nosync":                  c.config.PebbleNoSync,
+		"sqlite_mirror_enabled":          c.config.SQLiteMirror,
+		"sqlite_mirror_async":            c.config.SQLiteMirrorAsync,
+		"lifecycle_events":               c.config.LifecycleEvents,
+		"snapshot_threshold":             c.config.SnapshotThreshold,
+		"snapshot_interval":              c.config.SnapshotInterval.String(),
+		"apply_batch_max":                c.config.ApplyBatchMax,
+		"apply_batch_min_wait":           c.config.ApplyBatchMinWait.String(),
+		"apply_batch_extend_at":          c.config.ApplyBatchExtendAt,
+		"apply_batch_window":             c.config.ApplyBatchWindow.String(),
+		"apply_max_pending":              c.config.ApplyMaxPending,
+		"apply_max_fetch_queue_inflight": c.config.ApplyMaxFetchQueueInFly,
+		"apply_pending_now":              len(c.applyCh),
+		"apply_sub_batch_max":            c.config.ApplySubBatchMax,
+		"queue_time_hist":                c.queueHist.snapshot(),
+		"apply_time_hist":                c.applyHist.snapshot(),
+		"snapshot":                       c.snapshotStatus(),
+		"sqlite_mirror":                  c.fsm.SQLiteMirrorStatus(),
+		"sqlite_rebuild":                 c.fsm.SQLiteRebuildStatus(),
+		"nodes":                          serverMaps,
 	}
 }
 

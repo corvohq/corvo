@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"connectrpc.com/connect"
 	jobbiev1 "github.com/user/jobbie/internal/rpcconnect/gen/jobbie/v1"
@@ -28,6 +29,37 @@ func mapStoreError(err error) error {
 // Server implements the Connect WorkerService API.
 type Server struct {
 	store *store.Store
+}
+
+func longPollTimeout(lease int) time.Duration {
+	if lease <= 0 {
+		lease = 30
+	}
+	if lease > 60 {
+		lease = 60
+	}
+	return time.Duration(lease) * time.Second
+}
+
+func waitForFetch(ctx context.Context, timeout time.Duration, poll func() (bool, error)) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		ok, err := poll()
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // NewHandler creates a Connect HTTP handler for worker lifecycle RPCs.
@@ -57,11 +89,20 @@ func (s *Server) Enqueue(ctx context.Context, req *connect.Request[jobbiev1.Enqu
 }
 
 func (s *Server) Fetch(ctx context.Context, req *connect.Request[jobbiev1.FetchRequest]) (*connect.Response[jobbiev1.FetchResponse], error) {
-	result, err := s.store.Fetch(store.FetchRequest{
+	var result *store.FetchResult
+	fetchReq := store.FetchRequest{
 		Queues:        req.Msg.GetQueues(),
 		WorkerID:      req.Msg.GetWorkerId(),
 		Hostname:      req.Msg.GetHostname(),
 		LeaseDuration: int(req.Msg.GetLeaseDuration()),
+	}
+	err := waitForFetch(ctx, longPollTimeout(fetchReq.LeaseDuration), func() (bool, error) {
+		r, err := s.store.Fetch(fetchReq)
+		if err != nil {
+			return false, err
+		}
+		result = r
+		return result != nil, nil
 	})
 	if err != nil {
 		return nil, mapStoreError(err)
@@ -89,12 +130,21 @@ func (s *Server) FetchBatch(ctx context.Context, req *connect.Request[jobbiev1.F
 	if count <= 0 {
 		count = 1
 	}
-	jobs, err := s.store.FetchBatch(store.FetchRequest{
+	fetchReq := store.FetchRequest{
 		Queues:        req.Msg.GetQueues(),
 		WorkerID:      req.Msg.GetWorkerId(),
 		Hostname:      req.Msg.GetHostname(),
 		LeaseDuration: int(req.Msg.GetLeaseDuration()),
-	}, count)
+	}
+	var jobs []store.FetchResult
+	err := waitForFetch(ctx, longPollTimeout(fetchReq.LeaseDuration), func() (bool, error) {
+		r, err := s.store.FetchBatch(fetchReq, count)
+		if err != nil {
+			return false, err
+		}
+		jobs = r
+		return len(jobs) > 0, nil
+	})
 	if err != nil {
 		return nil, mapStoreError(err)
 	}
@@ -168,12 +218,21 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 		}
 
 		if n := int(req.GetFetchCount()); n > 0 {
-			jobs, err := s.store.FetchBatch(store.FetchRequest{
+			fetchReq := store.FetchRequest{
 				Queues:        req.GetQueues(),
 				WorkerID:      req.GetWorkerId(),
 				Hostname:      req.GetHostname(),
 				LeaseDuration: int(req.GetLeaseDuration()),
-			}, n)
+			}
+			var jobs []store.FetchResult
+			err := waitForFetch(ctx, longPollTimeout(fetchReq.LeaseDuration), func() (bool, error) {
+				r, err := s.store.FetchBatch(fetchReq, n)
+				if err != nil {
+					return false, err
+				}
+				jobs = r
+				return len(jobs) > 0, nil
+			})
 			if err != nil {
 				if store.IsOverloadedError(err) {
 					resp.Error = "OVERLOADED: fetch: " + err.Error()

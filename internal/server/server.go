@@ -44,8 +44,10 @@ func New(s *store.Store, cluster ClusterInfo, bindAddr string) *Server {
 	srv := &Server{store: s, cluster: cluster}
 	srv.router = srv.buildRouter()
 	srv.httpServer = &http.Server{
-		Addr:    bindAddr,
-		Handler: h2c.NewHandler(srv.router, &http2.Server{}),
+		Addr: bindAddr,
+		Handler: h2c.NewHandler(srv.router, &http2.Server{
+			MaxConcurrentStreams: 4096,
+		}),
 	}
 	return srv
 }

@@ -135,18 +135,40 @@ func (s *Server) handleFetchBatch(w http.ResponseWriter, r *http.Request) {
 	if req.Count > 512 {
 		req.Count = 512
 	}
-
-	jobs, err := s.store.FetchBatch(store.FetchRequest{
-		Queues:        req.Queues,
-		WorkerID:      req.WorkerID,
-		Hostname:      req.Hostname,
-		LeaseDuration: req.LeaseDuration,
-	}, req.Count)
-	if err != nil {
-		writeStoreError(w, err, http.StatusInternalServerError, "INTERNAL_ERROR")
-		return
+	timeout := req.LeaseDuration
+	if timeout <= 0 {
+		timeout = 30
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+	if timeout > 60 {
+		timeout = 60
+	}
+	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+	for {
+		jobs, err := s.store.FetchBatch(store.FetchRequest{
+			Queues:        req.Queues,
+			WorkerID:      req.WorkerID,
+			Hostname:      req.Hostname,
+			LeaseDuration: req.LeaseDuration,
+		}, req.Count)
+		if err != nil {
+			writeStoreError(w, err, http.StatusInternalServerError, "INTERNAL_ERROR")
+			return
+		}
+		if len(jobs) > 0 {
+			writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+			return
+		}
+		if time.Now().After(deadline) {
+			writeJSON(w, http.StatusOK, map[string]any{"jobs": []any{}})
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			writeJSON(w, http.StatusOK, map[string]any{"jobs": []any{}})
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {

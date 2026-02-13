@@ -297,8 +297,6 @@ func TestClusterOverloadPressureReturnsRetryHint(t *testing.T) {
 	cfg.Bootstrap = true
 	// Force admission pressure so burst traffic triggers overload signaling.
 	cfg.ApplyMaxPending = 8
-	cfg.ApplyMaxInFlight = 2
-	cfg.ApplyMaxTotalInFly = 8
 	cfg.ApplyBatchMax = 16
 	cfg.ApplyBatchMinWait = 200 * time.Microsecond
 	cfg.ApplyBatchWindow = 1 * time.Millisecond
