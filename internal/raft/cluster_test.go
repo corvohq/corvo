@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/pebble"
+	"github.com/hashicorp/raft"
 	"github.com/user/jobbie/internal/store"
 )
 
@@ -242,4 +246,43 @@ func TestClusterLateJoinAfterSnapshot(t *testing.T) {
 	addVoterWithRetry(t, c1, "node-3", addr3)
 
 	waitForJobCount(t, c3.SQLiteReadDB(), jobs, 12*time.Second)
+}
+
+func TestPrepareFSMForRecoveryClearsPebbleWhenNoSnapshot(t *testing.T) {
+	root := t.TempDir()
+	pebbleDir := filepath.Join(root, "pebble")
+	if err := os.MkdirAll(pebbleDir, 0o755); err != nil {
+		t.Fatalf("mkdir pebble dir: %v", err)
+	}
+	pdb, err := pebble.Open(pebbleDir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("open pebble: %v", err)
+	}
+	defer pdb.Close()
+
+	if err := pdb.Set([]byte("j|job-1"), []byte(`{"id":"job-1"}`), pebble.Sync); err != nil {
+		t.Fatalf("seed pebble: %v", err)
+	}
+
+	snapDir := filepath.Join(root, "raft")
+	if err := os.MkdirAll(snapDir, 0o755); err != nil {
+		t.Fatalf("mkdir raft dir: %v", err)
+	}
+	ss, err := raft.NewFileSnapshotStore(snapDir, 2, os.Stderr)
+	if err != nil {
+		t.Fatalf("new snapshot store: %v", err)
+	}
+
+	if err := prepareFSMForRecovery(pdb, ss); err != nil {
+		t.Fatalf("prepareFSMForRecovery: %v", err)
+	}
+
+	iter, err := pdb.NewIter(nil)
+	if err != nil {
+		t.Fatalf("iter: %v", err)
+	}
+	defer iter.Close()
+	if iter.First() {
+		t.Fatalf("expected empty pebble after recovery prep with no snapshots")
+	}
 }

@@ -76,3 +76,29 @@ Useful flags:
 - `-protocol` = `rpc|http|matrix`
 - `-repeats` and `-repeat-pause` for repeatability
 - `-fetch-batch-size`, `-ack-batch-size`, `-work-duration` for lifecycle shaping
+
+## E2E Perf Smoke Tests (CI/Local)
+
+These are real end-to-end tests that start the actual `cmd/jobbie server` path and run HTTP/RPC flows through client libraries.
+
+Run:
+
+```sh
+go test -tags perf ./tests/perf -v -count=1
+# or
+make perf
+```
+
+Latest run (2026-02-12):
+- `TestPerfE2EEnqueueHTTP`: `15,329.0 ops/sec` (`total=4000`, `c=10`)
+- `TestPerfE2ELifecycleRPC`: `27,833.5 ops/sec` (`total=3000`, `c=10`)
+
+Thresholds are intentionally loose and env-configurable for machine stability:
+- `JOBBIE_PERF_E2E_ENQ_TOTAL`
+- `JOBBIE_PERF_E2E_ENQ_CONCURRENCY`
+- `JOBBIE_PERF_E2E_ENQ_MIN_OPS`
+- `JOBBIE_PERF_E2E_LC_TOTAL`
+- `JOBBIE_PERF_E2E_LC_CONCURRENCY`
+- `JOBBIE_PERF_E2E_LC_FETCH_BATCH`
+- `JOBBIE_PERF_E2E_LC_ACK_BATCH`
+- `JOBBIE_PERF_E2E_LC_MIN_OPS`

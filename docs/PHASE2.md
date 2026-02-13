@@ -36,16 +36,16 @@ Out of scope:
 
 Files: `internal/raft/*`, `internal/server/*`, `cmd/jobbie/main.go`, `docs/DESIGN.md`
 
-- [ ] Deterministic pre-snapshot recovery:
+- [x] Deterministic pre-snapshot recovery:
   - On startup without snapshot, ensure FSM local state cannot replay on top of stale Pebble
-  - Add integration test for power-loss style restart before first snapshot
+  - Add regression test coverage for no-snapshot recovery guard
 - [ ] Snapshot policy hardening:
   - Trigger first snapshot after meaningful apply index (not empty snapshot)
   - Tune threshold/interval defaults for faster safe checkpoints
-- [ ] SQLite mirror safety net:
+- [x] SQLite mirror safety net:
   - Add admin endpoint to rebuild SQLite from Pebble
   - Add mirror lag / dropped-update counters
-- [ ] Durability UX:
+- [x] Durability UX:
   - Keep `pebbleNoSync=true` default
   - `--durable` controls only Raft fsync behavior
   - Improve docs/CLI wording and status endpoints to make risk explicit
@@ -61,7 +61,7 @@ Files: `internal/raft/cluster.go`, `internal/store/*`, `internal/rpcconnect/*`, 
 - [ ] Finish protobuf-first hot path:
   - Remove remaining JSON marshalling in enqueue/lifecycle apply path where possible
   - Keep Connect JSON as debug fallback only
-- [ ] Admission and fairness:
+- [x] Admission and fairness:
   - Add per-client fairness keying (in addition to queue/global)
   - Keep overload signaling (`429` / `ResourceExhausted`) with retry hints
 - [ ] Batch control tuning:
@@ -121,7 +121,7 @@ Exit criteria:
 
 ## Validation Cadence
 
-- [ ] Weekly benchmark run and update `docs/BENCHMARKS.md`
-- [ ] Regression suite on every durability/perf change: `go test ./... -count=1`
+- [x] Weekly benchmark run and update `docs/BENCHMARKS.md`
+- [x] Regression suite on every durability/perf change: `go test ./... -count=1`
 - [ ] Add targeted chaos test cases for restart/recovery and overload pressure
 - [ ] For each AI/platform feature PR: include before/after bench snippet for c10 and c50 unary enqueue + lifecycle
