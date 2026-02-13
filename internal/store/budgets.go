@@ -90,7 +90,15 @@ func (s *Store) SetBudget(req SetBudgetRequest) (*Budget, error) {
 	if err := s.applyOp(OpSetBudget, op).Err; err != nil {
 		return nil, err
 	}
-	return s.GetBudget(scope, target)
+	return &Budget{
+		ID:        op.ID,
+		Scope:     op.Scope,
+		Target:    op.Target,
+		DailyUSD:  op.DailyUSD,
+		PerJobUSD: op.PerJobUSD,
+		OnExceed:  op.OnExceed,
+		CreatedAt: op.CreatedAt,
+	}, nil
 }
 
 func (s *Store) DeleteBudget(scope, target string) error {
