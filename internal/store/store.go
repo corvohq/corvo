@@ -1,9 +1,14 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // Store is the main data access layer for Jobbie.
@@ -36,7 +41,18 @@ func (s *Store) ReadDB() *sql.DB {
 
 // applyOp submits an operation through Raft and returns the result.
 func (s *Store) applyOp(opType OpType, data any) *OpResult {
-	return s.applier.Apply(opType, data)
+	ctx := context.Background()
+	tracer := otel.Tracer("jobbie/store")
+	ctx, span := tracer.Start(ctx, "raft.apply")
+	span.SetAttributes(attribute.Int("jobbie.op_type", int(opType)))
+	res := s.applier.Apply(opType, data)
+	if res != nil && res.Err != nil {
+		span.RecordError(res.Err)
+		span.SetStatus(codes.Error, res.Err.Error())
+	}
+	span.End()
+	_ = ctx
+	return res
 }
 
 // applyOpResult submits an operation and extracts a typed result.

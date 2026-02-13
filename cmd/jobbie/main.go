@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/user/jobbie/internal/observability"
 	raftcluster "github.com/user/jobbie/internal/raft"
 	"github.com/user/jobbie/internal/scheduler"
 	"github.com/user/jobbie/internal/server"
@@ -66,6 +67,8 @@ var (
 	shutdownTimeout     = 500 * time.Millisecond
 	discoverMode        string
 	discoverDNSName     string
+	otelEnabled         bool
+	otelEndpoint        string
 )
 
 func init() {
@@ -83,6 +86,8 @@ func init() {
 	serverCmd.Flags().BoolVar(&durableMode, "durable", false, "Enable power-loss durability mode (Raft fsync per write). Significantly reduces throughput/latency performance; enable only if absolutely required.")
 	serverCmd.Flags().StringVar(&raftStore, "raft-store", "bolt", "Raft log/stable backend: bolt, badger, or pebble")
 	serverCmd.Flags().DurationVar(&shutdownTimeout, "shutdown-timeout", 500*time.Millisecond, "Graceful HTTP shutdown timeout before force-close (e.g. 500ms, 2s)")
+	serverCmd.Flags().BoolVar(&otelEnabled, "otel-enabled", false, "Enable OpenTelemetry tracing")
+	serverCmd.Flags().StringVar(&otelEndpoint, "otel-endpoint", "", "OTLP HTTP endpoint (host:port) for traces; if empty uses stdout exporter")
 
 	rootCmd.AddCommand(serverCmd)
 }
@@ -135,8 +140,20 @@ func runServer(cmd *cobra.Command, args []string) error {
 		"pebble_nosync", pebbleNoSync,
 		"raft_apply_timeout", applyTimeout,
 		"shutdown_timeout", shutdownTimeout,
+		"otel_enabled", otelEnabled,
+		"otel_endpoint", otelEndpoint,
 		"data_dir", dataDir,
 	)
+
+	otelShutdown, err := observability.InitTracer(otelEnabled, "jobbie-server", otelEndpoint)
+	if err != nil {
+		return fmt.Errorf("init otel: %w", err)
+	}
+	defer func() {
+		if err := otelShutdown(context.Background()); err != nil {
+			slog.Warn("otel shutdown error", "error", err)
+		}
+	}()
 
 	clusterCfg := raftcluster.DefaultClusterConfig()
 	clusterCfg.NodeID = nodeID
