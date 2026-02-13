@@ -101,6 +101,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/approval-policies", s.handleListApprovalPolicies)
 		r.Get("/webhooks", s.handleListWebhooks)
 		r.Get("/auth/keys", s.handleListAPIKeys)
+		r.Get("/billing/summary", s.handleBillingSummary)
 		r.Get("/scores/summary", s.handleScoreSummary)
 		r.Get("/scores/compare", s.handleScoreCompare)
 		r.Get("/jobs/{id}/scores", s.handleListJobScores)
@@ -130,6 +131,8 @@ func (s *Server) buildRouter() chi.Router {
 			r.Delete("/webhooks/{id}", s.handleDeleteWebhook)
 			r.Post("/auth/keys", s.handleSetAPIKey)
 			r.Delete("/auth/keys", s.handleDeleteAPIKey)
+			r.Get("/admin/backup", s.handleTenantBackup)
+			r.Post("/admin/restore", s.handleTenantRestore)
 
 			// Queue management
 			r.Post("/queues/{name}/pause", s.handlePauseQueue)

@@ -947,6 +947,77 @@ func TestAPIKeyAuthAndNamespaceIsolation(t *testing.T) {
 	}
 }
 
+func TestTenantBackupRestoreAndBilling(t *testing.T) {
+	srv, _ := testServer(t)
+	_ = doRequest(srv, "POST", "/api/v1/auth/keys", map[string]any{
+		"name":      "acme-admin",
+		"key":       "k_acme_admin",
+		"namespace": "acme",
+		"role":      "admin",
+	})
+	headers := map[string]string{"X-API-Key": "k_acme_admin"}
+	rr := doRequestWithHeaders(srv, "POST", "/api/v1/enqueue", map[string]any{
+		"queue":   "billing.q",
+		"payload": map[string]any{"x": 1},
+	}, headers)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("enqueue status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var enq store.EnqueueResult
+	decodeResponse(t, rr, &enq)
+
+	rr = doRequestWithHeaders(srv, "POST", "/api/v1/fetch", map[string]any{
+		"queues":    []string{"billing.q"},
+		"worker_id": "w1",
+		"hostname":  "h1",
+		"timeout":   1,
+	}, headers)
+	var f store.FetchResult
+	decodeResponse(t, rr, &f)
+	rr = doRequestWithHeaders(srv, "POST", "/api/v1/ack/"+f.JobID, map[string]any{
+		"usage": map[string]any{
+			"input_tokens":  10,
+			"output_tokens": 5,
+			"cost_usd":      0.01,
+		},
+	}, headers)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("ack status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequestWithHeaders(srv, "GET", "/api/v1/admin/backup?namespace=acme", nil, headers)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("backup status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var backup map[string]any
+	decodeResponse(t, rr, &backup)
+	if backup["namespace"] != "acme" {
+		t.Fatalf("backup namespace = %v", backup["namespace"])
+	}
+
+	rr = doRequestWithHeaders(srv, "POST", "/api/v1/admin/restore", map[string]any{
+		"namespace": "acme",
+		"jobs": []map[string]any{
+			{"queue": "restore.q", "payload": map[string]any{"a": 1}, "priority": 2},
+		},
+	}, headers)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("restore status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequestWithHeaders(srv, "GET", "/api/v1/billing/summary?period=24h", nil, headers)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("billing summary status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var bill map[string]any
+	decodeResponse(t, rr, &bill)
+	if _, ok := bill["summary"]; !ok {
+		t.Fatalf("billing summary missing summary field: %v", bill)
+	}
+
+	_ = enq
+}
+
 func TestApprovalPolicyEndpointsAndAutoHold(t *testing.T) {
 	srv, _ := testServer(t)
 
