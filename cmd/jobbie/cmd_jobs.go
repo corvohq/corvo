@@ -107,6 +107,91 @@ var cancelCmd = &cobra.Command{
 	},
 }
 
+var holdCmd = &cobra.Command{
+	Use:   "hold <job-id>",
+	Short: "Move a job to held state for human review",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		data, status, err := apiRequest("POST", "/api/v1/jobs/"+args[0]+"/hold", nil)
+		if err != nil {
+			return err
+		}
+		exitOnError(data, status)
+		fmt.Printf("Job %s held\n", args[0])
+		return nil
+	},
+}
+
+var approveCmd = &cobra.Command{
+	Use:   "approve <job-id>",
+	Short: "Approve a held job back to pending",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		data, status, err := apiRequest("POST", "/api/v1/jobs/"+args[0]+"/approve", nil)
+		if err != nil {
+			return err
+		}
+		exitOnError(data, status)
+		fmt.Printf("Job %s approved\n", args[0])
+		return nil
+	},
+}
+
+var rejectCmd = &cobra.Command{
+	Use:   "reject <job-id>",
+	Short: "Reject a held job to dead state",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		data, status, err := apiRequest("POST", "/api/v1/jobs/"+args[0]+"/reject", nil)
+		if err != nil {
+			return err
+		}
+		exitOnError(data, status)
+		fmt.Printf("Job %s rejected\n", args[0])
+		return nil
+	},
+}
+
+var heldCmd = &cobra.Command{
+	Use:   "held",
+	Short: "List held jobs awaiting approval",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		body := map[string]any{
+			"state": []string{"held"},
+			"limit": 100,
+			"sort":  "created_at",
+			"order": "desc",
+		}
+		data, status, err := apiRequest("POST", "/api/v1/jobs/search", body)
+		if err != nil {
+			return err
+		}
+		exitOnError(data, status)
+		if outputJSON {
+			printJSON(data)
+			return nil
+		}
+		var result struct {
+			Jobs []struct {
+				ID    string `json:"id"`
+				Queue string `json:"queue"`
+				State string `json:"state"`
+			} `json:"jobs"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			return err
+		}
+		if len(result.Jobs) == 0 {
+			fmt.Println("No held jobs")
+			return nil
+		}
+		for _, j := range result.Jobs {
+			fmt.Printf("%s  %s  %s\n", j.ID, j.Queue, j.State)
+		}
+		return nil
+	},
+}
+
 var moveCmd = &cobra.Command{
 	Use:   "move <job-id> <target-queue>",
 	Short: "Move a job to another queue",
@@ -146,6 +231,6 @@ func init() {
 	enqueueCmd.Flags().StringVar(&enqSchedule, "scheduled-at", "", "Schedule job for later (RFC3339)")
 	enqueueCmd.Flags().StringVar(&enqTags, "tags", "", "Job tags as JSON object")
 
-	addClientFlags(enqueueCmd, inspectCmd, retryCmd, cancelCmd, moveCmd, deleteCmd)
-	rootCmd.AddCommand(enqueueCmd, inspectCmd, retryCmd, cancelCmd, moveCmd, deleteCmd)
+	addClientFlags(enqueueCmd, inspectCmd, retryCmd, cancelCmd, holdCmd, approveCmd, rejectCmd, heldCmd, moveCmd, deleteCmd)
+	rootCmd.AddCommand(enqueueCmd, inspectCmd, retryCmd, cancelCmd, holdCmd, approveCmd, rejectCmd, heldCmd, moveCmd, deleteCmd)
 }

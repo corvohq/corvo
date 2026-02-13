@@ -1407,6 +1407,57 @@ func (f *FSM) applyMoveJobOp(op store.MoveJobOp) *store.OpResult {
 	return &store.OpResult{Data: nil}
 }
 
+// --- Budgets ---
+
+func (f *FSM) applySetBudget(data json.RawMessage) *store.OpResult {
+	var op store.SetBudgetOp
+	if err := json.Unmarshal(data, &op); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	return f.applySetBudgetOp(op)
+}
+
+func (f *FSM) applySetBudgetOp(op store.SetBudgetOp) *store.OpResult {
+	doc := store.Budget{
+		ID:        op.ID,
+		Scope:     op.Scope,
+		Target:    op.Target,
+		DailyUSD:  op.DailyUSD,
+		PerJobUSD: op.PerJobUSD,
+		OnExceed:  op.OnExceed,
+		CreatedAt: op.CreatedAt,
+	}
+	b, err := json.Marshal(doc)
+	if err != nil {
+		return &store.OpResult{Err: err}
+	}
+	if err := f.pebble.Set(kv.BudgetKey(op.Scope, op.Target), b, f.writeOpts); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	f.syncSQLite(func(db sqlExecer) error {
+		return sqliteUpsertBudget(db, doc)
+	})
+	return &store.OpResult{Data: nil}
+}
+
+func (f *FSM) applyDeleteBudget(data json.RawMessage) *store.OpResult {
+	var op store.DeleteBudgetOp
+	if err := json.Unmarshal(data, &op); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	return f.applyDeleteBudgetOp(op)
+}
+
+func (f *FSM) applyDeleteBudgetOp(op store.DeleteBudgetOp) *store.OpResult {
+	if err := f.pebble.Delete(kv.BudgetKey(op.Scope, op.Target), f.writeOpts); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	f.syncSQLite(func(db sqlExecer) error {
+		return sqliteDeleteBudget(db, op.Scope, op.Target)
+	})
+	return &store.OpResult{Data: nil}
+}
+
 // --- DeleteJob ---
 
 func (f *FSM) applyDeleteJob(data json.RawMessage) *store.OpResult {
@@ -1914,6 +1965,7 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 	defer batch.Close()
 
 	var affected int
+	lifecycleChanged := false
 
 	for _, jobID := range op.JobIDs {
 		jobVal, closer, err := f.pebble.Get(kv.JobKey(jobID))
@@ -2027,6 +2079,73 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 			jobData, _ := encodeJobDoc(job)
 			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
 			affected++
+
+		case "hold":
+			if job.State != store.StatePending && job.State != store.StateActive &&
+				job.State != store.StateScheduled && job.State != store.StateRetrying {
+				continue
+			}
+			removeFromSortedSet(batch, f.pebble, job, f.writeOpts)
+			job.State = store.StateHeld
+			job.WorkerID = nil
+			job.Hostname = nil
+			job.LeaseExpiresAt = nil
+			job.ScheduledAt = nil
+			jobData, _ := encodeJobDoc(job)
+			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			if err := f.appendLifecycleEvent(batch, "held", jobID, job.Queue, op.NowNs); err != nil {
+				return &store.OpResult{Err: err}
+			}
+			lifecycleChanged = true
+			affected++
+
+		case "approve":
+			if job.State != store.StateHeld {
+				continue
+			}
+			job.State = store.StatePending
+			job.WorkerID = nil
+			job.Hostname = nil
+			job.LeaseExpiresAt = nil
+			job.ScheduledAt = nil
+			jobData, _ := encodeJobDoc(job)
+			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			createdNs := op.NowNs
+			if job.Priority == store.PriorityNormal {
+				batch.Set(kv.QueueAppendKey(job.Queue, createdNs, jobID), nil, f.writeOpts)
+			} else {
+				batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, jobID), nil, f.writeOpts)
+			}
+			if err := f.appendLifecycleEvent(batch, "approved", jobID, job.Queue, op.NowNs); err != nil {
+				return &store.OpResult{Err: err}
+			}
+			lifecycleChanged = true
+			affected++
+
+		case "reject":
+			if job.State != store.StateHeld {
+				continue
+			}
+			now := time.Unix(0, int64(op.NowNs))
+			job.State = store.StateDead
+			job.FailedAt = &now
+			job.WorkerID = nil
+			job.Hostname = nil
+			job.LeaseExpiresAt = nil
+			job.ScheduledAt = nil
+			jobData, _ := encodeJobDoc(job)
+			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			if err := f.appendLifecycleEvent(batch, "rejected", jobID, job.Queue, op.NowNs); err != nil {
+				return &store.OpResult{Err: err}
+			}
+			lifecycleChanged = true
+			affected++
+		}
+	}
+
+	if lifecycleChanged {
+		if err := f.appendLifecycleCursor(batch); err != nil {
+			return &store.OpResult{Err: err}
 		}
 	}
 

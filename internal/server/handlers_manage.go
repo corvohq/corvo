@@ -173,6 +173,33 @@ func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
+func (s *Server) handleHoldJob(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if err := s.store.HoldJob(id); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "HOLD_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": store.StateHeld})
+}
+
+func (s *Server) handleApproveJob(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if err := s.store.ApproveJob(id); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "APPROVE_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": store.StatePending})
+}
+
+func (s *Server) handleRejectJob(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if err := s.store.RejectJob(id); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "REJECT_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": store.StateDead})
+}
+
 // Search and bulk
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {

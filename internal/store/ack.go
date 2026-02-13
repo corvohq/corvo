@@ -13,11 +13,21 @@ func (s *Store) Ack(jobID string, result json.RawMessage) error {
 
 // AckWithUsage marks a job completed and records optional usage metadata.
 func (s *Store) AckWithUsage(jobID string, result json.RawMessage, usage *UsageReport) error {
+	normUsage := normalizeUsage(usage)
+	if normUsage != nil {
+		exceeded, action, err := s.evaluatePerJobBudget(jobID, normUsage.CostUSD)
+		if err != nil {
+			return err
+		}
+		if exceeded && action == BudgetOnExceedReject {
+			return NewBudgetExceededError(fmt.Sprintf("per-job budget exceeded for job %q", jobID))
+		}
+	}
 	now := time.Now()
 	op := AckOp{
 		JobID:  jobID,
 		Result: result,
-		Usage:  normalizeUsage(usage),
+		Usage:  normUsage,
 		NowNs:  uint64(now.UnixNano()),
 	}
 
@@ -32,6 +42,16 @@ func (s *Store) AckBatch(acks []AckOp) (int, error) {
 	}
 	for i := range acks {
 		acks[i].Usage = normalizeUsage(acks[i].Usage)
+		if acks[i].Usage == nil {
+			continue
+		}
+		exceeded, action, err := s.evaluatePerJobBudget(acks[i].JobID, acks[i].Usage.CostUSD)
+		if err != nil {
+			return 0, err
+		}
+		if exceeded && action == BudgetOnExceedReject {
+			return 0, NewBudgetExceededError(fmt.Sprintf("per-job budget exceeded for job %q", acks[i].JobID))
+		}
 	}
 	now := uint64(time.Now().UnixNano())
 	op := AckBatchOp{

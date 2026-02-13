@@ -305,6 +305,25 @@ func sqliteMoveJob(db sqlExecer, jobID, targetQueue string) error {
 	return err
 }
 
+func sqliteUpsertBudget(db sqlExecer, b store.Budget) error {
+	_, err := db.Exec(`INSERT INTO budgets (id, scope, target, daily_usd, per_job_usd, on_exceed, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(scope, target) DO UPDATE SET
+			id = excluded.id,
+			daily_usd = excluded.daily_usd,
+			per_job_usd = excluded.per_job_usd,
+			on_exceed = excluded.on_exceed,
+			created_at = excluded.created_at`,
+		b.ID, b.Scope, b.Target, b.DailyUSD, b.PerJobUSD, b.OnExceed, b.CreatedAt,
+	)
+	return err
+}
+
+func sqliteDeleteBudget(db sqlExecer, scope, target string) error {
+	_, err := db.Exec("DELETE FROM budgets WHERE scope = ? AND target = ?", scope, target)
+	return err
+}
+
 func sqliteDeleteJob(db sqlExecer, jobID string) error {
 	db.Exec("DELETE FROM job_errors WHERE job_id = ?", jobID)
 	_, err := db.Exec("DELETE FROM jobs WHERE id = ?", jobID)
@@ -338,6 +357,7 @@ func sqliteBulkAction(db sqlExecer, op store.BulkActionOp) error {
 		args[i] = id
 	}
 	inClause := strings.Join(placeholders, ", ")
+	nowStr := time.Unix(0, int64(op.NowNs)).UTC().Format(time.RFC3339Nano)
 
 	switch op.Action {
 	case "retry":
@@ -364,6 +384,20 @@ func sqliteBulkAction(db sqlExecer, op store.BulkActionOp) error {
 		priArgs = append(priArgs, args...)
 		db.Exec(fmt.Sprintf(`UPDATE jobs SET priority = ?
 			WHERE id IN (%s) AND state IN ('pending', 'scheduled')`, inClause), priArgs...)
+	case "hold":
+		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'held', worker_id = NULL, hostname = NULL,
+			lease_expires_at = NULL, scheduled_at = NULL
+			WHERE id IN (%s) AND state IN ('pending', 'active', 'scheduled', 'retrying')`, inClause), args...)
+	case "approve":
+		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'pending', worker_id = NULL, hostname = NULL,
+			lease_expires_at = NULL, scheduled_at = NULL
+			WHERE id IN (%s) AND state = 'held'`, inClause), args...)
+	case "reject":
+		rejArgs := []any{nowStr}
+		rejArgs = append(rejArgs, args...)
+		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'dead', failed_at = ?, worker_id = NULL, hostname = NULL,
+			lease_expires_at = NULL, scheduled_at = NULL
+			WHERE id IN (%s) AND state = 'held'`, inClause), rejArgs...)
 	}
 	return nil
 }
@@ -387,6 +421,7 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 	defer tx.Rollback()
 
 	for _, stmt := range []string{
+		"DELETE FROM budgets",
 		"DELETE FROM job_errors",
 		"DELETE FROM unique_locks",
 		"DELETE FROM rate_limit_window",
@@ -531,6 +566,27 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 				return retErr
 			}
 			queueSeen[queue] = struct{}{}
+		case bytes.HasPrefix(key, []byte(kv.PrefixBudget)):
+			var b store.Budget
+			if err := json.Unmarshal(val, &b); err != nil {
+				continue
+			}
+			if b.Scope == "" || b.Target == "" {
+				scope, target, ok := parseBudgetKey(key)
+				if !ok {
+					continue
+				}
+				if b.Scope == "" {
+					b.Scope = scope
+				}
+				if b.Target == "" {
+					b.Target = target
+				}
+			}
+			if err := sqliteUpsertBudget(tx, b); err != nil {
+				retErr = fmt.Errorf("upsert budget: %w", err)
+				return retErr
+			}
 		}
 	}
 	if err := iter.Error(); err != nil {
@@ -728,6 +784,15 @@ func parseJobErrorKey(k []byte) (jobID string, attempt uint32, ok bool) {
 	jobID = string(rest[:i])
 	attempt = kv.GetUint32BE(rest[i+1 : i+1+4])
 	return jobID, attempt, true
+}
+
+func parseBudgetKey(k []byte) (scope, target string, ok bool) {
+	rest := k[len(kv.PrefixBudget):]
+	i := bytes.IndexByte(rest, 0)
+	if i <= 0 || i+1 >= len(rest) {
+		return "", "", false
+	}
+	return string(rest[:i]), string(rest[i+1:]), true
 }
 
 func boolToInt(v bool) int {

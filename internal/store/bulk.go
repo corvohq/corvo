@@ -12,7 +12,7 @@ import (
 type BulkRequest struct {
 	JobIDs      []string       `json:"job_ids,omitempty"`
 	Filter      *search.Filter `json:"filter,omitempty"`
-	Action      string         `json:"action"` // retry, delete, cancel, move, requeue, change_priority
+	Action      string         `json:"action"` // retry, delete, cancel, move, requeue, change_priority, hold, approve, reject
 	MoveToQueue string         `json:"move_to_queue,omitempty"`
 	Priority    string         `json:"priority,omitempty"`
 }
@@ -44,7 +44,7 @@ func (s *Store) BulkAction(req BulkRequest) (*BulkResult, error) {
 
 	// Validate action
 	switch req.Action {
-	case "retry", "delete", "cancel", "move", "requeue", "change_priority":
+	case "retry", "delete", "cancel", "move", "requeue", "change_priority", "hold", "approve", "reject":
 	default:
 		return nil, fmt.Errorf("unknown bulk action: %q", req.Action)
 	}

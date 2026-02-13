@@ -48,10 +48,10 @@ var statusCmd = &cobra.Command{
 		}
 
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "QUEUE\tPENDING\tACTIVE\tCOMPLETED\tDEAD")
+		fmt.Fprintln(w, "QUEUE\tPENDING\tACTIVE\tHELD\tCOMPLETED\tDEAD")
 		for _, q := range queues {
-			fmt.Fprintf(w, "%s\t%.0f\t%.0f\t%.0f\t%.0f\n",
-				q["name"], q["pending"], q["active"], q["completed"], q["dead"])
+			fmt.Fprintf(w, "%s\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\n",
+				q["name"], q["pending"], q["active"], q["held"], q["completed"], q["dead"])
 		}
 		w.Flush()
 		return nil

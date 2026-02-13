@@ -92,13 +92,13 @@ Files: `docs/AI.md`, `internal/store/*`, `internal/server/*`, `pkg/client/*`, `c
   - [x] `job_usage` storage + usage reporting via ack/heartbeat
   - [x] Usage summary API (`GET /api/v1/usage/summary`)
   - [x] Usage summary CLI (`jobbie usage`)
-- [ ] Budget enforcement:
-  - Budget table + checks on fetch/ack paths
-  - Queue/namespace/per-job budget APIs + CLI (`jobbie budget`)
+- [x] Budget enforcement:
+  - [x] Budget table + checks on fetch/ack paths
+  - [x] Queue/namespace/per-job budget APIs + CLI (`jobbie budget`)
 - [ ] Human-in-the-loop baseline:
-  - `held` state and approve/reject API
-  - CLI (`jobbie held`, `jobbie approve`, `jobbie reject`)
-  - UI held-jobs view
+  - [x] `held` state and approve/reject API
+  - [x] CLI (`jobbie held`, `jobbie approve`, `jobbie reject`)
+  - [x] UI held-jobs view
 
 Exit criteria:
 - AI usage and budget limits are enforced server-side (not client best effort)
@@ -154,3 +154,14 @@ Exit criteria:
   - Added `job_usage` migration + summary query path in store
   - Wired usage payloads through HTTP and Connect ack/ack-batch/heartbeat APIs
   - Added protobuf usage fields and dual-mode compatibility via regenerated RPC stubs
+- [x] Human-in-the-loop baseline:
+  - Added `held` state transitions (`hold`, `approve`, `reject`) in Raft + SQLite mirror paths
+  - Added HTTP APIs: `POST /api/v1/jobs/{id}/hold|approve|reject`
+  - Added CLI commands: `jobbie held`, `jobbie hold`, `jobbie approve`, `jobbie reject`
+  - Wired held-job UI cards to approve/reject endpoints
+- [x] Budget enforcement baseline:
+  - Added `budgets` migration + Raft-backed budget set/delete ops
+  - Added API endpoints: `GET/POST/DELETE /api/v1/budgets...`
+  - Added CLI commands: `jobbie budget list|set|delete`
+  - Added fetch-path queue/global budget checks with `hold`/`reject` behavior
+  - Added per-job budget checks on ack/heartbeat with soft `budget_exceeded` heartbeat signal

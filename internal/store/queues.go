@@ -17,6 +17,7 @@ func (s *Store) ListQueues() ([]QueueInfo, error) {
 			aq.name, COALESCE(q.paused, 0), q.max_concurrency, q.rate_limit, q.rate_window_ms,
 			COALESCE(SUM(CASE WHEN j.state = 'pending' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.state = 'active' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN j.state = 'held' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.state = 'completed' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.state = 'dead' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.state = 'scheduled' THEN 1 ELSE 0 END), 0),
@@ -39,7 +40,7 @@ func (s *Store) ListQueues() ([]QueueInfo, error) {
 		var maxConc, rateLimit, rateWindow sql.NullInt64
 		err := rows.Scan(
 			&qi.Name, &qi.Paused, &maxConc, &rateLimit, &rateWindow,
-			&qi.Pending, &qi.Active, &qi.Completed, &qi.Dead, &qi.Scheduled, &qi.Retrying,
+			&qi.Pending, &qi.Active, &qi.Held, &qi.Completed, &qi.Dead, &qi.Scheduled, &qi.Retrying,
 			&qi.Enqueued,
 		)
 		if err != nil {

@@ -19,7 +19,8 @@ type HeartbeatRequest struct {
 
 // HeartbeatJobResponse is the per-job heartbeat response.
 type HeartbeatJobResponse struct {
-	Status string `json:"status"` // "ok" or "cancel"
+	Status         string `json:"status"`                    // "ok" or "cancel"
+	BudgetExceeded bool   `json:"budget_exceeded,omitempty"` // soft signal to wrap up
 }
 
 // HeartbeatResponse is the batched heartbeat response.
@@ -52,5 +53,28 @@ func (s *Store) Heartbeat(req HeartbeatRequest) (*HeartbeatResponse, error) {
 		NowNs: uint64(now.UnixNano()),
 	}
 
-	return applyOpResult[HeartbeatResponse](s, OpHeartbeat, op)
+	resp, err := applyOpResult[HeartbeatResponse](s, OpHeartbeat, op)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+	for jobID, update := range req.Jobs {
+		incomingCost := 0.0
+		if n := normalizeUsage(update.Usage); n != nil {
+			incomingCost = n.CostUSD
+		}
+		exceeded, action, berr := s.evaluatePerJobBudget(jobID, incomingCost)
+		if berr != nil || !exceeded {
+			continue
+		}
+		jr := resp.Jobs[jobID]
+		jr.BudgetExceeded = true
+		resp.Jobs[jobID] = jr
+		switch action {
+		case BudgetOnExceedHold:
+			_ = s.HoldJob(jobID)
+		case BudgetOnExceedReject:
+			_, _ = s.CancelJob(jobID)
+		}
+	}
+	return resp, nil
 }

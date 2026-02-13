@@ -30,6 +30,33 @@ export function useCancelJob() {
   });
 }
 
+export function useHoldJob() {
+  const invalidate = useInvalidate();
+  return useMutation({
+    mutationFn: (id: string) => post(`/jobs/${id}/hold`),
+    onSuccess: () => { invalidate(); toast.success("Job held"); },
+    onError: (e) => toast.error(`Hold failed: ${e.message}`),
+  });
+}
+
+export function useApproveJob() {
+  const invalidate = useInvalidate();
+  return useMutation({
+    mutationFn: (id: string) => post(`/jobs/${id}/approve`),
+    onSuccess: () => { invalidate(); toast.success("Job approved"); },
+    onError: (e) => toast.error(`Approve failed: ${e.message}`),
+  });
+}
+
+export function useRejectJob() {
+  const invalidate = useInvalidate();
+  return useMutation({
+    mutationFn: (id: string) => post(`/jobs/${id}/reject`),
+    onSuccess: () => { invalidate(); toast.success("Job rejected"); },
+    onError: (e) => toast.error(`Reject failed: ${e.message}`),
+  });
+}
+
 export function useDeleteJob() {
   const invalidate = useInvalidate();
   return useMutation({

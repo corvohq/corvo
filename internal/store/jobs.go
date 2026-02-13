@@ -139,6 +139,63 @@ func (s *Store) DeleteJob(id string) error {
 	return res.Err
 }
 
+// HoldJob moves a job into held state for human review.
+func (s *Store) HoldJob(id string) error {
+	job, err := s.GetJob(id)
+	if err != nil {
+		return err
+	}
+	result, err := s.BulkAction(BulkRequest{
+		JobIDs: []string{id},
+		Action: "hold",
+	})
+	if err != nil {
+		return err
+	}
+	if result.Affected == 0 {
+		return fmt.Errorf("job %q cannot be held from state %q", id, job.State)
+	}
+	return nil
+}
+
+// ApproveJob releases a held job back to pending.
+func (s *Store) ApproveJob(id string) error {
+	job, err := s.GetJob(id)
+	if err != nil {
+		return err
+	}
+	result, err := s.BulkAction(BulkRequest{
+		JobIDs: []string{id},
+		Action: "approve",
+	})
+	if err != nil {
+		return err
+	}
+	if result.Affected == 0 {
+		return fmt.Errorf("job %q cannot be approved from state %q", id, job.State)
+	}
+	return nil
+}
+
+// RejectJob rejects a held job and moves it to dead.
+func (s *Store) RejectJob(id string) error {
+	job, err := s.GetJob(id)
+	if err != nil {
+		return err
+	}
+	result, err := s.BulkAction(BulkRequest{
+		JobIDs: []string{id},
+		Action: "reject",
+	})
+	if err != nil {
+		return err
+	}
+	if result.Affected == 0 {
+		return fmt.Errorf("job %q cannot be rejected from state %q", id, job.State)
+	}
+	return nil
+}
+
 func setNullableString(target **string, src sql.NullString) {
 	if src.Valid {
 		*target = &src.String

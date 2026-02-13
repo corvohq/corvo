@@ -48,6 +48,7 @@ export interface Queue {
 export interface QueueInfo extends Queue {
   pending: number;
   active: number;
+  held: number;
   completed: number;
   dead: number;
   scheduled: number;

@@ -114,6 +114,10 @@ func (f *FSM) applyByType(opType store.OpType, data json.RawMessage) *store.OpRe
 		return f.applyCleanUnique(data)
 	case store.OpCleanRateLimit:
 		return f.applyCleanRateLimit(data)
+	case store.OpSetBudget:
+		return f.applySetBudget(data)
+	case store.OpDeleteBudget:
+		return f.applyDeleteBudget(data)
 	default:
 		return &store.OpResult{Err: fmt.Errorf("unknown op type: %d", opType)}
 	}
@@ -246,6 +250,16 @@ func (f *FSM) applyDecoded(op *store.DecodedRaftOp) *store.OpResult {
 			return f.applyCleanRateLimitOp(*op.CleanRate)
 		}
 		return &store.OpResult{Err: fmt.Errorf("clean rate op missing payload")}
+	case store.OpSetBudget:
+		if op.SetBudget != nil {
+			return f.applySetBudgetOp(*op.SetBudget)
+		}
+		return &store.OpResult{Err: fmt.Errorf("set budget op missing payload")}
+	case store.OpDeleteBudget:
+		if op.DeleteBudget != nil {
+			return f.applyDeleteBudgetOp(*op.DeleteBudget)
+		}
+		return &store.OpResult{Err: fmt.Errorf("delete budget op missing payload")}
 	default:
 		return &store.OpResult{Err: fmt.Errorf("unknown op type: %d", op.Type)}
 	}
