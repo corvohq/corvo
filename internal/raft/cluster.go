@@ -426,9 +426,14 @@ func admissionKey(opType store.OpType, data any) string {
 		}
 	case store.OpHeartbeat:
 		if op, ok := data.(store.HeartbeatOp); ok && len(op.Jobs) > 0 {
-			// Heartbeats are worker-originated and can burst; worker-scoped
-			// admission keeps one worker from starving others.
-			return "w:hb"
+			// Heartbeats are worker-originated but currently don't carry worker ID.
+			// Use the first job key as a stable enough shard to avoid one global
+			// heartbeat bucket causing cross-worker contention.
+			for jobID := range op.Jobs {
+				if jobID != "" {
+					return "hb:" + jobID
+				}
+			}
 		}
 	case store.OpPauseQueue, store.OpResumeQueue, store.OpClearQueue, store.OpDeleteQueue, store.OpRemoveThrottle:
 		if op, ok := data.(store.QueueOp); ok && op.Queue != "" {
