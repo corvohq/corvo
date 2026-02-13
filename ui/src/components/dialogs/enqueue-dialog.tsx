@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   Dialog,
   DialogContent,
@@ -11,12 +11,23 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useEnqueueJob } from "@/hooks/use-mutations";
 
+interface CloneValues {
+  queue: string;
+  payload: unknown;
+  priority: number;
+  uniqueKey?: string;
+  maxRetries?: number;
+}
+
 interface EnqueueDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  initialValues?: CloneValues;
 }
 
-export function EnqueueDialog({ open, onOpenChange }: EnqueueDialogProps) {
+const PRIORITY_MAP: Record<number, string> = { 0: "critical", 1: "high", 2: "normal" };
+
+export function EnqueueDialog({ open, onOpenChange, initialValues }: EnqueueDialogProps) {
   const [queue, setQueue] = useState("");
   const [payload, setPayload] = useState("{}");
   const [priority, setPriority] = useState("normal");
@@ -24,6 +35,28 @@ export function EnqueueDialog({ open, onOpenChange }: EnqueueDialogProps) {
   const [scheduledAt, setScheduledAt] = useState("");
   const [uniqueKey, setUniqueKey] = useState("");
   const enqueue = useEnqueueJob();
+
+  const isClone = !!initialValues;
+
+  useEffect(() => {
+    if (open && initialValues) {
+      setQueue(initialValues.queue);
+      setPayload(
+        typeof initialValues.payload === "string"
+          ? initialValues.payload
+          : JSON.stringify(initialValues.payload ?? {}, null, 2),
+      );
+      setPriority(PRIORITY_MAP[initialValues.priority] ?? "normal");
+      setMaxRetries(
+        initialValues.maxRetries != null ? String(initialValues.maxRetries) : "",
+      );
+      setUniqueKey(initialValues.uniqueKey ?? "");
+      setScheduledAt("");
+    }
+    if (open && !initialValues) {
+      reset();
+    }
+  }, [open, initialValues]);
 
   const reset = () => {
     setQueue("");
@@ -71,8 +104,12 @@ export function EnqueueDialog({ open, onOpenChange }: EnqueueDialogProps) {
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Enqueue Job</DialogTitle>
-          <DialogDescription>Create a new job and add it to a queue.</DialogDescription>
+          <DialogTitle>{isClone ? "Clone Job" : "Enqueue Job"}</DialogTitle>
+          <DialogDescription>
+            {isClone
+              ? "Create a new job based on an existing one."
+              : "Create a new job and add it to a queue."}
+          </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
           <div>
@@ -144,7 +181,7 @@ export function EnqueueDialog({ open, onOpenChange }: EnqueueDialogProps) {
             onClick={handleSubmit}
             disabled={!queue || !payloadValid || enqueue.isPending}
           >
-            {enqueue.isPending ? "Enqueuing..." : "Enqueue"}
+            {enqueue.isPending ? "Enqueuing..." : isClone ? "Clone" : "Enqueue"}
           </Button>
         </DialogFooter>
       </DialogContent>

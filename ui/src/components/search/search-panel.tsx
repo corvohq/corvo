@@ -78,6 +78,7 @@ export function SearchPanel({ filter, onFilterChange, onReset }: SearchPanelProp
           <div>
             <label className="mb-1 block text-xs text-muted-foreground">Payload contains</label>
             <Input
+              data-search-input
               placeholder="Search in payload..."
               value={filter.payload_contains || ""}
               onChange={(e) =>

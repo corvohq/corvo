@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"time"
 )
 
 // ListQueues returns all queues with live job counts from local SQLite.
@@ -22,7 +23,8 @@ func (s *Store) ListQueues() ([]QueueInfo, error) {
 			COALESCE(SUM(CASE WHEN j.state = 'dead' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.state = 'scheduled' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.state = 'retrying' THEN 1 ELSE 0 END), 0),
-			COUNT(j.id)
+			COUNT(j.id),
+			MIN(CASE WHEN j.state = 'pending' THEN j.created_at END)
 		FROM all_queues aq
 		LEFT JOIN queues q ON q.name = aq.name
 		LEFT JOIN jobs j ON j.queue = aq.name
@@ -38,10 +40,12 @@ func (s *Store) ListQueues() ([]QueueInfo, error) {
 	for rows.Next() {
 		var qi QueueInfo
 		var maxConc, rateLimit, rateWindow sql.NullInt64
+		var oldestPending sql.NullString
 		err := rows.Scan(
 			&qi.Name, &qi.Paused, &maxConc, &rateLimit, &rateWindow,
 			&qi.Pending, &qi.Active, &qi.Held, &qi.Completed, &qi.Dead, &qi.Scheduled, &qi.Retrying,
 			&qi.Enqueued,
+			&oldestPending,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan queue: %w", err)
@@ -57,6 +61,13 @@ func (s *Store) ListQueues() ([]QueueInfo, error) {
 		if rateWindow.Valid {
 			v := int(rateWindow.Int64)
 			qi.RateWindowMs = &v
+		}
+		if oldestPending.Valid {
+			if t, err := time.Parse(time.RFC3339Nano, oldestPending.String); err == nil {
+				qi.OldestPendingAt = &t
+			} else if t, err := time.Parse("2006-01-02 15:04:05", oldestPending.String); err == nil {
+				qi.OldestPendingAt = &t
+			}
 		}
 		queues = append(queues, qi)
 	}

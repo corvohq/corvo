@@ -29,6 +29,7 @@ type Server struct {
 	httpServer *http.Server
 	router     chi.Router
 	uiFS       fs.FS
+	throughput *ThroughputTracker
 }
 
 // ClusterInfo contains cluster state methods used by HTTP handlers/middleware.
@@ -44,7 +45,7 @@ type ClusterInfo interface {
 // New creates a new Server.
 // If uiAssets is non-nil the embedded SPA will be served at /ui/.
 func New(s *store.Store, cluster ClusterInfo, bindAddr string, uiAssets fs.FS) *Server {
-	srv := &Server{store: s, cluster: cluster, uiFS: uiAssets}
+	srv := &Server{store: s, cluster: cluster, uiFS: uiAssets, throughput: NewThroughputTracker()}
 	srv.router = srv.buildRouter()
 	srv.httpServer = &http.Server{
 		Addr: bindAddr,
@@ -73,6 +74,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/cluster/status", s.handleClusterStatus)
 		r.Get("/cluster/events", s.handleClusterEvents)
 		r.Get("/events", s.handleSSE)
+		r.Get("/metrics/throughput", s.handleThroughput)
 		r.Get("/usage/summary", s.handleUsageSummary)
 		r.Get("/budgets", s.handleListBudgets)
 

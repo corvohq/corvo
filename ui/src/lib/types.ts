@@ -55,6 +55,7 @@ export interface QueueInfo extends Queue {
   retrying: number;
   enqueued: number;
   failed: number;
+  oldest_pending_at?: string;
 }
 
 export interface Worker {

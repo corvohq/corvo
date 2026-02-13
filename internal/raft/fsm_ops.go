@@ -1231,12 +1231,15 @@ func (f *FSM) applyRetryJobOp(op store.RetryJobOp) *store.OpResult {
 	}
 	closer.Close()
 
-	if job.State != store.StateDead && job.State != store.StateCancelled && job.State != store.StateCompleted {
+	if job.State != store.StateDead && job.State != store.StateCancelled && job.State != store.StateCompleted && job.State != store.StateScheduled {
 		return &store.OpResult{Err: fmt.Errorf("job %q cannot be retried from state %q", op.JobID, job.State)}
 	}
 
 	batch := f.pebble.NewBatch()
 	defer batch.Close()
+
+	// Remove from previous sorted set (e.g. scheduled key).
+	removeFromSortedSet(batch, f.pebble, job, f.writeOpts)
 
 	now := time.Unix(0, int64(op.NowNs))
 	createdNs := uint64(now.UnixNano())
@@ -1981,7 +1984,7 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 
 		switch op.Action {
 		case "retry":
-			if job.State != store.StateDead && job.State != store.StateCancelled && job.State != store.StateCompleted {
+			if job.State != store.StateDead && job.State != store.StateCancelled && job.State != store.StateCompleted && job.State != store.StateScheduled {
 				continue
 			}
 			removeFromSortedSet(batch, f.pebble, job, f.writeOpts)

@@ -2,14 +2,18 @@ import { useState, useCallback } from "react";
 import { useParams } from "react-router-dom";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { SearchPanel } from "@/components/search/search-panel";
 import { JobTable } from "@/components/jobs/job-table";
 import { BulkBar } from "@/components/bulk/bulk-bar";
 import { QueueActions } from "@/components/queues/queue-actions";
 import { useQueues } from "@/hooks/use-queues";
 import { useSearch } from "@/hooks/use-search";
+import { useFilterParams } from "@/hooks/use-filter-params";
+import { exportJSON, exportCSV } from "@/lib/export";
 import { formatNumber } from "@/lib/utils";
 import type { SearchFilter } from "@/lib/types";
+import { Download } from "lucide-react";
 
 const defaultFilter: SearchFilter = {
   limit: 50,
@@ -22,24 +26,25 @@ export default function QueueDetail() {
   const { data: queues } = useQueues();
   const queue = queues?.find((q) => q.name === name);
 
-  const [filter, setFilter] = useState<SearchFilter>({
+  const [filter, setFilter, resetFilter] = useFilterParams({
     ...defaultFilter,
     queue: name,
   });
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
-  const { data: searchResult, isLoading } = useSearch(filter);
+  const activeFilter = { ...filter, queue: name };
+  const { data: searchResult, isLoading } = useSearch(activeFilter);
 
   const handleFilterChange = useCallback(
     (f: SearchFilter) => {
       setFilter({ ...f, queue: name, cursor: undefined });
     },
-    [name],
+    [name, setFilter],
   );
 
   const handleReset = useCallback(() => {
-    setFilter({ ...defaultFilter, queue: name });
-  }, [name]);
+    resetFilter();
+  }, [resetFilter]);
 
   const handleSelect = useCallback((id: string, checked: boolean) => {
     setSelectedIds((prev) => {
@@ -63,9 +68,9 @@ export default function QueueDetail() {
 
   const handleLoadMore = useCallback(() => {
     if (searchResult?.cursor) {
-      setFilter((f) => ({ ...f, cursor: searchResult.cursor }));
+      setFilter({ ...filter, cursor: searchResult.cursor });
     }
-  }, [searchResult]);
+  }, [searchResult, filter, setFilter]);
 
   return (
     <div className="space-y-6">
@@ -101,7 +106,7 @@ export default function QueueDetail() {
 
       {/* Search */}
       <SearchPanel
-        filter={filter}
+        filter={activeFilter}
         onFilterChange={handleFilterChange}
         onReset={handleReset}
       />
@@ -118,6 +123,28 @@ export default function QueueDetail() {
                 </span>
               )}
             </CardTitle>
+            {searchResult?.jobs && searchResult.jobs.length > 0 && (
+              <div className="flex gap-1">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    exportJSON(searchResult.jobs, `${name}-jobs.json`)
+                  }
+                >
+                  <Download className="mr-1 h-3 w-3" /> JSON
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    exportCSV(searchResult.jobs, `${name}-jobs.csv`)
+                  }
+                >
+                  <Download className="mr-1 h-3 w-3" /> CSV
+                </Button>
+              </div>
+            )}
           </div>
         </CardHeader>
         <CardContent className="p-0">

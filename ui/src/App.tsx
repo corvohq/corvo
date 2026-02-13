@@ -12,6 +12,8 @@ import HeldJobs from "@/pages/held-jobs";
 import CostDashboard from "@/pages/cost-dashboard";
 import WorkersPage from "@/pages/workers-page";
 import ClusterPage from "@/pages/cluster-page";
+import ScheduledJobs from "@/pages/scheduled-jobs";
+import EventsPage from "@/pages/events-page";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -44,6 +46,8 @@ export default function App() {
               <Route path="/ui/cost" element={<CostDashboard />} />
               <Route path="/ui/workers" element={<WorkersPage />} />
               <Route path="/ui/cluster" element={<ClusterPage />} />
+              <Route path="/ui/scheduled" element={<ScheduledJobs />} />
+              <Route path="/ui/events" element={<EventsPage />} />
             </Route>
           </Routes>
         </BrowserRouter>

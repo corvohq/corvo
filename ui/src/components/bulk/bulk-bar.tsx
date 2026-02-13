@@ -3,14 +3,15 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { BulkConfirm } from "./bulk-confirm";
 import { useBulkAction } from "@/hooks/use-bulk";
-import { RotateCcw, Trash2, XCircle, ArrowRightLeft, Loader2 } from "lucide-react";
+import { RotateCcw, Trash2, XCircle, ArrowRightLeft, Loader2, Play } from "lucide-react";
 
 interface BulkBarProps {
   selectedIds: string[];
   onClear: () => void;
+  showRunNow?: boolean;
 }
 
-export function BulkBar({ selectedIds, onClear }: BulkBarProps) {
+export function BulkBar({ selectedIds, onClear, showRunNow }: BulkBarProps) {
   const [action, setAction] = useState<string | null>(null);
   const [moveQueue, setMoveQueue] = useState("");
   const bulk = useBulkAction();
@@ -52,13 +53,24 @@ export function BulkBar({ selectedIds, onClear }: BulkBarProps) {
                 {selectedIds.length} selected
               </span>
               <div className="flex gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setAction("retry")}
-                >
-                  <RotateCcw className="mr-1 h-3 w-3" /> Retry
-                </Button>
+                {showRunNow && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setAction("retry")}
+                  >
+                    <Play className="mr-1 h-3 w-3" /> Run Now
+                  </Button>
+                )}
+                {!showRunNow && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setAction("retry")}
+                  >
+                    <RotateCcw className="mr-1 h-3 w-3" /> Retry
+                  </Button>
+                )}
                 <Button
                   variant="outline"
                   size="sm"

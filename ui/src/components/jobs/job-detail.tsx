@@ -7,6 +7,7 @@ import { StateBadge } from "./state-badge";
 import { JobPayload } from "./job-payload";
 import { JobTimeline } from "./job-timeline";
 import { JobProgress } from "./job-progress";
+import { ErrorHistory } from "./error-history";
 import { PRIORITY_LABELS } from "@/lib/constants";
 import { timeAgo } from "@/lib/utils";
 import {
@@ -20,20 +21,25 @@ import {
   XCircle,
   Trash2,
   ArrowRightLeft,
+  Copy,
 } from "lucide-react";
 import { useState } from "react";
 import { MoveDialog } from "@/components/dialogs/move-dialog";
+import { EnqueueDialog } from "@/components/dialogs/enqueue-dialog";
 
 export function JobDetail({ job }: { job: Job }) {
   const retryJob = useRetryJob();
   const cancelJob = useCancelJob();
   const deleteJob = useDeleteJob();
   const [moveOpen, setMoveOpen] = useState(false);
+  const [cloneOpen, setCloneOpen] = useState(false);
 
-  const canRetry = ["dead", "cancelled"].includes(job.state);
+  const canRetry = ["dead", "cancelled", "scheduled"].includes(job.state);
   const canCancel = ["pending", "active", "retrying", "scheduled"].includes(
     job.state,
   );
+
+  const retryLabel = job.state === "scheduled" ? "Run Now" : "Retry";
 
   return (
     <div className="space-y-6">
@@ -56,7 +62,7 @@ export function JobDetail({ job }: { job: Job }) {
               onClick={() => retryJob.mutate(job.id)}
               disabled={retryJob.isPending}
             >
-              <RotateCcw className="mr-1 h-3 w-3" /> Retry
+              <RotateCcw className="mr-1 h-3 w-3" /> {retryLabel}
             </Button>
           )}
           {canCancel && (
@@ -69,6 +75,13 @@ export function JobDetail({ job }: { job: Job }) {
               <XCircle className="mr-1 h-3 w-3" /> Cancel
             </Button>
           )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setCloneOpen(true)}
+          >
+            <Copy className="mr-1 h-3 w-3" /> Clone
+          </Button>
           <Button
             variant="outline"
             size="sm"
@@ -198,37 +211,7 @@ export function JobDetail({ job }: { job: Job }) {
       <JobPayload label="Checkpoint" data={job.checkpoint} />
 
       {/* Errors */}
-      {job.errors && job.errors.length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">Attempt History</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-3">
-              {job.errors.map((err) => (
-                <div key={err.id} className="rounded-md border p-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm font-medium">
-                      Attempt {err.attempt}
-                    </span>
-                    <span className="text-xs text-muted-foreground">
-                      {timeAgo(err.created_at)}
-                    </span>
-                  </div>
-                  <p className="mt-1 font-mono text-xs text-destructive">
-                    {err.error}
-                  </p>
-                  {err.backtrace && (
-                    <pre className="mt-2 overflow-auto rounded bg-muted p-2 text-xs">
-                      {err.backtrace}
-                    </pre>
-                  )}
-                </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-      )}
+      <ErrorHistory errors={job.errors || []} />
 
       <Separator />
 
@@ -246,6 +229,18 @@ export function JobDetail({ job }: { job: Job }) {
         open={moveOpen}
         onOpenChange={setMoveOpen}
         jobId={job.id}
+      />
+
+      <EnqueueDialog
+        open={cloneOpen}
+        onOpenChange={setCloneOpen}
+        initialValues={{
+          queue: job.queue,
+          payload: job.payload,
+          priority: job.priority,
+          uniqueKey: job.unique_key,
+          maxRetries: job.max_retries,
+        }}
       />
     </div>
   );

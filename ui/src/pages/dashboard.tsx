@@ -5,6 +5,7 @@ import { QueueTable } from "@/components/queues/queue-table";
 import { WorkerTable } from "@/components/workers/worker-table";
 import { ClusterPanel } from "@/components/cluster/cluster-panel";
 import { StateBadge } from "@/components/jobs/state-badge";
+import { ThroughputChart } from "@/components/charts/throughput-chart";
 import { EnqueueDialog } from "@/components/dialogs/enqueue-dialog";
 import { useQueues } from "@/hooks/use-queues";
 import { useWorkers } from "@/hooks/use-workers";
@@ -13,6 +14,20 @@ import { useSearch } from "@/hooks/use-search";
 import { timeAgo, truncateId } from "@/lib/utils";
 import { useNavigate } from "react-router-dom";
 import { Plus } from "lucide-react";
+
+function maxLatency(queues: { oldest_pending_at?: string }[]): string | null {
+  let maxMs = 0;
+  for (const q of queues) {
+    if (!q.oldest_pending_at) continue;
+    const ms = Date.now() - new Date(q.oldest_pending_at).getTime();
+    if (ms > maxMs) maxMs = ms;
+  }
+  if (maxMs === 0) return null;
+  const seconds = Math.floor(maxMs / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
 
 export default function Dashboard() {
   const [enqueueOpen, setEnqueueOpen] = useState(false);
@@ -27,6 +42,8 @@ export default function Dashboard() {
   });
   const navigate = useNavigate();
 
+  const latency = queues ? maxLatency(queues) : null;
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -39,7 +56,7 @@ export default function Dashboard() {
 
       {/* Summary stats */}
       {queues && (
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm text-muted-foreground">
@@ -86,8 +103,23 @@ export default function Dashboard() {
               <p className="text-2xl font-bold">{queues.length}</p>
             </CardContent>
           </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm text-muted-foreground">
+                Max Latency
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-2xl font-bold">
+                {latency || "-"}
+              </p>
+            </CardContent>
+          </Card>
         </div>
       )}
+
+      {/* Throughput chart */}
+      <ThroughputChart />
 
       {/* Queues */}
       <Card>

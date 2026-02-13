@@ -28,6 +28,7 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, http.StatusInternalServerError, "INTERNAL_ERROR")
 		return
 	}
+	s.throughput.Inc("enqueued")
 
 	status := http.StatusCreated
 	if result.UniqueExisting {
@@ -184,6 +185,7 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, http.StatusBadRequest, "ACK_ERROR")
 		return
 	}
+	s.throughput.Inc("completed")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -242,7 +244,12 @@ func (s *Server) handleFail(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, http.StatusBadRequest, "FAIL_ERROR")
 		return
 	}
+	s.throughput.Inc("failed")
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleThroughput(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.throughput.Snapshot())
 }
 
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {

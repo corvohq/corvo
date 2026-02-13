@@ -1,32 +1,29 @@
 import { useState, useCallback } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
 import { SearchPanel } from "@/components/search/search-panel";
 import { JobTable } from "@/components/jobs/job-table";
 import { BulkBar } from "@/components/bulk/bulk-bar";
 import { useSearch } from "@/hooks/use-search";
 import { useFilterParams } from "@/hooks/use-filter-params";
-import { exportJSON, exportCSV } from "@/lib/export";
 import type { SearchFilter } from "@/lib/types";
-import { Download } from "lucide-react";
 
 const defaultFilter: SearchFilter = {
-  state: ["dead"],
+  state: ["scheduled"],
   limit: 50,
   sort: "created_at",
   order: "desc",
 };
 
-export default function DeadLetter() {
+export default function ScheduledJobs() {
   const [filter, setFilter, resetFilter] = useFilterParams(defaultFilter);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
-  const activeFilter = { ...filter, state: ["dead"] as string[] };
+  const activeFilter = { ...filter, state: ["scheduled"] as string[] };
   const { data: searchResult, isLoading } = useSearch(activeFilter);
 
   const handleFilterChange = useCallback(
     (f: SearchFilter) => {
-      setFilter({ ...f, state: ["dead"], cursor: undefined });
+      setFilter({ ...f, state: ["scheduled"], cursor: undefined });
     },
     [setFilter],
   );
@@ -63,9 +60,9 @@ export default function DeadLetter() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-bold">Dead Letter Queue</h1>
+      <h1 className="text-2xl font-bold">Scheduled Jobs</h1>
       <p className="text-sm text-muted-foreground">
-        Jobs that have exhausted all retry attempts across all queues.
+        Jobs scheduled to run at a future time. Use "Run Now" to promote them immediately.
       </p>
 
       <SearchPanel
@@ -76,34 +73,14 @@ export default function DeadLetter() {
 
       <Card>
         <CardHeader>
-          <div className="flex items-center justify-between">
-            <CardTitle className="text-sm">
-              Dead Jobs
-              {searchResult && (
-                <span className="ml-2 font-normal text-muted-foreground">
-                  ({searchResult.total} total)
-                </span>
-              )}
-            </CardTitle>
-            {searchResult?.jobs && searchResult.jobs.length > 0 && (
-              <div className="flex gap-1">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => exportJSON(searchResult.jobs, "dead-jobs.json")}
-                >
-                  <Download className="mr-1 h-3 w-3" /> JSON
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => exportCSV(searchResult.jobs, "dead-jobs.csv")}
-                >
-                  <Download className="mr-1 h-3 w-3" /> CSV
-                </Button>
-              </div>
+          <CardTitle className="text-sm">
+            Scheduled Jobs
+            {searchResult && (
+              <span className="ml-2 font-normal text-muted-foreground">
+                ({searchResult.total} total)
+              </span>
             )}
-          </div>
+          </CardTitle>
         </CardHeader>
         <CardContent className="p-0">
           <JobTable
@@ -114,6 +91,7 @@ export default function DeadLetter() {
             hasMore={searchResult?.has_more}
             onLoadMore={handleLoadMore}
             loading={isLoading}
+            showScheduledAt
           />
         </CardContent>
       </Card>
@@ -121,6 +99,7 @@ export default function DeadLetter() {
       <BulkBar
         selectedIds={Array.from(selectedIds)}
         onClear={() => setSelectedIds(new Set())}
+        showRunNow
       />
     </div>
   );

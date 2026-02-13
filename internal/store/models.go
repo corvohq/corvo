@@ -109,15 +109,16 @@ type Queue struct {
 // QueueInfo is a queue plus live job counts.
 type QueueInfo struct {
 	Queue
-	Pending   int `json:"pending"`
-	Active    int `json:"active"`
-	Held      int `json:"held"`
-	Completed int `json:"completed"`
-	Dead      int `json:"dead"`
-	Scheduled int `json:"scheduled"`
-	Retrying  int `json:"retrying"`
-	Enqueued  int `json:"enqueued"`
-	Failed    int `json:"failed"`
+	Pending        int        `json:"pending"`
+	Active         int        `json:"active"`
+	Held           int        `json:"held"`
+	Completed      int        `json:"completed"`
+	Dead           int        `json:"dead"`
+	Scheduled      int        `json:"scheduled"`
+	Retrying       int        `json:"retrying"`
+	Enqueued       int        `json:"enqueued"`
+	Failed         int        `json:"failed"`
+	OldestPendingAt *time.Time `json:"oldest_pending_at,omitempty"`
 }
 
 // Batch represents a group of jobs with an optional completion callback.

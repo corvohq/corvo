@@ -10,13 +10,17 @@ import {
   DollarSign,
   Users,
   Network,
+  Clock,
+  Radio,
 } from "lucide-react";
 
 const navItems = [
   { to: "/ui", icon: LayoutDashboard, label: "Dashboard", end: true },
   { to: "/ui/queues", icon: ListOrdered, label: "Queues" },
+  { to: "/ui/scheduled", icon: Clock, label: "Scheduled" },
   { to: "/ui/dead-letter", icon: Skull, label: "Dead Letter" },
   { to: "/ui/held", icon: HandMetal, label: "Held Jobs" },
+  { to: "/ui/events", icon: Radio, label: "Events" },
   { to: "/ui/cost", icon: DollarSign, label: "Cost" },
   { to: "/ui/workers", icon: Users, label: "Workers" },
   { to: "/ui/cluster", icon: Network, label: "Cluster" },
