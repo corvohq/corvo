@@ -112,6 +112,7 @@ func (db *DB) migrate() error {
 	}{
 		{version: 1, path: "migrations/001_initial.sql"},
 		{version: 2, path: "migrations/002_job_usage.sql"},
+		{version: 3, path: "migrations/003_budgets.sql"},
 	}
 
 	for _, m := range migrationsToApply {

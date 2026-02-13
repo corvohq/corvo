@@ -21,6 +21,7 @@ const (
 	PrefixQueueCursor = "qac|" // qac|{queue} => last consumed queue-append key
 	PrefixEventLog    = "ev|"  // ev|{seq:8BE}
 	KeyEventCursor    = "evc|" // evc|last_seq
+	PrefixBudget      = "bg|"  // bg|{scope}\x00{target}
 )
 
 const sep = '\x00'
@@ -228,4 +229,16 @@ func EventSeqFromKey(k []byte) (uint64, bool) {
 		return 0, false
 	}
 	return GetUint64BE(k[len(PrefixEventLog):]), true
+}
+
+// BudgetKey returns the Pebble key for a budget config: bg|{scope}\x00{target}
+func BudgetKey(scope, target string) []byte {
+	k := append([]byte(PrefixBudget), scope...)
+	k = append(k, sep)
+	return append(k, target...)
+}
+
+// BudgetPrefix returns scan prefix for budgets: bg|
+func BudgetPrefix() []byte {
+	return []byte(PrefixBudget)
 }

@@ -34,6 +34,8 @@ const (
 	OpAckBatch       OpType = 23
 	OpMulti          OpType = 24
 	OpFetchBatch     OpType = 25
+	OpSetBudget      OpType = 26
+	OpDeleteBudget   OpType = 27
 )
 
 // Op is the Raft log entry payload.
@@ -222,4 +224,19 @@ type CleanUniqueOp struct {
 
 type CleanRateLimitOp struct {
 	CutoffNs uint64 `json:"cutoff_ns"`
+}
+
+type SetBudgetOp struct {
+	ID        string   `json:"id"`
+	Scope     string   `json:"scope"`
+	Target    string   `json:"target"`
+	DailyUSD  *float64 `json:"daily_usd,omitempty"`
+	PerJobUSD *float64 `json:"per_job_usd,omitempty"`
+	OnExceed  string   `json:"on_exceed"`
+	CreatedAt string   `json:"created_at"`
+}
+
+type DeleteBudgetOp struct {
+	Scope  string `json:"scope"`
+	Target string `json:"target"`
 }

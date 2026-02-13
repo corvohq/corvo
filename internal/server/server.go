@@ -74,6 +74,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/cluster/events", s.handleClusterEvents)
 		r.Get("/events", s.handleSSE)
 		r.Get("/usage/summary", s.handleUsageSummary)
+		r.Get("/budgets", s.handleListBudgets)
 
 		// Write endpoints (leader only when clustered)
 		r.Group(func(r chi.Router) {
@@ -88,6 +89,8 @@ func (s *Server) buildRouter() chi.Router {
 			r.Post("/ack/{job_id}", s.handleAck)
 			r.Post("/fail/{job_id}", s.handleFail)
 			r.Post("/heartbeat", s.handleHeartbeat)
+			r.Post("/budgets", s.handleSetBudget)
+			r.Delete("/budgets/{scope}/{target}", s.handleDeleteBudget)
 
 			// Queue management
 			r.Post("/queues/{name}/pause", s.handlePauseQueue)
@@ -213,6 +216,10 @@ func writeStoreError(w http.ResponseWriter, err error, fallbackStatus int, fallb
 			return
 		}
 		writeError(w, http.StatusTooManyRequests, err.Error(), "OVERLOADED")
+		return
+	}
+	if store.IsBudgetExceededError(err) {
+		writeError(w, http.StatusTooManyRequests, err.Error(), "BUDGET_EXCEEDED")
 		return
 	}
 	writeError(w, fallbackStatus, err.Error(), fallbackCode)

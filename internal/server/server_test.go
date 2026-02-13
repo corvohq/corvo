@@ -493,6 +493,36 @@ func TestBulkEndpoint(t *testing.T) {
 	}
 }
 
+func TestBudgetEndpoints(t *testing.T) {
+	srv, _ := testServer(t)
+
+	rr := doRequest(srv, "POST", "/api/v1/budgets", map[string]any{
+		"scope":       "queue",
+		"target":      "budget.api",
+		"daily_usd":   5.0,
+		"per_job_usd": 1.0,
+		"on_exceed":   "hold",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("set budget status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(srv, "GET", "/api/v1/budgets", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list budgets status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var budgets []map[string]any
+	decodeResponse(t, rr, &budgets)
+	if len(budgets) == 0 {
+		t.Fatalf("expected at least one budget")
+	}
+
+	rr = doRequest(srv, "DELETE", "/api/v1/budgets/queue/budget.api", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete budget status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestClusterStatusEndpoint(t *testing.T) {
 	srv, _ := testServer(t)
 	rr := doRequest(srv, "GET", "/api/v1/cluster/status", nil)

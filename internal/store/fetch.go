@@ -35,6 +35,13 @@ func (s *Store) Fetch(req FetchRequest) (*FetchResult, error) {
 	if len(req.Queues) == 0 {
 		return nil, fmt.Errorf("at least one queue is required")
 	}
+	allowedQueues, err := s.enforceFetchBudgets(req.Queues)
+	if err != nil {
+		return nil, err
+	}
+	if len(allowedQueues) == 0 {
+		return nil, nil
+	}
 
 	leaseDuration := req.LeaseDuration
 	if leaseDuration <= 0 {
@@ -43,7 +50,7 @@ func (s *Store) Fetch(req FetchRequest) (*FetchResult, error) {
 
 	now := time.Now()
 	op := FetchOp{
-		Queues:        req.Queues,
+		Queues:        allowedQueues,
 		WorkerID:      req.WorkerID,
 		Hostname:      req.Hostname,
 		LeaseDuration: leaseDuration,
@@ -63,6 +70,14 @@ func (s *Store) FetchBatch(req FetchRequest, count int) ([]FetchResult, error) {
 		return []FetchResult{}, nil
 	}
 
+	allowedQueues, err := s.enforceFetchBudgets(req.Queues)
+	if err != nil {
+		return nil, err
+	}
+	if len(allowedQueues) == 0 {
+		return []FetchResult{}, nil
+	}
+
 	leaseDuration := req.LeaseDuration
 	if leaseDuration <= 0 {
 		leaseDuration = 60
@@ -70,7 +85,7 @@ func (s *Store) FetchBatch(req FetchRequest, count int) ([]FetchResult, error) {
 
 	now := time.Now()
 	op := FetchBatchOp{
-		Queues:        req.Queues,
+		Queues:        allowedQueues,
 		WorkerID:      req.WorkerID,
 		Hostname:      req.Hostname,
 		LeaseDuration: leaseDuration,

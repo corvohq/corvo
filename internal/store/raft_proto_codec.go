@@ -38,6 +38,8 @@ type DecodedRaftOp struct {
 	BulkAction   *BulkActionOp
 	CleanUnique  *CleanUniqueOp
 	CleanRate    *CleanRateLimitOp
+	SetBudget    *SetBudgetOp
+	DeleteBudget *DeleteBudgetOp
 	Multi        []*DecodedRaftOp
 }
 
@@ -74,6 +76,8 @@ type pbOp struct {
 	BulkAction   *pbBulkActionOp   `protobuf:"bytes,24,opt,name=bulk_action,json=bulkAction,proto3" json:"bulk_action,omitempty"`
 	CleanUnique  *pbCleanUniqueOp  `protobuf:"bytes,25,opt,name=clean_unique,json=cleanUnique,proto3" json:"clean_unique,omitempty"`
 	CleanRate    *pbCleanRateOp    `protobuf:"bytes,26,opt,name=clean_rate,json=cleanRate,proto3" json:"clean_rate,omitempty"`
+	SetBudget    *pbSetBudgetOp    `protobuf:"bytes,27,opt,name=set_budget,json=setBudget,proto3" json:"set_budget,omitempty"`
+	DeleteBudget *pbDeleteBudgetOp `protobuf:"bytes,28,opt,name=delete_budget,json=deleteBudget,proto3" json:"delete_budget,omitempty"`
 }
 
 func (m *pbOp) Reset()         { *m = pbOp{} }
@@ -334,6 +338,31 @@ func (m *pbCleanRateOp) Reset()         { *m = pbCleanRateOp{} }
 func (m *pbCleanRateOp) String() string { return oldproto.CompactTextString(m) }
 func (*pbCleanRateOp) ProtoMessage()    {}
 
+type pbSetBudgetOp struct {
+	ID          string  `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Scope       string  `protobuf:"bytes,2,opt,name=scope,proto3" json:"scope,omitempty"`
+	Target      string  `protobuf:"bytes,3,opt,name=target,proto3" json:"target,omitempty"`
+	DailyUsd    float64 `protobuf:"fixed64,4,opt,name=daily_usd,json=dailyUsd,proto3" json:"daily_usd,omitempty"`
+	HasDailyUsd bool    `protobuf:"varint,5,opt,name=has_daily_usd,json=hasDailyUsd,proto3" json:"has_daily_usd,omitempty"`
+	PerJobUsd   float64 `protobuf:"fixed64,6,opt,name=per_job_usd,json=perJobUsd,proto3" json:"per_job_usd,omitempty"`
+	HasPerJob   bool    `protobuf:"varint,7,opt,name=has_per_job,json=hasPerJob,proto3" json:"has_per_job,omitempty"`
+	OnExceed    string  `protobuf:"bytes,8,opt,name=on_exceed,json=onExceed,proto3" json:"on_exceed,omitempty"`
+	CreatedAt   string  `protobuf:"bytes,9,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+}
+
+func (m *pbSetBudgetOp) Reset()         { *m = pbSetBudgetOp{} }
+func (m *pbSetBudgetOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbSetBudgetOp) ProtoMessage()    {}
+
+type pbDeleteBudgetOp struct {
+	Scope  string `protobuf:"bytes,1,opt,name=scope,proto3" json:"scope,omitempty"`
+	Target string `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
+}
+
+func (m *pbDeleteBudgetOp) Reset()         { *m = pbDeleteBudgetOp{} }
+func (m *pbDeleteBudgetOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbDeleteBudgetOp) ProtoMessage()    {}
+
 func encodeRaftOp(opType OpType, data any) ([]byte, error) {
 	pb, err := buildPBOp(opType, data)
 	if err != nil {
@@ -529,6 +558,18 @@ func buildPBOp(opType OpType, data any) (*pbOp, error) {
 			return nil, fmt.Errorf("clean rate op type mismatch: %T", data)
 		}
 		op.CleanRate = toPBCleanRate(v)
+	case OpSetBudget:
+		v, ok := data.(SetBudgetOp)
+		if !ok {
+			return nil, fmt.Errorf("set budget op type mismatch: %T", data)
+		}
+		op.SetBudget = toPBSetBudget(v)
+	case OpDeleteBudget:
+		v, ok := data.(DeleteBudgetOp)
+		if !ok {
+			return nil, fmt.Errorf("delete budget op type mismatch: %T", data)
+		}
+		op.DeleteBudget = toPBDeleteBudget(v)
 	case OpMulti:
 		v, ok := data.(MultiOp)
 		if !ok {
@@ -696,6 +737,18 @@ func buildPBSubOp(sub Op) (*pbOp, error) {
 			return nil, err
 		}
 		op.CleanRate = toPBCleanRate(v)
+	case OpSetBudget:
+		var v SetBudgetOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.SetBudget = toPBSetBudget(v)
+	case OpDeleteBudget:
+		var v DeleteBudgetOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.DeleteBudget = toPBDeleteBudget(v)
 	default:
 		return nil, fmt.Errorf("unsupported multi sub-op type: %d", sub.Type)
 	}
@@ -833,6 +886,16 @@ func fromPBOp(op *pbOp) (*DecodedRaftOp, error) {
 	if op.CleanRate != nil {
 		v := fromPBCleanRate(op.CleanRate)
 		out.CleanRate = &v
+		return out, nil
+	}
+	if op.SetBudget != nil {
+		v := fromPBSetBudget(op.SetBudget)
+		out.SetBudget = &v
+		return out, nil
+	}
+	if op.DeleteBudget != nil {
+		v := fromPBDeleteBudget(op.DeleteBudget)
+		out.DeleteBudget = &v
 		return out, nil
 	}
 	return nil, fmt.Errorf("protobuf op %d missing payload", op.Type)
@@ -1198,4 +1261,56 @@ func toPBCleanRate(op CleanRateLimitOp) *pbCleanRateOp {
 
 func fromPBCleanRate(op *pbCleanRateOp) CleanRateLimitOp {
 	return CleanRateLimitOp{CutoffNs: op.CutoffNs}
+}
+
+func toPBSetBudget(op SetBudgetOp) *pbSetBudgetOp {
+	out := &pbSetBudgetOp{
+		ID:        op.ID,
+		Scope:     op.Scope,
+		Target:    op.Target,
+		OnExceed:  op.OnExceed,
+		CreatedAt: op.CreatedAt,
+	}
+	if op.DailyUSD != nil {
+		out.HasDailyUsd = true
+		out.DailyUsd = *op.DailyUSD
+	}
+	if op.PerJobUSD != nil {
+		out.HasPerJob = true
+		out.PerJobUsd = *op.PerJobUSD
+	}
+	return out
+}
+
+func fromPBSetBudget(op *pbSetBudgetOp) SetBudgetOp {
+	out := SetBudgetOp{
+		ID:        op.ID,
+		Scope:     op.Scope,
+		Target:    op.Target,
+		OnExceed:  op.OnExceed,
+		CreatedAt: op.CreatedAt,
+	}
+	if op.HasDailyUsd {
+		v := op.DailyUsd
+		out.DailyUSD = &v
+	}
+	if op.HasPerJob {
+		v := op.PerJobUsd
+		out.PerJobUSD = &v
+	}
+	return out
+}
+
+func toPBDeleteBudget(op DeleteBudgetOp) *pbDeleteBudgetOp {
+	return &pbDeleteBudgetOp{
+		Scope:  op.Scope,
+		Target: op.Target,
+	}
+}
+
+func fromPBDeleteBudget(op *pbDeleteBudgetOp) DeleteBudgetOp {
+	return DeleteBudgetOp{
+		Scope:  op.Scope,
+		Target: op.Target,
+	}
 }

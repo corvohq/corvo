@@ -5,7 +5,8 @@ import "errors"
 type ErrorCode string
 
 const (
-	ErrorCodeOverloaded ErrorCode = "OVERLOADED"
+	ErrorCodeOverloaded     ErrorCode = "OVERLOADED"
+	ErrorCodeBudgetExceeded ErrorCode = "BUDGET_EXCEEDED"
 )
 
 type StoreError struct {
@@ -27,6 +28,10 @@ func NewOverloadedErrorRetry(msg string, retryAfterMs int) error {
 		retryAfterMs = 0
 	}
 	return &StoreError{Code: ErrorCodeOverloaded, Msg: msg, RetryAfterMs: retryAfterMs}
+}
+
+func NewBudgetExceededError(msg string) error {
+	return &StoreError{Code: ErrorCodeBudgetExceeded, Msg: msg}
 }
 
 func IsOverloadedError(err error) bool {
@@ -52,4 +57,15 @@ func OverloadRetryAfterMs(err error) (int, bool) {
 		return 0, false
 	}
 	return se.RetryAfterMs, se.RetryAfterMs > 0
+}
+
+func IsBudgetExceededError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se *StoreError
+	if !errors.As(err, &se) {
+		return false
+	}
+	return se.Code == ErrorCodeBudgetExceeded
 }

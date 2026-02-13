@@ -1407,6 +1407,57 @@ func (f *FSM) applyMoveJobOp(op store.MoveJobOp) *store.OpResult {
 	return &store.OpResult{Data: nil}
 }
 
+// --- Budgets ---
+
+func (f *FSM) applySetBudget(data json.RawMessage) *store.OpResult {
+	var op store.SetBudgetOp
+	if err := json.Unmarshal(data, &op); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	return f.applySetBudgetOp(op)
+}
+
+func (f *FSM) applySetBudgetOp(op store.SetBudgetOp) *store.OpResult {
+	doc := store.Budget{
+		ID:        op.ID,
+		Scope:     op.Scope,
+		Target:    op.Target,
+		DailyUSD:  op.DailyUSD,
+		PerJobUSD: op.PerJobUSD,
+		OnExceed:  op.OnExceed,
+		CreatedAt: op.CreatedAt,
+	}
+	b, err := json.Marshal(doc)
+	if err != nil {
+		return &store.OpResult{Err: err}
+	}
+	if err := f.pebble.Set(kv.BudgetKey(op.Scope, op.Target), b, f.writeOpts); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	f.syncSQLite(func(db sqlExecer) error {
+		return sqliteUpsertBudget(db, doc)
+	})
+	return &store.OpResult{Data: nil}
+}
+
+func (f *FSM) applyDeleteBudget(data json.RawMessage) *store.OpResult {
+	var op store.DeleteBudgetOp
+	if err := json.Unmarshal(data, &op); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	return f.applyDeleteBudgetOp(op)
+}
+
+func (f *FSM) applyDeleteBudgetOp(op store.DeleteBudgetOp) *store.OpResult {
+	if err := f.pebble.Delete(kv.BudgetKey(op.Scope, op.Target), f.writeOpts); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	f.syncSQLite(func(db sqlExecer) error {
+		return sqliteDeleteBudget(db, op.Scope, op.Target)
+	})
+	return &store.OpResult{Data: nil}
+}
+
 // --- DeleteJob ---
 
 func (f *FSM) applyDeleteJob(data json.RawMessage) *store.OpResult {
