@@ -4,6 +4,11 @@ bin/
 *.db-shm
 node_modules/
 ui/node_modules/
-ui/dist/assets/
+ui/dist/
 *.tsbuildinfo
 *.log
+
+# SDK build artifacts
+sdk/typescript/dist/
+sdk/python/**/__pycache__/
+*.pyc
