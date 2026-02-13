@@ -1,48 +1,51 @@
 # AI Extras
 
-High-value AI workflow extensions beyond the current Phase 2 implementation.
+Infrastructure-only AI workflow extensions for Jobbie.
+
+This document intentionally stays within the design boundary from `docs/DESIGN.md`:
+- Jobbie provides execution infrastructure.
+- Workers own prompts, LLM calls, and tool choice.
+
+## Scope
+
+In scope:
+- queue/runtime safety controls
+- human review infrastructure
+- observability and queryability
+- cache behavior in enqueue/fetch/ack workflow
+
+Out of scope:
+- prompt authoring/version management product
+- model selection/canary decisioning product logic
+- evaluator orchestration platform
+- SLO/incident management product layer
 
 ## Priority Backlog
 
-1. Prompt/version as first-class metadata
-- Add dedicated fields for `prompt_id`, `prompt_version`, and `experiment` (instead of relying only on tags).
-- Use these fields in score/cost/latency breakdowns and comparisons.
+1. Rich approval policies
+- Status: implemented baseline.
+- Next: expand predicates (cost range, payload field matches, tag patterns, queue patterns), add dry-run mode, add policy hit diagnostics endpoint.
 
-2. Automatic eval pipelines
-- Add on-complete evaluator hooks that automatically write `job_scores`.
-- Add threshold-based pass/fail and regression alerting.
+2. Trace UI improvements
+- Status: trace storage and display implemented.
+- Next: iteration-to-iteration diff and tool/action timeline view in job detail.
 
-3. Canary rollouts for models/prompts
-- Add weighted routing for controlled rollouts (for example `90/10`, `50/50`).
-- Add automated score/cost/latency comparison and promote/demote controls.
+3. Exact-match caching at enqueue
+- Status: usage has cache token metrics; enqueue cache-hit behavior not implemented.
+- Next: add payload-hash cache key lookup on enqueue, short-circuit completed response on hit, TTL-aware invalidation.
 
-4. Rich approval policies
-- Expand policy predicates for action type, cost range, queue, tags, and payload fields.
-- Add dry-run mode and policy-hit diagnostics.
+4. Budget warning signal in heartbeat
+- Status: implemented (`budget_exceeded` in heartbeat response).
+- Next: document in API/CLI help and surface clearly in worker examples.
 
-5. Budget degrade workflow
-- Add a degrade action that switches to cheaper fallback execution before hold/reject.
-- Add burn-rate forecast and budget alerting.
+5. Better usage tag querying
+- Status: queue/model grouping exists.
+- Next: add `group_by=tag:<key>` support to usage summary with tests and docs.
 
-6. Trace tooling
-- Add iteration diff view and tool-call timeline.
-- Add exportable trace bundles and replay from trace checkpoints.
+## Implementation Order
 
-7. Real caching workflow
-- Add enqueue-time cache hit behavior for exact/semantic matching with TTL and invalidation policy.
-- Add cache clear endpoints by queue/tag/model.
-
-8. AI SLO and incident workflow
-- Add AI SLOs for p95 latency, hold rate, provider-error rate, and cost/job.
-- Add alert surfaces in UI and runbook links.
-
-## Suggested Implementation Order
-
-1. Prompt/version metadata
-2. Automatic eval pipelines
-3. Canary rollouts
-4. Rich approval policies
-5. Budget degrade workflow
-6. Trace tooling
-7. Real caching workflow
-8. AI SLO and incident workflow
+1. Trace UI improvements
+2. Exact-match caching at enqueue
+3. Usage `group_by=tag:<key>`
+4. Approval policy predicate expansion and diagnostics
+5. Budget warning docs/examples polish
