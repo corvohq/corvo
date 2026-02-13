@@ -125,6 +125,23 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
+func (s *Server) handleListJobIterations(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if _, err := s.store.GetJob(id); err != nil {
+		writeError(w, http.StatusNotFound, err.Error(), "NOT_FOUND")
+		return
+	}
+	iterations, err := s.store.ListJobIterations(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
+		return
+	}
+	if iterations == nil {
+		iterations = []store.JobIteration{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"iterations": iterations})
+}
+
 func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if err := s.store.RetryJob(id); err != nil {

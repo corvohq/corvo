@@ -195,6 +195,46 @@ var replayCmd = &cobra.Command{
 	},
 }
 
+var iterationsCmd = &cobra.Command{
+	Use:   "iterations <job-id>",
+	Short: "List iteration history for an agent job",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		data, status, err := apiRequest("GET", "/api/v1/jobs/"+args[0]+"/iterations", nil)
+		if err != nil {
+			return err
+		}
+		exitOnError(data, status)
+		if outputJSON {
+			printJSON(data)
+			return nil
+		}
+		var resp struct {
+			Iterations []struct {
+				Iteration  int     `json:"iteration"`
+				Status     string  `json:"status"`
+				CostUSD    float64 `json:"cost_usd"`
+				HoldReason *string `json:"hold_reason,omitempty"`
+			} `json:"iterations"`
+		}
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return err
+		}
+		if len(resp.Iterations) == 0 {
+			fmt.Println("No iterations")
+			return nil
+		}
+		for _, it := range resp.Iterations {
+			if it.HoldReason != nil && *it.HoldReason != "" {
+				fmt.Printf("%d  %s  cost=%.6f  hold=%s\n", it.Iteration, it.Status, it.CostUSD, *it.HoldReason)
+				continue
+			}
+			fmt.Printf("%d  %s  cost=%.6f\n", it.Iteration, it.Status, it.CostUSD)
+		}
+		return nil
+	},
+}
+
 var heldCmd = &cobra.Command{
 	Use:   "held",
 	Short: "List held jobs awaiting approval",
@@ -278,6 +318,6 @@ func init() {
 	enqueueCmd.Flags().StringVar(&enqAgentIterationTimeout, "agent-iteration-timeout", "", "Agent per-iteration timeout (e.g. 2m)")
 	replayCmd.Flags().IntVar(&replayFromIteration, "from", 0, "Replay from this agent iteration (required)")
 
-	addClientFlags(enqueueCmd, inspectCmd, retryCmd, cancelCmd, holdCmd, approveCmd, rejectCmd, replayCmd, heldCmd, moveCmd, deleteCmd)
-	rootCmd.AddCommand(enqueueCmd, inspectCmd, retryCmd, cancelCmd, holdCmd, approveCmd, rejectCmd, replayCmd, heldCmd, moveCmd, deleteCmd)
+	addClientFlags(enqueueCmd, inspectCmd, retryCmd, cancelCmd, holdCmd, approveCmd, rejectCmd, replayCmd, iterationsCmd, heldCmd, moveCmd, deleteCmd)
+	rootCmd.AddCommand(enqueueCmd, inspectCmd, retryCmd, cancelCmd, holdCmd, approveCmd, rejectCmd, replayCmd, iterationsCmd, heldCmd, moveCmd, deleteCmd)
 }

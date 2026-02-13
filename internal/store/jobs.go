@@ -177,6 +177,57 @@ func (s *Store) ReplayFromIteration(id string, from int) (*EnqueueResult, error)
 	return s.Enqueue(req)
 }
 
+func (s *Store) ListJobIterations(id string) ([]JobIteration, error) {
+	rows, err := s.sqliteR.Query(`
+		SELECT id, job_id, iteration, status, checkpoint, hold_reason, result,
+			input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+			model, provider, cost_usd, created_at
+		FROM job_iterations
+		WHERE job_id = ?
+		ORDER BY iteration ASC, id ASC
+	`, id)
+	if err != nil {
+		return nil, fmt.Errorf("list iterations for %q: %w", id, err)
+	}
+	defer rows.Close()
+
+	out := make([]JobIteration, 0, 16)
+	for rows.Next() {
+		var it JobIteration
+		var checkpoint, holdReason, result sql.NullString
+		var model, provider sql.NullString
+		var createdAt string
+		if err := rows.Scan(
+			&it.ID, &it.JobID, &it.Iteration, &it.Status, &checkpoint, &holdReason, &result,
+			&it.InputTokens, &it.OutputTokens, &it.CacheCreationTokens, &it.CacheReadTokens,
+			&model, &provider, &it.CostUSD, &createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan job iteration: %w", err)
+		}
+		if checkpoint.Valid {
+			it.Checkpoint = json.RawMessage(checkpoint.String)
+		}
+		if holdReason.Valid {
+			it.HoldReason = &holdReason.String
+		}
+		if result.Valid {
+			it.Result = json.RawMessage(result.String)
+		}
+		if model.Valid {
+			it.Model = &model.String
+		}
+		if provider.Valid {
+			it.Provider = &provider.String
+		}
+		it.CreatedAt = parseTime(createdAt)
+		out = append(out, it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate job iterations rows: %w", err)
+	}
+	return out, nil
+}
+
 // RetryJob resets a dead/cancelled/completed job back to pending via Raft.
 func (s *Store) RetryJob(id string) error {
 	now := time.Now()

@@ -23,8 +23,8 @@ func sqliteInsertJob(db sqlExecer, op store.EnqueueOp) error {
 	var agentMaxIterations *int
 	var agentMaxCostUSD *float64
 	var agentIterationTimeout *string
-	var agentIteration *int
-	var agentTotalCostUSD *float64
+	agentIteration := 0
+	agentTotalCostUSD := 0.0
 	if op.ScheduledAt != nil {
 		s := op.ScheduledAt.UTC().Format(time.RFC3339Nano)
 		scheduledAt = &s
@@ -48,8 +48,8 @@ func sqliteInsertJob(db sqlExecer, op store.EnqueueOp) error {
 		agentMaxIterations = &op.Agent.MaxIterations
 		agentMaxCostUSD = &op.Agent.MaxCostUSD
 		agentIterationTimeout = nullableString(op.Agent.IterationTimeout)
-		agentIteration = &op.Agent.Iteration
-		agentTotalCostUSD = &op.Agent.TotalCostUSD
+		agentIteration = op.Agent.Iteration
+		agentTotalCostUSD = op.Agent.TotalCostUSD
 	}
 
 	createdAt := op.CreatedAt.UTC().Format(time.RFC3339Nano)
@@ -103,8 +103,8 @@ func sqliteInsertBatch(db sqlExecer, op store.EnqueueBatchOp) error {
 		var agentMaxIterations *int
 		var agentMaxCostUSD *float64
 		var agentIterationTimeout *string
-		var agentIteration *int
-		var agentTotalCostUSD *float64
+		agentIteration := 0
+		agentTotalCostUSD := 0.0
 		if len(j.Tags) > 0 {
 			s := string(j.Tags)
 			tags = &s
@@ -117,8 +117,8 @@ func sqliteInsertBatch(db sqlExecer, op store.EnqueueBatchOp) error {
 			agentMaxIterations = &j.Agent.MaxIterations
 			agentMaxCostUSD = &j.Agent.MaxCostUSD
 			agentIterationTimeout = nullableString(j.Agent.IterationTimeout)
-			agentIteration = &j.Agent.Iteration
-			agentTotalCostUSD = &j.Agent.TotalCostUSD
+			agentIteration = j.Agent.Iteration
+			agentTotalCostUSD = j.Agent.TotalCostUSD
 		}
 		var batchIDPtr *string
 		if op.BatchID != "" {
@@ -710,8 +710,8 @@ func sqliteUpsertJobDoc(db sqlExecer, j store.Job) error {
 	var agentMaxIterations *int
 	var agentMaxCostUSD *float64
 	var agentIterationTimeout *string
-	var agentIteration *int
-	var agentTotalCostUSD *float64
+	agentIteration := 0
+	agentTotalCostUSD := 0.0
 	if j.UniqueKey != nil {
 		uniqueKey = j.UniqueKey
 	}
@@ -752,21 +752,52 @@ func sqliteUpsertJobDoc(db sqlExecer, j store.Job) error {
 		agentMaxIterations = &j.Agent.MaxIterations
 		agentMaxCostUSD = &j.Agent.MaxCostUSD
 		agentIterationTimeout = nullableString(j.Agent.IterationTimeout)
-		agentIteration = &j.Agent.Iteration
-		agentTotalCostUSD = &j.Agent.TotalCostUSD
+		agentIteration = j.Agent.Iteration
+		agentTotalCostUSD = j.Agent.TotalCostUSD
 	}
 	if j.HoldReason != nil {
 		holdReason = j.HoldReason
 	}
 	createdAt := j.CreatedAt.UTC().Format(time.RFC3339Nano)
 
-	_, err := db.Exec(`INSERT OR REPLACE INTO jobs (
+	_, err := db.Exec(`INSERT INTO jobs (
 		id, queue, state, payload, priority, attempt, max_retries,
 		retry_backoff, retry_base_delay_ms, retry_max_delay_ms,
 		unique_key, batch_id, worker_id, hostname, tags, progress, checkpoint, result,
 		agent_max_iterations, agent_max_cost_usd, agent_iteration_timeout, agent_iteration, agent_total_cost_usd,
 		hold_reason, lease_expires_at, scheduled_at, expire_at, created_at, started_at, completed_at, failed_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(id) DO UPDATE SET
+		queue = excluded.queue,
+		state = excluded.state,
+		payload = excluded.payload,
+		priority = excluded.priority,
+		attempt = excluded.attempt,
+		max_retries = excluded.max_retries,
+		retry_backoff = excluded.retry_backoff,
+		retry_base_delay_ms = excluded.retry_base_delay_ms,
+		retry_max_delay_ms = excluded.retry_max_delay_ms,
+		unique_key = excluded.unique_key,
+		batch_id = excluded.batch_id,
+		worker_id = excluded.worker_id,
+		hostname = excluded.hostname,
+		tags = excluded.tags,
+		progress = excluded.progress,
+		checkpoint = excluded.checkpoint,
+		result = excluded.result,
+		agent_max_iterations = excluded.agent_max_iterations,
+		agent_max_cost_usd = excluded.agent_max_cost_usd,
+		agent_iteration_timeout = excluded.agent_iteration_timeout,
+		agent_iteration = excluded.agent_iteration,
+		agent_total_cost_usd = excluded.agent_total_cost_usd,
+		hold_reason = excluded.hold_reason,
+		lease_expires_at = excluded.lease_expires_at,
+		scheduled_at = excluded.scheduled_at,
+		expire_at = excluded.expire_at,
+		created_at = excluded.created_at,
+		started_at = excluded.started_at,
+		completed_at = excluded.completed_at,
+		failed_at = excluded.failed_at`,
 		j.ID, j.Queue, j.State, string(j.Payload), j.Priority, j.Attempt, j.MaxRetries,
 		j.RetryBackoff, j.RetryBaseDelay, j.RetryMaxDelay,
 		uniqueKey, batchID, workerID, hostname, string(j.Tags), string(j.Progress), string(j.Checkpoint), string(j.Result),
