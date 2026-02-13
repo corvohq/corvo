@@ -8,7 +8,10 @@ function useInvalidate() {
     qc.invalidateQueries({ queryKey: ["search"] });
     qc.invalidateQueries({ queryKey: ["queues"] });
     qc.invalidateQueries({ queryKey: ["job"] });
+    qc.invalidateQueries({ queryKey: ["job-iterations"] });
     qc.invalidateQueries({ queryKey: ["workers"] });
+    qc.invalidateQueries({ queryKey: ["usage-summary"] });
+    qc.invalidateQueries({ queryKey: ["budgets"] });
   };
 }
 
@@ -73,6 +76,19 @@ export function useMoveJob() {
       post(`/jobs/${id}/move`, { queue }),
     onSuccess: () => { invalidate(); toast.success("Job moved"); },
     onError: (e) => toast.error(`Move failed: ${e.message}`),
+  });
+}
+
+export function useReplayJob() {
+  const invalidate = useInvalidate();
+  return useMutation({
+    mutationFn: ({ id, from }: { id: string; from: number }) =>
+      post(`/jobs/${id}/replay`, { from }),
+    onSuccess: () => {
+      invalidate();
+      toast.success("Replay job enqueued");
+    },
+    onError: (e) => toast.error(`Replay failed: ${e.message}`),
   });
 }
 

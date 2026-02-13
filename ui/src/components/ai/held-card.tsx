@@ -19,7 +19,9 @@ export function HeldCard({ job }: HeldCardProps) {
 
   // Hold reason/payload would come from tags or payload
   const holdReason =
-    (job.tags as Record<string, string> | undefined)?.hold_reason || "Awaiting approval";
+    job.hold_reason ||
+    (job.tags as Record<string, string> | undefined)?.hold_reason ||
+    "Awaiting approval";
 
   return (
     <Card>

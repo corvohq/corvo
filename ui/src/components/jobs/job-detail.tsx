@@ -14,6 +14,7 @@ import {
   useRetryJob,
   useCancelJob,
   useDeleteJob,
+  useReplayJob,
 } from "@/hooks/use-mutations";
 import type { Job } from "@/lib/types";
 import {
@@ -26,11 +27,17 @@ import {
 import { useState } from "react";
 import { MoveDialog } from "@/components/dialogs/move-dialog";
 import { EnqueueDialog } from "@/components/dialogs/enqueue-dialog";
+import { useJobIterations } from "@/hooks/use-job-iterations";
+import { IterationTable } from "@/components/ai/iteration-table";
+import { ScoreSummary } from "@/components/ai/score-summary";
+import { StreamOutput } from "@/components/ai/stream-output";
 
 export function JobDetail({ job }: { job: Job }) {
   const retryJob = useRetryJob();
   const cancelJob = useCancelJob();
   const deleteJob = useDeleteJob();
+  const replayJob = useReplayJob();
+  const { data: iterations = [], isLoading: isIterationsLoading } = useJobIterations(job.id);
   const [moveOpen, setMoveOpen] = useState(false);
   const [cloneOpen, setCloneOpen] = useState(false);
 
@@ -40,6 +47,23 @@ export function JobDetail({ job }: { job: Job }) {
   );
 
   const retryLabel = job.state === "scheduled" ? "Run Now" : "Retry";
+  const resultObj =
+    job.result && typeof job.result === "object" && !Array.isArray(job.result)
+      ? (job.result as Record<string, unknown>)
+      : {};
+  const scores =
+    resultObj.scores && typeof resultObj.scores === "object" && !Array.isArray(resultObj.scores)
+      ? (resultObj.scores as Record<string, number>)
+      : {};
+  const outputText =
+    typeof resultObj.output === "string"
+      ? resultObj.output
+      : typeof resultObj.text === "string"
+        ? resultObj.text
+        : typeof resultObj.summary === "string"
+          ? resultObj.summary
+          : "";
+  const isAgentJob = !!job.agent;
 
   return (
     <div className="space-y-6">
@@ -184,6 +208,24 @@ export function JobDetail({ job }: { job: Job }) {
                 </dd>
               </div>
             )}
+            {job.agent && (
+              <>
+                <div>
+                  <dt className="text-muted-foreground">Agent Iteration</dt>
+                  <dd>
+                    {job.agent.iteration || 0}
+                    {job.agent.max_iterations ? ` / ${job.agent.max_iterations}` : ""}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Agent Cost</dt>
+                  <dd>
+                    ${((job.agent.total_cost_usd || 0)).toFixed(4)}
+                    {job.agent.max_cost_usd ? ` / $${job.agent.max_cost_usd.toFixed(4)}` : ""}
+                  </dd>
+                </div>
+              </>
+            )}
           </dl>
 
           {job.tags && Object.keys(job.tags).length > 0 && (
@@ -198,8 +240,55 @@ export function JobDetail({ job }: { job: Job }) {
               </div>
             </div>
           )}
+          {job.hold_reason && (
+            <div className="mt-4">
+              <p className="mb-1 text-sm text-muted-foreground">Hold Reason</p>
+              <p className="rounded bg-muted px-2 py-1 text-sm">{job.hold_reason}</p>
+            </div>
+          )}
         </CardContent>
       </Card>
+
+      {Object.keys(scores).length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Scores</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ScoreSummary scores={scores} />
+          </CardContent>
+        </Card>
+      )}
+
+      {outputText && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Output</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <StreamOutput content={outputText} />
+          </CardContent>
+        </Card>
+      )}
+
+      {isAgentJob && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Agent Iterations</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {isIterationsLoading ? (
+              <p className="py-4 text-sm text-muted-foreground">Loading iterations...</p>
+            ) : (
+              <IterationTable
+                iterations={iterations}
+                replaying={replayJob.isPending}
+                onReplay={(from) => replayJob.mutate({ id: job.id, from })}
+              />
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {/* Payload */}
       <JobPayload label="Payload" data={job.payload} defaultOpen />

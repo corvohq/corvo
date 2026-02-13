@@ -24,7 +24,17 @@ export interface Job {
   started_at?: string;
   completed_at?: string;
   failed_at?: string;
+  hold_reason?: string;
+  agent?: AgentState;
   errors?: JobError[];
+}
+
+export interface AgentState {
+  max_iterations?: number;
+  max_cost_usd?: number;
+  iteration_timeout?: string;
+  iteration?: number;
+  total_cost_usd?: number;
 }
 
 export interface JobError {
@@ -133,4 +143,53 @@ export interface ClusterNode {
   address?: string;
   role: string;
   status: string;
+}
+
+export interface UsageSummaryTotals {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  count: number;
+}
+
+export interface UsageSummaryGroup extends UsageSummaryTotals {
+  key: string;
+}
+
+export interface UsageSummaryResponse {
+  period: string;
+  from: string;
+  to: string;
+  totals: UsageSummaryTotals;
+  groups?: UsageSummaryGroup[];
+}
+
+export interface Budget {
+  id: string;
+  scope: "queue" | "tag" | "global";
+  target: string;
+  daily_usd?: number;
+  per_job_usd?: number;
+  on_exceed: "hold" | "reject" | "alert_only";
+  created_at: string;
+}
+
+export interface JobIteration {
+  id: number;
+  job_id: string;
+  iteration: number;
+  status: "continue" | "done" | "hold" | string;
+  checkpoint?: unknown;
+  hold_reason?: string;
+  result?: unknown;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_creation_tokens?: number;
+  cache_read_tokens?: number;
+  model?: string;
+  provider?: string;
+  cost_usd?: number;
+  created_at: string;
 }

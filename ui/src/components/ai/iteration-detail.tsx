@@ -1,47 +1,47 @@
 interface IterationDetailProps {
   iteration: {
-    request?: unknown;
-    response?: unknown;
-    tool_calls?: unknown[];
+    checkpoint?: unknown;
+    result?: unknown;
+    hold_reason?: string;
   };
 }
 
 export function IterationDetail({ iteration }: IterationDetailProps) {
   return (
     <div className="space-y-3 border-t bg-muted/30 p-4">
-      {iteration.request != null && (
+      {iteration.checkpoint != null && (
         <div>
           <h4 className="mb-1 text-xs font-medium text-muted-foreground">
-            Request
+            Checkpoint
           </h4>
           <pre className="overflow-auto rounded bg-muted p-2 text-xs">
-            {JSON.stringify(iteration.request, null, 2)}
+            {JSON.stringify(iteration.checkpoint, null, 2)}
           </pre>
         </div>
       )}
-      {iteration.response != null && (
+      {iteration.result != null && (
         <div>
           <h4 className="mb-1 text-xs font-medium text-muted-foreground">
-            Response
+            Result
           </h4>
           <pre className="overflow-auto rounded bg-muted p-2 text-xs whitespace-pre-wrap">
-            {typeof iteration.response === "string"
-              ? iteration.response
-              : JSON.stringify(iteration.response, null, 2)}
+            {typeof iteration.result === "string"
+              ? iteration.result
+              : JSON.stringify(iteration.result, null, 2)}
           </pre>
         </div>
       )}
-      {iteration.tool_calls && iteration.tool_calls.length > 0 && (
+      {iteration.hold_reason && (
         <div>
           <h4 className="mb-1 text-xs font-medium text-muted-foreground">
-            Tool Calls ({iteration.tool_calls.length})
+            Hold Reason
           </h4>
-          <pre className="overflow-auto rounded bg-muted p-2 text-xs">
-            {JSON.stringify(iteration.tool_calls, null, 2)}
-          </pre>
+          <p className="rounded bg-muted p-2 text-xs whitespace-pre-wrap">
+            {iteration.hold_reason}
+          </p>
         </div>
       )}
-      {!iteration.request && !iteration.response && !iteration.tool_calls && (
+      {!iteration.checkpoint && !iteration.result && !iteration.hold_reason && (
         <p className="text-xs text-muted-foreground">No detail available</p>
       )}
     </div>
