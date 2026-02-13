@@ -1,4 +1,4 @@
-.PHONY: build run test lint clean
+.PHONY: build run test perf lint clean
 
 BINARY := jobbie
 BUILD_DIR := bin
@@ -14,6 +14,9 @@ run: build
 
 test:
 	CGO_ENABLED=1 go test ./... -v -count=1
+
+perf:
+	CGO_ENABLED=1 go test -tags perf ./tests/perf -v -count=1
 
 lint:
 	golangci-lint run ./...

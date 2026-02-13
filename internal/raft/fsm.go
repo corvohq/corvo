@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -28,6 +29,7 @@ type FSM struct {
 	sqliteQueue  chan func(db sqlExecer) error
 	sqliteStop   chan struct{}
 	sqliteDone   chan struct{}
+	sqliteMu     sync.Mutex
 }
 
 // NewFSM creates a new FSM with the given Pebble and SQLite databases.
@@ -382,6 +384,8 @@ func (f *FSM) syncSQLite(fn func(db sqlExecer) error) {
 			return
 		}
 	}
+	f.sqliteMu.Lock()
+	defer f.sqliteMu.Unlock()
 	if err := fn(f.sqlite); err != nil {
 		slog.Error("sqlite sync failed (non-fatal)", "error", err)
 	}
@@ -455,6 +459,8 @@ func (f *FSM) sqliteMirrorLoop() {
 			batch = batch[:0]
 			return
 		}
+		f.sqliteMu.Lock()
+		defer f.sqliteMu.Unlock()
 
 		for i, fn := range batch {
 			sp := fmt.Sprintf("sp%d", i)

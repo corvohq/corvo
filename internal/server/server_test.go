@@ -25,10 +25,11 @@ type mockCluster struct {
 	leaderAddr string
 }
 
-func (m mockCluster) IsLeader() bool                { return m.isLeader }
-func (m mockCluster) LeaderAddr() string            { return m.leaderAddr }
-func (m mockCluster) ClusterStatus() map[string]any { return map[string]any{"mode": "cluster"} }
-func (m mockCluster) State() string                 { return "follower" }
+func (m mockCluster) IsLeader() bool                 { return m.isLeader }
+func (m mockCluster) LeaderAddr() string             { return m.leaderAddr }
+func (m mockCluster) ClusterStatus() map[string]any  { return map[string]any{"mode": "cluster"} }
+func (m mockCluster) State() string                  { return "follower" }
+func (m mockCluster) RebuildSQLiteFromPebble() error { return nil }
 func (m mockCluster) EventLog(afterSeq uint64, limit int) ([]map[string]any, error) {
 	return []map[string]any{{"seq": 1, "type": "enqueued"}}, nil
 }
@@ -72,6 +73,20 @@ func TestHealthz(t *testing.T) {
 	rr := doRequest(srv, "GET", "/healthz", nil)
 	if rr.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+}
+
+func TestRebuildSQLiteEndpointCluster(t *testing.T) {
+	_, s := testServer(t)
+	srv := New(s, mockCluster{isLeader: true}, ":0")
+	rr := doRequest(srv, "POST", "/api/v1/admin/rebuild-sqlite", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	decodeResponse(t, rr, &body)
+	if body["status"] != "ok" {
+		t.Fatalf("status body = %v", body["status"])
 	}
 }
 

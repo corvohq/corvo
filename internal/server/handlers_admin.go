@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"strconv"
+	"time"
 )
 
 func (s *Server) handleListWorkers(w http.ResponseWriter, r *http.Request) {
@@ -99,4 +100,21 @@ func (s *Server) handleClusterEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": events})
+}
+
+func (s *Server) handleRebuildSQLite(w http.ResponseWriter, r *http.Request) {
+	if s.cluster == nil {
+		writeError(w, http.StatusNotImplemented, "cluster rebuild unavailable", "UNSUPPORTED")
+		return
+	}
+	start := time.Now()
+	if err := s.cluster.RebuildSQLiteFromPebble(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":      "ok",
+		"rebuilt":     true,
+		"duration_ms": time.Since(start).Milliseconds(),
+	})
 }

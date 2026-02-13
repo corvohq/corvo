@@ -2086,8 +2086,13 @@ curl -X POST http://localhost:8080/api/v1/enqueue \
 ```
 jobbie/
 ├── cmd/
-│   └── jobbie/
-│       └── main.go              # Entry point — server, CLI subcommands
+│   ├── jobbie/
+│   │   └── main.go              # Entry point — server, CLI subcommands
+│   └── bench/
+│       └── main.go              # HTTP/RPC benchmark tool for throughput + latency
+├── proto/
+│   └── jobbie/v1/
+│       └── worker.proto         # Connect RPC service definitions (protobuf)
 ├── internal/
 │   ├── kv/
 │   │   ├── keys.go              # Pebble key construction + prefix constants
@@ -2095,27 +2100,44 @@ jobbie/
 │   │   ├── encoding.go          # Big-endian integer encoding
 │   │   └── encoding_test.go     # Encoding tests
 │   ├── raft/
-│   │   ├── ops.go               # Op/OpType definitions, per-op data structs
-│   │   ├── fsm.go               # FSM struct, Apply dispatch
-│   │   ├── fsm_ops.go           # One apply* function per OpType
+│   │   ├── ops.go               # Op/OpType definitions (shared with store)
+│   │   ├── fsm.go               # FSM struct, Apply dispatch, mirror config
+│   │   ├── fsm_ops.go           # One apply* function per OpType (25 ops)
+│   │   ├── fsm_multi_test.go    # Multi-operation FSM tests
 │   │   ├── fsm_snapshot.go      # Snapshot + Restore (Pebble checkpoint + SQLite backup)
 │   │   ├── fsm_sqlite.go        # SQLite materialized view sync helpers
 │   │   ├── eventlog.go          # Per-job lifecycle event log (optional, Pebble-backed)
+│   │   ├── job_codec.go         # Job document encoding/decoding
 │   │   ├── cluster.go           # Raft node setup, apply pipeline, admission control
 │   │   ├── cluster_test.go      # Single + multi-node tests
 │   │   ├── config.go            # ClusterConfig struct (batch, admission, durability params)
-│   │   ├── raft_store.go        # Raft log/stable store abstraction (bolt, badger, pebble)
+│   │   ├── direct.go            # Direct communication between nodes
+│   │   ├── raft_store.go        # Raft log/stable store interface + bolt backend
 │   │   ├── raft_store_badger.go # BadgerDB Raft log store implementation
 │   │   ├── raft_store_pebble.go # Pebble Raft log store implementation
 │   │   └── transport.go         # TCP transport config
+│   ├── rpc/
+│   │   ├── server.go            # RESP-compatible TCP RPC server (legacy)
+│   │   └── server_test.go       # RPC server tests
+│   ├── rpcconnect/
+│   │   ├── server.go            # Connect RPC WorkerService (HTTP/2, protobuf)
+│   │   └── gen/jobbie/v1/       # Generated protobuf + Connect code
 │   ├── server/
-│   │   ├── server.go            # HTTP server setup, middleware, routing, leader proxy
+│   │   ├── server.go            # HTTP/2 server setup, middleware, routing, leader proxy
 │   │   ├── handlers_worker.go   # enqueue, fetch, ack, fail, heartbeat
 │   │   ├── handlers_manage.go   # queues, jobs, search, bulk operations
-│   │   └── handlers_admin.go    # cluster status, metrics, healthz
+│   │   ├── handlers_admin.go    # cluster status, events, metrics, healthz
+│   │   └── server_test.go       # Server integration tests
 │   ├── store/
 │   │   ├── store.go             # Store struct (holds *raft.Cluster + *sql.DB for reads)
+│   │   ├── store_test.go        # Store integration tests
+│   │   ├── ops.go               # OpInput, MarshalOp, MarshalMulti, OpResult, OverloadedError
+│   │   ├── raft_proto_codec.go  # Protobuf codec for Raft operations
 │   │   ├── db.go                # OpenMaterializedView() — single SQLite setup
+│   │   ├── models.go            # All types (Job, Queue, Batch, etc.)
+│   │   ├── ids.go               # ULID-based ID generation
+│   │   ├── errors.go            # Error types (OverloadedError, etc.)
+│   │   ├── backoff.go           # Retry backoff calculation
 │   │   ├── enqueue.go           # Build Op → cluster.Apply()
 │   │   ├── fetch.go             # Build Op → cluster.Apply()
 │   │   ├── ack.go               # Build Op → cluster.Apply()
@@ -2125,34 +2147,29 @@ jobbie/
 │   │   ├── queues.go            # ListQueues reads SQLite; mutations through Raft
 │   │   ├── bulk.go              # Filter from SQLite → bulk op through Raft
 │   │   ├── search.go            # SQL query builder for search filters
-│   │   └── models.go            # All types (Job, Queue, Batch, etc.)
-│   ├── scheduler/
-│   │   └── scheduler.go         # Cron evaluation, delayed job promotion (leader-only)
-│   ├── search/
-│   │   └── builder.go           # Build SQL WHERE clauses from search filters
-│   └── worker/
-│       └── tracker.go           # Worker heartbeat tracking, lease management
+│   │   └── migrations/
+│   │       └── 001_initial.sql  # SQLite materialized view schema
+│   └── scheduler/
+│       ├── scheduler.go         # Delayed job promotion, lease reclaim (leader-only)
+│       └── scheduler_test.go    # Scheduler tests
 ├── pkg/
 │   └── client/
-│       └── client.go            # Go client library (thin HTTP wrapper)
-├── clients/
-│   ├── typescript/              # npm package — ~200 lines
-│   ├── python/                  # pip package — ~200 lines
-│   ├── rust/                    # crates.io package — ~200 lines
-│   └── haskell/                 # Cabal package — ~200 lines
-├── ui/                          # SPA (React/Solid/Svelte)
-│   └── dist/                    # Built assets, embedded via go:embed
-├── migrations/
-│   └── 001_initial.sql          # SQLite materialized view schema
+│       ├── client.go            # Go client library (thin HTTP wrapper)
+│       ├── client_test.go       # Client tests
+│       └── worker.go            # Go worker library (fetch loops + heartbeat)
 ├── deploy/
-│   ├── Dockerfile
-│   ├── docker-compose.yml       # Single node quick start
-│   ├── docker-compose-cluster.yml
-│   └── helm/
-│       └── jobbie/              # Helm chart (single node + clustered)
-└── tests/
-    ├── integration/             # Spin up real server + workers, test full lifecycle
-    └── chaos/                   # Kill nodes, simulate failures, verify recovery
+│   ├── Dockerfile               # Multi-stage Docker build
+│   └── docker-compose.yml       # Single node quick start
+├── tests/
+│   └── integration/
+│       └── integration_test.go  # Full lifecycle integration tests
+└── docs/
+    ├── DESIGN.md                # This document
+    ├── AI.md                    # AI/LLM workload features spec
+    ├── PHASE1.md                # Phase 1 (MVP) implementation checklist
+    ├── PHASE2.md                # Phase 2 delivery plan
+    ├── BENCHMARKS.md            # Benchmark results
+    └── claude-refactor-pebble-raft-sqlite.md  # Pebble + Raft architecture doc
 ```
 
 ---
@@ -2257,84 +2274,126 @@ The boundary is clear: **OSS handles all job processing features. Cloud handles 
 
 ## Implementation plan
 
-### Phase 1 — KV Key Encoding + Raft FSM
+### Phase 1 — Core MVP (SQLite-only) ✅ COMPLETE
 
-- [ ] `internal/kv/`: key construction, prefix constants, big-endian encoding
-- [ ] Thorough sort-order tests for all key patterns
-- [ ] `internal/raft/ops.go`: Op/OpType definitions, per-op data structs
-- [ ] `internal/raft/fsm.go`: FSM struct, Apply dispatch
-- [ ] `internal/raft/fsm_ops.go`: one apply* function per OpType (Pebble batch writes)
-- [ ] `internal/raft/fsm_sqlite.go`: SQLite materialized view sync helpers
-- [ ] Test FSM directly (no networking) — Pebble + SQLite in temp dir, apply ops, verify state
+Single-node server with embedded SQLite, HTTP/JSON API, CLI, Go client. See `docs/PHASE1.md` for full details.
 
-### Phase 2 — Raft Cluster + Store Refactor
+- [x] Project scaffold, Go dependencies, directory structure
+- [x] SQLite database layer (WAL mode, migrations)
+- [x] Domain models, ULID ID generation
+- [x] Store layer: enqueue, fetch, ack, fail, heartbeat, backoff
+- [x] Scheduler: promote scheduled/retrying, reclaim leases, clean unique locks
+- [x] Queue management: pause, resume, clear, drain, delete, concurrency, throttle
+- [x] Job management: get, retry, cancel, move, delete
+- [x] Search: full SQL query builder with all filter types, cursor pagination
+- [x] Bulk operations: retry, delete, cancel, move, requeue, change_priority
+- [x] HTTP server: all worker, management, and admin endpoints with chi router
+- [x] Graceful shutdown (SIGTERM/SIGINT)
+- [x] CLI: full management commands
+- [x] Go client library (`pkg/client/`)
+- [x] Docker image + docker-compose
+- [x] Integration tests (full job lifecycle, priority, unique, pause, search, bulk, cancel, checkpoint)
 
-- [ ] `internal/raft/cluster.go`: Raft node setup, bootstrap, peer management
-- [ ] `internal/raft/config.go`, `transport.go`: cluster config, TCP transport
-- [ ] `internal/raft/fsm_snapshot.go`: Pebble checkpoint + SQLite VACUUM INTO, restore
-- [ ] Single-node bootstrap test, snapshot/restore test
-- [ ] Refactor `store.Store` to hold `*raft.Cluster` + `*sql.DB` for reads
-- [ ] Each store write method → build Op → cluster.Apply()
-- [ ] Read methods unchanged (query local SQLite)
-- [ ] Simplify `db.go` to `OpenMaterializedView()` — single SQLite, no events.db
+### Phase 2 — Pebble + Raft + Performance ✅ COMPLETE
 
-### Phase 3 — Core (MVP)
+Replaced SQLite-only store with Pebble (source of truth) + Raft (consensus) + SQLite (materialized view). See `docs/claude-refactor-pebble-raft-sqlite.md` for architecture details.
 
-- [ ] HTTP API: enqueue, enqueue/batch, fetch, ack, fail, heartbeat
-- [ ] Job lifecycle: pending → active → completed/failed/dead
-- [ ] Retries with configurable backoff (none, fixed, linear, exponential)
-- [ ] Priority (3 tiers via Pebble key sort order)
-- [ ] Unique jobs (Pebble unique lock keys with TTL)
-- [ ] Dead letter queue
-- [ ] Lease management + automatic reclamation
-- [ ] Scheduler: delayed job promotion + lease expiry sweep (leader-only)
-- [ ] Queue management: pause, resume, clear, drain, delete
-- [ ] Job operations: cancel, delete, move to queue
-- [ ] Search API: full SQL-backed filter (query local SQLite materialized view)
-- [ ] Bulk operations API: filter from SQLite → bulk op through Raft
-- [ ] Server: leader proxy middleware (followers proxy writes to leader)
-- [ ] Graceful shutdown (SIGTERM handling)
-- [ ] CLI: full management commands + new flags (--bootstrap, --join, --raft-bind, --node-id)
-- [ ] Go client library (in `pkg/client/`)
-- [ ] TypeScript client library
-- [ ] Docker image
-- [ ] Integration tests
+**KV + FSM:**
+- [x] `internal/kv/`: key construction, prefix constants, big-endian encoding, sort-order tests
+- [x] `internal/raft/fsm.go`: FSM struct, Apply dispatch, configurable SQLite mirror (sync/async)
+- [x] `internal/raft/fsm_ops.go`: apply function for all 25 op types
+- [x] `internal/raft/fsm_sqlite.go`: SQLite materialized view sync helpers
+- [x] `internal/raft/fsm_snapshot.go`: Pebble checkpoint + SQLite VACUUM INTO, restore
+- [x] `internal/raft/eventlog.go`: optional per-job lifecycle event log in Pebble
 
-### Phase 4 — Production ready
+**Cluster + store refactor:**
+- [x] `internal/raft/cluster.go`: Raft node setup, bootstrap, peer management
+- [x] `internal/raft/config.go`: ClusterConfig with all tuning parameters
+- [x] `internal/raft/transport.go`: TCP transport config
+- [x] Refactored `store.Store` to hold `*raft.Cluster` + `*sql.DB` for reads
+- [x] Each store write method → build Op → `cluster.Apply(opType, data)`
+- [x] Simplified `db.go` to `OpenMaterializedView()` — single SQLite
+
+**Raft log store backends:**
+- [x] `internal/raft/raft_store.go`: raftStore interface (bolt, badger, pebble)
+- [x] `internal/raft/raft_store_badger.go`: BadgerDB v4 backend
+- [x] `internal/raft/raft_store_pebble.go`: Pebble backend
+- [x] `--raft-store` CLI flag (bolt, badger, pebble)
+
+**Write pipeline + backpressure:**
+- [x] Group-commit batching (applyLoop with adaptive timer)
+- [x] Sub-batch splitting (ApplySubBatchMax)
+- [x] Admission control: per-queue and global in-flight limits
+- [x] Overload error with dynamic Retry-After (1–10ms)
+- [x] Backpressure via bounded pending queue (ApplyMaxPending)
+- [x] Latency histograms (queue time + apply time, p50/p90/p99)
+
+**Protocol + performance:**
+- [x] Connect RPC (HTTP/2 with protobuf): Enqueue, Fetch, FetchBatch, Ack, AckBatch, Fail, Heartbeat
+- [x] Bidirectional streaming: StreamLifecycle (single connection for continuous fetch/ack)
+- [x] Protobuf codec for Raft ops (`store/raft_proto_codec.go`)
+- [x] OpMulti for group-commit batching
+- [x] FetchBatch + AckBatch ops
+- [x] HTTP benchmark tool (`cmd/bench/`)
+
+**Durability:**
+- [x] `pebbleNoSync=true` always (Pebble rebuilt from Raft log/snapshots)
+- [x] `raftNoSync` configurable (default: true for throughput; `--raft-sync` for power-loss safety)
+- [x] Early snapshot on leader startup
+- [x] Leader proxy middleware (followers proxy writes to leader, transparent to clients)
+
+**Clustering:**
+- [x] Multi-node Raft (bootstrap, join, AddVoter, RemoveServer)
+- [x] Write proxying (follower → leader)
+- [x] Automatic failover + rejoin
+- [x] Raft snapshots + log compaction
+- [x] Cluster status endpoint with histograms + in-flight stats
+- [x] Event log endpoint
+
+### Phase 3 — Production hardening
 
 - [ ] payload_jq filter (translate jq subset to json_extract queries)
 - [ ] Async bulk operations (>10k jobs — background processing with progress SSE)
-- [ ] Cron jobs with leader-only execution
-- [ ] Checkpointing API for long-running jobs
-- [ ] Progress reporting
-- [ ] Cancellation (pending + active via heartbeat)
-- [ ] Concurrency control (per-worker + per-queue / singleton queues)
-- [ ] Rate limiting / throttling (Pebble sliding window keys)
-- [ ] Batches with completion callbacks
-- [ ] Job expiration (TTL)
 - [ ] Real-time UI updates via SSE
 - [ ] Prometheus metrics endpoint
 - [ ] Web UI: dashboard, queue detail with search/filter, job detail, bulk actions
-- [ ] Python client library
-- [ ] Helm chart (single node)
-
-### Phase 5 — Clustering + Ecosystem
-
-- [ ] Multi-node Raft clustering (bootstrap, join, remove)
-- [ ] Write proxying (follower → Raft leader)
-- [ ] Automatic failover + rejoin
-- [ ] Raft snapshots + log compaction
 - [ ] DNS-based peer discovery for Kubernetes
-- [ ] Helm chart (clustered StatefulSet)
-- [ ] Webhooks on job lifecycle events
-- [ ] Job dependencies (job B waits for job A)
-- [ ] UI: cluster status view, Raft state monitoring
-- [ ] Rust client library
-- [ ] Haskell client library
-- [ ] OpenTelemetry integration (trace job from enqueue to complete)
+- [ ] Helm chart (single node + clustered StatefulSet)
+- [ ] Admin endpoint to rebuild SQLite from Pebble
+- [ ] SQLite mirror lag / dropped-update counters
 - [ ] Chaos tests (kill nodes, verify recovery)
 - [ ] 3-node in-process cluster tests, leader election, failover, snapshot transfer
-- [ ] Throughput benchmarks vs old architecture
+- [ ] TypeScript client library
+- [ ] Python client library
+
+### Phase 4 — AI foundations
+
+See `docs/AI.md` for full spec and `docs/PHASE2.md` for delivery plan.
+
+- [ ] Token and cost tracking (`job_usage` table, usage reporting on ack/heartbeat)
+- [ ] Usage summary endpoints + CLI (`jobbie usage`)
+- [ ] Budget enforcement (daily/per-job limits, hold/reject/alert actions)
+- [ ] `held` job state + approve/reject endpoints + CLI
+- [ ] Agent loop primitive (iterative jobs with server-enforced guardrails)
+- [ ] `job_iterations` table + iteration tracking
+- [ ] Agent replay from specific iteration
+- [ ] Provider-aware rate limiting (token-based sliding window)
+- [ ] Model fallback routing
+- [ ] Result schema validation (JSON Schema on ack)
+- [ ] Job chaining (`then` config)
+- [ ] Semantic caching (payload hash)
+- [ ] Output scoring + aggregate queries
+- [ ] Cost dashboard in UI
+- [ ] Held jobs view in UI
+
+### Phase 5 — Ecosystem + polish
+
+- [ ] Webhooks on job lifecycle events
+- [ ] Job dependencies (job B waits for job A)
+- [ ] OpenTelemetry integration (trace job from enqueue to complete)
+- [ ] Rust client library
+- [ ] Haskell client library
+- [ ] Streaming progress deltas via SSE (for LLM agent output)
 
 ### Phase 6 — Enterprise + Cloud
 

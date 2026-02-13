@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -166,6 +167,13 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 		logStore.Close()
 		return nil, fmt.Errorf("create snapshot store: %w", err)
 	}
+	if err := prepareFSMForRecovery(pdb, snapshotStore); err != nil {
+		pdb.Close()
+		sqliteDB.Close()
+		transport.Close()
+		logStore.Close()
+		return nil, fmt.Errorf("prepare fsm recovery: %w", err)
+	}
 
 	// Create Raft instance
 	r, err := raft.NewRaft(raftConfig, fsm, logStore, logStore, snapshotStore, transport)
@@ -232,6 +240,52 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 	)
 
 	return cluster, nil
+}
+
+func prepareFSMForRecovery(pdb *pebble.DB, snapshotStore raft.SnapshotStore) error {
+	snapshots, err := snapshotStore.List()
+	if err != nil {
+		return fmt.Errorf("list snapshots: %w", err)
+	}
+	if len(snapshots) > 0 {
+		return nil
+	}
+	// No snapshot exists yet. Clear local Pebble state so any Raft log replay
+	// starts from a deterministic empty FSM baseline after crash/power loss.
+	if err := clearPebbleAll(pdb); err != nil {
+		return err
+	}
+	slog.Info("recovery prep: no snapshot found; cleared local pebble state before raft replay")
+	return nil
+}
+
+func clearPebbleAll(pdb *pebble.DB) error {
+	iter, err := pdb.NewIter(nil)
+	if err != nil {
+		return fmt.Errorf("create pebble iterator: %w", err)
+	}
+	defer iter.Close()
+
+	batch := pdb.NewBatch()
+	defer batch.Close()
+	var n int
+	for iter.First(); iter.Valid(); iter.Next() {
+		k := append([]byte(nil), iter.Key()...)
+		if err := batch.Delete(k, pebble.Sync); err != nil {
+			return fmt.Errorf("delete pebble key: %w", err)
+		}
+		n++
+	}
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("iterate pebble keys: %w", err)
+	}
+	if n == 0 {
+		return nil
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("commit pebble clear batch: %w", err)
+	}
+	return nil
 }
 
 // Apply submits an operation to the Raft cluster and returns the result.
@@ -1030,32 +1084,32 @@ func (c *Cluster) ClusterStatus() map[string]any {
 	c.admitMu.Unlock()
 
 	return map[string]any{
-		"mode":                  "cluster",
-		"state":                 c.State(),
-		"leader_id":             c.LeaderID(),
-		"leader_addr":           c.LeaderAddr(),
-		"node_id":               c.config.NodeID,
-		"applied_index":         stats["applied_index"],
-		"commit_index":          stats["commit_index"],
-		"raft_nosync":           c.config.RaftNoSync,
-		"raft_store":            c.config.RaftStore,
-		"pebble_nosync":         c.config.PebbleNoSync,
-		"sqlite_mirror_enabled": c.config.SQLiteMirror,
-		"sqlite_mirror_async":   c.config.SQLiteMirrorAsync,
-		"lifecycle_events":      c.config.LifecycleEvents,
-		"apply_batch_max":       c.config.ApplyBatchMax,
-		"apply_batch_min_wait":  c.config.ApplyBatchMinWait.String(),
-		"apply_batch_extend_at": c.config.ApplyBatchExtendAt,
-		"apply_batch_window":    c.config.ApplyBatchWindow.String(),
-		"apply_max_pending":     c.config.ApplyMaxPending,
-		"apply_max_inflight":    c.config.ApplyMaxInFlight,
+		"mode":                     "cluster",
+		"state":                    c.State(),
+		"leader_id":                c.LeaderID(),
+		"leader_addr":              c.LeaderAddr(),
+		"node_id":                  c.config.NodeID,
+		"applied_index":            stats["applied_index"],
+		"commit_index":             stats["commit_index"],
+		"raft_nosync":              c.config.RaftNoSync,
+		"raft_store":               c.config.RaftStore,
+		"pebble_nosync":            c.config.PebbleNoSync,
+		"sqlite_mirror_enabled":    c.config.SQLiteMirror,
+		"sqlite_mirror_async":      c.config.SQLiteMirrorAsync,
+		"lifecycle_events":         c.config.LifecycleEvents,
+		"apply_batch_max":          c.config.ApplyBatchMax,
+		"apply_batch_min_wait":     c.config.ApplyBatchMinWait.String(),
+		"apply_batch_extend_at":    c.config.ApplyBatchExtendAt,
+		"apply_batch_window":       c.config.ApplyBatchWindow.String(),
+		"apply_max_pending":        c.config.ApplyMaxPending,
+		"apply_max_inflight":       c.config.ApplyMaxInFlight,
 		"apply_max_total_inflight": c.config.ApplyMaxTotalInFly,
-		"apply_inflight_now":    inFlightNow,
-		"apply_pending_now":     len(c.applyCh),
-		"apply_sub_batch_max":   c.config.ApplySubBatchMax,
-		"queue_time_hist":       c.queueHist.snapshot(),
-		"apply_time_hist":       c.applyHist.snapshot(),
-		"nodes":                 serverMaps,
+		"apply_inflight_now":       inFlightNow,
+		"apply_pending_now":        len(c.applyCh),
+		"apply_sub_batch_max":      c.config.ApplySubBatchMax,
+		"queue_time_hist":          c.queueHist.snapshot(),
+		"apply_time_hist":          c.applyHist.snapshot(),
+		"nodes":                    serverMaps,
 	}
 }
 
@@ -1114,4 +1168,38 @@ func (c *Cluster) ApplyJSON(data []byte) *store.OpResult {
 // Raft returns the underlying raft.Raft instance.
 func (c *Cluster) Raft() *raft.Raft {
 	return c.raft
+}
+
+// RebuildSQLiteFromPebble rebuilds local SQLite materialized state from Pebble.
+func (c *Cluster) RebuildSQLiteFromPebble() error {
+	return c.fsm.RebuildSQLiteFromPebble()
+}
+
+// SnapshotAfterFirstApply waits until the first user-applied Raft entry exists,
+// then attempts a snapshot. It avoids the "nothing new to snapshot" startup noise.
+func (c *Cluster) SnapshotAfterFirstApply(timeout time.Duration) error {
+	if !c.IsLeader() {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		stats := c.raft.Stats()
+		applied, _ := strconv.ParseUint(stats["applied_index"], 10, 64)
+		if applied > 0 {
+			if err := c.raft.Snapshot().Error(); err != nil && !strings.Contains(strings.ToLower(err.Error()), "nothing new to snapshot") {
+				return err
+			}
+			return nil
+		}
+		if timeout > 0 && time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for first apply before snapshot")
+		}
+		select {
+		case <-c.stopCh:
+			return fmt.Errorf("cluster stopping")
+		case <-ticker.C:
+		}
+	}
 }

@@ -143,14 +143,16 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if err := cluster.WaitForLeader(10 * time.Second); err != nil {
 		return fmt.Errorf("wait for leader: %w", err)
 	}
-	// Force an early snapshot on leaders to minimize pre-first-snapshot
-	// recovery ambiguity after abrupt power loss.
+	// Trigger initial snapshot after the first real apply on leaders to
+	// minimize pre-first-snapshot recovery ambiguity without noisy empty snapshots.
 	if cluster.IsLeader() {
-		if err := cluster.Raft().Snapshot().Error(); err != nil {
-			slog.Warn("initial raft snapshot failed", "error", err)
-		} else {
+		go func() {
+			if err := cluster.SnapshotAfterFirstApply(30 * time.Second); err != nil {
+				slog.Warn("initial raft snapshot skipped/failed", "error", err)
+				return
+			}
 			slog.Info("initial raft snapshot complete")
-		}
+		}()
 	}
 
 	// Join workflow placeholder; full join flow requires leader-side join endpoint.

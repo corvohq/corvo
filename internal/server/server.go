@@ -36,6 +36,7 @@ type ClusterInfo interface {
 	ClusterStatus() map[string]any
 	State() string
 	EventLog(afterSeq uint64, limit int) ([]map[string]any, error)
+	RebuildSQLiteFromPebble() error
 }
 
 // New creates a new Server.
@@ -99,6 +100,7 @@ func (s *Server) buildRouter() chi.Router {
 
 			// Bulk
 			r.Post("/jobs/bulk", s.handleBulk)
+			r.Post("/admin/rebuild-sqlite", s.handleRebuildSQLite)
 		})
 
 	})
