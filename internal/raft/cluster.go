@@ -1050,6 +1050,20 @@ CREATE TABLE IF NOT EXISTS approval_policies (
     created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
 );
 CREATE INDEX IF NOT EXISTS idx_approval_policies_enabled ON approval_policies(enabled);
+
+CREATE TABLE IF NOT EXISTS webhooks (
+    id               TEXT PRIMARY KEY,
+    url              TEXT NOT NULL,
+    events           TEXT NOT NULL,
+    secret           TEXT,
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    retry_limit      INTEGER NOT NULL DEFAULT 3,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+    last_status_code INTEGER,
+    last_error       TEXT,
+    last_delivery_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_webhooks_enabled ON webhooks(enabled, created_at);
 `
 
 // WaitForLeader blocks until the cluster has a leader or timeout.

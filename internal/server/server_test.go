@@ -869,6 +869,36 @@ func TestBudgetEndpoints(t *testing.T) {
 	}
 }
 
+func TestWebhookEndpoints(t *testing.T) {
+	srv, _ := testServer(t)
+
+	rr := doRequest(srv, "POST", "/api/v1/webhooks", map[string]any{
+		"id":          "wh_test",
+		"url":         "http://example.invalid/hook",
+		"events":      []string{"completed", "failed"},
+		"enabled":     true,
+		"retry_limit": 2,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("set webhook status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(srv, "GET", "/api/v1/webhooks", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list webhooks status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var hooks []map[string]any
+	decodeResponse(t, rr, &hooks)
+	if len(hooks) == 0 {
+		t.Fatalf("expected webhook rows")
+	}
+
+	rr = doRequest(srv, "DELETE", "/api/v1/webhooks/wh_test", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete webhook status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestApprovalPolicyEndpointsAndAutoHold(t *testing.T) {
 	srv, _ := testServer(t)
 

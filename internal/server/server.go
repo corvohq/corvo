@@ -24,13 +24,15 @@ import (
 
 // Server is the HTTP server for Jobbie.
 type Server struct {
-	store      *store.Store
-	cluster    ClusterInfo
-	httpServer *http.Server
-	router     chi.Router
-	uiFS       fs.FS
-	throughput *ThroughputTracker
-	bulkAsync  *asyncBulkManager
+	store       *store.Store
+	cluster     ClusterInfo
+	httpServer  *http.Server
+	router      chi.Router
+	uiFS        fs.FS
+	throughput  *ThroughputTracker
+	bulkAsync   *asyncBulkManager
+	webhookStop chan struct{}
+	webhookDone chan struct{}
 }
 
 // ClusterInfo contains cluster state methods used by HTTP handlers/middleware.
@@ -47,11 +49,13 @@ type ClusterInfo interface {
 // If uiAssets is non-nil the embedded SPA will be served at /ui/.
 func New(s *store.Store, cluster ClusterInfo, bindAddr string, uiAssets fs.FS) *Server {
 	srv := &Server{
-		store:      s,
-		cluster:    cluster,
-		uiFS:       uiAssets,
-		throughput: NewThroughputTracker(),
-		bulkAsync:  newAsyncBulkManager(s),
+		store:       s,
+		cluster:     cluster,
+		uiFS:        uiAssets,
+		throughput:  NewThroughputTracker(),
+		bulkAsync:   newAsyncBulkManager(s),
+		webhookStop: make(chan struct{}),
+		webhookDone: make(chan struct{}),
 	}
 	srv.router = srv.buildRouter()
 	srv.httpServer = &http.Server{
@@ -88,6 +92,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/budgets", s.handleListBudgets)
 		r.Get("/providers", s.handleListProviders)
 		r.Get("/approval-policies", s.handleListApprovalPolicies)
+		r.Get("/webhooks", s.handleListWebhooks)
 		r.Get("/scores/summary", s.handleScoreSummary)
 		r.Get("/scores/compare", s.handleScoreCompare)
 		r.Get("/jobs/{id}/scores", s.handleListJobScores)
@@ -113,6 +118,8 @@ func (s *Server) buildRouter() chi.Router {
 			r.Post("/scores", s.handleAddScore)
 			r.Post("/approval-policies", s.handleSetApprovalPolicy)
 			r.Delete("/approval-policies/{id}", s.handleDeleteApprovalPolicy)
+			r.Post("/webhooks", s.handleSetWebhook)
+			r.Delete("/webhooks/{id}", s.handleDeleteWebhook)
 
 			// Queue management
 			r.Post("/queues/{name}/pause", s.handlePauseQueue)
@@ -210,18 +217,37 @@ func (s *Server) mountUI(r chi.Router) {
 // Start begins listening for HTTP requests.
 func (s *Server) Start() error {
 	slog.Info("HTTP server starting", "addr", s.httpServer.Addr)
+	go s.webhookDispatcherLoop()
 	return s.httpServer.ListenAndServe()
 }
 
 // Shutdown gracefully stops the server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	slog.Info("HTTP server shutting down")
+	select {
+	case <-s.webhookStop:
+	default:
+		close(s.webhookStop)
+	}
+	select {
+	case <-s.webhookDone:
+	case <-ctx.Done():
+	}
 	return s.httpServer.Shutdown(ctx)
 }
 
 // Close force-closes all active connections immediately.
 func (s *Server) Close() error {
 	slog.Info("HTTP server force close")
+	select {
+	case <-s.webhookStop:
+	default:
+		close(s.webhookStop)
+	}
+	select {
+	case <-s.webhookDone:
+	default:
+	}
 	return s.httpServer.Close()
 }
 
