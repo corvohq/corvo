@@ -1,0 +1,15 @@
+cabal-version:      2.4
+name:               jobbie-client
+version:            0.1.0
+build-type:         Simple
+
+library
+  exposed-modules:     Jobbie.Client
+  hs-source-dirs:      src
+  build-depends:       base >=4.14 && <5,
+                       aeson,
+                       bytestring,
+                       text,
+                       http-conduit,
+                       http-types
+  default-language:    Haskell2010
