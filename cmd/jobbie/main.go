@@ -199,10 +199,13 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	// Graceful shutdown sequence
 	slog.Info("stopping HTTP server")
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		slog.Error("HTTP shutdown error", "error", err)
+		slog.Error("HTTP shutdown error; forcing close", "error", err)
+		if closeErr := srv.Close(); closeErr != nil {
+			slog.Error("HTTP force close error", "error", closeErr)
+		}
 	}
 
 	slog.Info("stopping scheduler")

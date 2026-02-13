@@ -204,6 +204,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.httpServer.Shutdown(ctx)
 }
 
+// Close force-closes all active connections immediately.
+func (s *Server) Close() error {
+	slog.Info("HTTP server force close")
+	return s.httpServer.Close()
+}
+
 // Handler returns the http.Handler for testing.
 func (s *Server) Handler() http.Handler {
 	return s.httpServer.Handler
