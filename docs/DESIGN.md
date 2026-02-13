@@ -2356,13 +2356,13 @@ Replaced SQLite-only store with Pebble (source of truth) + Raft (consensus) + SQ
 - [x] Web UI: mobile-responsive sidebar (Sheet drawer), dark mode toggle, enqueue job dialog
 - [x] Web UI: date range filters, bulk progress indicator, static asset cache headers (immutable/no-cache)
 - [x] DNS-based peer discovery for Kubernetes
-- [ ] Helm chart (single node + clustered StatefulSet)
+- [x] Helm chart (single node + clustered StatefulSet)
 - [x] Admin endpoint to rebuild SQLite from Pebble
 - [x] SQLite mirror lag / dropped-update counters
 - [x] Chaos tests (kill nodes, verify recovery)
 - [x] 3-node in-process cluster tests, leader election, failover, snapshot transfer
-- [ ] TypeScript client library
-- [ ] Python client library
+- [x] TypeScript client library
+- [x] Python client library
 
 ### Phase 4 — AI foundations
 

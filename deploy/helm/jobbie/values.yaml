@@ -1,0 +1,29 @@
+image:
+  repository: jobbie/jobbie
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+
+single:
+  enabled: true
+  replicaCount: 1
+
+cluster:
+  enabled: false
+  replicas: 3
+  raftPort: 9400
+  headlessServiceName: ""
+
+resources: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClassName: ""

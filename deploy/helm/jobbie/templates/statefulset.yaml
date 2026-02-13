@@ -1,0 +1,76 @@
+{{- if .Values.cluster.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "jobbie.fullname" . }}
+  labels:
+    {{- include "jobbie.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ default (printf "%s-headless" (include "jobbie.fullname" .)) .Values.cluster.headlessServiceName }}
+  replicas: {{ .Values.cluster.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "jobbie.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "jobbie.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: jobbie
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - server
+            - --bind
+            - :8080
+            - --raft-bind
+            - :{{ .Values.cluster.raftPort }}
+            - --node-id
+            - $(POD_NAME)
+            - --bootstrap=false
+            - --discover=dns
+            - --discover-dns-name={{ default (printf "%s-headless" (include "jobbie.fullname" .)) .Values.cluster.headlessServiceName }}.{{ .Release.Namespace }}.svc.cluster.local
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: raft
+              containerPort: {{ .Values.cluster.raftPort }}
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName }}
+        {{- end }}
+{{- end }}
