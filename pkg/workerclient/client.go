@@ -88,6 +88,7 @@ func defaultHTTPClient() *http.Client {
 type EnqueueRequest struct {
 	Queue   string
 	Payload json.RawMessage
+	Agent   *AgentConfig
 }
 
 type EnqueueResponse struct {
@@ -108,6 +109,7 @@ func (c *Client) Enqueue(ctx context.Context, req EnqueueRequest) (*EnqueueRespo
 	resp, err := c.rpc.Enqueue(ctx, connect.NewRequest(&jobbiev1.EnqueueRequest{
 		Queue:       req.Queue,
 		PayloadJson: payload,
+		Agent:       agentConfigToPB(req.Agent),
 	}))
 	if err != nil {
 		return nil, err
@@ -135,6 +137,7 @@ type FetchedJob struct {
 	LeaseDuration int
 	Checkpoint    json.RawMessage
 	Tags          json.RawMessage
+	Agent         *AgentState
 }
 
 // Fetch returns nil,nil when no job is available.
@@ -160,6 +163,7 @@ func (c *Client) Fetch(ctx context.Context, req FetchRequest) (*FetchedJob, erro
 		LeaseDuration: int(resp.Msg.GetLeaseDuration()),
 		Checkpoint:    json.RawMessage(resp.Msg.GetCheckpointJson()),
 		Tags:          json.RawMessage(resp.Msg.GetTagsJson()),
+		Agent:         agentStateFromPB(resp.Msg.GetAgent()),
 	}, nil
 }
 
@@ -188,6 +192,7 @@ func (c *Client) FetchBatch(ctx context.Context, req FetchRequest, count int) ([
 			LeaseDuration: int(j.GetLeaseDuration()),
 			Checkpoint:    json.RawMessage(j.GetCheckpointJson()),
 			Tags:          json.RawMessage(j.GetTagsJson()),
+			Agent:         agentStateFromPB(j.GetAgent()),
 		})
 	}
 	return jobs, nil
@@ -198,17 +203,39 @@ func (c *Client) Ack(ctx context.Context, jobID string, result json.RawMessage) 
 }
 
 func (c *Client) AckWithUsage(ctx context.Context, jobID string, result json.RawMessage, usage *UsageReport) error {
+	return c.AckWithOptions(ctx, AckOptions{
+		JobID:  jobID,
+		Result: result,
+		Usage:  usage,
+	})
+}
+
+type AckOptions struct {
+	JobID       string
+	Result      json.RawMessage
+	Checkpoint  json.RawMessage
+	Usage       *UsageReport
+	AgentStatus string
+	HoldReason  string
+}
+
+func (c *Client) AckWithOptions(ctx context.Context, req AckOptions) error {
+	jobID := strings.TrimSpace(req.JobID)
 	if jobID == "" {
 		return fmt.Errorf("job_id is required")
 	}
-	resultJSON := strings.TrimSpace(string(result))
+	resultJSON := strings.TrimSpace(string(req.Result))
 	if resultJSON == "" {
 		resultJSON = `{}`
 	}
+	checkpointJSON := strings.TrimSpace(string(req.Checkpoint))
 	_, err := c.rpc.Ack(ctx, connect.NewRequest(&jobbiev1.AckRequest{
-		JobId:      jobID,
-		ResultJson: resultJSON,
-		Usage:      usageToPB(usage),
+		JobId:          jobID,
+		ResultJson:     resultJSON,
+		Usage:          usageToPB(req.Usage),
+		CheckpointJson: checkpointJSON,
+		AgentStatus:    req.AgentStatus,
+		HoldReason:     req.HoldReason,
 	}))
 	return err
 }
@@ -261,6 +288,7 @@ type LifecycleRequest struct {
 type LifecycleEnqueueItem struct {
 	Queue   string
 	Payload json.RawMessage
+	Agent   *AgentConfig
 }
 
 type LifecycleResponse struct {
@@ -320,6 +348,7 @@ func (s *LifecycleStream) Exchange(req LifecycleRequest) (*LifecycleResponse, er
 		enqueues = append(enqueues, &jobbiev1.LifecycleEnqueueItem{
 			Queue:       queue,
 			PayloadJson: payload,
+			Agent:       agentConfigToPB(enq.Agent),
 		})
 	}
 
@@ -360,6 +389,7 @@ func (s *LifecycleStream) Exchange(req LifecycleRequest) (*LifecycleResponse, er
 			LeaseDuration: int(j.GetLeaseDuration()),
 			Checkpoint:    json.RawMessage(j.GetCheckpointJson()),
 			Tags:          json.RawMessage(j.GetTagsJson()),
+			Agent:         agentStateFromPB(j.GetAgent()),
 		})
 	}
 	return resp, nil
@@ -470,6 +500,20 @@ type UsageReport struct {
 	CostUSD             float64
 }
 
+type AgentConfig struct {
+	MaxIterations    int
+	MaxCostUSD       float64
+	IterationTimeout string
+}
+
+type AgentState struct {
+	MaxIterations    int
+	MaxCostUSD       float64
+	IterationTimeout string
+	Iteration        int
+	TotalCostUSD     float64
+}
+
 func usageToPB(u *UsageReport) *jobbiev1.UsageReport {
 	if u == nil {
 		return nil
@@ -482,5 +526,29 @@ func usageToPB(u *UsageReport) *jobbiev1.UsageReport {
 		Model:               strings.TrimSpace(u.Model),
 		Provider:            strings.TrimSpace(u.Provider),
 		CostUsd:             u.CostUSD,
+	}
+}
+
+func agentConfigToPB(a *AgentConfig) *jobbiev1.AgentConfig {
+	if a == nil {
+		return nil
+	}
+	return &jobbiev1.AgentConfig{
+		MaxIterations:    int32(a.MaxIterations),
+		MaxCostUsd:       a.MaxCostUSD,
+		IterationTimeout: strings.TrimSpace(a.IterationTimeout),
+	}
+}
+
+func agentStateFromPB(a *jobbiev1.AgentState) *AgentState {
+	if a == nil {
+		return nil
+	}
+	return &AgentState{
+		MaxIterations:    int(a.GetMaxIterations()),
+		MaxCostUSD:       a.GetMaxCostUsd(),
+		IterationTimeout: a.GetIterationTimeout(),
+		Iteration:        int(a.GetIteration()),
+		TotalCostUSD:     a.GetTotalCostUsd(),
 	}
 }

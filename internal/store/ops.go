@@ -92,6 +92,7 @@ type EnqueueOp struct {
 	Queue        string          `json:"queue"`
 	State        string          `json:"state"`
 	Payload      json.RawMessage `json:"payload"`
+	Checkpoint   json.RawMessage `json:"checkpoint,omitempty"`
 	Priority     int             `json:"priority"`
 	MaxRetries   int             `json:"max_retries"`
 	Backoff      string          `json:"backoff"`
@@ -105,6 +106,7 @@ type EnqueueOp struct {
 	CreatedAt    time.Time       `json:"created_at"`
 	NowNs        uint64          `json:"now_ns"`
 	BatchID      string          `json:"batch_id,omitempty"`
+	Agent        *AgentState     `json:"agent,omitempty"`
 }
 
 type EnqueueBatchOp struct {
@@ -138,10 +140,13 @@ type FetchBatchOp struct {
 }
 
 type AckOp struct {
-	JobID  string          `json:"job_id"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Usage  *UsageReport    `json:"usage,omitempty"`
-	NowNs  uint64          `json:"now_ns"`
+	JobID       string          `json:"job_id"`
+	Result      json.RawMessage `json:"result,omitempty"`
+	Checkpoint  json.RawMessage `json:"checkpoint,omitempty"`
+	Usage       *UsageReport    `json:"usage,omitempty"`
+	AgentStatus string          `json:"agent_status,omitempty"`
+	HoldReason  string          `json:"hold_reason,omitempty"`
+	NowNs       uint64          `json:"now_ns"`
 }
 
 type AckBatchOp struct {

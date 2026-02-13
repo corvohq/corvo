@@ -265,6 +265,161 @@ func TestAckCleansUniqueLock(t *testing.T) {
 	}
 }
 
+func TestAgentContinueTransitionsAndGuardrailHold(t *testing.T) {
+	s := testStore(t)
+
+	enq, err := s.Enqueue(store.EnqueueRequest{
+		Queue:   "agent.loop",
+		Payload: json.RawMessage(`{"task":"iterate"}`),
+		Agent: &store.AgentConfig{
+			MaxIterations: 2,
+			MaxCostUSD:    1.0,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	f1, err := s.Fetch(store.FetchRequest{Queues: []string{"agent.loop"}, WorkerID: "w1", Hostname: "h1"})
+	if err != nil {
+		t.Fatalf("Fetch #1: %v", err)
+	}
+	if f1 == nil {
+		t.Fatal("Fetch #1 returned nil")
+	}
+	if f1.Agent == nil || f1.Agent.Iteration != 1 {
+		t.Fatalf("fetch #1 agent iteration = %+v, want iteration=1", f1.Agent)
+	}
+
+	err = s.AckJob(store.AckRequest{
+		JobID:       f1.JobID,
+		AgentStatus: store.AgentStatusContinue,
+		Checkpoint:  json.RawMessage(`{"step":1}`),
+		Usage:       &store.UsageReport{CostUSD: 0.2},
+	})
+	if err != nil {
+		t.Fatalf("Ack continue #1: %v", err)
+	}
+
+	j1, err := s.GetJob(enq.JobID)
+	if err != nil {
+		t.Fatalf("GetJob #1: %v", err)
+	}
+	if j1.State != store.StatePending {
+		t.Fatalf("state after continue #1 = %s, want %s", j1.State, store.StatePending)
+	}
+	if j1.Agent == nil || j1.Agent.Iteration != 2 {
+		t.Fatalf("agent after continue #1 = %+v, want iteration=2", j1.Agent)
+	}
+	if string(j1.Checkpoint) != `{"step":1}` {
+		t.Fatalf("checkpoint after continue #1 = %s", string(j1.Checkpoint))
+	}
+
+	f2, err := s.Fetch(store.FetchRequest{Queues: []string{"agent.loop"}, WorkerID: "w1", Hostname: "h1"})
+	if err != nil {
+		t.Fatalf("Fetch #2: %v", err)
+	}
+	if f2 == nil {
+		t.Fatal("Fetch #2 returned nil")
+	}
+	if f2.Agent == nil || f2.Agent.Iteration != 2 {
+		t.Fatalf("fetch #2 agent iteration = %+v, want iteration=2", f2.Agent)
+	}
+
+	err = s.AckJob(store.AckRequest{
+		JobID:       f2.JobID,
+		AgentStatus: store.AgentStatusContinue,
+		Checkpoint:  json.RawMessage(`{"step":2}`),
+		Usage:       &store.UsageReport{CostUSD: 0.3},
+	})
+	if err != nil {
+		t.Fatalf("Ack continue #2: %v", err)
+	}
+
+	j2, err := s.GetJob(enq.JobID)
+	if err != nil {
+		t.Fatalf("GetJob #2: %v", err)
+	}
+	if j2.State != store.StateHeld {
+		t.Fatalf("state after continue #2 = %s, want %s", j2.State, store.StateHeld)
+	}
+	if j2.HoldReason == nil || *j2.HoldReason == "" {
+		t.Fatalf("hold reason not set: %+v", j2.HoldReason)
+	}
+}
+
+func TestReplayFromIteration(t *testing.T) {
+	s := testStore(t)
+
+	enq, err := s.Enqueue(store.EnqueueRequest{
+		Queue:   "agent.replay",
+		Payload: json.RawMessage(`{"task":"replay"}`),
+		Tags:    json.RawMessage(`{"tenant":"acme"}`),
+		Agent: &store.AgentConfig{
+			MaxIterations: 5,
+			MaxCostUSD:    10,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	f1, err := s.Fetch(store.FetchRequest{Queues: []string{"agent.replay"}, WorkerID: "w1", Hostname: "h1"})
+	if err != nil {
+		t.Fatalf("Fetch #1: %v", err)
+	}
+	if f1 == nil {
+		t.Fatal("Fetch #1 returned nil")
+	}
+	if err := s.AckJob(store.AckRequest{
+		JobID:       f1.JobID,
+		AgentStatus: store.AgentStatusContinue,
+		Checkpoint:  json.RawMessage(`{"cursor":"iter1"}`),
+	}); err != nil {
+		t.Fatalf("Ack continue: %v", err)
+	}
+
+	f2, err := s.Fetch(store.FetchRequest{Queues: []string{"agent.replay"}, WorkerID: "w1", Hostname: "h1"})
+	if err != nil {
+		t.Fatalf("Fetch #2: %v", err)
+	}
+	if f2 == nil {
+		t.Fatal("Fetch #2 returned nil")
+	}
+	if err := s.AckJob(store.AckRequest{
+		JobID:       f2.JobID,
+		AgentStatus: store.AgentStatusDone,
+		Result:      json.RawMessage(`{"ok":true}`),
+	}); err != nil {
+		t.Fatalf("Ack done: %v", err)
+	}
+
+	replayed, err := s.ReplayFromIteration(enq.JobID, 1)
+	if err != nil {
+		t.Fatalf("ReplayFromIteration: %v", err)
+	}
+	if replayed.JobID == "" {
+		t.Fatal("replay job_id is empty")
+	}
+	if replayed.JobID == enq.JobID {
+		t.Fatal("replay reused original job ID")
+	}
+
+	j, err := s.GetJob(replayed.JobID)
+	if err != nil {
+		t.Fatalf("Get replayed job: %v", err)
+	}
+	if j.State != store.StatePending {
+		t.Fatalf("replayed state = %s, want %s", j.State, store.StatePending)
+	}
+	if string(j.Checkpoint) != `{"cursor":"iter1"}` {
+		t.Fatalf("replayed checkpoint = %s", string(j.Checkpoint))
+	}
+	if j.Agent == nil || j.Agent.Iteration != 1 {
+		t.Fatalf("replayed agent = %+v, want iteration=1", j.Agent)
+	}
+}
+
 func TestFailWithRetry(t *testing.T) {
 	s := testStore(t)
 

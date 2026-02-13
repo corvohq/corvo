@@ -27,6 +27,7 @@ type FetchResult struct {
 	LeaseDuration int             `json:"lease_duration"`
 	Checkpoint    json.RawMessage `json:"checkpoint,omitempty"`
 	Tags          json.RawMessage `json:"tags,omitempty"`
+	Agent         *AgentState     `json:"agent,omitempty"`
 }
 
 // Fetch claims the highest-priority pending job from the given queues via Raft.

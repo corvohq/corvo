@@ -93,25 +93,32 @@ func (m *pbMultiOp) String() string { return oldproto.CompactTextString(m) }
 func (*pbMultiOp) ProtoMessage()    {}
 
 type pbEnqueueOp struct {
-	JobID          string `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	Queue          string `protobuf:"bytes,2,opt,name=queue,proto3" json:"queue,omitempty"`
-	State          string `protobuf:"bytes,3,opt,name=state,proto3" json:"state,omitempty"`
-	Payload        []byte `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
-	Priority       int32  `protobuf:"varint,5,opt,name=priority,proto3" json:"priority,omitempty"`
-	MaxRetries     int32  `protobuf:"varint,6,opt,name=max_retries,json=maxRetries,proto3" json:"max_retries,omitempty"`
-	Backoff        string `protobuf:"bytes,7,opt,name=backoff,proto3" json:"backoff,omitempty"`
-	BaseDelayMs    int32  `protobuf:"varint,8,opt,name=base_delay_ms,json=baseDelayMs,proto3" json:"base_delay_ms,omitempty"`
-	MaxDelayMs     int32  `protobuf:"varint,9,opt,name=max_delay_ms,json=maxDelayMs,proto3" json:"max_delay_ms,omitempty"`
-	UniqueKey      string `protobuf:"bytes,10,opt,name=unique_key,json=uniqueKey,proto3" json:"unique_key,omitempty"`
-	UniquePeriod   int32  `protobuf:"varint,11,opt,name=unique_period,json=uniquePeriod,proto3" json:"unique_period,omitempty"`
-	Tags           []byte `protobuf:"bytes,12,opt,name=tags,proto3" json:"tags,omitempty"`
-	ScheduledAtNs  int64  `protobuf:"varint,13,opt,name=scheduled_at_ns,json=scheduledAtNs,proto3" json:"scheduled_at_ns,omitempty"`
-	HasScheduledAt bool   `protobuf:"varint,14,opt,name=has_scheduled_at,json=hasScheduledAt,proto3" json:"has_scheduled_at,omitempty"`
-	ExpireAtNs     int64  `protobuf:"varint,15,opt,name=expire_at_ns,json=expireAtNs,proto3" json:"expire_at_ns,omitempty"`
-	HasExpireAt    bool   `protobuf:"varint,16,opt,name=has_expire_at,json=hasExpireAt,proto3" json:"has_expire_at,omitempty"`
-	CreatedAtNs    int64  `protobuf:"varint,17,opt,name=created_at_ns,json=createdAtNs,proto3" json:"created_at_ns,omitempty"`
-	NowNs          uint64 `protobuf:"varint,18,opt,name=now_ns,json=nowNs,proto3" json:"now_ns,omitempty"`
-	BatchID        string `protobuf:"bytes,19,opt,name=batch_id,json=batchId,proto3" json:"batch_id,omitempty"`
+	JobID                 string  `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Queue                 string  `protobuf:"bytes,2,opt,name=queue,proto3" json:"queue,omitempty"`
+	State                 string  `protobuf:"bytes,3,opt,name=state,proto3" json:"state,omitempty"`
+	Payload               []byte  `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
+	Priority              int32   `protobuf:"varint,5,opt,name=priority,proto3" json:"priority,omitempty"`
+	MaxRetries            int32   `protobuf:"varint,6,opt,name=max_retries,json=maxRetries,proto3" json:"max_retries,omitempty"`
+	Backoff               string  `protobuf:"bytes,7,opt,name=backoff,proto3" json:"backoff,omitempty"`
+	BaseDelayMs           int32   `protobuf:"varint,8,opt,name=base_delay_ms,json=baseDelayMs,proto3" json:"base_delay_ms,omitempty"`
+	MaxDelayMs            int32   `protobuf:"varint,9,opt,name=max_delay_ms,json=maxDelayMs,proto3" json:"max_delay_ms,omitempty"`
+	UniqueKey             string  `protobuf:"bytes,10,opt,name=unique_key,json=uniqueKey,proto3" json:"unique_key,omitempty"`
+	UniquePeriod          int32   `protobuf:"varint,11,opt,name=unique_period,json=uniquePeriod,proto3" json:"unique_period,omitempty"`
+	Tags                  []byte  `protobuf:"bytes,12,opt,name=tags,proto3" json:"tags,omitempty"`
+	ScheduledAtNs         int64   `protobuf:"varint,13,opt,name=scheduled_at_ns,json=scheduledAtNs,proto3" json:"scheduled_at_ns,omitempty"`
+	HasScheduledAt        bool    `protobuf:"varint,14,opt,name=has_scheduled_at,json=hasScheduledAt,proto3" json:"has_scheduled_at,omitempty"`
+	ExpireAtNs            int64   `protobuf:"varint,15,opt,name=expire_at_ns,json=expireAtNs,proto3" json:"expire_at_ns,omitempty"`
+	HasExpireAt           bool    `protobuf:"varint,16,opt,name=has_expire_at,json=hasExpireAt,proto3" json:"has_expire_at,omitempty"`
+	CreatedAtNs           int64   `protobuf:"varint,17,opt,name=created_at_ns,json=createdAtNs,proto3" json:"created_at_ns,omitempty"`
+	NowNs                 uint64  `protobuf:"varint,18,opt,name=now_ns,json=nowNs,proto3" json:"now_ns,omitempty"`
+	BatchID               string  `protobuf:"bytes,19,opt,name=batch_id,json=batchId,proto3" json:"batch_id,omitempty"`
+	Checkpoint            []byte  `protobuf:"bytes,20,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
+	AgentMaxIterations    int32   `protobuf:"varint,21,opt,name=agent_max_iterations,json=agentMaxIterations,proto3" json:"agent_max_iterations,omitempty"`
+	AgentMaxCostUsd       float64 `protobuf:"fixed64,22,opt,name=agent_max_cost_usd,json=agentMaxCostUsd,proto3" json:"agent_max_cost_usd,omitempty"`
+	AgentIterationTimeout string  `protobuf:"bytes,23,opt,name=agent_iteration_timeout,json=agentIterationTimeout,proto3" json:"agent_iteration_timeout,omitempty"`
+	AgentIteration        int32   `protobuf:"varint,24,opt,name=agent_iteration,json=agentIteration,proto3" json:"agent_iteration,omitempty"`
+	AgentTotalCostUsd     float64 `protobuf:"fixed64,25,opt,name=agent_total_cost_usd,json=agentTotalCostUsd,proto3" json:"agent_total_cost_usd,omitempty"`
+	HasAgent              bool    `protobuf:"varint,26,opt,name=has_agent,json=hasAgent,proto3" json:"has_agent,omitempty"`
 }
 
 func (m *pbEnqueueOp) Reset()         { *m = pbEnqueueOp{} }
@@ -165,10 +172,13 @@ func (m *pbFetchBatchOp) String() string { return oldproto.CompactTextString(m) 
 func (*pbFetchBatchOp) ProtoMessage()    {}
 
 type pbAckOp struct {
-	JobID  string         `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	Result []byte         `protobuf:"bytes,2,opt,name=result,proto3" json:"result,omitempty"`
-	Usage  *pbUsageReport `protobuf:"bytes,3,opt,name=usage,proto3" json:"usage,omitempty"`
-	NowNs  uint64         `protobuf:"varint,4,opt,name=now_ns,json=nowNs,proto3" json:"now_ns,omitempty"`
+	JobID       string         `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Result      []byte         `protobuf:"bytes,2,opt,name=result,proto3" json:"result,omitempty"`
+	Usage       *pbUsageReport `protobuf:"bytes,3,opt,name=usage,proto3" json:"usage,omitempty"`
+	NowNs       uint64         `protobuf:"varint,4,opt,name=now_ns,json=nowNs,proto3" json:"now_ns,omitempty"`
+	Checkpoint  []byte         `protobuf:"bytes,5,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
+	AgentStatus string         `protobuf:"bytes,6,opt,name=agent_status,json=agentStatus,proto3" json:"agent_status,omitempty"`
+	HoldReason  string         `protobuf:"bytes,7,opt,name=hold_reason,json=holdReason,proto3" json:"hold_reason,omitempty"`
 }
 
 func (m *pbAckOp) Reset()         { *m = pbAckOp{} }
@@ -918,6 +928,7 @@ func toPBEnqueue(op EnqueueOp) *pbEnqueueOp {
 		CreatedAtNs:  op.CreatedAt.UnixNano(),
 		NowNs:        op.NowNs,
 		BatchID:      op.BatchID,
+		Checkpoint:   append([]byte(nil), op.Checkpoint...),
 	}
 	if op.ScheduledAt != nil {
 		p.HasScheduledAt = true
@@ -926,6 +937,14 @@ func toPBEnqueue(op EnqueueOp) *pbEnqueueOp {
 	if op.ExpireAt != nil {
 		p.HasExpireAt = true
 		p.ExpireAtNs = op.ExpireAt.UnixNano()
+	}
+	if op.Agent != nil {
+		p.HasAgent = true
+		p.AgentMaxIterations = int32(op.Agent.MaxIterations)
+		p.AgentMaxCostUsd = op.Agent.MaxCostUSD
+		p.AgentIterationTimeout = op.Agent.IterationTimeout
+		p.AgentIteration = int32(op.Agent.Iteration)
+		p.AgentTotalCostUsd = op.Agent.TotalCostUSD
 	}
 	return p
 }
@@ -947,6 +966,7 @@ func fromPBEnqueue(op *pbEnqueueOp) EnqueueOp {
 		CreatedAt:    time.Unix(0, op.CreatedAtNs).UTC(),
 		NowNs:        op.NowNs,
 		BatchID:      op.BatchID,
+		Checkpoint:   append([]byte(nil), op.Checkpoint...),
 	}
 	if op.HasScheduledAt {
 		t := time.Unix(0, op.ScheduledAtNs).UTC()
@@ -955,6 +975,15 @@ func fromPBEnqueue(op *pbEnqueueOp) EnqueueOp {
 	if op.HasExpireAt {
 		t := time.Unix(0, op.ExpireAtNs).UTC()
 		out.ExpireAt = &t
+	}
+	if op.HasAgent {
+		out.Agent = &AgentState{
+			MaxIterations:    int(op.AgentMaxIterations),
+			MaxCostUSD:       op.AgentMaxCostUsd,
+			IterationTimeout: op.AgentIterationTimeout,
+			Iteration:        int(op.AgentIteration),
+			TotalCostUSD:     op.AgentTotalCostUsd,
+		}
 	}
 	return out
 }
@@ -1041,19 +1070,25 @@ func fromPBFetchBatch(op *pbFetchBatchOp) FetchBatchOp {
 
 func toPBAck(op AckOp) *pbAckOp {
 	return &pbAckOp{
-		JobID:  op.JobID,
-		Result: append([]byte(nil), op.Result...),
-		Usage:  toPBUsage(op.Usage),
-		NowNs:  op.NowNs,
+		JobID:       op.JobID,
+		Result:      append([]byte(nil), op.Result...),
+		Usage:       toPBUsage(op.Usage),
+		NowNs:       op.NowNs,
+		Checkpoint:  append([]byte(nil), op.Checkpoint...),
+		AgentStatus: op.AgentStatus,
+		HoldReason:  op.HoldReason,
 	}
 }
 
 func fromPBAck(op *pbAckOp) AckOp {
 	return AckOp{
-		JobID:  op.JobID,
-		Result: append([]byte(nil), op.Result...),
-		Usage:  fromPBUsage(op.Usage),
-		NowNs:  op.NowNs,
+		JobID:       op.JobID,
+		Result:      append([]byte(nil), op.Result...),
+		Usage:       fromPBUsage(op.Usage),
+		NowNs:       op.NowNs,
+		Checkpoint:  append([]byte(nil), op.Checkpoint...),
+		AgentStatus: op.AgentStatus,
+		HoldReason:  op.HoldReason,
 	}
 }
 

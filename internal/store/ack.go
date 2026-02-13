@@ -3,32 +3,57 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
+type AckRequest struct {
+	JobID       string
+	Result      json.RawMessage
+	Checkpoint  json.RawMessage
+	Usage       *UsageReport
+	AgentStatus string
+	HoldReason  string
+}
+
 // Ack marks a job as completed via Raft consensus.
 func (s *Store) Ack(jobID string, result json.RawMessage) error {
-	return s.AckWithUsage(jobID, result, nil)
+	return s.AckJob(AckRequest{JobID: jobID, Result: result})
 }
 
 // AckWithUsage marks a job completed and records optional usage metadata.
 func (s *Store) AckWithUsage(jobID string, result json.RawMessage, usage *UsageReport) error {
-	normUsage := normalizeUsage(usage)
+	return s.AckJob(AckRequest{JobID: jobID, Result: result, Usage: usage})
+}
+
+func (s *Store) AckJob(req AckRequest) error {
+	normUsage := normalizeUsage(req.Usage)
 	if normUsage != nil {
-		exceeded, action, err := s.evaluatePerJobBudget(jobID, normUsage.CostUSD)
+		exceeded, action, err := s.evaluatePerJobBudget(req.JobID, normUsage.CostUSD)
 		if err != nil {
 			return err
 		}
 		if exceeded && action == BudgetOnExceedReject {
-			return NewBudgetExceededError(fmt.Sprintf("per-job budget exceeded for job %q", jobID))
+			return NewBudgetExceededError(fmt.Sprintf("per-job budget exceeded for job %q", req.JobID))
 		}
 	}
+
+	status := strings.TrimSpace(strings.ToLower(req.AgentStatus))
+	switch status {
+	case "", AgentStatusContinue, AgentStatusDone, AgentStatusHold:
+	default:
+		return fmt.Errorf("invalid agent_status %q", req.AgentStatus)
+	}
+
 	now := time.Now()
 	op := AckOp{
-		JobID:  jobID,
-		Result: result,
-		Usage:  normUsage,
-		NowNs:  uint64(now.UnixNano()),
+		JobID:       req.JobID,
+		Result:      req.Result,
+		Checkpoint:  req.Checkpoint,
+		Usage:       normUsage,
+		AgentStatus: status,
+		HoldReason:  strings.TrimSpace(req.HoldReason),
+		NowNs:       uint64(now.UnixNano()),
 	}
 
 	res := s.applyOp(OpAck, op)

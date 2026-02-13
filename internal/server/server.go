@@ -69,6 +69,7 @@ func (s *Server) buildRouter() chi.Router {
 		// Read endpoints
 		r.Get("/queues", s.handleListQueues)
 		r.Get("/jobs/{id}", s.handleGetJob)
+		r.Get("/jobs/{id}/iterations", s.handleListJobIterations)
 		r.Post("/jobs/search", s.handleSearch)
 		r.Get("/workers", s.handleListWorkers)
 		r.Get("/cluster/status", s.handleClusterStatus)
@@ -110,6 +111,7 @@ func (s *Server) buildRouter() chi.Router {
 			r.Post("/jobs/{id}/hold", s.handleHoldJob)
 			r.Post("/jobs/{id}/approve", s.handleApproveJob)
 			r.Post("/jobs/{id}/reject", s.handleRejectJob)
+			r.Post("/jobs/{id}/replay", s.handleReplayJob)
 			r.Post("/jobs/{id}/move", s.handleMoveJob)
 			r.Delete("/jobs/{id}", s.handleDeleteJob)
 

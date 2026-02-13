@@ -125,6 +125,23 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
+func (s *Server) handleListJobIterations(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if _, err := s.store.GetJob(id); err != nil {
+		writeError(w, http.StatusNotFound, err.Error(), "NOT_FOUND")
+		return
+	}
+	iterations, err := s.store.ListJobIterations(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
+		return
+	}
+	if iterations == nil {
+		iterations = []store.JobIteration{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"iterations": iterations})
+}
+
 func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if err := s.store.RetryJob(id); err != nil {
@@ -198,6 +215,27 @@ func (s *Server) handleRejectJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": store.StateDead})
+}
+
+func (s *Server) handleReplayJob(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var body struct {
+		From int `json:"from"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
+		return
+	}
+	if body.From <= 0 {
+		writeError(w, http.StatusBadRequest, "from must be > 0", "VALIDATION_ERROR")
+		return
+	}
+	result, err := s.store.ReplayFromIteration(id, body.From)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "REPLAY_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusCreated, result)
 }
 
 // Search and bulk

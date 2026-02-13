@@ -29,6 +29,20 @@ func New(url string) *Client {
 // EnqueueOption configures an enqueue request.
 type EnqueueOption func(map[string]interface{})
 
+type AgentConfig struct {
+	MaxIterations    int     `json:"max_iterations,omitempty"`
+	MaxCostUSD       float64 `json:"max_cost_usd,omitempty"`
+	IterationTimeout string  `json:"iteration_timeout,omitempty"`
+}
+
+type AgentState struct {
+	MaxIterations    int     `json:"max_iterations,omitempty"`
+	MaxCostUSD       float64 `json:"max_cost_usd,omitempty"`
+	IterationTimeout string  `json:"iteration_timeout,omitempty"`
+	Iteration        int     `json:"iteration,omitempty"`
+	TotalCostUSD     float64 `json:"total_cost_usd,omitempty"`
+}
+
 func WithPriority(p string) EnqueueOption {
 	return func(m map[string]interface{}) { m["priority"] = p }
 }
@@ -64,6 +78,10 @@ func WithRetryBackoff(strategy, baseDelay, maxDelay string) EnqueueOption {
 		m["retry_base_delay"] = baseDelay
 		m["retry_max_delay"] = maxDelay
 	}
+}
+
+func WithAgent(cfg AgentConfig) EnqueueOption {
+	return func(m map[string]interface{}) { m["agent"] = cfg }
 }
 
 // EnqueueResult is the response from enqueuing a job.
@@ -134,6 +152,8 @@ type Job struct {
 	MaxRetries  int             `json:"max_retries"`
 	Tags        json.RawMessage `json:"tags,omitempty"`
 	Checkpoint  json.RawMessage `json:"checkpoint,omitempty"`
+	Agent       *AgentState     `json:"agent,omitempty"`
+	HoldReason  *string         `json:"hold_reason,omitempty"`
 	CreatedAt   string          `json:"created_at"`
 	StartedAt   *string         `json:"started_at,omitempty"`
 	CompletedAt *string         `json:"completed_at,omitempty"`

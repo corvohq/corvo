@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 	"github.com/user/jobbie/internal/raft"
@@ -441,6 +442,146 @@ func TestHeldJobEndpoints(t *testing.T) {
 	decodeResponse(t, rr, &job)
 	if job.State != store.StateDead {
 		t.Fatalf("job state = %s, want %s", job.State, store.StateDead)
+	}
+}
+
+func TestReplayEndpoint(t *testing.T) {
+	srv, _ := testServer(t)
+
+	rr := doRequest(srv, "POST", "/api/v1/enqueue", map[string]any{
+		"queue":   "replay.q",
+		"payload": map[string]string{"k": "v"},
+		"agent": map[string]any{
+			"max_iterations": 5,
+			"max_cost_usd":   10.0,
+		},
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("enqueue status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var enqResult store.EnqueueResult
+	decodeResponse(t, rr, &enqResult)
+
+	rr = doRequest(srv, "POST", "/api/v1/fetch", map[string]any{
+		"queues":    []string{"replay.q"},
+		"worker_id": "w1",
+		"hostname":  "h1",
+		"timeout":   1,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("fetch status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var f1 store.FetchResult
+	decodeResponse(t, rr, &f1)
+
+	rr = doRequest(srv, "POST", "/api/v1/ack/"+f1.JobID, map[string]any{
+		"agent_status": "continue",
+		"checkpoint":   map[string]any{"cursor": "iter1"},
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("ack continue status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(srv, "POST", "/api/v1/jobs/"+enqResult.JobID+"/replay", map[string]any{
+		"from": 1,
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("replay status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var replay store.EnqueueResult
+	decodeResponse(t, rr, &replay)
+	if replay.JobID == "" {
+		t.Fatal("replay job_id is empty")
+	}
+
+	rr = doRequest(srv, "GET", "/api/v1/jobs/"+replay.JobID, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get replayed job status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var replayedJob store.Job
+	decodeResponse(t, rr, &replayedJob)
+	if string(replayedJob.Checkpoint) != `{"cursor":"iter1"}` {
+		t.Fatalf("replayed checkpoint = %s", string(replayedJob.Checkpoint))
+	}
+}
+
+func TestJobIterationsEndpoint(t *testing.T) {
+	srv, _ := testServer(t)
+
+	rr := doRequest(srv, "POST", "/api/v1/enqueue", map[string]any{
+		"queue":   "iter.q",
+		"payload": map[string]string{"k": "v"},
+		"agent": map[string]any{
+			"max_iterations": 5,
+		},
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("enqueue status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var enqResult store.EnqueueResult
+	decodeResponse(t, rr, &enqResult)
+
+	rr = doRequest(srv, "POST", "/api/v1/fetch", map[string]any{
+		"queues":    []string{"iter.q"},
+		"worker_id": "w1",
+		"hostname":  "h1",
+		"timeout":   1,
+	})
+	var f1 store.FetchResult
+	decodeResponse(t, rr, &f1)
+	rr = doRequest(srv, "POST", "/api/v1/ack/"+f1.JobID, map[string]any{
+		"agent_status": "continue",
+		"checkpoint":   map[string]any{"step": 1},
+		"usage": map[string]any{
+			"cost_usd": 0.12,
+		},
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("ack #1 status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(srv, "POST", "/api/v1/fetch", map[string]any{
+		"queues":    []string{"iter.q"},
+		"worker_id": "w1",
+		"hostname":  "h1",
+		"timeout":   1,
+	})
+	var f2 store.FetchResult
+	decodeResponse(t, rr, &f2)
+	rr = doRequest(srv, "POST", "/api/v1/ack/"+f2.JobID, map[string]any{
+		"agent_status": "done",
+		"result":       map[string]any{"ok": true},
+		"usage": map[string]any{
+			"cost_usd": 0.08,
+		},
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("ack #2 status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+
+	var out struct {
+		Iterations []store.JobIteration `json:"iterations"`
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		rr = doRequest(srv, "GET", "/api/v1/jobs/"+enqResult.JobID+"/iterations", nil)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("iterations status = %d, body: %s", rr.Code, rr.Body.String())
+		}
+		decodeResponse(t, rr, &out)
+		if len(out.Iterations) >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(out.Iterations) != 2 {
+		t.Fatalf("iterations = %d, want 2", len(out.Iterations))
+	}
+	if out.Iterations[0].Status != "continue" {
+		t.Fatalf("iteration 1 status = %s, want continue", out.Iterations[0].Status)
+	}
+	if out.Iterations[1].Status != "done" {
+		t.Fatalf("iteration 2 status = %s, want done", out.Iterations[1].Status)
 	}
 }
 

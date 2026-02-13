@@ -8,11 +8,15 @@ import (
 )
 
 var (
-	enqPriority   string
-	enqUniqueKey  string
-	enqMaxRetries int
-	enqSchedule   string
-	enqTags       string
+	enqPriority              string
+	enqUniqueKey             string
+	enqMaxRetries            int
+	enqSchedule              string
+	enqTags                  string
+	enqAgentMaxIterations    int
+	enqAgentMaxCostUSD       float64
+	enqAgentIterationTimeout string
+	replayFromIteration      int
 )
 
 var enqueueCmd = &cobra.Command{
@@ -41,6 +45,19 @@ var enqueueCmd = &cobra.Command{
 		}
 		if enqTags != "" {
 			body["tags"] = json.RawMessage(enqTags)
+		}
+		if enqAgentMaxIterations > 0 || enqAgentMaxCostUSD > 0 || enqAgentIterationTimeout != "" {
+			agent := map[string]interface{}{}
+			if enqAgentMaxIterations > 0 {
+				agent["max_iterations"] = enqAgentMaxIterations
+			}
+			if enqAgentMaxCostUSD > 0 {
+				agent["max_cost_usd"] = enqAgentMaxCostUSD
+			}
+			if enqAgentIterationTimeout != "" {
+				agent["iteration_timeout"] = enqAgentIterationTimeout
+			}
+			body["agent"] = agent
 		}
 
 		data, status, err := apiRequest("POST", "/api/v1/enqueue", body)
@@ -152,6 +169,72 @@ var rejectCmd = &cobra.Command{
 	},
 }
 
+var replayCmd = &cobra.Command{
+	Use:   "replay <job-id>",
+	Short: "Replay an agent job from a specific iteration",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if replayFromIteration <= 0 {
+			return fmt.Errorf("--from must be > 0")
+		}
+		data, status, err := apiRequest("POST", "/api/v1/jobs/"+args[0]+"/replay", map[string]int{
+			"from": replayFromIteration,
+		})
+		if err != nil {
+			return err
+		}
+		exitOnError(data, status)
+		if outputJSON {
+			printJSON(data)
+			return nil
+		}
+		var result map[string]interface{}
+		json.Unmarshal(data, &result)
+		fmt.Printf("Replay enqueued: %s (status: %s)\n", result["job_id"], result["status"])
+		return nil
+	},
+}
+
+var iterationsCmd = &cobra.Command{
+	Use:   "iterations <job-id>",
+	Short: "List iteration history for an agent job",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		data, status, err := apiRequest("GET", "/api/v1/jobs/"+args[0]+"/iterations", nil)
+		if err != nil {
+			return err
+		}
+		exitOnError(data, status)
+		if outputJSON {
+			printJSON(data)
+			return nil
+		}
+		var resp struct {
+			Iterations []struct {
+				Iteration  int     `json:"iteration"`
+				Status     string  `json:"status"`
+				CostUSD    float64 `json:"cost_usd"`
+				HoldReason *string `json:"hold_reason,omitempty"`
+			} `json:"iterations"`
+		}
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return err
+		}
+		if len(resp.Iterations) == 0 {
+			fmt.Println("No iterations")
+			return nil
+		}
+		for _, it := range resp.Iterations {
+			if it.HoldReason != nil && *it.HoldReason != "" {
+				fmt.Printf("%d  %s  cost=%.6f  hold=%s\n", it.Iteration, it.Status, it.CostUSD, *it.HoldReason)
+				continue
+			}
+			fmt.Printf("%d  %s  cost=%.6f\n", it.Iteration, it.Status, it.CostUSD)
+		}
+		return nil
+	},
+}
+
 var heldCmd = &cobra.Command{
 	Use:   "held",
 	Short: "List held jobs awaiting approval",
@@ -230,7 +313,11 @@ func init() {
 	enqueueCmd.Flags().IntVar(&enqMaxRetries, "max-retries", -1, "Maximum retry attempts")
 	enqueueCmd.Flags().StringVar(&enqSchedule, "scheduled-at", "", "Schedule job for later (RFC3339)")
 	enqueueCmd.Flags().StringVar(&enqTags, "tags", "", "Job tags as JSON object")
+	enqueueCmd.Flags().IntVar(&enqAgentMaxIterations, "agent-max-iterations", 0, "Agent max iterations (enables agent mode)")
+	enqueueCmd.Flags().Float64Var(&enqAgentMaxCostUSD, "agent-max-cost-usd", 0, "Agent max total USD cost guardrail")
+	enqueueCmd.Flags().StringVar(&enqAgentIterationTimeout, "agent-iteration-timeout", "", "Agent per-iteration timeout (e.g. 2m)")
+	replayCmd.Flags().IntVar(&replayFromIteration, "from", 0, "Replay from this agent iteration (required)")
 
-	addClientFlags(enqueueCmd, inspectCmd, retryCmd, cancelCmd, holdCmd, approveCmd, rejectCmd, heldCmd, moveCmd, deleteCmd)
-	rootCmd.AddCommand(enqueueCmd, inspectCmd, retryCmd, cancelCmd, holdCmd, approveCmd, rejectCmd, heldCmd, moveCmd, deleteCmd)
+	addClientFlags(enqueueCmd, inspectCmd, retryCmd, cancelCmd, holdCmd, approveCmd, rejectCmd, replayCmd, iterationsCmd, heldCmd, moveCmd, deleteCmd)
+	rootCmd.AddCommand(enqueueCmd, inspectCmd, retryCmd, cancelCmd, holdCmd, approveCmd, rejectCmd, replayCmd, iterationsCmd, heldCmd, moveCmd, deleteCmd)
 }

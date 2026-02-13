@@ -19,7 +19,12 @@ type sqlExecer interface {
 }
 
 func sqliteInsertJob(db sqlExecer, op store.EnqueueOp) error {
-	var scheduledAt, expireAt, tags, uniqueKey *string
+	var scheduledAt, expireAt, tags, uniqueKey, checkpoint *string
+	var agentMaxIterations *int
+	var agentMaxCostUSD *float64
+	var agentIterationTimeout *string
+	agentIteration := 0
+	agentTotalCostUSD := 0.0
 	if op.ScheduledAt != nil {
 		s := op.ScheduledAt.UTC().Format(time.RFC3339Nano)
 		scheduledAt = &s
@@ -35,15 +40,30 @@ func sqliteInsertJob(db sqlExecer, op store.EnqueueOp) error {
 	if op.UniqueKey != "" {
 		uniqueKey = &op.UniqueKey
 	}
+	if len(op.Checkpoint) > 0 {
+		s := string(op.Checkpoint)
+		checkpoint = &s
+	}
+	if op.Agent != nil {
+		agentMaxIterations = &op.Agent.MaxIterations
+		agentMaxCostUSD = &op.Agent.MaxCostUSD
+		agentIterationTimeout = nullableString(op.Agent.IterationTimeout)
+		agentIteration = op.Agent.Iteration
+		agentTotalCostUSD = op.Agent.TotalCostUSD
+	}
 
 	createdAt := op.CreatedAt.UTC().Format(time.RFC3339Nano)
 
 	_, err := db.Exec(`INSERT OR REPLACE INTO jobs (id, queue, state, payload, priority, max_retries,
-		retry_backoff, retry_base_delay_ms, retry_max_delay_ms, unique_key, tags, scheduled_at, expire_at, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		retry_backoff, retry_base_delay_ms, retry_max_delay_ms, unique_key, tags, checkpoint,
+		agent_max_iterations, agent_max_cost_usd, agent_iteration_timeout, agent_iteration, agent_total_cost_usd,
+		scheduled_at, expire_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		op.JobID, op.Queue, op.State, string(op.Payload), op.Priority,
 		op.MaxRetries, op.Backoff, op.BaseDelayMs, op.MaxDelayMs,
-		uniqueKey, tags, scheduledAt, expireAt, createdAt,
+		uniqueKey, tags, checkpoint,
+		agentMaxIterations, agentMaxCostUSD, agentIterationTimeout, agentIteration, agentTotalCostUSD,
+		scheduledAt, expireAt, createdAt,
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite insert job: %w", err)
@@ -79,10 +99,26 @@ func sqliteInsertBatch(db sqlExecer, op store.EnqueueBatchOp) error {
 	}
 
 	for _, j := range op.Jobs {
-		var tags *string
+		var tags, checkpoint *string
+		var agentMaxIterations *int
+		var agentMaxCostUSD *float64
+		var agentIterationTimeout *string
+		agentIteration := 0
+		agentTotalCostUSD := 0.0
 		if len(j.Tags) > 0 {
 			s := string(j.Tags)
 			tags = &s
+		}
+		if len(j.Checkpoint) > 0 {
+			s := string(j.Checkpoint)
+			checkpoint = &s
+		}
+		if j.Agent != nil {
+			agentMaxIterations = &j.Agent.MaxIterations
+			agentMaxCostUSD = &j.Agent.MaxCostUSD
+			agentIterationTimeout = nullableString(j.Agent.IterationTimeout)
+			agentIteration = j.Agent.Iteration
+			agentTotalCostUSD = j.Agent.TotalCostUSD
 		}
 		var batchIDPtr *string
 		if op.BatchID != "" {
@@ -90,11 +126,15 @@ func sqliteInsertBatch(db sqlExecer, op store.EnqueueBatchOp) error {
 		}
 		createdAt := j.CreatedAt.UTC().Format(time.RFC3339Nano)
 		db.Exec(`INSERT OR REPLACE INTO jobs (id, queue, state, payload, priority, max_retries,
-			retry_backoff, retry_base_delay_ms, retry_max_delay_ms, tags, batch_id, created_at)
-			VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			retry_backoff, retry_base_delay_ms, retry_max_delay_ms, tags, checkpoint,
+			agent_max_iterations, agent_max_cost_usd, agent_iteration_timeout, agent_iteration, agent_total_cost_usd,
+			batch_id, created_at)
+			VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			j.JobID, j.Queue, string(j.Payload), j.Priority,
 			j.MaxRetries, j.Backoff, j.BaseDelayMs, j.MaxDelayMs,
-			tags, batchIDPtr, createdAt,
+			tags, checkpoint,
+			agentMaxIterations, agentMaxCostUSD, agentIterationTimeout, agentIteration, agentTotalCostUSD,
+			batchIDPtr, createdAt,
 		)
 		db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", j.Queue)
 	}
@@ -138,7 +178,7 @@ func sqliteAckJob(db sqlExecer, job store.Job, op store.AckOp, callbackJobID str
 		resultStr = &s
 	}
 
-	_, err := db.Exec(`UPDATE jobs SET state = 'completed', completed_at = ?, result = ?,
+	_, err := db.Exec(`UPDATE jobs SET state = 'completed', completed_at = ?, result = ?, hold_reason = NULL,
 		worker_id = NULL, hostname = NULL, lease_expires_at = NULL WHERE id = ?`,
 		now, resultStr, op.JobID)
 	if err != nil {
@@ -195,14 +235,14 @@ func sqliteFailJob(db sqlExecer, job store.Job, op store.FailOp, errDoc store.Jo
 			s := job.ScheduledAt.UTC().Format(time.RFC3339Nano)
 			scheduledAt = &s
 		}
-		_, err := db.Exec(`UPDATE jobs SET state = 'retrying', failed_at = ?, scheduled_at = ?,
+		_, err := db.Exec(`UPDATE jobs SET state = 'retrying', failed_at = ?, scheduled_at = ?, hold_reason = NULL,
 			worker_id = NULL, hostname = NULL, lease_expires_at = NULL WHERE id = ?`,
 			now, scheduledAt, op.JobID)
 		return err
 	}
 
 	// Dead
-	_, err := db.Exec(`UPDATE jobs SET state = 'dead', failed_at = ?,
+	_, err := db.Exec(`UPDATE jobs SET state = 'dead', failed_at = ?, hold_reason = NULL,
 		worker_id = NULL, hostname = NULL, lease_expires_at = NULL WHERE id = ?`,
 		now, op.JobID)
 	if err != nil {
@@ -280,6 +320,53 @@ func sqliteInsertUsage(db sqlExecer, jobID, queue string, attempt int, phase str
 	return nil
 }
 
+func sqliteInsertJobIteration(db sqlExecer, job store.Job, op store.AckOp, status string, createdAt string) error {
+	if job.Agent == nil {
+		return nil
+	}
+	var checkpoint, holdReason, result *string
+	if len(op.Checkpoint) > 0 {
+		s := string(op.Checkpoint)
+		checkpoint = &s
+	} else if len(job.Checkpoint) > 0 {
+		s := string(job.Checkpoint)
+		checkpoint = &s
+	}
+	if op.HoldReason != "" {
+		holdReason = &op.HoldReason
+	} else if job.HoldReason != nil {
+		holdReason = job.HoldReason
+	}
+	if len(op.Result) > 0 {
+		s := string(op.Result)
+		result = &s
+	}
+	var model, provider *string
+	var inputTokens, outputTokens, cacheCreate, cacheRead int64
+	var costUSD float64
+	if op.Usage != nil {
+		model = nullableString(op.Usage.Model)
+		provider = nullableString(op.Usage.Provider)
+		inputTokens = op.Usage.InputTokens
+		outputTokens = op.Usage.OutputTokens
+		cacheCreate = op.Usage.CacheCreationTokens
+		cacheRead = op.Usage.CacheReadTokens
+		costUSD = op.Usage.CostUSD
+	}
+	_, err := db.Exec(`INSERT INTO job_iterations (
+		job_id, iteration, status, checkpoint, hold_reason, result,
+		input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+		model, provider, cost_usd, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		job.ID, job.Agent.Iteration, status, checkpoint, holdReason, result,
+		inputTokens, outputTokens, cacheCreate, cacheRead, model, provider, costUSD, createdAt,
+	)
+	if err != nil {
+		return fmt.Errorf("insert job iteration %s/%d: %w", job.ID, job.Agent.Iteration, err)
+	}
+	return nil
+}
+
 func nullableString(s string) *string {
 	trimmed := strings.TrimSpace(s)
 	if trimmed == "" {
@@ -290,12 +377,12 @@ func nullableString(s string) *string {
 
 func sqliteRetryJob(db sqlExecer, jobID string) error {
 	_, err := db.Exec(`UPDATE jobs SET state = 'pending', attempt = 0, failed_at = NULL, completed_at = NULL,
-		worker_id = NULL, hostname = NULL, lease_expires_at = NULL, scheduled_at = NULL WHERE id = ?`, jobID)
+		worker_id = NULL, hostname = NULL, lease_expires_at = NULL, scheduled_at = NULL, hold_reason = NULL WHERE id = ?`, jobID)
 	return err
 }
 
 func sqliteCancelJob(db sqlExecer, jobID string) error {
-	_, err := db.Exec("UPDATE jobs SET state = 'cancelled' WHERE id = ?", jobID)
+	_, err := db.Exec("UPDATE jobs SET state = 'cancelled', hold_reason = NULL WHERE id = ?", jobID)
 	return err
 }
 
@@ -390,13 +477,13 @@ func sqliteBulkAction(db sqlExecer, op store.BulkActionOp) error {
 			WHERE id IN (%s) AND state IN ('pending', 'active', 'scheduled', 'retrying')`, inClause), args...)
 	case "approve":
 		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'pending', worker_id = NULL, hostname = NULL,
-			lease_expires_at = NULL, scheduled_at = NULL
+			lease_expires_at = NULL, scheduled_at = NULL, hold_reason = NULL
 			WHERE id IN (%s) AND state = 'held'`, inClause), args...)
 	case "reject":
 		rejArgs := []any{nowStr}
 		rejArgs = append(rejArgs, args...)
 		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'dead', failed_at = ?, worker_id = NULL, hostname = NULL,
-			lease_expires_at = NULL, scheduled_at = NULL
+			lease_expires_at = NULL, scheduled_at = NULL, hold_reason = NULL
 			WHERE id IN (%s) AND state = 'held'`, inClause), rejArgs...)
 	}
 	return nil
@@ -422,6 +509,7 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 
 	for _, stmt := range []string{
 		"DELETE FROM budgets",
+		"DELETE FROM job_iterations",
 		"DELETE FROM job_errors",
 		"DELETE FROM unique_locks",
 		"DELETE FROM rate_limit_window",
@@ -618,7 +706,12 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 }
 
 func sqliteUpsertJobDoc(db sqlExecer, j store.Job) error {
-	var uniqueKey, batchID, workerID, hostname, leaseExpiresAt, scheduledAt, expireAt, startedAt, completedAt, failedAt *string
+	var uniqueKey, batchID, workerID, hostname, leaseExpiresAt, scheduledAt, expireAt, startedAt, completedAt, failedAt, holdReason *string
+	var agentMaxIterations *int
+	var agentMaxCostUSD *float64
+	var agentIterationTimeout *string
+	agentIteration := 0
+	agentTotalCostUSD := 0.0
 	if j.UniqueKey != nil {
 		uniqueKey = j.UniqueKey
 	}
@@ -655,18 +748,61 @@ func sqliteUpsertJobDoc(db sqlExecer, j store.Job) error {
 		s := j.FailedAt.UTC().Format(time.RFC3339Nano)
 		failedAt = &s
 	}
+	if j.Agent != nil {
+		agentMaxIterations = &j.Agent.MaxIterations
+		agentMaxCostUSD = &j.Agent.MaxCostUSD
+		agentIterationTimeout = nullableString(j.Agent.IterationTimeout)
+		agentIteration = j.Agent.Iteration
+		agentTotalCostUSD = j.Agent.TotalCostUSD
+	}
+	if j.HoldReason != nil {
+		holdReason = j.HoldReason
+	}
 	createdAt := j.CreatedAt.UTC().Format(time.RFC3339Nano)
 
-	_, err := db.Exec(`INSERT OR REPLACE INTO jobs (
+	_, err := db.Exec(`INSERT INTO jobs (
 		id, queue, state, payload, priority, attempt, max_retries,
 		retry_backoff, retry_base_delay_ms, retry_max_delay_ms,
 		unique_key, batch_id, worker_id, hostname, tags, progress, checkpoint, result,
-		lease_expires_at, scheduled_at, expire_at, created_at, started_at, completed_at, failed_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		agent_max_iterations, agent_max_cost_usd, agent_iteration_timeout, agent_iteration, agent_total_cost_usd,
+		hold_reason, lease_expires_at, scheduled_at, expire_at, created_at, started_at, completed_at, failed_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(id) DO UPDATE SET
+		queue = excluded.queue,
+		state = excluded.state,
+		payload = excluded.payload,
+		priority = excluded.priority,
+		attempt = excluded.attempt,
+		max_retries = excluded.max_retries,
+		retry_backoff = excluded.retry_backoff,
+		retry_base_delay_ms = excluded.retry_base_delay_ms,
+		retry_max_delay_ms = excluded.retry_max_delay_ms,
+		unique_key = excluded.unique_key,
+		batch_id = excluded.batch_id,
+		worker_id = excluded.worker_id,
+		hostname = excluded.hostname,
+		tags = excluded.tags,
+		progress = excluded.progress,
+		checkpoint = excluded.checkpoint,
+		result = excluded.result,
+		agent_max_iterations = excluded.agent_max_iterations,
+		agent_max_cost_usd = excluded.agent_max_cost_usd,
+		agent_iteration_timeout = excluded.agent_iteration_timeout,
+		agent_iteration = excluded.agent_iteration,
+		agent_total_cost_usd = excluded.agent_total_cost_usd,
+		hold_reason = excluded.hold_reason,
+		lease_expires_at = excluded.lease_expires_at,
+		scheduled_at = excluded.scheduled_at,
+		expire_at = excluded.expire_at,
+		created_at = excluded.created_at,
+		started_at = excluded.started_at,
+		completed_at = excluded.completed_at,
+		failed_at = excluded.failed_at`,
 		j.ID, j.Queue, j.State, string(j.Payload), j.Priority, j.Attempt, j.MaxRetries,
 		j.RetryBackoff, j.RetryBaseDelay, j.RetryMaxDelay,
 		uniqueKey, batchID, workerID, hostname, string(j.Tags), string(j.Progress), string(j.Checkpoint), string(j.Result),
-		leaseExpiresAt, scheduledAt, expireAt, createdAt, startedAt, completedAt, failedAt,
+		agentMaxIterations, agentMaxCostUSD, agentIterationTimeout, agentIteration, agentTotalCostUSD,
+		holdReason, leaseExpiresAt, scheduledAt, expireAt, createdAt, startedAt, completedAt, failedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert job %s: %w", j.ID, err)
