@@ -1178,21 +1178,21 @@ These features are additive and can be built incrementally after the core MVP fr
 - [x] Usage summary endpoints (`/api/v1/usage/summary`)
 - [ ] Cost dashboard in UI
 - [x] CLI: `jobbie usage`
-- [ ] `held` job state + approve/reject endpoints
-- [ ] Held jobs view in UI
-- [ ] CLI: `jobbie held`, `jobbie approve`, `jobbie reject`
-- [ ] Budget table + enforcement on fetch and ack
-- [ ] CLI: `jobbie budget`
+- [x] `held` job state + approve/reject endpoints
+- [x] Held jobs view in UI
+- [x] CLI: `jobbie held`, `jobbie approve`, `jobbie reject`
+- [x] Budget table + enforcement on fetch and ack
+- [x] CLI: `jobbie budget`
 
 ### Phase 2b — Agent loop
 
-- [ ] `agent` config on enqueue
-- [ ] `agent_status` handling on ack (continue, done, hold)
-- [ ] `job_iterations` table + iteration tracking
-- [ ] Server-side guardrail enforcement (max iterations, max cost)
+- [x] `agent` config on enqueue
+- [x] `agent_status` handling on ack (continue, done, hold)
+- [x] `job_iterations` table + iteration tracking
+- [x] Server-side guardrail enforcement (max iterations, max cost)
 - [ ] Agent trace storage (optional `trace` field)
 - [ ] Agent job detail view in UI (iteration history, expandable traces)
-- [ ] Replay endpoint + CLI
+- [x] Replay endpoint + CLI
 - [ ] Streaming progress deltas via SSE
 - [ ] Streaming output in job detail UI
 

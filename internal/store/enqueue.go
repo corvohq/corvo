@@ -9,6 +9,7 @@ import (
 type EnqueueRequest struct {
 	Queue          string          `json:"queue"`
 	Payload        json.RawMessage `json:"payload"`
+	Checkpoint     json.RawMessage `json:"checkpoint,omitempty"`
 	Priority       string          `json:"priority"`
 	UniqueKey      string          `json:"unique_key,omitempty"`
 	UniquePeriod   int             `json:"unique_period,omitempty"` // seconds
@@ -19,6 +20,7 @@ type EnqueueRequest struct {
 	ScheduledAt    *time.Time      `json:"scheduled_at,omitempty"`
 	ExpireAfter    string          `json:"expire_after,omitempty"` // e.g. "1h"
 	Tags           json.RawMessage `json:"tags,omitempty"`
+	Agent          *AgentConfig    `json:"agent,omitempty"`
 }
 
 // EnqueueResult is the response from enqueuing a job.
@@ -76,6 +78,7 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 		Queue:        req.Queue,
 		State:        state,
 		Payload:      req.Payload,
+		Checkpoint:   req.Checkpoint,
 		Priority:     priority,
 		MaxRetries:   maxRetries,
 		Backoff:      backoff,
@@ -88,6 +91,7 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 		ExpireAt:     expireAt,
 		CreatedAt:    now.UTC(),
 		NowNs:        uint64(now.UnixNano()),
+		Agent:        normalizeAgentConfig(req.Agent),
 	}
 
 	return applyOpResult[EnqueueResult](s, OpEnqueue, op)
@@ -148,6 +152,7 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 			Queue:       jobReq.Queue,
 			State:       StatePending,
 			Payload:     jobReq.Payload,
+			Checkpoint:  jobReq.Checkpoint,
 			Priority:    priority,
 			MaxRetries:  maxRetries,
 			Backoff:     backoff,
@@ -156,6 +161,7 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 			Tags:        jobReq.Tags,
 			CreatedAt:   now.UTC(),
 			NowNs:       uint64(now.UnixNano()),
+			Agent:       normalizeAgentConfig(jobReq.Agent),
 		}
 	}
 
@@ -174,4 +180,23 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 	}
 
 	return applyOpResult[BatchEnqueueResult](s, OpEnqueueBatch, op)
+}
+
+func normalizeAgentConfig(cfg *AgentConfig) *AgentState {
+	if cfg == nil {
+		return nil
+	}
+	out := &AgentState{
+		MaxIterations:    cfg.MaxIterations,
+		MaxCostUSD:       cfg.MaxCostUSD,
+		IterationTimeout: cfg.IterationTimeout,
+		Iteration:        1,
+	}
+	if out.MaxIterations < 0 {
+		out.MaxIterations = 0
+	}
+	if out.MaxCostUSD < 0 {
+		out.MaxCostUSD = 0
+	}
+	return out
 }

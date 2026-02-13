@@ -444,6 +444,66 @@ func TestHeldJobEndpoints(t *testing.T) {
 	}
 }
 
+func TestReplayEndpoint(t *testing.T) {
+	srv, _ := testServer(t)
+
+	rr := doRequest(srv, "POST", "/api/v1/enqueue", map[string]any{
+		"queue":   "replay.q",
+		"payload": map[string]string{"k": "v"},
+		"agent": map[string]any{
+			"max_iterations": 5,
+			"max_cost_usd":   10.0,
+		},
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("enqueue status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var enqResult store.EnqueueResult
+	decodeResponse(t, rr, &enqResult)
+
+	rr = doRequest(srv, "POST", "/api/v1/fetch", map[string]any{
+		"queues":    []string{"replay.q"},
+		"worker_id": "w1",
+		"hostname":  "h1",
+		"timeout":   1,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("fetch status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var f1 store.FetchResult
+	decodeResponse(t, rr, &f1)
+
+	rr = doRequest(srv, "POST", "/api/v1/ack/"+f1.JobID, map[string]any{
+		"agent_status": "continue",
+		"checkpoint":   map[string]any{"cursor": "iter1"},
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("ack continue status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(srv, "POST", "/api/v1/jobs/"+enqResult.JobID+"/replay", map[string]any{
+		"from": 1,
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("replay status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var replay store.EnqueueResult
+	decodeResponse(t, rr, &replay)
+	if replay.JobID == "" {
+		t.Fatal("replay job_id is empty")
+	}
+
+	rr = doRequest(srv, "GET", "/api/v1/jobs/"+replay.JobID, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get replayed job status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var replayedJob store.Job
+	decodeResponse(t, rr, &replayedJob)
+	if string(replayedJob.Checkpoint) != `{"cursor":"iter1"}` {
+		t.Fatalf("replayed checkpoint = %s", string(replayedJob.Checkpoint))
+	}
+}
+
 func TestSearchEndpoint(t *testing.T) {
 	srv, _ := testServer(t)
 

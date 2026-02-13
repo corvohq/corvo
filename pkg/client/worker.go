@@ -21,6 +21,7 @@ type FetchedJob struct {
 	LeaseDuration int             `json:"lease_duration"`
 	Checkpoint    json.RawMessage `json:"checkpoint,omitempty"`
 	Tags          json.RawMessage `json:"tags,omitempty"`
+	Agent         *AgentState     `json:"agent,omitempty"`
 }
 
 // JobContext provides helper methods for the job handler.
@@ -76,7 +77,7 @@ type Worker struct {
 	activeJobs      map[string]*JobContext
 	mu              sync.Mutex
 	draining        bool
-	stopFetch       chan struct{} // closed to stop fetch loops
+	stopFetch       chan struct{}  // closed to stop fetch loops
 	handlerWg       sync.WaitGroup // tracks in-flight handler goroutines
 }
 

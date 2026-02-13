@@ -499,6 +499,7 @@ func (f *FSM) applyFetchOp(op store.FetchOp) *store.OpResult {
 			LeaseDuration: leaseDuration,
 			Tags:          job.Tags,
 			Checkpoint:    job.Checkpoint,
+			Agent:         job.Agent,
 		}
 		return &store.OpResult{Data: result}
 	}
@@ -646,6 +647,7 @@ func (f *FSM) applyFetchBatchOp(op store.FetchBatchOp) *store.OpResult {
 				LeaseDuration: leaseDuration,
 				Tags:          job.Tags,
 				Checkpoint:    job.Checkpoint,
+				Agent:         job.Agent,
 			})
 			if len(results) >= op.Count {
 				break
@@ -843,7 +845,6 @@ func (f *FSM) applyAck(data json.RawMessage) *store.OpResult {
 }
 
 func (f *FSM) applyAckOp(op store.AckOp) *store.OpResult {
-
 	jobVal, closer, err := f.pebble.Get(kv.JobKey(op.JobID))
 	if err != nil {
 		return &store.OpResult{Err: fmt.Errorf("job %s not found", op.JobID)}
@@ -858,14 +859,74 @@ func (f *FSM) applyAckOp(op store.AckOp) *store.OpResult {
 		return &store.OpResult{Err: fmt.Errorf("job %s is not active", op.JobID)}
 	}
 
+	if op.AgentStatus != "" && job.Agent == nil {
+		return &store.OpResult{Err: fmt.Errorf("job %s is not an agent job", op.JobID)}
+	}
+
 	batch := f.pebble.NewBatch()
 	defer batch.Close()
 
 	now := time.Unix(0, int64(op.NowNs))
-	job.State = store.StateCompleted
-	job.CompletedAt = &now
+	nextState := store.StateCompleted
+	iterationStatus := "done"
+	iterationToRecord := 0
+	if job.Agent != nil {
+		iterationToRecord = job.Agent.Iteration
+	}
+	if op.AgentStatus != "" {
+		iterationStatus = op.AgentStatus
+	}
+
+	if len(op.Checkpoint) > 0 {
+		job.Checkpoint = op.Checkpoint
+	}
+	if op.Usage != nil && job.Agent != nil {
+		job.Agent.TotalCostUSD += op.Usage.CostUSD
+	}
+
+	if job.Agent != nil {
+		switch iterationStatus {
+		case store.AgentStatusContinue:
+			nextIteration := job.Agent.Iteration + 1
+			guardrailReason := ""
+			if job.Agent.MaxIterations > 0 && nextIteration > job.Agent.MaxIterations {
+				guardrailReason = fmt.Sprintf("max_iterations exceeded (%d)", job.Agent.MaxIterations)
+			}
+			if guardrailReason == "" && job.Agent.MaxCostUSD > 0 && job.Agent.TotalCostUSD > job.Agent.MaxCostUSD {
+				guardrailReason = fmt.Sprintf("max_cost_usd exceeded (%.4f > %.4f)", job.Agent.TotalCostUSD, job.Agent.MaxCostUSD)
+			}
+			job.Agent.Iteration = nextIteration
+			if guardrailReason != "" {
+				nextState = store.StateHeld
+				iterationStatus = store.AgentStatusHold
+				if op.HoldReason == "" {
+					op.HoldReason = guardrailReason
+				}
+			} else {
+				nextState = store.StatePending
+			}
+		case store.AgentStatusHold:
+			nextState = store.StateHeld
+		case "", store.AgentStatusDone:
+			nextState = store.StateCompleted
+			iterationStatus = store.AgentStatusDone
+		default:
+			return &store.OpResult{Err: fmt.Errorf("invalid agent_status %q", op.AgentStatus)}
+		}
+	}
+
+	job.State = nextState
 	if len(op.Result) > 0 {
 		job.Result = op.Result
+	}
+	if op.HoldReason != "" {
+		job.HoldReason = &op.HoldReason
+	} else if nextState != store.StateHeld {
+		job.HoldReason = nil
+	}
+
+	if nextState == store.StateCompleted {
+		job.CompletedAt = &now
 	}
 	job.WorkerID = nil
 	job.Hostname = nil
@@ -875,17 +936,33 @@ func (f *FSM) applyAckOp(op store.AckOp) *store.OpResult {
 	batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts)
 	batch.Delete(kv.ActiveKey(job.Queue, op.JobID), f.writeOpts)
 
-	// Clean unique lock
-	if job.UniqueKey != nil {
+	if nextState == store.StatePending {
+		createdNs := uint64(now.UnixNano())
+		if job.Priority == store.PriorityNormal {
+			batch.Set(kv.QueueAppendKey(job.Queue, createdNs, op.JobID), nil, f.writeOpts)
+		} else {
+			batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, op.JobID), nil, f.writeOpts)
+		}
+	}
+
+	// Clean unique lock only on terminal completion.
+	if nextState == store.StateCompleted && job.UniqueKey != nil {
 		batch.Delete(kv.UniqueKey(job.Queue, *job.UniqueKey), f.writeOpts)
 	}
 
 	// Update batch counter
 	var callbackJobID string
-	if job.BatchID != nil {
+	if nextState == store.StateCompleted && job.BatchID != nil {
 		callbackJobID = f.updateBatchPebble(batch, *job.BatchID, "success", op.NowNs)
 	}
-	if err := f.appendLifecycleEvent(batch, "completed", op.JobID, job.Queue, op.NowNs); err != nil {
+	eventType := "completed"
+	switch nextState {
+	case store.StatePending:
+		eventType = "continued"
+	case store.StateHeld:
+		eventType = "held"
+	}
+	if err := f.appendLifecycleEvent(batch, eventType, op.JobID, job.Queue, op.NowNs); err != nil {
 		return &store.OpResult{Err: err}
 	}
 	if err := f.appendLifecycleCursor(batch); err != nil {
@@ -897,7 +974,29 @@ func (f *FSM) applyAckOp(op store.AckOp) *store.OpResult {
 	}
 
 	f.syncSQLite(func(db sqlExecer) error {
-		return sqliteAckJob(db, job, op, callbackJobID)
+		nowStr := now.UTC().Format(time.RFC3339Nano)
+		iterationJob := job
+		if iterationToRecord > 0 && iterationJob.Agent != nil {
+			a := *iterationJob.Agent
+			a.Iteration = iterationToRecord
+			iterationJob.Agent = &a
+		}
+		if err := sqliteUpsertJobDoc(db, job); err != nil {
+			return err
+		}
+		if nextState == store.StateCompleted && job.UniqueKey != nil {
+			db.Exec("DELETE FROM unique_locks WHERE job_id = ?", op.JobID)
+		}
+		if nextState == store.StateCompleted && job.BatchID != nil {
+			sqliteUpdateBatch(db, *job.BatchID, "success", callbackJobID)
+		}
+		if err := sqliteInsertUsage(db, op.JobID, job.Queue, job.Attempt, "ack", op.Usage, nowStr); err != nil {
+			return err
+		}
+		if err := sqliteInsertJobIteration(db, iterationJob, op, iterationStatus, nowStr); err != nil {
+			return err
+		}
+		return nil
 	})
 
 	return &store.OpResult{Data: nil}
@@ -2400,6 +2499,7 @@ func jobToDoc(op store.EnqueueOp) store.Job {
 		Queue:          op.Queue,
 		State:          op.State,
 		Payload:        op.Payload,
+		Checkpoint:     op.Checkpoint,
 		Priority:       op.Priority,
 		MaxRetries:     op.MaxRetries,
 		RetryBackoff:   op.Backoff,
@@ -2407,6 +2507,7 @@ func jobToDoc(op store.EnqueueOp) store.Job {
 		RetryMaxDelay:  op.MaxDelayMs,
 		CreatedAt:      op.CreatedAt,
 		Tags:           op.Tags,
+		Agent:          op.Agent,
 	}
 	if op.UniqueKey != "" {
 		j.UniqueKey = &op.UniqueKey

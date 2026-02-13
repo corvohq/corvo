@@ -11,7 +11,12 @@ import (
 func (s *Store) GetJob(id string) (*Job, error) {
 	var j Job
 	var payload, tags, progress, checkpoint, result sql.NullString
+	var agentIterTimeout, holdReason sql.NullString
 	var uniqueKey, batchID, workerID, hostname sql.NullString
+	var agentMaxIterations sql.NullInt64
+	var agentIteration sql.NullInt64
+	var agentMaxCostUSD sql.NullFloat64
+	var agentTotalCostUSD sql.NullFloat64
 	var leaseExpiresAt, scheduledAt, expireAt, startedAt, completedAt, failedAt sql.NullString
 	var createdAt string
 
@@ -20,6 +25,8 @@ func (s *Store) GetJob(id string) (*Job, error) {
 			retry_backoff, retry_base_delay_ms, retry_max_delay_ms,
 			unique_key, batch_id, worker_id, hostname,
 			tags, progress, checkpoint, result,
+			agent_max_iterations, agent_max_cost_usd, agent_iteration_timeout, agent_iteration, agent_total_cost_usd,
+			hold_reason,
 			lease_expires_at, scheduled_at, expire_at,
 			created_at, started_at, completed_at, failed_at
 		FROM jobs WHERE id = ?
@@ -28,6 +35,8 @@ func (s *Store) GetJob(id string) (*Job, error) {
 		&j.RetryBackoff, &j.RetryBaseDelay, &j.RetryMaxDelay,
 		&uniqueKey, &batchID, &workerID, &hostname,
 		&tags, &progress, &checkpoint, &result,
+		&agentMaxIterations, &agentMaxCostUSD, &agentIterTimeout, &agentIteration, &agentTotalCostUSD,
+		&holdReason,
 		&leaseExpiresAt, &scheduledAt, &expireAt,
 		&createdAt, &startedAt, &completedAt, &failedAt,
 	)
@@ -54,6 +63,26 @@ func (s *Store) GetJob(id string) (*Job, error) {
 	}
 	if result.Valid {
 		j.Result = json.RawMessage(result.String)
+	}
+	if agentIteration.Valid {
+		j.Agent = &AgentState{
+			Iteration: int(agentIteration.Int64),
+		}
+		if agentMaxIterations.Valid {
+			j.Agent.MaxIterations = int(agentMaxIterations.Int64)
+		}
+		if agentMaxCostUSD.Valid {
+			j.Agent.MaxCostUSD = agentMaxCostUSD.Float64
+		}
+		if agentIterTimeout.Valid {
+			j.Agent.IterationTimeout = agentIterTimeout.String
+		}
+		if agentTotalCostUSD.Valid {
+			j.Agent.TotalCostUSD = agentTotalCostUSD.Float64
+		}
+	}
+	if holdReason.Valid {
+		j.HoldReason = &holdReason.String
 	}
 	j.CreatedAt = parseTime(createdAt)
 	j.LeaseExpiresAt = parseNullableTime(leaseExpiresAt)
@@ -88,6 +117,64 @@ func (s *Store) GetJob(id string) (*Job, error) {
 	}
 
 	return &j, rows.Err()
+}
+
+func (s *Store) ReplayFromIteration(id string, from int) (*EnqueueResult, error) {
+	if from <= 0 {
+		return nil, fmt.Errorf("from iteration must be > 0")
+	}
+	job, err := s.GetJob(id)
+	if err != nil {
+		return nil, err
+	}
+	if job.Agent == nil {
+		return nil, fmt.Errorf("job %q is not an agent job", id)
+	}
+
+	var checkpoint sql.NullString
+	foundIteration := false
+	// SQLite mirror writes may be async; briefly wait for the iteration row.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err = s.sqliteR.QueryRow(
+			"SELECT checkpoint FROM job_iterations WHERE job_id = ? AND iteration = ? LIMIT 1",
+			id, from,
+		).Scan(&checkpoint)
+		if err == nil {
+			foundIteration = true
+			break
+		}
+		if err != sql.ErrNoRows {
+			return nil, fmt.Errorf("lookup iteration %d for %q: %w", from, id, err)
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	req := EnqueueRequest{
+		Queue:      job.Queue,
+		Payload:    job.Payload,
+		Priority:   PriorityToString(job.Priority),
+		Tags:       job.Tags,
+		Checkpoint: nil,
+		Agent: &AgentConfig{
+			MaxIterations:    job.Agent.MaxIterations,
+			MaxCostUSD:       job.Agent.MaxCostUSD,
+			IterationTimeout: job.Agent.IterationTimeout,
+		},
+	}
+	if checkpoint.Valid && checkpoint.String != "" {
+		req.Checkpoint = json.RawMessage(checkpoint.String)
+	} else if !foundIteration {
+		// Fallback when async mirror lag/drops prevent iteration row lookup.
+		if len(job.Checkpoint) == 0 {
+			return nil, fmt.Errorf("iteration %d not found for job %q", from, id)
+		}
+		req.Checkpoint = append(json.RawMessage(nil), job.Checkpoint...)
+	}
+	return s.Enqueue(req)
 }
 
 // RetryJob resets a dead/cancelled/completed job back to pending via Raft.

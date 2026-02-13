@@ -13,41 +13,49 @@ import (
 var jobProtoPrefix = []byte{0x4a, 0x42, 0x31} // "JB1"
 
 type pbJobDoc struct {
-	ID             string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Queue          string `protobuf:"bytes,2,opt,name=queue,proto3" json:"queue,omitempty"`
-	State          string `protobuf:"bytes,3,opt,name=state,proto3" json:"state,omitempty"`
-	Payload        []byte `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
-	Priority       int32  `protobuf:"varint,5,opt,name=priority,proto3" json:"priority,omitempty"`
-	Attempt        int32  `protobuf:"varint,6,opt,name=attempt,proto3" json:"attempt,omitempty"`
-	MaxRetries     int32  `protobuf:"varint,7,opt,name=max_retries,json=maxRetries,proto3" json:"max_retries,omitempty"`
-	RetryBackoff   string `protobuf:"bytes,8,opt,name=retry_backoff,json=retryBackoff,proto3" json:"retry_backoff,omitempty"`
-	RetryBaseDelay int32  `protobuf:"varint,9,opt,name=retry_base_delay,json=retryBaseDelay,proto3" json:"retry_base_delay,omitempty"`
-	RetryMaxDelay  int32  `protobuf:"varint,10,opt,name=retry_max_delay,json=retryMaxDelay,proto3" json:"retry_max_delay,omitempty"`
-	UniqueKey      string `protobuf:"bytes,11,opt,name=unique_key,json=uniqueKey,proto3" json:"unique_key,omitempty"`
-	HasUniqueKey   bool   `protobuf:"varint,12,opt,name=has_unique_key,json=hasUniqueKey,proto3" json:"has_unique_key,omitempty"`
-	BatchID        string `protobuf:"bytes,13,opt,name=batch_id,json=batchId,proto3" json:"batch_id,omitempty"`
-	HasBatchID     bool   `protobuf:"varint,14,opt,name=has_batch_id,json=hasBatchID,proto3" json:"has_batch_id,omitempty"`
-	WorkerID       string `protobuf:"bytes,15,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
-	HasWorkerID    bool   `protobuf:"varint,16,opt,name=has_worker_id,json=hasWorkerID,proto3" json:"has_worker_id,omitempty"`
-	Hostname       string `protobuf:"bytes,17,opt,name=hostname,proto3" json:"hostname,omitempty"`
-	HasHostname    bool   `protobuf:"varint,18,opt,name=has_hostname,json=hasHostname,proto3" json:"has_hostname,omitempty"`
-	Tags           []byte `protobuf:"bytes,19,opt,name=tags,proto3" json:"tags,omitempty"`
-	Progress       []byte `protobuf:"bytes,20,opt,name=progress,proto3" json:"progress,omitempty"`
-	Checkpoint     []byte `protobuf:"bytes,21,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
-	Result         []byte `protobuf:"bytes,22,opt,name=result,proto3" json:"result,omitempty"`
-	LeaseExpiresNs int64  `protobuf:"varint,23,opt,name=lease_expires_ns,json=leaseExpiresNs,proto3" json:"lease_expires_ns,omitempty"`
-	HasLease       bool   `protobuf:"varint,24,opt,name=has_lease,json=hasLease,proto3" json:"has_lease,omitempty"`
-	ScheduledAtNs  int64  `protobuf:"varint,25,opt,name=scheduled_at_ns,json=scheduledAtNs,proto3" json:"scheduled_at_ns,omitempty"`
-	HasScheduled   bool   `protobuf:"varint,26,opt,name=has_scheduled,json=hasScheduled,proto3" json:"has_scheduled,omitempty"`
-	ExpireAtNs     int64  `protobuf:"varint,27,opt,name=expire_at_ns,json=expireAtNs,proto3" json:"expire_at_ns,omitempty"`
-	HasExpire      bool   `protobuf:"varint,28,opt,name=has_expire,json=hasExpire,proto3" json:"has_expire,omitempty"`
-	CreatedAtNs    int64  `protobuf:"varint,29,opt,name=created_at_ns,json=createdAtNs,proto3" json:"created_at_ns,omitempty"`
-	StartedAtNs    int64  `protobuf:"varint,30,opt,name=started_at_ns,json=startedAtNs,proto3" json:"started_at_ns,omitempty"`
-	HasStarted     bool   `protobuf:"varint,31,opt,name=has_started,json=hasStarted,proto3" json:"has_started,omitempty"`
-	CompletedAtNs  int64  `protobuf:"varint,32,opt,name=completed_at_ns,json=completedAtNs,proto3" json:"completed_at_ns,omitempty"`
-	HasCompleted   bool   `protobuf:"varint,33,opt,name=has_completed,json=hasCompleted,proto3" json:"has_completed,omitempty"`
-	FailedAtNs     int64  `protobuf:"varint,34,opt,name=failed_at_ns,json=failedAtNs,proto3" json:"failed_at_ns,omitempty"`
-	HasFailed      bool   `protobuf:"varint,35,opt,name=has_failed,json=hasFailed,proto3" json:"has_failed,omitempty"`
+	ID                    string  `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Queue                 string  `protobuf:"bytes,2,opt,name=queue,proto3" json:"queue,omitempty"`
+	State                 string  `protobuf:"bytes,3,opt,name=state,proto3" json:"state,omitempty"`
+	Payload               []byte  `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
+	Priority              int32   `protobuf:"varint,5,opt,name=priority,proto3" json:"priority,omitempty"`
+	Attempt               int32   `protobuf:"varint,6,opt,name=attempt,proto3" json:"attempt,omitempty"`
+	MaxRetries            int32   `protobuf:"varint,7,opt,name=max_retries,json=maxRetries,proto3" json:"max_retries,omitempty"`
+	RetryBackoff          string  `protobuf:"bytes,8,opt,name=retry_backoff,json=retryBackoff,proto3" json:"retry_backoff,omitempty"`
+	RetryBaseDelay        int32   `protobuf:"varint,9,opt,name=retry_base_delay,json=retryBaseDelay,proto3" json:"retry_base_delay,omitempty"`
+	RetryMaxDelay         int32   `protobuf:"varint,10,opt,name=retry_max_delay,json=retryMaxDelay,proto3" json:"retry_max_delay,omitempty"`
+	UniqueKey             string  `protobuf:"bytes,11,opt,name=unique_key,json=uniqueKey,proto3" json:"unique_key,omitempty"`
+	HasUniqueKey          bool    `protobuf:"varint,12,opt,name=has_unique_key,json=hasUniqueKey,proto3" json:"has_unique_key,omitempty"`
+	BatchID               string  `protobuf:"bytes,13,opt,name=batch_id,json=batchId,proto3" json:"batch_id,omitempty"`
+	HasBatchID            bool    `protobuf:"varint,14,opt,name=has_batch_id,json=hasBatchID,proto3" json:"has_batch_id,omitempty"`
+	WorkerID              string  `protobuf:"bytes,15,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	HasWorkerID           bool    `protobuf:"varint,16,opt,name=has_worker_id,json=hasWorkerID,proto3" json:"has_worker_id,omitempty"`
+	Hostname              string  `protobuf:"bytes,17,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	HasHostname           bool    `protobuf:"varint,18,opt,name=has_hostname,json=hasHostname,proto3" json:"has_hostname,omitempty"`
+	Tags                  []byte  `protobuf:"bytes,19,opt,name=tags,proto3" json:"tags,omitempty"`
+	Progress              []byte  `protobuf:"bytes,20,opt,name=progress,proto3" json:"progress,omitempty"`
+	Checkpoint            []byte  `protobuf:"bytes,21,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
+	Result                []byte  `protobuf:"bytes,22,opt,name=result,proto3" json:"result,omitempty"`
+	LeaseExpiresNs        int64   `protobuf:"varint,23,opt,name=lease_expires_ns,json=leaseExpiresNs,proto3" json:"lease_expires_ns,omitempty"`
+	HasLease              bool    `protobuf:"varint,24,opt,name=has_lease,json=hasLease,proto3" json:"has_lease,omitempty"`
+	ScheduledAtNs         int64   `protobuf:"varint,25,opt,name=scheduled_at_ns,json=scheduledAtNs,proto3" json:"scheduled_at_ns,omitempty"`
+	HasScheduled          bool    `protobuf:"varint,26,opt,name=has_scheduled,json=hasScheduled,proto3" json:"has_scheduled,omitempty"`
+	ExpireAtNs            int64   `protobuf:"varint,27,opt,name=expire_at_ns,json=expireAtNs,proto3" json:"expire_at_ns,omitempty"`
+	HasExpire             bool    `protobuf:"varint,28,opt,name=has_expire,json=hasExpire,proto3" json:"has_expire,omitempty"`
+	CreatedAtNs           int64   `protobuf:"varint,29,opt,name=created_at_ns,json=createdAtNs,proto3" json:"created_at_ns,omitempty"`
+	StartedAtNs           int64   `protobuf:"varint,30,opt,name=started_at_ns,json=startedAtNs,proto3" json:"started_at_ns,omitempty"`
+	HasStarted            bool    `protobuf:"varint,31,opt,name=has_started,json=hasStarted,proto3" json:"has_started,omitempty"`
+	CompletedAtNs         int64   `protobuf:"varint,32,opt,name=completed_at_ns,json=completedAtNs,proto3" json:"completed_at_ns,omitempty"`
+	HasCompleted          bool    `protobuf:"varint,33,opt,name=has_completed,json=hasCompleted,proto3" json:"has_completed,omitempty"`
+	FailedAtNs            int64   `protobuf:"varint,34,opt,name=failed_at_ns,json=failedAtNs,proto3" json:"failed_at_ns,omitempty"`
+	HasFailed             bool    `protobuf:"varint,35,opt,name=has_failed,json=hasFailed,proto3" json:"has_failed,omitempty"`
+	AgentMaxIterations    int32   `protobuf:"varint,36,opt,name=agent_max_iterations,json=agentMaxIterations,proto3" json:"agent_max_iterations,omitempty"`
+	AgentMaxCostUsd       float64 `protobuf:"fixed64,37,opt,name=agent_max_cost_usd,json=agentMaxCostUsd,proto3" json:"agent_max_cost_usd,omitempty"`
+	AgentIterationTimeout string  `protobuf:"bytes,38,opt,name=agent_iteration_timeout,json=agentIterationTimeout,proto3" json:"agent_iteration_timeout,omitempty"`
+	AgentIteration        int32   `protobuf:"varint,39,opt,name=agent_iteration,json=agentIteration,proto3" json:"agent_iteration,omitempty"`
+	AgentTotalCostUsd     float64 `protobuf:"fixed64,40,opt,name=agent_total_cost_usd,json=agentTotalCostUsd,proto3" json:"agent_total_cost_usd,omitempty"`
+	HasAgent              bool    `protobuf:"varint,41,opt,name=has_agent,json=hasAgent,proto3" json:"has_agent,omitempty"`
+	HoldReason            string  `protobuf:"bytes,42,opt,name=hold_reason,json=holdReason,proto3" json:"hold_reason,omitempty"`
+	HasHoldReason         bool    `protobuf:"varint,43,opt,name=has_hold_reason,json=hasHoldReason,proto3" json:"has_hold_reason,omitempty"`
 }
 
 func (m *pbJobDoc) Reset()         { *m = pbJobDoc{} }
@@ -111,6 +119,18 @@ func encodeJobDoc(job store.Job) ([]byte, error) {
 	if job.FailedAt != nil {
 		p.HasFailed = true
 		p.FailedAtNs = job.FailedAt.UnixNano()
+	}
+	if job.Agent != nil {
+		p.HasAgent = true
+		p.AgentMaxIterations = int32(job.Agent.MaxIterations)
+		p.AgentMaxCostUsd = job.Agent.MaxCostUSD
+		p.AgentIterationTimeout = job.Agent.IterationTimeout
+		p.AgentIteration = int32(job.Agent.Iteration)
+		p.AgentTotalCostUsd = job.Agent.TotalCostUSD
+	}
+	if job.HoldReason != nil {
+		p.HasHoldReason = true
+		p.HoldReason = *job.HoldReason
 	}
 	wire, err := oldproto.Marshal(p)
 	if err != nil {
@@ -181,6 +201,19 @@ func decodeJobDoc(data []byte, out *store.Job) error {
 		if p.HasFailed {
 			t := time.Unix(0, p.FailedAtNs).UTC()
 			out.FailedAt = &t
+		}
+		if p.HasAgent {
+			out.Agent = &store.AgentState{
+				MaxIterations:    int(p.AgentMaxIterations),
+				MaxCostUSD:       p.AgentMaxCostUsd,
+				IterationTimeout: p.AgentIterationTimeout,
+				Iteration:        int(p.AgentIteration),
+				TotalCostUSD:     p.AgentTotalCostUsd,
+			}
+		}
+		if p.HasHoldReason {
+			v := p.HoldReason
+			out.HoldReason = &v
 		}
 		return nil
 	}

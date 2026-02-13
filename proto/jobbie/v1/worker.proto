@@ -20,6 +20,7 @@ service WorkerService {
 message EnqueueRequest {
   string queue = 1;
   string payload_json = 2;
+  AgentConfig agent = 3;
 }
 
 message EnqueueResponse {
@@ -45,6 +46,7 @@ message FetchResponse {
   int32 lease_duration = 7;
   string checkpoint_json = 8;
   string tags_json = 9;
+  AgentState agent = 10;
 }
 
 message FetchBatchRequest {
@@ -64,6 +66,7 @@ message FetchBatchJob {
   int32 lease_duration = 6;
   string checkpoint_json = 7;
   string tags_json = 8;
+  AgentState agent = 9;
 }
 
 message FetchBatchResponse {
@@ -84,6 +87,9 @@ message AckRequest {
   string job_id = 1;
   string result_json = 2;
   UsageReport usage = 3;
+  string checkpoint_json = 4;
+  string agent_status = 5;
+  string hold_reason = 6;
 }
 
 message AckResponse {}
@@ -116,6 +122,21 @@ message LifecycleStreamRequest {
 message LifecycleEnqueueItem {
   string queue = 1;
   string payload_json = 2;
+  AgentConfig agent = 3;
+}
+
+message AgentConfig {
+  int32 max_iterations = 1;
+  double max_cost_usd = 2;
+  string iteration_timeout = 3;
+}
+
+message AgentState {
+  int32 max_iterations = 1;
+  double max_cost_usd = 2;
+  string iteration_timeout = 3;
+  int32 iteration = 4;
+  double total_cost_usd = 5;
 }
 
 message LifecycleStreamResponse {

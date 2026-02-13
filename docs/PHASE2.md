@@ -108,13 +108,13 @@ Exit criteria:
 
 Files: `internal/store/*`, `internal/server/*`, `pkg/client/*`, UI files
 
-- [ ] Minimal agent fields on enqueue (`agent` config)
-- [ ] Ack handling for `agent_status` (`continue`, `done`, `hold`)
-- [ ] `job_iterations` table and iteration counter
-- [ ] Guardrails:
+- [x] Minimal agent fields on enqueue (`agent` config)
+- [x] Ack handling for `agent_status` (`continue`, `done`, `hold`)
+- [x] `job_iterations` table and iteration counter
+- [x] Guardrails:
   - max iterations
   - max cost
-- [ ] Replay baseline:
+- [x] Replay baseline:
   - replay from iteration endpoint + CLI
 
 Exit criteria:

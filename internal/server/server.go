@@ -108,6 +108,7 @@ func (s *Server) buildRouter() chi.Router {
 			r.Post("/jobs/{id}/hold", s.handleHoldJob)
 			r.Post("/jobs/{id}/approve", s.handleApproveJob)
 			r.Post("/jobs/{id}/reject", s.handleRejectJob)
+			r.Post("/jobs/{id}/replay", s.handleReplayJob)
 			r.Post("/jobs/{id}/move", s.handleMoveJob)
 			r.Delete("/jobs/{id}", s.handleDeleteJob)
 

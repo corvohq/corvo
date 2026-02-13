@@ -76,6 +76,7 @@ func (s *Server) Enqueue(ctx context.Context, req *connect.Request[jobbiev1.Enqu
 	result, err := s.store.Enqueue(store.EnqueueRequest{
 		Queue:   req.Msg.GetQueue(),
 		Payload: json.RawMessage(payload),
+		Agent:   agentConfigFromPB(req.Msg.GetAgent()),
 	})
 	if err != nil {
 		return nil, mapStoreError(err)
@@ -121,6 +122,7 @@ func (s *Server) Fetch(ctx context.Context, req *connect.Request[jobbiev1.FetchR
 		LeaseDuration:  int32(result.LeaseDuration),
 		CheckpointJson: string(result.Checkpoint),
 		TagsJson:       string(result.Tags),
+		Agent:          agentStateToPB(result.Agent),
 	}
 	return connect.NewResponse(resp), nil
 }
@@ -160,6 +162,7 @@ func (s *Server) FetchBatch(ctx context.Context, req *connect.Request[jobbiev1.F
 			LeaseDuration:  int32(j.LeaseDuration),
 			CheckpointJson: string(j.Checkpoint),
 			TagsJson:       string(j.Tags),
+			Agent:          agentStateToPB(j.Agent),
 		})
 	}
 	return connect.NewResponse(&jobbiev1.FetchBatchResponse{Jobs: respJobs}), nil
@@ -170,7 +173,14 @@ func (s *Server) Ack(ctx context.Context, req *connect.Request[jobbiev1.AckReque
 	if resultJSON == "" {
 		resultJSON = `{}`
 	}
-	if err := s.store.AckWithUsage(req.Msg.GetJobId(), json.RawMessage(resultJSON), usageFromPB(req.Msg.GetUsage())); err != nil {
+	if err := s.store.AckJob(store.AckRequest{
+		JobID:       req.Msg.GetJobId(),
+		Result:      json.RawMessage(resultJSON),
+		Checkpoint:  json.RawMessage(strings.TrimSpace(req.Msg.GetCheckpointJson())),
+		Usage:       usageFromPB(req.Msg.GetUsage()),
+		AgentStatus: req.Msg.GetAgentStatus(),
+		HoldReason:  req.Msg.GetHoldReason(),
+	}); err != nil {
 		return nil, mapStoreError(err)
 	}
 	return connect.NewResponse(&jobbiev1.AckResponse{}), nil
@@ -252,6 +262,7 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 						LeaseDuration:  int32(j.LeaseDuration),
 						CheckpointJson: string(j.Checkpoint),
 						TagsJson:       string(j.Tags),
+						Agent:          agentStateToPB(j.Agent),
 					})
 				}
 				resp.Jobs = respJobs
@@ -311,6 +322,7 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 				jobs = append(jobs, store.EnqueueRequest{
 					Queue:   queue,
 					Payload: json.RawMessage(payload),
+					Agent:   agentConfigFromPB(item.GetAgent()),
 				})
 			}
 			if len(jobs) > 0 {
@@ -401,5 +413,29 @@ func usageFromPB(in *jobbiev1.UsageReport) *store.UsageReport {
 		Model:               strings.TrimSpace(in.GetModel()),
 		Provider:            strings.TrimSpace(in.GetProvider()),
 		CostUSD:             in.GetCostUsd(),
+	}
+}
+
+func agentConfigFromPB(in *jobbiev1.AgentConfig) *store.AgentConfig {
+	if in == nil {
+		return nil
+	}
+	return &store.AgentConfig{
+		MaxIterations:    int(in.GetMaxIterations()),
+		MaxCostUSD:       in.GetMaxCostUsd(),
+		IterationTimeout: strings.TrimSpace(in.GetIterationTimeout()),
+	}
+}
+
+func agentStateToPB(in *store.AgentState) *jobbiev1.AgentState {
+	if in == nil {
+		return nil
+	}
+	return &jobbiev1.AgentState{
+		MaxIterations:    int32(in.MaxIterations),
+		MaxCostUsd:       in.MaxCostUSD,
+		IterationTimeout: in.IterationTimeout,
+		Iteration:        int32(in.Iteration),
+		TotalCostUsd:     in.TotalCostUSD,
 	}
 }

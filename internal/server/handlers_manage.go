@@ -200,6 +200,27 @@ func (s *Server) handleRejectJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": store.StateDead})
 }
 
+func (s *Server) handleReplayJob(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var body struct {
+		From int `json:"from"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
+		return
+	}
+	if body.From <= 0 {
+		writeError(w, http.StatusBadRequest, "from must be > 0", "VALIDATION_ERROR")
+		return
+	}
+	result, err := s.store.ReplayFromIteration(id, body.From)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "REPLAY_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusCreated, result)
+}
+
 // Search and bulk
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {

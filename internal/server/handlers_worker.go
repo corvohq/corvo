@@ -175,12 +175,22 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	jobID := chi.URLParam(r, "job_id")
 
 	var body struct {
-		Result json.RawMessage    `json:"result"`
-		Usage  *store.UsageReport `json:"usage"`
+		Result      json.RawMessage    `json:"result"`
+		Checkpoint  json.RawMessage    `json:"checkpoint"`
+		Usage       *store.UsageReport `json:"usage"`
+		AgentStatus string             `json:"agent_status"`
+		HoldReason  string             `json:"hold_reason"`
 	}
 	decodeJSON(r, &body)
 
-	if err := s.store.AckWithUsage(jobID, body.Result, body.Usage); err != nil {
+	if err := s.store.AckJob(store.AckRequest{
+		JobID:       jobID,
+		Result:      body.Result,
+		Checkpoint:  body.Checkpoint,
+		Usage:       body.Usage,
+		AgentStatus: body.AgentStatus,
+		HoldReason:  body.HoldReason,
+	}); err != nil {
 		writeStoreError(w, err, http.StatusBadRequest, "ACK_ERROR")
 		return
 	}
