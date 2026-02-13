@@ -112,6 +112,7 @@ type EnqueueOp struct {
 	ChainID      string          `json:"chain_id,omitempty"`
 	ChainStep    *int            `json:"chain_step,omitempty"`
 	ChainConfig  json.RawMessage `json:"chain_config,omitempty"`
+	Routing      *RoutingConfig  `json:"routing,omitempty"`
 }
 
 type EnqueueBatchOp struct {

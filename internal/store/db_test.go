@@ -100,8 +100,8 @@ func TestMigrationIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query migration version: %v", err)
 	}
-	if version != 5 {
-		t.Errorf("migration version = %d, want 5", version)
+	if version != 6 {
+		t.Errorf("migration version = %d, want 6", version)
 	}
 }
 
@@ -154,6 +154,7 @@ func TestMigrationCreatesIndexes(t *testing.T) {
 		"idx_job_scores_job",
 		"idx_job_scores_dimension",
 		"idx_provider_usage",
+		"idx_jobs_routing_target",
 	}
 
 	for _, idx := range expectedIndexes {

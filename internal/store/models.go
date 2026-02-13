@@ -92,6 +92,9 @@ type Job struct {
 	ChainStep      *int            `json:"chain_step,omitempty"`
 	ChainConfig    json.RawMessage `json:"chain_config,omitempty"`
 	ProviderError  bool            `json:"provider_error,omitempty"`
+	Routing        *RoutingConfig  `json:"routing,omitempty"`
+	RoutingTarget  *string         `json:"routing_target,omitempty"`
+	RoutingIndex   int             `json:"routing_index,omitempty"`
 	CreatedAt      time.Time       `json:"created_at"`
 	StartedAt      *time.Time      `json:"started_at,omitempty"`
 	CompletedAt    *time.Time      `json:"completed_at,omitempty"`
@@ -187,6 +190,12 @@ type AgentConfig struct {
 	MaxIterations    int     `json:"max_iterations,omitempty"`
 	MaxCostUSD       float64 `json:"max_cost_usd,omitempty"`
 	IterationTimeout string  `json:"iteration_timeout,omitempty"`
+}
+
+type RoutingConfig struct {
+	Prefer   string   `json:"prefer,omitempty"`
+	Fallback []string `json:"fallback,omitempty"`
+	Strategy string   `json:"strategy,omitempty"`
 }
 
 type AgentState struct {

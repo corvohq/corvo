@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -26,6 +27,7 @@ type EnqueueRequest struct {
 	ChainID        string          `json:"chain_id,omitempty"`
 	ChainStep      *int            `json:"chain_step,omitempty"`
 	ChainConfig    json.RawMessage `json:"chain_config,omitempty"`
+	Routing        *RoutingConfig  `json:"routing,omitempty"`
 }
 
 // EnqueueResult is the response from enqueuing a job.
@@ -106,6 +108,7 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 		ChainID:      req.ChainID,
 		ChainStep:    req.ChainStep,
 		ChainConfig:  req.ChainConfig,
+		Routing:      normalizeRoutingConfig(req.Routing),
 	}
 
 	return applyOpResult[EnqueueResult](s, OpEnqueue, op)
@@ -184,6 +187,7 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 			ChainID:      jobReq.ChainID,
 			ChainStep:    jobReq.ChainStep,
 			ChainConfig:  jobReq.ChainConfig,
+			Routing:      normalizeRoutingConfig(jobReq.Routing),
 		}
 	}
 
@@ -219,6 +223,42 @@ func normalizeAgentConfig(cfg *AgentConfig) *AgentState {
 	}
 	if out.MaxCostUSD < 0 {
 		out.MaxCostUSD = 0
+	}
+	return out
+}
+
+func normalizeRoutingConfig(cfg *RoutingConfig) *RoutingConfig {
+	if cfg == nil {
+		return nil
+	}
+	out := &RoutingConfig{
+		Prefer:   strings.TrimSpace(cfg.Prefer),
+		Strategy: strings.TrimSpace(cfg.Strategy),
+	}
+	seen := map[string]struct{}{}
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return
+		}
+		if _, ok := seen[v]; ok {
+			return
+		}
+		seen[v] = struct{}{}
+		out.Fallback = append(out.Fallback, v)
+	}
+	for _, v := range cfg.Fallback {
+		add(v)
+	}
+	if out.Prefer == "" && len(out.Fallback) > 0 {
+		out.Prefer = out.Fallback[0]
+		out.Fallback = out.Fallback[1:]
+	}
+	if out.Prefer == "" && len(out.Fallback) == 0 {
+		return nil
+	}
+	if out.Strategy == "" {
+		out.Strategy = "fallback_on_error"
 	}
 	return out
 }

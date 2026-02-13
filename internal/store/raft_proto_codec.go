@@ -125,6 +125,7 @@ type pbEnqueueOp struct {
 	ChainStep             int32   `protobuf:"varint,30,opt,name=chain_step,json=chainStep,proto3" json:"chain_step,omitempty"`
 	HasChainStep          bool    `protobuf:"varint,31,opt,name=has_chain_step,json=hasChainStep,proto3" json:"has_chain_step,omitempty"`
 	ChainConfig           []byte  `protobuf:"bytes,32,opt,name=chain_config,json=chainConfig,proto3" json:"chain_config,omitempty"`
+	Routing               []byte  `protobuf:"bytes,33,opt,name=routing,proto3" json:"routing,omitempty"`
 }
 
 func (m *pbEnqueueOp) Reset()         { *m = pbEnqueueOp{} }
@@ -941,6 +942,10 @@ func toPBEnqueue(op EnqueueOp) *pbEnqueueOp {
 		ChainID:      op.ChainID,
 		ChainConfig:  append([]byte(nil), op.ChainConfig...),
 	}
+	if op.Routing != nil {
+		b, _ := json.Marshal(op.Routing)
+		p.Routing = b
+	}
 	if op.ChainStep != nil {
 		p.HasChainStep = true
 		p.ChainStep = int32(*op.ChainStep)
@@ -986,6 +991,12 @@ func fromPBEnqueue(op *pbEnqueueOp) EnqueueOp {
 		ParentID:     op.ParentID,
 		ChainID:      op.ChainID,
 		ChainConfig:  append([]byte(nil), op.ChainConfig...),
+	}
+	if len(op.Routing) > 0 {
+		var r RoutingConfig
+		if err := json.Unmarshal(op.Routing, &r); err == nil {
+			out.Routing = &r
+		}
 	}
 	if op.HasChainStep {
 		v := int(op.ChainStep)

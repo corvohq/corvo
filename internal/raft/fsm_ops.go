@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -500,6 +501,7 @@ func (f *FSM) applyFetchOp(op store.FetchOp) *store.OpResult {
 			Tags:          job.Tags,
 			Checkpoint:    job.Checkpoint,
 			Agent:         job.Agent,
+			RoutingTarget: job.RoutingTarget,
 		}
 		return &store.OpResult{Data: result}
 	}
@@ -648,6 +650,7 @@ func (f *FSM) applyFetchBatchOp(op store.FetchBatchOp) *store.OpResult {
 				Tags:          job.Tags,
 				Checkpoint:    job.Checkpoint,
 				Agent:         job.Agent,
+				RoutingTarget: job.RoutingTarget,
 			})
 			if len(results) >= op.Count {
 				break
@@ -1171,12 +1174,26 @@ func (f *FSM) applyFailOp(op store.FailOp) *store.OpResult {
 	if remaining < 0 {
 		remaining = 0
 	}
+	routed := false
+	if op.ProviderError && remaining > 0 && job.Routing != nil {
+		strategy := strings.ToLower(strings.TrimSpace(job.Routing.Strategy))
+		if strategy == "" || strategy == "fallback_on_error" {
+			if target, idx, ok := routingTargetFor(job.Routing, job.RoutingIndex+1); ok {
+				job.RoutingTarget = &target
+				job.RoutingIndex = idx
+				routed = true
+			}
+		}
+	}
 
 	var result store.FailResult
 	var callbackJobID string
 
 	if remaining > 0 {
 		delay := store.CalculateBackoff(job.RetryBackoff, job.Attempt, job.RetryBaseDelay, job.RetryMaxDelay)
+		if routed {
+			delay = 0
+		}
 		nextAttempt := now.Add(delay)
 		retryNs := uint64(nextAttempt.UnixNano())
 
@@ -2502,6 +2519,14 @@ func (f *FSM) deleteJobsByPrefix(batch *pebble.Batch, prefix []byte) {
 
 // jobToDoc creates a store.Job from an EnqueueOp for Pebble storage.
 func jobToDoc(op store.EnqueueOp) store.Job {
+	var routingTarget *string
+	routingIndex := 0
+	if op.Routing != nil {
+		if t, idx, ok := routingTargetFor(op.Routing, 0); ok {
+			routingTarget = &t
+			routingIndex = idx
+		}
+	}
 	j := store.Job{
 		ID:             op.JobID,
 		Queue:          op.Queue,
@@ -2517,6 +2542,9 @@ func jobToDoc(op store.EnqueueOp) store.Job {
 		CreatedAt:      op.CreatedAt,
 		Tags:           op.Tags,
 		Agent:          op.Agent,
+		Routing:        op.Routing,
+		RoutingTarget:  routingTarget,
+		RoutingIndex:   routingIndex,
 	}
 	if op.UniqueKey != "" {
 		j.UniqueKey = &op.UniqueKey
@@ -2543,6 +2571,27 @@ func jobToDoc(op store.EnqueueOp) store.Job {
 		j.ChainConfig = op.ChainConfig
 	}
 	return j
+}
+
+func routingTargetFor(cfg *store.RoutingConfig, index int) (string, int, bool) {
+	if cfg == nil {
+		return "", 0, false
+	}
+	candidates := make([]string, 0, 1+len(cfg.Fallback))
+	if cfg.Prefer != "" {
+		candidates = append(candidates, cfg.Prefer)
+	}
+	candidates = append(candidates, cfg.Fallback...)
+	if len(candidates) == 0 {
+		return "", 0, false
+	}
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(candidates) {
+		return "", 0, false
+	}
+	return candidates[index], index, true
 }
 
 func marshalStringSlice(ss []string) json.RawMessage {

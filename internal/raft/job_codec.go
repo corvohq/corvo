@@ -65,6 +65,10 @@ type pbJobDoc struct {
 	HasChainStep          bool    `protobuf:"varint,50,opt,name=has_chain_step,json=hasChainStep,proto3" json:"has_chain_step,omitempty"`
 	ChainConfig           []byte  `protobuf:"bytes,51,opt,name=chain_config,json=chainConfig,proto3" json:"chain_config,omitempty"`
 	ProviderError         bool    `protobuf:"varint,52,opt,name=provider_error,json=providerError,proto3" json:"provider_error,omitempty"`
+	Routing               []byte  `protobuf:"bytes,53,opt,name=routing,proto3" json:"routing,omitempty"`
+	RoutingTarget         string  `protobuf:"bytes,54,opt,name=routing_target,json=routingTarget,proto3" json:"routing_target,omitempty"`
+	HasRoutingTarget      bool    `protobuf:"varint,55,opt,name=has_routing_target,json=hasRoutingTarget,proto3" json:"has_routing_target,omitempty"`
+	RoutingIndex          int32   `protobuf:"varint,56,opt,name=routing_index,json=routingIndex,proto3" json:"routing_index,omitempty"`
 }
 
 func (m *pbJobDoc) Reset()         { *m = pbJobDoc{} }
@@ -90,6 +94,11 @@ func encodeJobDoc(job store.Job) ([]byte, error) {
 		ResultSchema:   append([]byte(nil), job.ResultSchema...),
 		CreatedAtNs:    job.CreatedAt.UnixNano(),
 		ProviderError:  job.ProviderError,
+		RoutingIndex:   int32(job.RoutingIndex),
+	}
+	if job.Routing != nil {
+		b, _ := json.Marshal(job.Routing)
+		p.Routing = b
 	}
 	if job.UniqueKey != nil {
 		p.HasUniqueKey = true
@@ -158,6 +167,10 @@ func encodeJobDoc(job store.Job) ([]byte, error) {
 	if len(job.ChainConfig) > 0 {
 		p.ChainConfig = append([]byte(nil), job.ChainConfig...)
 	}
+	if job.RoutingTarget != nil {
+		p.HasRoutingTarget = true
+		p.RoutingTarget = *job.RoutingTarget
+	}
 	wire, err := oldproto.Marshal(p)
 	if err != nil {
 		return nil, err
@@ -189,6 +202,13 @@ func decodeJobDoc(data []byte, out *store.Job) error {
 			ResultSchema:   append([]byte(nil), p.ResultSchema...),
 			CreatedAt:      time.Unix(0, p.CreatedAtNs).UTC(),
 			ProviderError:  p.ProviderError,
+			RoutingIndex:   int(p.RoutingIndex),
+		}
+		if len(p.Routing) > 0 {
+			var r store.RoutingConfig
+			if err := json.Unmarshal(p.Routing, &r); err == nil {
+				out.Routing = &r
+			}
 		}
 		if p.HasUniqueKey {
 			v := p.UniqueKey
@@ -257,6 +277,10 @@ func decodeJobDoc(data []byte, out *store.Job) error {
 		}
 		if len(p.ChainConfig) > 0 {
 			out.ChainConfig = append([]byte(nil), p.ChainConfig...)
+		}
+		if p.HasRoutingTarget {
+			v := p.RoutingTarget
+			out.RoutingTarget = &v
 		}
 		return nil
 	}

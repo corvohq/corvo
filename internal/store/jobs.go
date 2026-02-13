@@ -10,10 +10,10 @@ import (
 // GetJob returns a job with its error history from local SQLite.
 func (s *Store) GetJob(id string) (*Job, error) {
 	var j Job
-	var payload, tags, progress, checkpoint, result, resultSchema, chainConfig sql.NullString
+	var payload, tags, progress, checkpoint, result, resultSchema, chainConfig, routing, routingTarget sql.NullString
 	var agentIterTimeout, holdReason sql.NullString
 	var uniqueKey, batchID, workerID, hostname, parentID, chainID sql.NullString
-	var chainStep sql.NullInt64
+	var chainStep, routingIndex sql.NullInt64
 	var providerError int
 	var agentMaxIterations sql.NullInt64
 	var agentIteration sql.NullInt64
@@ -28,6 +28,7 @@ func (s *Store) GetJob(id string) (*Job, error) {
 			unique_key, batch_id, worker_id, hostname,
 			tags, progress, checkpoint, result,
 			result_schema, parent_id, chain_id, chain_step, chain_config, provider_error,
+			routing, routing_target, routing_index,
 			agent_max_iterations, agent_max_cost_usd, agent_iteration_timeout, agent_iteration, agent_total_cost_usd,
 			hold_reason,
 			lease_expires_at, scheduled_at, expire_at,
@@ -39,6 +40,7 @@ func (s *Store) GetJob(id string) (*Job, error) {
 		&uniqueKey, &batchID, &workerID, &hostname,
 		&tags, &progress, &checkpoint, &result,
 		&resultSchema, &parentID, &chainID, &chainStep, &chainConfig, &providerError,
+		&routing, &routingTarget, &routingIndex,
 		&agentMaxIterations, &agentMaxCostUSD, &agentIterTimeout, &agentIteration, &agentTotalCostUSD,
 		&holdReason,
 		&leaseExpiresAt, &scheduledAt, &expireAt,
@@ -85,6 +87,18 @@ func (s *Store) GetJob(id string) (*Job, error) {
 		j.ChainConfig = json.RawMessage(chainConfig.String)
 	}
 	j.ProviderError = providerError == 1
+	if routing.Valid {
+		var cfg RoutingConfig
+		if err := json.Unmarshal([]byte(routing.String), &cfg); err == nil {
+			j.Routing = &cfg
+		}
+	}
+	if routingTarget.Valid {
+		j.RoutingTarget = &routingTarget.String
+	}
+	if routingIndex.Valid {
+		j.RoutingIndex = int(routingIndex.Int64)
+	}
 	if agentIteration.Valid {
 		j.Agent = &AgentState{
 			Iteration: int(agentIteration.Int64),

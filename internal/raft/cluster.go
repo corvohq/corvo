@@ -777,6 +777,9 @@ func ensureMaterializedViewSchema(db *sql.DB) error {
 		{table: "jobs", name: "chain_step", sql: "ALTER TABLE jobs ADD COLUMN chain_step INTEGER"},
 		{table: "jobs", name: "chain_config", sql: "ALTER TABLE jobs ADD COLUMN chain_config TEXT"},
 		{table: "jobs", name: "provider_error", sql: "ALTER TABLE jobs ADD COLUMN provider_error INTEGER NOT NULL DEFAULT 0"},
+		{table: "jobs", name: "routing", sql: "ALTER TABLE jobs ADD COLUMN routing TEXT"},
+		{table: "jobs", name: "routing_target", sql: "ALTER TABLE jobs ADD COLUMN routing_target TEXT"},
+		{table: "jobs", name: "routing_index", sql: "ALTER TABLE jobs ADD COLUMN routing_index INTEGER NOT NULL DEFAULT 0"},
 		{table: "queues", name: "provider", sql: "ALTER TABLE queues ADD COLUMN provider TEXT REFERENCES providers(name)"},
 	}
 	for _, c := range columns {
@@ -792,9 +795,11 @@ func ensureMaterializedViewSchema(db *sql.DB) error {
 		}
 	}
 	_, err := db.Exec(`
-		CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_id) WHERE parent_id IS NOT NULL;
-		CREATE INDEX IF NOT EXISTS idx_jobs_chain ON jobs(chain_id) WHERE chain_id IS NOT NULL;
-		CREATE INDEX IF NOT EXISTS idx_jobs_provider_error ON jobs(provider_error) WHERE provider_error = 1;
+CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_id) WHERE parent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_jobs_chain ON jobs(chain_id) WHERE chain_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_jobs_provider_error ON jobs(provider_error) WHERE provider_error = 1;
+CREATE INDEX IF NOT EXISTS idx_jobs_routing_target ON jobs(routing_target) WHERE routing_target IS NOT NULL;
+		CREATE INDEX IF NOT EXISTS idx_jobs_routing_target ON jobs(routing_target) WHERE routing_target IS NOT NULL;
 	`)
 	return err
 }
@@ -848,6 +853,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     chain_step      INTEGER,
     chain_config    TEXT,
     provider_error  INTEGER NOT NULL DEFAULT 0,
+    routing         TEXT,
+    routing_target  TEXT,
+    routing_index   INTEGER NOT NULL DEFAULT 0,
     agent_max_iterations INTEGER,
     agent_max_cost_usd REAL,
     agent_iteration_timeout TEXT,
