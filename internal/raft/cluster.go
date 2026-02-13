@@ -1,0 +1,1117 @@
+package raft
+
+import (
+	"bytes"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/cockroachdb/pebble"
+	"github.com/hashicorp/raft"
+	"github.com/user/jobbie/internal/kv"
+	"github.com/user/jobbie/internal/store"
+)
+
+// Cluster manages the Raft node, Pebble KV store, and SQLite materialized view.
+type Cluster struct {
+	raft      *raft.Raft
+	fsm       *FSM
+	transport *raft.NetworkTransport
+	logStore  raftStore
+	config    ClusterConfig
+	applyCh   chan *applyRequest
+	applyExec chan []*applyRequest
+	admitMu   sync.Mutex
+	inFlight  map[string]int
+	inFlightN int
+	queueHist *durationHistogram
+	applyHist *durationHistogram
+	stopCh    chan struct{}
+	doneCh    chan struct{}
+	workerCh  chan struct{}
+}
+
+type applyRequest struct {
+	opType store.OpType
+	data   any
+	key    string
+	enqAt  time.Time
+	respCh chan *store.OpResult
+}
+
+type durationHistogram struct {
+	mu      sync.Mutex
+	buckets []time.Duration
+	counts  []uint64
+	total   uint64
+	sumNs   uint64
+}
+
+// NewCluster creates and starts a Raft cluster node.
+func NewCluster(cfg ClusterConfig) (*Cluster, error) {
+	if cfg.ApplyTimeout == 0 {
+		cfg.ApplyTimeout = 10 * time.Second
+	}
+	if cfg.ApplyBatchMax <= 0 {
+		cfg.ApplyBatchMax = 128
+	}
+	if cfg.ApplyBatchWindow <= 0 {
+		cfg.ApplyBatchWindow = 2 * time.Millisecond
+	}
+	if cfg.ApplyBatchMinWait <= 0 {
+		cfg.ApplyBatchMinWait = 100 * time.Microsecond
+	}
+	if cfg.ApplyBatchMinWait > cfg.ApplyBatchWindow {
+		cfg.ApplyBatchMinWait = cfg.ApplyBatchWindow
+	}
+	if cfg.ApplyBatchExtendAt <= 1 {
+		cfg.ApplyBatchExtendAt = 32
+	}
+	if cfg.ApplyBatchExtendAt > cfg.ApplyBatchMax {
+		cfg.ApplyBatchExtendAt = cfg.ApplyBatchMax
+	}
+	if cfg.ApplyMaxPending <= 0 {
+		cfg.ApplyMaxPending = cfg.ApplyBatchMax * 16
+	}
+	if cfg.ApplyMaxInFlight <= 0 {
+		cfg.ApplyMaxInFlight = 256
+	}
+	if cfg.ApplyMaxTotalInFly <= 0 {
+		cfg.ApplyMaxTotalInFly = cfg.ApplyMaxInFlight * 16
+	}
+	if cfg.ApplySubBatchMax <= 0 {
+		cfg.ApplySubBatchMax = 128
+	}
+	if cfg.ApplySubBatchMax > cfg.ApplyBatchMax {
+		cfg.ApplySubBatchMax = cfg.ApplyBatchMax
+	}
+	if cfg.RaftStore == "" {
+		cfg.RaftStore = "bolt"
+	}
+	cfg.RaftStore = strings.ToLower(cfg.RaftStore)
+
+	// Ensure directories exist
+	pebbleDir := filepath.Join(cfg.DataDir, "pebble")
+	raftDir := filepath.Join(cfg.DataDir, "raft")
+	for _, dir := range []string{pebbleDir, raftDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("create dir %s: %w", dir, err)
+		}
+	}
+
+	// Open Pebble with write-heavy tuning to reduce flush/compaction stalls
+	// on enqueue-heavy workloads.
+	pdb, err := pebble.Open(pebbleDir, &pebble.Options{
+		MemTableSize:          64 << 20, // 64MB
+		L0CompactionThreshold: 8,
+		MaxConcurrentCompactions: func() int {
+			return 4
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("open pebble: %w", err)
+	}
+
+	// Open SQLite materialized view
+	sqlitePath := filepath.Join(cfg.DataDir, "jobbie.db")
+	sqliteDB, err := openMaterializedView(sqlitePath)
+	if err != nil {
+		pdb.Close()
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+
+	// Create FSM
+	fsm := NewFSM(pdb, sqliteDB)
+	fsm.SetPebbleNoSync(cfg.PebbleNoSync)
+	fsm.SetSQLiteMirrorEnabled(cfg.SQLiteMirror)
+	fsm.SetSQLiteMirrorAsync(cfg.SQLiteMirrorAsync)
+	fsm.SetLifecycleEventsEnabled(cfg.LifecycleEvents)
+
+	// Raft config
+	raftConfig := raft.DefaultConfig()
+	raftConfig.LocalID = raft.ServerID(cfg.NodeID)
+	raftConfig.SnapshotThreshold = 8192
+	raftConfig.SnapshotInterval = 2 * time.Minute
+
+	// Transport
+	transport, err := newTCPTransport(cfg.RaftBind, cfg.RaftAdvertise)
+	if err != nil {
+		pdb.Close()
+		sqliteDB.Close()
+		return nil, fmt.Errorf("create transport: %w", err)
+	}
+
+	// Log store + stable store
+	logStore, err := openRaftStore(raftDir, cfg)
+	if err != nil {
+		pdb.Close()
+		sqliteDB.Close()
+		transport.Close()
+		return nil, err
+	}
+
+	// Snapshot store
+	snapshotStore, err := raft.NewFileSnapshotStore(raftDir, 2, os.Stderr)
+	if err != nil {
+		pdb.Close()
+		sqliteDB.Close()
+		transport.Close()
+		logStore.Close()
+		return nil, fmt.Errorf("create snapshot store: %w", err)
+	}
+
+	// Create Raft instance
+	r, err := raft.NewRaft(raftConfig, fsm, logStore, logStore, snapshotStore, transport)
+	if err != nil {
+		pdb.Close()
+		sqliteDB.Close()
+		transport.Close()
+		logStore.Close()
+		return nil, fmt.Errorf("create raft: %w", err)
+	}
+
+	// Bootstrap if requested
+	if cfg.Bootstrap {
+		configuration := raft.Configuration{
+			Servers: []raft.Server{
+				{
+					ID:      raft.ServerID(cfg.NodeID),
+					Address: transport.LocalAddr(),
+				},
+			},
+		}
+		f := r.BootstrapCluster(configuration)
+		if err := f.Error(); err != nil && err != raft.ErrCantBootstrap {
+			slog.Warn("bootstrap cluster", "error", err)
+		}
+	}
+
+	cluster := &Cluster{
+		raft:      r,
+		fsm:       fsm,
+		transport: transport,
+		logStore:  logStore,
+		config:    cfg,
+		applyCh:   make(chan *applyRequest, cfg.ApplyMaxPending),
+		applyExec: make(chan []*applyRequest, 4),
+		inFlight:  make(map[string]int),
+		queueHist: newDurationHistogram(),
+		applyHist: newDurationHistogram(),
+		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
+		workerCh:  make(chan struct{}),
+	}
+	go cluster.applyExecLoop()
+	go cluster.applyLoop()
+
+	slog.Info("raft cluster started",
+		"node_id", cfg.NodeID,
+		"raft_bind", cfg.RaftBind,
+		"raft_store", cfg.RaftStore,
+		"raft_no_sync", cfg.RaftNoSync,
+		"pebble_no_sync", cfg.PebbleNoSync,
+		"sqlite_mirror", cfg.SQLiteMirror,
+		"sqlite_mirror_async", cfg.SQLiteMirrorAsync,
+		"lifecycle_events", cfg.LifecycleEvents,
+		"apply_batch_max", cfg.ApplyBatchMax,
+		"apply_batch_min_wait", cfg.ApplyBatchMinWait,
+		"apply_batch_extend_at", cfg.ApplyBatchExtendAt,
+		"apply_batch_window", cfg.ApplyBatchWindow,
+		"apply_max_pending", cfg.ApplyMaxPending,
+		"apply_max_inflight", cfg.ApplyMaxInFlight,
+		"apply_max_total_inflight", cfg.ApplyMaxTotalInFly,
+		"apply_sub_batch_max", cfg.ApplySubBatchMax,
+		"bootstrap", cfg.Bootstrap,
+	)
+
+	return cluster, nil
+}
+
+// Apply submits an operation to the Raft cluster and returns the result.
+func (c *Cluster) Apply(opType store.OpType, data any) *store.OpResult {
+	key := admissionKey(opType, data)
+	if !c.tryAcquireAdmission(key) {
+		return c.overloadedResult(fmt.Sprintf("raft apply overloaded for key %q: too many in-flight requests", key))
+	}
+	req := &applyRequest{
+		opType: opType,
+		data:   data,
+		key:    key,
+		enqAt:  time.Now(),
+		respCh: make(chan *store.OpResult, 1),
+	}
+	select {
+	case c.applyCh <- req:
+	default:
+		c.releaseAdmission(key)
+		return c.overloadedResult("raft apply overloaded: pending queue is full")
+	case <-c.stopCh:
+		c.releaseAdmission(key)
+		return &store.OpResult{Err: fmt.Errorf("raft cluster stopping")}
+	}
+
+	select {
+	case res := <-req.respCh:
+		c.releaseAdmission(key)
+		return res
+	case <-c.stopCh:
+		c.releaseAdmission(key)
+		return &store.OpResult{Err: fmt.Errorf("raft cluster stopping")}
+	}
+}
+
+func (c *Cluster) tryAcquireAdmission(key string) bool {
+	c.admitMu.Lock()
+	defer c.admitMu.Unlock()
+	if c.inFlightN >= c.config.ApplyMaxTotalInFly {
+		return false
+	}
+	if c.inFlight[key] >= c.config.ApplyMaxInFlight {
+		return false
+	}
+	c.inFlight[key]++
+	c.inFlightN++
+	return true
+}
+
+func (c *Cluster) releaseAdmission(key string) {
+	c.admitMu.Lock()
+	defer c.admitMu.Unlock()
+	n := c.inFlight[key]
+	if n <= 1 {
+		delete(c.inFlight, key)
+	} else {
+		c.inFlight[key] = n - 1
+	}
+	if c.inFlightN > 0 {
+		c.inFlightN--
+	}
+}
+
+func (c *Cluster) overloadedResult(msg string) *store.OpResult {
+	return &store.OpResult{Err: store.NewOverloadedErrorRetry(msg, c.overloadRetryAfterMs())}
+}
+
+func (c *Cluster) overloadRetryAfterMs() int {
+	backlog := len(c.applyCh)
+	c.admitMu.Lock()
+	inFlight := c.inFlightN
+	c.admitMu.Unlock()
+	score := 1
+	if c.config.ApplyMaxPending > 0 {
+		score += (backlog * 8) / c.config.ApplyMaxPending
+	}
+	if c.config.ApplyMaxTotalInFly > 0 {
+		score += (inFlight * 8) / c.config.ApplyMaxTotalInFly
+	}
+	switch {
+	case score >= 12:
+		return 10
+	case score >= 8:
+		return 5
+	case score >= 5:
+		return 2
+	default:
+		return 1
+	}
+}
+
+func admissionKey(opType store.OpType, data any) string {
+	switch opType {
+	case store.OpEnqueue:
+		if op, ok := data.(store.EnqueueOp); ok && op.Queue != "" {
+			return "q:" + op.Queue
+		}
+	case store.OpEnqueueBatch:
+		if op, ok := data.(store.EnqueueBatchOp); ok && len(op.Jobs) > 0 {
+			first := op.Jobs[0].Queue
+			if first == "" {
+				return "g:*"
+			}
+			for i := 1; i < len(op.Jobs); i++ {
+				if op.Jobs[i].Queue != first {
+					return "g:*"
+				}
+			}
+			return "q:" + first
+		}
+	case store.OpFetch:
+		if op, ok := data.(store.FetchOp); ok && len(op.Queues) > 0 {
+			return "q:" + op.Queues[0]
+		}
+	case store.OpFetchBatch:
+		if op, ok := data.(store.FetchBatchOp); ok && len(op.Queues) > 0 {
+			return "q:" + op.Queues[0]
+		}
+	case store.OpPauseQueue, store.OpResumeQueue, store.OpClearQueue, store.OpDeleteQueue, store.OpRemoveThrottle:
+		if op, ok := data.(store.QueueOp); ok && op.Queue != "" {
+			return "q:" + op.Queue
+		}
+	case store.OpSetConcurrency:
+		if op, ok := data.(store.SetConcurrencyOp); ok && op.Queue != "" {
+			return "q:" + op.Queue
+		}
+	case store.OpSetThrottle:
+		if op, ok := data.(store.SetThrottleOp); ok && op.Queue != "" {
+			return "q:" + op.Queue
+		}
+	}
+	return "g:*"
+}
+
+func (c *Cluster) applyLoop() {
+	defer close(c.doneCh)
+	defer close(c.applyExec)
+
+	enqueueExec := func(b []*applyRequest) {
+		if len(b) == 0 {
+			return
+		}
+		out := make([]*applyRequest, len(b))
+		copy(out, b)
+		select {
+		case c.applyExec <- out:
+		case <-c.stopCh:
+			for _, req := range out {
+				req.respCh <- &store.OpResult{Err: fmt.Errorf("raft cluster stopping")}
+			}
+		}
+	}
+
+	maxBatch := c.config.ApplyBatchMax
+	maxWindow := c.config.ApplyBatchWindow
+	minWindow := c.config.ApplyBatchMinWait
+	extendAt := c.config.ApplyBatchExtendAt
+	batch := make([]*applyRequest, 0, maxBatch)
+	timer := time.NewTimer(maxWindow)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+	timerActive := false
+	var firstAt time.Time
+	var deadline time.Time
+	extended := false
+
+	resetTimer := func(wait time.Duration) {
+		if wait <= 0 {
+			wait = time.Microsecond
+		}
+		if timerActive {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+		timer.Reset(wait)
+		timerActive = true
+	}
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		enqueueExec(batch)
+		batch = batch[:0]
+		timerActive = false
+		extended = false
+		firstAt = time.Time{}
+		deadline = time.Time{}
+	}
+
+	chooseWait := func(backlog int) time.Duration {
+		c.admitMu.Lock()
+		inFlight := c.inFlightN
+		c.admitMu.Unlock()
+		wait := minWindow
+		switch {
+		case backlog >= maxBatch:
+			wait = 10 * time.Microsecond
+		case backlog >= extendAt:
+			wait = 20 * time.Microsecond
+		case backlog >= extendAt/2:
+			wait = minWindow / 4
+		case backlog > 0:
+			wait = minWindow / 2
+		}
+		// Under heavy global pressure, bias toward immediate group commits.
+		if c.config.ApplyMaxTotalInFly > 0 {
+			if inFlight >= (c.config.ApplyMaxTotalInFly*3)/4 && wait > 20*time.Microsecond {
+				wait /= 2
+			}
+			if inFlight >= (c.config.ApplyMaxTotalInFly*9)/10 {
+				wait = 20 * time.Microsecond
+			}
+		}
+		if wait < 20*time.Microsecond {
+			wait = 20 * time.Microsecond
+		}
+		return wait
+	}
+
+	for {
+		if len(batch) == 0 {
+			select {
+			case req := <-c.applyCh:
+				batch = append(batch, req)
+				firstAt = time.Now()
+				wait := chooseWait(len(c.applyCh))
+				deadline = firstAt.Add(wait)
+				extended = false
+				resetTimer(time.Until(deadline))
+			case <-c.stopCh:
+				// Drain what is queued and hand off for execution.
+				for {
+					select {
+					case req := <-c.applyCh:
+						batch = append(batch, req)
+						if len(batch) >= maxBatch {
+							flush()
+						}
+					default:
+						flush()
+						return
+					}
+				}
+			case <-c.workerCh:
+				return
+			}
+			continue
+		}
+
+		select {
+		case req := <-c.applyCh:
+			batch = append(batch, req)
+			if len(batch) >= extendAt/2 {
+				age := time.Since(firstAt)
+				if age >= minWindow/2 {
+					flush()
+					continue
+				}
+			}
+			if !extended && len(batch) >= extendAt {
+				maxDeadline := firstAt.Add(maxWindow)
+				if maxDeadline.After(deadline) {
+					deadline = maxDeadline
+					resetTimer(time.Until(deadline))
+				}
+				extended = true
+			}
+			// If pressure rises, shorten the timer immediately.
+			if timerActive {
+				target := firstAt.Add(chooseWait(len(c.applyCh)))
+				if target.Before(deadline) {
+					deadline = target
+					resetTimer(time.Until(deadline))
+				}
+			}
+			if len(batch) >= maxBatch {
+				flush()
+			}
+		case <-timer.C:
+			timerActive = false
+			flush()
+		case <-c.stopCh:
+			// Drain queued requests before exit.
+			for {
+				select {
+				case req := <-c.applyCh:
+					batch = append(batch, req)
+					if len(batch) >= maxBatch {
+						flush()
+					}
+				default:
+					flush()
+					return
+				}
+			}
+		}
+	}
+}
+
+func (c *Cluster) applyExecLoop() {
+	defer close(c.workerCh)
+	for batch := range c.applyExec {
+		now := time.Now()
+		for _, req := range batch {
+			if !req.enqAt.IsZero() {
+				c.queueHist.observe(now.Sub(req.enqAt))
+			}
+		}
+		c.flushApplyBatch(batch)
+	}
+}
+
+func (c *Cluster) flushApplyBatch(batch []*applyRequest) {
+	if len(batch) > c.config.ApplySubBatchMax {
+		for i := 0; i < len(batch); i += c.config.ApplySubBatchMax {
+			j := i + c.config.ApplySubBatchMax
+			if j > len(batch) {
+				j = len(batch)
+			}
+			c.flushApplyBatch(batch[i:j])
+		}
+		return
+	}
+
+	if len(batch) == 1 {
+		req := batch[0]
+		start := time.Now()
+		req.respCh <- c.applyImmediate(req.opType, req.data)
+		c.applyHist.observe(time.Since(start))
+		return
+	}
+
+	inputs := make([]store.OpInput, 0, len(batch))
+	validReqs := make([]*applyRequest, 0, len(batch))
+	for _, req := range batch {
+		inputs = append(inputs, store.OpInput{
+			Type: req.opType,
+			Data: req.data,
+		})
+		validReqs = append(validReqs, req)
+	}
+	if len(inputs) == 0 {
+		return
+	}
+
+	multiBytes, err := store.MarshalMulti(inputs)
+	if err != nil {
+		for _, req := range batch {
+			req.respCh <- &store.OpResult{Err: fmt.Errorf("marshal multi op: %w", err)}
+		}
+		return
+	}
+
+	start := time.Now()
+	res := c.applyBytes(multiBytes)
+	c.applyHist.observe(time.Since(start))
+	if res.Err != nil {
+		for _, req := range validReqs {
+			req.respCh <- &store.OpResult{Err: res.Err}
+		}
+		return
+	}
+
+	subResults, ok := res.Data.([]*store.OpResult)
+	if !ok || len(subResults) != len(validReqs) {
+		err := fmt.Errorf("unexpected multi response type/count: %T (%d)", res.Data, len(subResults))
+		for _, req := range validReqs {
+			req.respCh <- &store.OpResult{Err: err}
+		}
+		return
+	}
+
+	for i, req := range validReqs {
+		req.respCh <- subResults[i]
+	}
+}
+
+func (c *Cluster) applyImmediate(opType store.OpType, data any) *store.OpResult {
+	opBytes, err := store.MarshalOp(opType, data)
+	if err != nil {
+		return &store.OpResult{Err: fmt.Errorf("marshal op: %w", err)}
+	}
+	return c.applyBytes(opBytes)
+}
+
+func (c *Cluster) applyBytes(opBytes []byte) *store.OpResult {
+	future := c.raft.Apply(opBytes, c.config.ApplyTimeout)
+	if err := future.Error(); err != nil {
+		return &store.OpResult{Err: fmt.Errorf("raft apply: %w", err)}
+	}
+	result, ok := future.Response().(*store.OpResult)
+	if !ok {
+		return &store.OpResult{Err: fmt.Errorf("unexpected response type: %T", future.Response())}
+	}
+	return result
+}
+
+// IsLeader returns true if this node is the Raft leader.
+func (c *Cluster) IsLeader() bool {
+	return c.raft.State() == raft.Leader
+}
+
+// LeaderAddr returns the address of the current Raft leader.
+func (c *Cluster) LeaderAddr() string {
+	addr, _ := c.raft.LeaderWithID()
+	return string(addr)
+}
+
+// LeaderID returns the ID of the current leader.
+func (c *Cluster) LeaderID() string {
+	_, id := c.raft.LeaderWithID()
+	return string(id)
+}
+
+// SQLiteReadDB returns the local SQLite database for read queries.
+func (c *Cluster) SQLiteReadDB() *sql.DB {
+	return c.fsm.SQLiteDB()
+}
+
+// PebbleDB returns the underlying Pebble database.
+func (c *Cluster) PebbleDB() *pebble.DB {
+	return c.fsm.PebbleDB()
+}
+
+// Stats returns Raft cluster statistics.
+func (c *Cluster) Stats() map[string]string {
+	return c.raft.Stats()
+}
+
+// State returns the Raft state (leader, follower, candidate).
+func (c *Cluster) State() string {
+	return c.raft.State().String()
+}
+
+// AddVoter adds a new voting member to the cluster.
+func (c *Cluster) AddVoter(nodeID, addr string) error {
+	f := c.raft.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(addr), 0, c.config.ApplyTimeout)
+	return f.Error()
+}
+
+// RemoveServer removes a node from the cluster.
+func (c *Cluster) RemoveServer(nodeID string) error {
+	f := c.raft.RemoveServer(raft.ServerID(nodeID), 0, c.config.ApplyTimeout)
+	return f.Error()
+}
+
+// Shutdown gracefully shuts down the Raft node and closes all stores.
+func (c *Cluster) Shutdown() error {
+	slog.Info("shutting down raft cluster")
+	close(c.stopCh)
+	<-c.doneCh
+
+	if err := c.raft.Shutdown().Error(); err != nil {
+		slog.Error("raft shutdown error", "error", err)
+	}
+	c.fsm.Close()
+
+	if err := c.transport.Close(); err != nil {
+		slog.Error("transport close error", "error", err)
+	}
+
+	if err := c.logStore.Close(); err != nil {
+		slog.Error("log store close error", "error", err)
+	}
+
+	if err := c.fsm.pebble.Close(); err != nil {
+		slog.Error("pebble close error", "error", err)
+	}
+
+	if err := c.fsm.sqlite.Close(); err != nil {
+		slog.Error("sqlite close error", "error", err)
+	}
+
+	slog.Info("raft cluster shut down")
+	return nil
+}
+
+// openMaterializedView opens a SQLite database for the materialized view.
+// It creates tables if they don't exist and configures WAL mode.
+func openMaterializedView(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_synchronous=NORMAL&_foreign_keys=ON&_busy_timeout=5000")
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	// Create tables for the materialized view
+	// These mirror the main schema but without events tables (no longer needed).
+	_, err = db.Exec(materializedViewSchema)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create materialized view schema: %w", err)
+	}
+
+	return db, nil
+}
+
+const materializedViewSchema = `
+CREATE TABLE IF NOT EXISTS jobs (
+    id              TEXT PRIMARY KEY,
+    queue           TEXT NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'pending',
+    payload         TEXT NOT NULL,
+    priority        INTEGER NOT NULL DEFAULT 2,
+    attempt         INTEGER NOT NULL DEFAULT 0,
+    max_retries     INTEGER NOT NULL DEFAULT 3,
+    retry_backoff   TEXT NOT NULL DEFAULT 'exponential',
+    retry_base_delay_ms INTEGER NOT NULL DEFAULT 5000,
+    retry_max_delay_ms  INTEGER NOT NULL DEFAULT 600000,
+    unique_key      TEXT,
+    batch_id        TEXT,
+    worker_id       TEXT,
+    hostname        TEXT,
+    tags            TEXT,
+    progress        TEXT,
+    checkpoint      TEXT,
+    result          TEXT,
+    lease_expires_at TEXT,
+    scheduled_at    TEXT,
+    expire_at       TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+    started_at      TEXT,
+    completed_at    TEXT,
+    failed_at       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_queue_state_priority ON jobs(queue, state, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
+CREATE INDEX IF NOT EXISTS idx_jobs_scheduled ON jobs(state, scheduled_at) WHERE state IN ('scheduled', 'retrying');
+CREATE INDEX IF NOT EXISTS idx_jobs_lease ON jobs(state, lease_expires_at) WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS idx_jobs_unique ON jobs(queue, unique_key) WHERE unique_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs(batch_id) WHERE batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_jobs_expire ON jobs(expire_at) WHERE expire_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
+
+CREATE TABLE IF NOT EXISTS job_errors (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id     TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    attempt    INTEGER NOT NULL,
+    error      TEXT NOT NULL,
+    backtrace  TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_job_errors_job ON job_errors(job_id);
+
+CREATE TABLE IF NOT EXISTS unique_locks (
+    queue      TEXT NOT NULL,
+    unique_key TEXT NOT NULL,
+    job_id     TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (queue, unique_key)
+);
+
+CREATE TABLE IF NOT EXISTS batches (
+    id               TEXT PRIMARY KEY,
+    total            INTEGER NOT NULL,
+    pending          INTEGER NOT NULL,
+    succeeded        INTEGER NOT NULL DEFAULT 0,
+    failed           INTEGER NOT NULL DEFAULT 0,
+    callback_queue   TEXT,
+    callback_payload TEXT,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS queues (
+    name            TEXT PRIMARY KEY,
+    paused          INTEGER NOT NULL DEFAULT 0,
+    max_concurrency INTEGER,
+    rate_limit      INTEGER,
+    rate_window_ms  INTEGER,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS rate_limit_window (
+    queue      TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rate_limit ON rate_limit_window(queue, fetched_at);
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    queue      TEXT NOT NULL,
+    cron       TEXT NOT NULL,
+    timezone   TEXT NOT NULL DEFAULT 'UTC',
+    payload    TEXT NOT NULL,
+    unique_key TEXT,
+    max_retries INTEGER NOT NULL DEFAULT 3,
+    last_run   TEXT,
+    next_run   TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS workers (
+    id              TEXT PRIMARY KEY,
+    hostname        TEXT,
+    queues          TEXT,
+    last_heartbeat  TEXT NOT NULL,
+    started_at      TEXT NOT NULL
+);
+`
+
+// WaitForLeader blocks until the cluster has a leader or timeout.
+func (c *Cluster) WaitForLeader(timeout time.Duration) error {
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			return fmt.Errorf("timeout waiting for leader")
+		case <-ticker.C:
+			addr, _ := c.raft.LeaderWithID()
+			if addr != "" {
+				return nil
+			}
+		}
+	}
+}
+
+// JoinCluster sends a join request to the given leader address.
+// The leader must call AddVoter to add this node.
+func (c *Cluster) JoinCluster(leaderAddr string) error {
+	// This would typically be done via an HTTP/RPC call to the leader
+	// For now, it's a placeholder — the server layer handles join requests
+	return fmt.Errorf("join via HTTP: POST %s/api/v1/cluster/join with node_id and addr", leaderAddr)
+}
+
+// Configuration returns the current Raft cluster configuration.
+func (c *Cluster) Configuration() ([]ServerInfo, error) {
+	future := c.raft.GetConfiguration()
+	if err := future.Error(); err != nil {
+		return nil, err
+	}
+
+	var servers []ServerInfo
+	for _, s := range future.Configuration().Servers {
+		servers = append(servers, ServerInfo{
+			ID:      string(s.ID),
+			Address: string(s.Address),
+			Voter:   s.Suffrage == raft.Voter,
+		})
+	}
+	return servers, nil
+}
+
+// ServerInfo describes a node in the cluster.
+type ServerInfo struct {
+	ID      string `json:"id"`
+	Address string `json:"address"`
+	Voter   bool   `json:"voter"`
+}
+
+func newDurationHistogram() *durationHistogram {
+	// Buckets optimized for queue/apply timing visibility.
+	b := []time.Duration{
+		50 * time.Microsecond,
+		100 * time.Microsecond,
+		200 * time.Microsecond,
+		500 * time.Microsecond,
+		1 * time.Millisecond,
+		2 * time.Millisecond,
+		5 * time.Millisecond,
+		10 * time.Millisecond,
+		20 * time.Millisecond,
+		50 * time.Millisecond,
+		100 * time.Millisecond,
+		200 * time.Millisecond,
+		500 * time.Millisecond,
+		1 * time.Second,
+	}
+	return &durationHistogram{
+		buckets: b,
+		counts:  make([]uint64, len(b)+1), // +Inf bucket
+	}
+}
+
+func (h *durationHistogram) observe(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	idx := len(h.buckets)
+	for i, b := range h.buckets {
+		if d <= b {
+			idx = i
+			break
+		}
+	}
+	h.counts[idx]++
+	h.total++
+	h.sumNs += uint64(d)
+}
+
+func (h *durationHistogram) snapshot() map[string]any {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.total == 0 {
+		return map[string]any{
+			"count": 0,
+		}
+	}
+	p50 := h.quantileLocked(0.50)
+	p90 := h.quantileLocked(0.90)
+	p99 := h.quantileLocked(0.99)
+	avg := time.Duration(0)
+	if h.total > 0 {
+		avg = time.Duration(h.sumNs / h.total)
+	}
+	buckets := make([]map[string]any, 0, len(h.counts))
+	for i, c := range h.counts {
+		label := "+Inf"
+		if i < len(h.buckets) {
+			label = h.buckets[i].String()
+		}
+		buckets = append(buckets, map[string]any{
+			"le":    label,
+			"count": c,
+		})
+	}
+	return map[string]any{
+		"count":   h.total,
+		"avg":     avg.String(),
+		"p50":     p50.String(),
+		"p90":     p90.String(),
+		"p99":     p99.String(),
+		"buckets": buckets,
+	}
+}
+
+func (h *durationHistogram) quantileLocked(q float64) time.Duration {
+	if h.total == 0 {
+		return 0
+	}
+	if q <= 0 {
+		return 0
+	}
+	if q > 1 {
+		q = 1
+	}
+	target := uint64(math.Ceil(q * float64(h.total)))
+	if target == 0 {
+		target = 1
+	}
+	var acc uint64
+	for i, c := range h.counts {
+		acc += c
+		if acc >= target {
+			if i < len(h.buckets) {
+				return h.buckets[i]
+			}
+			if len(h.buckets) == 0 {
+				return 0
+			}
+			return h.buckets[len(h.buckets)-1]
+		}
+	}
+	if len(h.buckets) == 0 {
+		return 0
+	}
+	return h.buckets[len(h.buckets)-1]
+}
+
+// ClusterStatus returns a JSON-friendly status of the cluster.
+func (c *Cluster) ClusterStatus() map[string]any {
+	stats := c.raft.Stats()
+	servers, _ := c.Configuration()
+
+	var serverMaps []map[string]any
+	for _, s := range servers {
+		m := map[string]any{
+			"id":      s.ID,
+			"address": s.Address,
+			"voter":   s.Voter,
+		}
+		if s.ID == c.config.NodeID {
+			m["role"] = c.State()
+			m["self"] = true
+		}
+		serverMaps = append(serverMaps, m)
+	}
+
+	c.admitMu.Lock()
+	inFlightNow := c.inFlightN
+	c.admitMu.Unlock()
+
+	return map[string]any{
+		"mode":                  "cluster",
+		"state":                 c.State(),
+		"leader_id":             c.LeaderID(),
+		"leader_addr":           c.LeaderAddr(),
+		"node_id":               c.config.NodeID,
+		"applied_index":         stats["applied_index"],
+		"commit_index":          stats["commit_index"],
+		"raft_nosync":           c.config.RaftNoSync,
+		"raft_store":            c.config.RaftStore,
+		"pebble_nosync":         c.config.PebbleNoSync,
+		"sqlite_mirror_enabled": c.config.SQLiteMirror,
+		"sqlite_mirror_async":   c.config.SQLiteMirrorAsync,
+		"lifecycle_events":      c.config.LifecycleEvents,
+		"apply_batch_max":       c.config.ApplyBatchMax,
+		"apply_batch_min_wait":  c.config.ApplyBatchMinWait.String(),
+		"apply_batch_extend_at": c.config.ApplyBatchExtendAt,
+		"apply_batch_window":    c.config.ApplyBatchWindow.String(),
+		"apply_max_pending":     c.config.ApplyMaxPending,
+		"apply_max_inflight":    c.config.ApplyMaxInFlight,
+		"apply_max_total_inflight": c.config.ApplyMaxTotalInFly,
+		"apply_inflight_now":    inFlightNow,
+		"apply_pending_now":     len(c.applyCh),
+		"apply_sub_batch_max":   c.config.ApplySubBatchMax,
+		"queue_time_hist":       c.queueHist.snapshot(),
+		"apply_time_hist":       c.applyHist.snapshot(),
+		"nodes":                 serverMaps,
+	}
+}
+
+// EventLog returns events after afterSeq (exclusive), up to limit entries.
+func (c *Cluster) EventLog(afterSeq uint64, limit int) ([]map[string]any, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	start := afterSeq + 1
+	iter, err := c.fsm.pebble.NewIter(&pebble.IterOptions{
+		LowerBound: kv.EventLogKey(start),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	prefix := kv.EventLogPrefix()
+	events := make([]map[string]any, 0, limit)
+	for iter.First(); iter.Valid() && len(events) < limit; iter.Next() {
+		if !bytes.HasPrefix(iter.Key(), prefix) {
+			break
+		}
+		var ev lifecycleEvent
+		if err := json.Unmarshal(iter.Value(), &ev); err != nil {
+			continue
+		}
+		item := map[string]any{
+			"seq":   ev.Seq,
+			"type":  ev.Type,
+			"at_ns": ev.AtNs,
+		}
+		if ev.JobID != "" {
+			item["job_id"] = ev.JobID
+		}
+		if ev.Queue != "" {
+			item["queue"] = ev.Queue
+		}
+		events = append(events, item)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+// ApplyJSON is a convenience for applying a pre-serialized Op byte slice.
+func (c *Cluster) ApplyJSON(data []byte) *store.OpResult {
+	return c.applyBytes(data)
+}
+
+// Raft returns the underlying raft.Raft instance.
+func (c *Cluster) Raft() *raft.Raft {
+	return c.raft
+}

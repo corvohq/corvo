@@ -7,16 +7,15 @@ import (
 	"time"
 )
 
-// GetJob returns a job with its error history.
+// GetJob returns a job with its error history from local SQLite.
 func (s *Store) GetJob(id string) (*Job, error) {
 	var j Job
 	var payload, tags, progress, checkpoint, result sql.NullString
 	var uniqueKey, batchID, workerID, hostname sql.NullString
 	var leaseExpiresAt, scheduledAt, expireAt, startedAt, completedAt, failedAt sql.NullString
 	var createdAt string
-	var paused int
 
-	err := s.db.Read.QueryRow(`
+	err := s.sqliteR.QueryRow(`
 		SELECT id, queue, state, payload, priority, attempt, max_retries,
 			retry_backoff, retry_base_delay_ms, retry_max_delay_ms,
 			unique_key, batch_id, worker_id, hostname,
@@ -39,7 +38,6 @@ func (s *Store) GetJob(id string) (*Job, error) {
 		return nil, fmt.Errorf("get job: %w", err)
 	}
 
-	_ = paused
 	j.Payload = json.RawMessage(payload.String)
 	setNullableString(&j.UniqueKey, uniqueKey)
 	setNullableString(&j.BatchID, batchID)
@@ -66,7 +64,7 @@ func (s *Store) GetJob(id string) (*Job, error) {
 	j.FailedAt = parseNullableTime(failedAt)
 
 	// Load errors
-	rows, err := s.db.Read.Query(
+	rows, err := s.sqliteR.Query(
 		"SELECT id, job_id, attempt, error, backtrace, created_at FROM job_errors WHERE job_id = ? ORDER BY attempt",
 		id,
 	)
@@ -92,130 +90,53 @@ func (s *Store) GetJob(id string) (*Job, error) {
 	return &j, rows.Err()
 }
 
-// RetryJob resets a dead/cancelled/completed job back to pending.
+// RetryJob resets a dead/cancelled/completed job back to pending via Raft.
 func (s *Store) RetryJob(id string) error {
-	var queue string
-
-	err := s.writer.ExecuteTx(func(tx *sql.Tx) error {
-		var state string
-		err := tx.QueryRow("SELECT state, queue FROM jobs WHERE id = ?", id).Scan(&state, &queue)
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("job %q not found", id)
-		}
-		if err != nil {
-			return err
-		}
-
-		if state != StateDead && state != StateCancelled && state != StateCompleted {
-			return fmt.Errorf("job %q cannot be retried from state %q", id, state)
-		}
-
-		_, err = tx.Exec(`
-			UPDATE jobs SET
-				state = 'pending',
-				attempt = 0,
-				failed_at = NULL,
-				completed_at = NULL,
-				worker_id = NULL,
-				hostname = NULL,
-				lease_expires_at = NULL,
-				scheduled_at = NULL
-			WHERE id = ?
-		`, id)
-		if err != nil {
-			return fmt.Errorf("retry job: %w", err)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return err
+	now := time.Now()
+	op := RetryJobOp{
+		JobID: id,
+		NowNs: uint64(now.UnixNano()),
 	}
-
-	// Async: emit event (non-critical)
-	s.async.Emit("INSERT INTO events (type, job_id, queue) VALUES ('retried', ?, ?)", id, queue)
-	return nil
+	res := s.applyOp(OpRetryJob, op)
+	return res.Err
 }
 
-// CancelJob cancels a pending/scheduled job or marks an active job for cancellation.
+// CancelJob cancels a job via Raft.
 func (s *Store) CancelJob(id string) (string, error) {
-	var resultStatus string
-	var queue string
-
-	err := s.writer.ExecuteTx(func(tx *sql.Tx) error {
-		var state string
-		err := tx.QueryRow("SELECT state, queue FROM jobs WHERE id = ?", id).Scan(&state, &queue)
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("job %q not found", id)
-		}
-		if err != nil {
-			return err
-		}
-
-		switch state {
-		case StatePending, StateScheduled, StateRetrying:
-			_, err = tx.Exec("UPDATE jobs SET state = 'cancelled' WHERE id = ?", id)
-			resultStatus = StateCancelled
-		case StateActive:
-			// Mark as cancelled — worker will see this on next heartbeat
-			_, err = tx.Exec("UPDATE jobs SET state = 'cancelled' WHERE id = ?", id)
-			resultStatus = "cancelling"
-		default:
-			return fmt.Errorf("job %q cannot be cancelled from state %q", id, state)
-		}
-		if err != nil {
-			return fmt.Errorf("cancel job: %w", err)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return "", err
+	now := time.Now()
+	op := CancelJobOp{
+		JobID: id,
+		NowNs: uint64(now.UnixNano()),
 	}
-
-	// Async: emit event (non-critical)
-	s.async.Emit("INSERT INTO events (type, job_id, queue) VALUES ('cancelled', ?, ?)", id, queue)
-	return resultStatus, err
+	res := s.applyOp(OpCancelJob, op)
+	if res.Err != nil {
+		return "", res.Err
+	}
+	if status, ok := res.Data.(string); ok {
+		return status, nil
+	}
+	return StateCancelled, nil
 }
 
-// MoveJob moves a job to a different queue.
+// MoveJob moves a job to a different queue via Raft.
 func (s *Store) MoveJob(id, targetQueue string) error {
-	err := s.writer.ExecuteTx(func(tx *sql.Tx) error {
-		res, err := tx.Exec("UPDATE jobs SET queue = ? WHERE id = ?", targetQueue, id)
-		if err != nil {
-			return fmt.Errorf("move job: %w", err)
-		}
-		affected, _ := res.RowsAffected()
-		if affected == 0 {
-			return fmt.Errorf("job %q not found", id)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return err
+	now := time.Now()
+	op := MoveJobOp{
+		JobID:       id,
+		TargetQueue: targetQueue,
+		NowNs:       uint64(now.UnixNano()),
 	}
-
-	// Async: ensure target queue exists, emit event (non-critical)
-	s.async.Emit("INSERT OR IGNORE INTO queues (name) VALUES (?)", targetQueue)
-	s.async.Emit("INSERT INTO events (type, job_id, queue) VALUES ('moved', ?, ?)", id, targetQueue)
-	return nil
+	res := s.applyOp(OpMoveJob, op)
+	return res.Err
 }
 
-// DeleteJob permanently removes a job.
+// DeleteJob permanently removes a job via Raft.
 func (s *Store) DeleteJob(id string) error {
-	res, err := s.writer.Execute("DELETE FROM jobs WHERE id = ?", id)
-	if err != nil {
-		return fmt.Errorf("delete job: %w", err)
+	op := DeleteJobOp{
+		JobID: id,
 	}
-	affected, _ := res.RowsAffected()
-	if affected == 0 {
-		return fmt.Errorf("job %q not found", id)
-	}
-	return nil
+	res := s.applyOp(OpDeleteJob, op)
+	return res.Err
 }
 
 func setNullableString(target **string, src sql.NullString) {

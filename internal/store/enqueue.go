@@ -1,9 +1,7 @@
 package store
 
 import (
-	"database/sql"
 	"encoding/json"
-	"fmt"
 	"time"
 )
 
@@ -30,8 +28,9 @@ type EnqueueResult struct {
 	UniqueExisting bool   `json:"unique_existing"`
 }
 
-// Enqueue inserts a new job into the store.
+// Enqueue inserts a new job into the store via Raft consensus.
 func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
+	now := time.Now()
 	jobID := NewJobID()
 	priority := PriorityFromString(req.Priority)
 
@@ -60,86 +59,38 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 	}
 
 	state := StatePending
-	var scheduledAt *string
 	if req.ScheduledAt != nil {
 		state = StateScheduled
-		sa := req.ScheduledAt.UTC().Format(time.RFC3339Nano)
-		scheduledAt = &sa
 	}
 
-	var expireAt *string
+	var expireAt *time.Time
 	if req.ExpireAfter != "" {
 		if d, err := time.ParseDuration(req.ExpireAfter); err == nil {
-			t := time.Now().Add(d).UTC().Format(time.RFC3339Nano)
+			t := now.Add(d).UTC()
 			expireAt = &t
 		}
 	}
 
-	var tags *string
-	if len(req.Tags) > 0 {
-		ts := string(req.Tags)
-		tags = &ts
+	op := EnqueueOp{
+		JobID:        jobID,
+		Queue:        req.Queue,
+		State:        state,
+		Payload:      req.Payload,
+		Priority:     priority,
+		MaxRetries:   maxRetries,
+		Backoff:      backoff,
+		BaseDelayMs:  baseDelayMs,
+		MaxDelayMs:   maxDelayMs,
+		UniqueKey:    req.UniqueKey,
+		UniquePeriod: req.UniquePeriod,
+		Tags:         req.Tags,
+		ScheduledAt:  req.ScheduledAt,
+		ExpireAt:     expireAt,
+		CreatedAt:    now.UTC(),
+		NowNs:        uint64(now.UnixNano()),
 	}
 
-	var uniqueKey *string
-	if req.UniqueKey != "" {
-		uniqueKey = &req.UniqueKey
-	}
-
-	result := &EnqueueResult{JobID: jobID, Status: state}
-
-	err := s.writer.ExecuteTx(func(tx *sql.Tx) error {
-		// Check unique lock if unique_key is set
-		if uniqueKey != nil {
-			var existingJobID string
-			err := tx.Stmt(s.stmtCheckUnique).QueryRow(req.Queue, *uniqueKey).Scan(&existingJobID)
-			if err == nil {
-				// Lock exists — return existing job
-				result.JobID = existingJobID
-				result.UniqueExisting = true
-				result.Status = "duplicate"
-				return nil
-			}
-			if err != sql.ErrNoRows {
-				return fmt.Errorf("check unique lock: %w", err)
-			}
-
-			// Insert unique lock
-			period := 3600 // default 1 hour
-			if req.UniquePeriod > 0 {
-				period = req.UniquePeriod
-			}
-			_, err = tx.Stmt(s.stmtInsertUnique).Exec(req.Queue, *uniqueKey, jobID, period)
-			if err != nil {
-				return fmt.Errorf("insert unique lock: %w", err)
-			}
-		}
-
-		// Insert job (prepared statement)
-		_, err := tx.Stmt(s.stmtInsertJob).Exec(
-			jobID, req.Queue, state, string(req.Payload), priority,
-			maxRetries, backoff, baseDelayMs, maxDelayMs,
-			uniqueKey, tags, scheduledAt, expireAt,
-		)
-		if err != nil {
-			return fmt.Errorf("insert job: %w", err)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	// Async: ensure queue exists, emit event and stats (non-critical)
-	if !result.UniqueExisting {
-		s.async.Emit("INSERT OR IGNORE INTO queues (name) VALUES (?)", req.Queue)
-		s.async.Emit("INSERT INTO events (type, job_id, queue) VALUES ('enqueued', ?, ?)", jobID, req.Queue)
-		s.async.Emit("INSERT INTO queue_stats (queue, enqueued) VALUES (?, 1) ON CONFLICT(queue) DO UPDATE SET enqueued = enqueued + 1", req.Queue)
-	}
-
-	return result, nil
+	return applyOpResult[EnqueueResult](s, OpEnqueue, op)
 }
 
 // BatchEnqueueRequest contains parameters for batch enqueue.
@@ -160,93 +111,67 @@ type BatchEnqueueResult struct {
 	BatchID string   `json:"batch_id,omitempty"`
 }
 
-// EnqueueBatch inserts multiple jobs and optionally creates a batch row.
+// EnqueueBatch inserts multiple jobs via Raft.
 func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, error) {
+	now := time.Now()
 	var batchID string
 	if req.Batch != nil {
 		batchID = NewBatchID()
 	}
 
-	jobIDs := make([]string, len(req.Jobs))
-	for i := range req.Jobs {
-		jobIDs[i] = NewJobID()
-	}
-
-	err := s.writer.ExecuteTx(func(tx *sql.Tx) error {
-		// Create batch row if configured
-		if req.Batch != nil {
-			var callbackPayload *string
-			if len(req.Batch.CallbackPayload) > 0 {
-				cp := string(req.Batch.CallbackPayload)
-				callbackPayload = &cp
-			}
-			_, err := tx.Exec(
-				`INSERT INTO batches (id, total, pending, callback_queue, callback_payload) VALUES (?, ?, ?, ?, ?)`,
-				batchID, len(req.Jobs), len(req.Jobs), req.Batch.CallbackQueue, callbackPayload,
-			)
-			if err != nil {
-				return fmt.Errorf("insert batch: %w", err)
-			}
-		}
-
-		for i, jobReq := range req.Jobs {
-			priority := PriorityFromString(jobReq.Priority)
-			maxRetries := 3
-			if jobReq.MaxRetries != nil {
-				maxRetries = *jobReq.MaxRetries
-			}
-			backoff := BackoffExponential
-			if jobReq.RetryBackoff != "" {
-				backoff = jobReq.RetryBackoff
-			}
-			baseDelayMs := 5000
-			if jobReq.RetryBaseDelay != "" {
-				if d, err := time.ParseDuration(jobReq.RetryBaseDelay); err == nil {
-					baseDelayMs = int(d.Milliseconds())
-				}
-			}
-			maxDelayMs := 600000
-			if jobReq.RetryMaxDelay != "" {
-				if d, err := time.ParseDuration(jobReq.RetryMaxDelay); err == nil {
-					maxDelayMs = int(d.Milliseconds())
-				}
-			}
-
-			var tags *string
-			if len(jobReq.Tags) > 0 {
-				ts := string(jobReq.Tags)
-				tags = &ts
-			}
-
-			var batchIDPtr *string
-			if batchID != "" {
-				batchIDPtr = &batchID
-			}
-
-			_, err := tx.Exec(
-				`INSERT INTO jobs (id, queue, state, payload, priority, max_retries, retry_backoff, retry_base_delay_ms, retry_max_delay_ms, tags, batch_id) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`,
-				jobIDs[i], jobReq.Queue, string(jobReq.Payload), priority,
-				maxRetries, backoff, baseDelayMs, maxDelayMs,
-				tags, batchIDPtr,
-			)
-			if err != nil {
-				return fmt.Errorf("insert job %d: %w", i, err)
-			}
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	// Async: ensure queues exist, emit events and stats (non-critical)
+	jobs := make([]EnqueueOp, len(req.Jobs))
 	for i, jobReq := range req.Jobs {
-		s.async.Emit("INSERT OR IGNORE INTO queues (name) VALUES (?)", jobReq.Queue)
-		s.async.Emit("INSERT INTO events (type, job_id, queue) VALUES ('enqueued', ?, ?)", jobIDs[i], jobReq.Queue)
-		s.async.Emit("INSERT INTO queue_stats (queue, enqueued) VALUES (?, 1) ON CONFLICT(queue) DO UPDATE SET enqueued = enqueued + 1", jobReq.Queue)
+		priority := PriorityFromString(jobReq.Priority)
+		maxRetries := 3
+		if jobReq.MaxRetries != nil {
+			maxRetries = *jobReq.MaxRetries
+		}
+		backoff := BackoffExponential
+		if jobReq.RetryBackoff != "" {
+			backoff = jobReq.RetryBackoff
+		}
+		baseDelayMs := 5000
+		if jobReq.RetryBaseDelay != "" {
+			if d, err := time.ParseDuration(jobReq.RetryBaseDelay); err == nil {
+				baseDelayMs = int(d.Milliseconds())
+			}
+		}
+		maxDelayMs := 600000
+		if jobReq.RetryMaxDelay != "" {
+			if d, err := time.ParseDuration(jobReq.RetryMaxDelay); err == nil {
+				maxDelayMs = int(d.Milliseconds())
+			}
+		}
+
+		jobs[i] = EnqueueOp{
+			JobID:       NewJobID(),
+			Queue:       jobReq.Queue,
+			State:       StatePending,
+			Payload:     jobReq.Payload,
+			Priority:    priority,
+			MaxRetries:  maxRetries,
+			Backoff:     backoff,
+			BaseDelayMs: baseDelayMs,
+			MaxDelayMs:  maxDelayMs,
+			Tags:        jobReq.Tags,
+			CreatedAt:   now.UTC(),
+			NowNs:       uint64(now.UnixNano()),
+		}
 	}
 
-	return &BatchEnqueueResult{JobIDs: jobIDs, BatchID: batchID}, nil
+	var batchOp *BatchOp
+	if req.Batch != nil {
+		batchOp = &BatchOp{
+			CallbackQueue:   req.Batch.CallbackQueue,
+			CallbackPayload: req.Batch.CallbackPayload,
+		}
+	}
+
+	op := EnqueueBatchOp{
+		Jobs:    jobs,
+		BatchID: batchID,
+		Batch:   batchOp,
+	}
+
+	return applyOpResult[BatchEnqueueResult](s, OpEnqueueBatch, op)
 }

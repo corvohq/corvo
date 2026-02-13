@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/user/jobbie/internal/raft"
 	"github.com/user/jobbie/internal/scheduler"
 	"github.com/user/jobbie/internal/server"
 	"github.com/user/jobbie/internal/store"
@@ -16,25 +17,25 @@ import (
 
 // testEnv holds a fully wired test stack.
 type testEnv struct {
-	client    *client.Client
-	sched     *scheduler.Scheduler
-	url       string
-	httpC     *http.Client
+	client *client.Client
+	sched  *scheduler.Scheduler
+	url    string
+	httpC  *http.Client
 }
 
 func setup(t *testing.T) *testEnv {
 	t.Helper()
 
-	db, err := store.Open(t.TempDir())
+	da, err := raft.NewDirectApplier(t.TempDir())
 	if err != nil {
-		t.Fatalf("store.Open: %v", err)
+		t.Fatalf("raft.NewDirectApplier: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { da.Close() })
 
-	s := store.NewStore(db)
+	s := store.NewStore(da, da.SQLiteDB())
 	t.Cleanup(func() { s.Close() })
-	sched := scheduler.New(db.Write, scheduler.DefaultConfig())
-	srv := server.New(s, ":0")
+	sched := scheduler.New(s, nil, scheduler.DefaultConfig())
+	srv := server.New(s, nil, ":0")
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 

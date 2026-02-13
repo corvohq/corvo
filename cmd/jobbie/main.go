@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	raftcluster "github.com/user/jobbie/internal/raft"
 	"github.com/user/jobbie/internal/scheduler"
 	"github.com/user/jobbie/internal/server"
 	"github.com/user/jobbie/internal/store"
@@ -43,8 +44,20 @@ var serverCmd = &cobra.Command{
 }
 
 var (
-	bindAddr string
-	dataDir  string
+	bindAddr            string
+	dataDir             string
+	raftBind            string
+	raftAdvertise       string
+	nodeID              string
+	bootstrap           bool
+	joinAddr            string
+	durableMode         bool
+	raftStore           = "bolt"
+	schedulerEnabled    = true
+	schedulerInterval   = time.Second
+	sqliteMirrorEnabled = true
+	sqliteMirrorAsync   = true
+	applyTimeout        = 10 * time.Second
 )
 
 func init() {
@@ -52,6 +65,13 @@ func init() {
 
 	serverCmd.Flags().StringVar(&bindAddr, "bind", ":8080", "HTTP server bind address")
 	serverCmd.Flags().StringVar(&dataDir, "data-dir", "data", "Directory for SQLite database files")
+	serverCmd.Flags().StringVar(&raftBind, "raft-bind", ":9000", "Raft transport bind address")
+	serverCmd.Flags().StringVar(&raftAdvertise, "raft-advertise", "", "Raft advertised address for peers (defaults to 127.0.0.1:<raft-bind-port> when bind is wildcard)")
+	serverCmd.Flags().StringVar(&nodeID, "node-id", "node-1", "Unique node ID")
+	serverCmd.Flags().BoolVar(&bootstrap, "bootstrap", true, "Bootstrap a new single-node cluster")
+	serverCmd.Flags().StringVar(&joinAddr, "join", "", "Join an existing cluster via leader address")
+	serverCmd.Flags().BoolVar(&durableMode, "durable", false, "Enable power-loss durability mode (Raft fsync per write). Significantly reduces throughput/latency performance; enable only if absolutely required.")
+	serverCmd.Flags().StringVar(&raftStore, "raft-store", "bolt", "Raft log/stable backend: bolt, badger, or pebble")
 
 	rootCmd.AddCommand(serverCmd)
 }
@@ -73,25 +93,86 @@ func setupLogging() {
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
-	slog.Info("starting jobbie server", "bind", bindAddr, "data_dir", dataDir)
+	// Pebble is treated as rebuildable materialized state; keep Pebble fsync
+	// disabled for throughput in all modes. Durability is controlled by Raft.
+	clusteredMode := joinAddr != "" || !bootstrap
+	raftNoSync := !durableMode
+	pebbleNoSync := true
 
-	// Open database
-	db, err := store.Open(dataDir)
+	slog.Info("starting jobbie server",
+		"bind", bindAddr,
+		"raft_bind", raftBind,
+		"raft_advertise", raftAdvertise,
+		"node_id", nodeID,
+		"bootstrap", bootstrap,
+		"join", joinAddr,
+		"raft_store", raftStore,
+		"scheduler_enabled", schedulerEnabled,
+		"scheduler_interval", schedulerInterval,
+		"sqlite_mirror_enabled", sqliteMirrorEnabled,
+		"sqlite_mirror_async", sqliteMirrorAsync,
+		"clustered_mode", clusteredMode,
+		"durable_mode", durableMode,
+		"durable_mode_note", "raft fsync per write; significant throughput/latency cost; use only when power-loss durability is required",
+		"raft_nosync", raftNoSync,
+		"pebble_nosync", pebbleNoSync,
+		"raft_apply_timeout", applyTimeout,
+		"data_dir", dataDir,
+	)
+
+	clusterCfg := raftcluster.DefaultClusterConfig()
+	clusterCfg.NodeID = nodeID
+	clusterCfg.DataDir = dataDir
+	clusterCfg.RaftBind = raftBind
+	clusterCfg.RaftAdvertise = raftAdvertise
+	clusterCfg.RaftStore = raftStore
+	clusterCfg.RaftNoSync = raftNoSync
+	clusterCfg.PebbleNoSync = pebbleNoSync
+	clusterCfg.SQLiteMirror = sqliteMirrorEnabled
+	clusterCfg.SQLiteMirrorAsync = sqliteMirrorAsync
+	clusterCfg.ApplyTimeout = applyTimeout
+	clusterCfg.Bootstrap = bootstrap
+	clusterCfg.JoinAddr = joinAddr
+
+	cluster, err := raftcluster.NewCluster(clusterCfg)
 	if err != nil {
-		return fmt.Errorf("open database: %w", err)
+		return fmt.Errorf("start raft cluster: %w", err)
+	}
+	defer cluster.Shutdown()
+
+	if err := cluster.WaitForLeader(10 * time.Second); err != nil {
+		return fmt.Errorf("wait for leader: %w", err)
+	}
+	// Force an early snapshot on leaders to minimize pre-first-snapshot
+	// recovery ambiguity after abrupt power loss.
+	if cluster.IsLeader() {
+		if err := cluster.Raft().Snapshot().Error(); err != nil {
+			slog.Warn("initial raft snapshot failed", "error", err)
+		} else {
+			slog.Info("initial raft snapshot complete")
+		}
 	}
 
-	// Create batch writer and store
-	bw := store.NewBatchWriter(db.Write, store.DefaultBatchWriterConfig())
-	s := store.NewStoreWithWriter(db, bw)
+	// Join workflow placeholder; full join flow requires leader-side join endpoint.
+	if joinAddr != "" && !bootstrap {
+		slog.Warn("join requested; ensure leader has added this node as a voter",
+			"join_addr", joinAddr, "node_id", nodeID, "raft_bind", raftBind)
+	}
 
-	// Start scheduler
-	sched := scheduler.New(db.Write, scheduler.DefaultConfig())
-	schedCtx, schedCancel := context.WithCancel(context.Background())
-	go sched.Run(schedCtx)
+	s := store.NewStore(cluster, cluster.SQLiteReadDB())
+
+	var schedCancel context.CancelFunc = func() {}
+	if schedulerEnabled {
+		schedCfg := scheduler.DefaultConfig()
+		schedCfg.Interval = schedulerInterval
+		sched := scheduler.New(s, cluster, schedCfg)
+		var schedCtx context.Context
+		schedCtx, schedCancel = context.WithCancel(context.Background())
+		go sched.Run(schedCtx)
+	}
 
 	// Start HTTP server
-	srv := server.New(s, bindAddr)
+	srv := server.New(s, cluster, bindAddr)
 	go func() {
 		if err := srv.Start(); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTP server error", "error", err)
@@ -118,16 +199,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 	slog.Info("stopping scheduler")
 	schedCancel()
 
-	slog.Info("stopping store async writer")
+	slog.Info("stopping store")
 	s.Close()
-
-	slog.Info("stopping batch writer")
-	bw.Stop()
-
-	slog.Info("closing database")
-	if err := db.Close(); err != nil {
-		slog.Error("database close error", "error", err)
-	}
 
 	slog.Info("jobbie server stopped")
 	return nil

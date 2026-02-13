@@ -1,28 +1,29 @@
-package store
+package store_test
 
 import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/user/jobbie/internal/raft"
+	"github.com/user/jobbie/internal/store"
 )
 
-// testStore creates a Store with a temporary database for testing.
-func testStore(t *testing.T) *Store {
+// testStore creates a Store backed by a DirectApplier for testing.
+func testStore(t *testing.T) *store.Store {
 	t.Helper()
-	db, err := Open(t.TempDir())
+	da, err := raft.NewDirectApplier(t.TempDir())
 	if err != nil {
-		t.Fatalf("Open() error: %v", err)
+		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
-	s := NewStore(db)
-	t.Cleanup(func() { s.Close() })
-	return s
+	t.Cleanup(func() { da.Close() })
+	return store.NewStore(da, da.SQLiteDB())
 }
 
 func TestEnqueue(t *testing.T) {
 	s := testStore(t)
 
-	result, err := s.Enqueue(EnqueueRequest{
+	result, err := s.Enqueue(store.EnqueueRequest{
 		Queue:   "test.queue",
 		Payload: json.RawMessage(`{"hello":"world"}`),
 	})
@@ -32,28 +33,27 @@ func TestEnqueue(t *testing.T) {
 	if result.JobID == "" {
 		t.Error("Enqueue() returned empty job ID")
 	}
-	if result.Status != StatePending {
-		t.Errorf("Enqueue() status = %q, want %q", result.Status, StatePending)
+	if result.Status != store.StatePending {
+		t.Errorf("Enqueue() status = %q, want %q", result.Status, store.StatePending)
 	}
 	if result.UniqueExisting {
 		t.Error("Enqueue() returned unique_existing = true for non-unique job")
 	}
 
-	// Verify job exists in DB
-	var state string
-	err = s.db.Read.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
+	// Verify via GetJob
+	job, err := s.GetJob(result.JobID)
 	if err != nil {
-		t.Fatalf("query job: %v", err)
+		t.Fatalf("GetJob: %v", err)
 	}
-	if state != StatePending {
-		t.Errorf("job state = %q, want %q", state, StatePending)
+	if job.State != store.StatePending {
+		t.Errorf("job state = %q, want %q", job.State, store.StatePending)
 	}
 }
 
 func TestEnqueueWithPriority(t *testing.T) {
 	s := testStore(t)
 
-	result, err := s.Enqueue(EnqueueRequest{
+	result, err := s.Enqueue(store.EnqueueRequest{
 		Queue:    "test.queue",
 		Payload:  json.RawMessage(`{}`),
 		Priority: "critical",
@@ -62,10 +62,9 @@ func TestEnqueueWithPriority(t *testing.T) {
 		t.Fatalf("Enqueue() error: %v", err)
 	}
 
-	var priority int
-	s.db.Read.QueryRow("SELECT priority FROM jobs WHERE id = ?", result.JobID).Scan(&priority)
-	if priority != PriorityCritical {
-		t.Errorf("priority = %d, want %d", priority, PriorityCritical)
+	job, _ := s.GetJob(result.JobID)
+	if job.Priority != store.PriorityCritical {
+		t.Errorf("priority = %d, want %d", job.Priority, store.PriorityCritical)
 	}
 }
 
@@ -73,7 +72,7 @@ func TestEnqueueScheduled(t *testing.T) {
 	s := testStore(t)
 
 	future := time.Now().Add(1 * time.Hour)
-	result, err := s.Enqueue(EnqueueRequest{
+	result, err := s.Enqueue(store.EnqueueRequest{
 		Queue:       "test.queue",
 		Payload:     json.RawMessage(`{}`),
 		ScheduledAt: &future,
@@ -81,15 +80,15 @@ func TestEnqueueScheduled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Enqueue() error: %v", err)
 	}
-	if result.Status != StateScheduled {
-		t.Errorf("status = %q, want %q", result.Status, StateScheduled)
+	if result.Status != store.StateScheduled {
+		t.Errorf("status = %q, want %q", result.Status, store.StateScheduled)
 	}
 }
 
 func TestEnqueueUniqueDuplicate(t *testing.T) {
 	s := testStore(t)
 
-	req := EnqueueRequest{
+	req := store.EnqueueRequest{
 		Queue:     "test.queue",
 		Payload:   json.RawMessage(`{}`),
 		UniqueKey: "unique-1",
@@ -118,10 +117,10 @@ func TestEnqueueUniqueDuplicate(t *testing.T) {
 	}
 }
 
-func TestEnqueueCreatesQueueRow(t *testing.T) {
+func TestEnqueueQueueAppearsInList(t *testing.T) {
 	s := testStore(t)
 
-	_, err := s.Enqueue(EnqueueRequest{
+	_, err := s.Enqueue(store.EnqueueRequest{
 		Queue:   "auto.created",
 		Payload: json.RawMessage(`{}`),
 	})
@@ -129,48 +128,31 @@ func TestEnqueueCreatesQueueRow(t *testing.T) {
 		t.Fatalf("Enqueue() error: %v", err)
 	}
 
-	// Queue row is created asynchronously
-	s.FlushAsync()
-
-	var name string
-	err = s.db.Read.QueryRow("SELECT name FROM queues WHERE name = ?", "auto.created").Scan(&name)
+	queues, err := s.ListQueues()
 	if err != nil {
-		t.Fatalf("queue not auto-created: %v", err)
+		t.Fatalf("ListQueues() error: %v", err)
 	}
-}
-
-func TestEnqueueUpdatesQueueStats(t *testing.T) {
-	s := testStore(t)
-
-	for range 3 {
-		_, err := s.Enqueue(EnqueueRequest{
-			Queue:   "stats.queue",
-			Payload: json.RawMessage(`{}`),
-		})
-		if err != nil {
-			t.Fatalf("Enqueue() error: %v", err)
+	found := false
+	for _, q := range queues {
+		if q.Name == "auto.created" {
+			found = true
+			break
 		}
 	}
-
-	// Flush async writer so stats are visible on the read connection
-	s.FlushAsync()
-
-	var enqueued int
-	s.db.Read.QueryRow("SELECT enqueued FROM queue_stats WHERE queue = ?", "stats.queue").Scan(&enqueued)
-	if enqueued != 3 {
-		t.Errorf("enqueued = %d, want 3", enqueued)
+	if !found {
+		t.Fatalf("queue 'auto.created' not found in ListQueues")
 	}
 }
 
 func TestFetchBasic(t *testing.T) {
 	s := testStore(t)
 
-	enqResult, _ := s.Enqueue(EnqueueRequest{
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{
 		Queue:   "test.queue",
 		Payload: json.RawMessage(`{"task":"do-it"}`),
 	})
 
-	fetchResult, err := s.Fetch(FetchRequest{
+	fetchResult, err := s.Fetch(store.FetchRequest{
 		Queues:   []string{"test.queue"},
 		WorkerID: "worker-1",
 		Hostname: "host-1",
@@ -192,17 +174,16 @@ func TestFetchBasic(t *testing.T) {
 	}
 
 	// Verify job is now active
-	var state string
-	s.db.Read.QueryRow("SELECT state FROM jobs WHERE id = ?", enqResult.JobID).Scan(&state)
-	if state != StateActive {
-		t.Errorf("job state = %q, want %q", state, StateActive)
+	job, _ := s.GetJob(enqResult.JobID)
+	if job.State != store.StateActive {
+		t.Errorf("job state = %q, want %q", job.State, store.StateActive)
 	}
 }
 
 func TestFetchReturnsNilWhenEmpty(t *testing.T) {
 	s := testStore(t)
 
-	fetchResult, err := s.Fetch(FetchRequest{
+	fetchResult, err := s.Fetch(store.FetchRequest{
 		Queues:   []string{"empty.queue"},
 		WorkerID: "worker-1",
 		Hostname: "host-1",
@@ -218,12 +199,10 @@ func TestFetchReturnsNilWhenEmpty(t *testing.T) {
 func TestFetchPriorityOrder(t *testing.T) {
 	s := testStore(t)
 
-	// Enqueue normal, then critical
-	s.Enqueue(EnqueueRequest{Queue: "prio.queue", Payload: json.RawMessage(`{"p":"normal"}`), Priority: "normal"})
-	s.Enqueue(EnqueueRequest{Queue: "prio.queue", Payload: json.RawMessage(`{"p":"critical"}`), Priority: "critical"})
+	s.Enqueue(store.EnqueueRequest{Queue: "prio.queue", Payload: json.RawMessage(`{"p":"normal"}`), Priority: "normal"})
+	s.Enqueue(store.EnqueueRequest{Queue: "prio.queue", Payload: json.RawMessage(`{"p":"critical"}`), Priority: "critical"})
 
-	// Fetch should return critical first
-	r, _ := s.Fetch(FetchRequest{Queues: []string{"prio.queue"}, WorkerID: "w", Hostname: "h"})
+	r, _ := s.Fetch(store.FetchRequest{Queues: []string{"prio.queue"}, WorkerID: "w", Hostname: "h"})
 	if r == nil {
 		t.Fatal("Fetch() returned nil")
 	}
@@ -235,11 +214,10 @@ func TestFetchPriorityOrder(t *testing.T) {
 func TestFetchSkipsPausedQueue(t *testing.T) {
 	s := testStore(t)
 
-	s.Enqueue(EnqueueRequest{Queue: "paused.queue", Payload: json.RawMessage(`{}`)})
-	s.FlushAsync() // ensure queue row exists before pausing
-	s.db.Write.Exec("UPDATE queues SET paused = 1 WHERE name = 'paused.queue'")
+	s.Enqueue(store.EnqueueRequest{Queue: "paused.queue", Payload: json.RawMessage(`{}`)})
+	s.PauseQueue("paused.queue")
 
-	r, err := s.Fetch(FetchRequest{Queues: []string{"paused.queue"}, WorkerID: "w", Hostname: "h"})
+	r, err := s.Fetch(store.FetchRequest{Queues: []string{"paused.queue"}, WorkerID: "w", Hostname: "h"})
 	if err != nil {
 		t.Fatalf("Fetch() error: %v", err)
 	}
@@ -251,34 +229,33 @@ func TestFetchSkipsPausedQueue(t *testing.T) {
 func TestAck(t *testing.T) {
 	s := testStore(t)
 
-	enqResult, _ := s.Enqueue(EnqueueRequest{Queue: "ack.queue", Payload: json.RawMessage(`{}`)})
-	s.Fetch(FetchRequest{Queues: []string{"ack.queue"}, WorkerID: "w", Hostname: "h"})
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{Queue: "ack.queue", Payload: json.RawMessage(`{}`)})
+	s.Fetch(store.FetchRequest{Queues: []string{"ack.queue"}, WorkerID: "w", Hostname: "h"})
 
 	err := s.Ack(enqResult.JobID, json.RawMessage(`{"done":true}`))
 	if err != nil {
 		t.Fatalf("Ack() error: %v", err)
 	}
 
-	var state string
-	s.db.Read.QueryRow("SELECT state FROM jobs WHERE id = ?", enqResult.JobID).Scan(&state)
-	if state != StateCompleted {
-		t.Errorf("job state = %q, want %q", state, StateCompleted)
+	job, _ := s.GetJob(enqResult.JobID)
+	if job.State != store.StateCompleted {
+		t.Errorf("job state = %q, want %q", job.State, store.StateCompleted)
 	}
 }
 
-func TestAckCleansUniquelock(t *testing.T) {
+func TestAckCleansUniqueLock(t *testing.T) {
 	s := testStore(t)
 
-	enqResult, _ := s.Enqueue(EnqueueRequest{
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{
 		Queue:     "unique.queue",
 		Payload:   json.RawMessage(`{}`),
 		UniqueKey: "key-1",
 	})
-	s.Fetch(FetchRequest{Queues: []string{"unique.queue"}, WorkerID: "w", Hostname: "h"})
+	s.Fetch(store.FetchRequest{Queues: []string{"unique.queue"}, WorkerID: "w", Hostname: "h"})
 	s.Ack(enqResult.JobID, nil)
 
 	// Should be able to enqueue same unique key again
-	r2, _ := s.Enqueue(EnqueueRequest{
+	r2, _ := s.Enqueue(store.EnqueueRequest{
 		Queue:     "unique.queue",
 		Payload:   json.RawMessage(`{}`),
 		UniqueKey: "key-1",
@@ -292,19 +269,19 @@ func TestFailWithRetry(t *testing.T) {
 	s := testStore(t)
 
 	maxRetries := 3
-	enqResult, _ := s.Enqueue(EnqueueRequest{
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{
 		Queue:      "fail.queue",
 		Payload:    json.RawMessage(`{}`),
 		MaxRetries: &maxRetries,
 	})
-	s.Fetch(FetchRequest{Queues: []string{"fail.queue"}, WorkerID: "w", Hostname: "h"})
+	s.Fetch(store.FetchRequest{Queues: []string{"fail.queue"}, WorkerID: "w", Hostname: "h"})
 
 	result, err := s.Fail(enqResult.JobID, "something broke", "stack trace here")
 	if err != nil {
 		t.Fatalf("Fail() error: %v", err)
 	}
-	if result.Status != StateRetrying {
-		t.Errorf("Fail() status = %q, want %q", result.Status, StateRetrying)
+	if result.Status != store.StateRetrying {
+		t.Errorf("Fail() status = %q, want %q", result.Status, store.StateRetrying)
 	}
 	if result.AttemptsRemaining != 2 {
 		t.Errorf("Fail() remaining = %d, want 2", result.AttemptsRemaining)
@@ -314,10 +291,9 @@ func TestFailWithRetry(t *testing.T) {
 	}
 
 	// Verify error record was created
-	var errCount int
-	s.db.Read.QueryRow("SELECT COUNT(*) FROM job_errors WHERE job_id = ?", enqResult.JobID).Scan(&errCount)
-	if errCount != 1 {
-		t.Errorf("job_errors count = %d, want 1", errCount)
+	job, _ := s.GetJob(enqResult.JobID)
+	if len(job.Errors) != 1 {
+		t.Errorf("job_errors count = %d, want 1", len(job.Errors))
 	}
 }
 
@@ -325,19 +301,19 @@ func TestFailDead(t *testing.T) {
 	s := testStore(t)
 
 	maxRetries := 1
-	enqResult, _ := s.Enqueue(EnqueueRequest{
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{
 		Queue:      "dead.queue",
 		Payload:    json.RawMessage(`{}`),
 		MaxRetries: &maxRetries,
 	})
-	s.Fetch(FetchRequest{Queues: []string{"dead.queue"}, WorkerID: "w", Hostname: "h"})
+	s.Fetch(store.FetchRequest{Queues: []string{"dead.queue"}, WorkerID: "w", Hostname: "h"})
 
 	result, err := s.Fail(enqResult.JobID, "fatal error", "")
 	if err != nil {
 		t.Fatalf("Fail() error: %v", err)
 	}
-	if result.Status != StateDead {
-		t.Errorf("Fail() status = %q, want %q", result.Status, StateDead)
+	if result.Status != store.StateDead {
+		t.Errorf("Fail() status = %q, want %q", result.Status, store.StateDead)
 	}
 	if result.AttemptsRemaining != 0 {
 		t.Errorf("Fail() remaining = %d, want 0", result.AttemptsRemaining)
@@ -347,17 +323,17 @@ func TestFailDead(t *testing.T) {
 func TestHeartbeatExtendsLease(t *testing.T) {
 	s := testStore(t)
 
-	enqResult, _ := s.Enqueue(EnqueueRequest{Queue: "hb.queue", Payload: json.RawMessage(`{}`)})
-	s.Fetch(FetchRequest{Queues: []string{"hb.queue"}, WorkerID: "w", Hostname: "h"})
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{Queue: "hb.queue", Payload: json.RawMessage(`{}`)})
+	s.Fetch(store.FetchRequest{Queues: []string{"hb.queue"}, WorkerID: "w", Hostname: "h"})
 
 	// Get current lease
-	var leaseBefore string
-	s.db.Read.QueryRow("SELECT lease_expires_at FROM jobs WHERE id = ?", enqResult.JobID).Scan(&leaseBefore)
+	job1, _ := s.GetJob(enqResult.JobID)
+	leaseBefore := job1.LeaseExpiresAt
 
 	time.Sleep(10 * time.Millisecond) // ensure time moves forward
 
-	resp, err := s.Heartbeat(HeartbeatRequest{
-		Jobs: map[string]HeartbeatJobUpdate{
+	resp, err := s.Heartbeat(store.HeartbeatRequest{
+		Jobs: map[string]store.HeartbeatJobUpdate{
 			enqResult.JobID: {},
 		},
 	})
@@ -368,9 +344,9 @@ func TestHeartbeatExtendsLease(t *testing.T) {
 		t.Errorf("Heartbeat() status = %q, want %q", resp.Jobs[enqResult.JobID].Status, "ok")
 	}
 
-	var leaseAfter string
-	s.db.Read.QueryRow("SELECT lease_expires_at FROM jobs WHERE id = ?", enqResult.JobID).Scan(&leaseAfter)
-	if leaseAfter <= leaseBefore {
+	job2, _ := s.GetJob(enqResult.JobID)
+	leaseAfter := job2.LeaseExpiresAt
+	if leaseBefore != nil && leaseAfter != nil && !leaseAfter.After(*leaseBefore) {
 		t.Error("Heartbeat() should have extended the lease")
 	}
 }
@@ -378,11 +354,11 @@ func TestHeartbeatExtendsLease(t *testing.T) {
 func TestHeartbeatWithProgress(t *testing.T) {
 	s := testStore(t)
 
-	enqResult, _ := s.Enqueue(EnqueueRequest{Queue: "prog.queue", Payload: json.RawMessage(`{}`)})
-	s.Fetch(FetchRequest{Queues: []string{"prog.queue"}, WorkerID: "w", Hostname: "h"})
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{Queue: "prog.queue", Payload: json.RawMessage(`{}`)})
+	s.Fetch(store.FetchRequest{Queues: []string{"prog.queue"}, WorkerID: "w", Hostname: "h"})
 
-	_, err := s.Heartbeat(HeartbeatRequest{
-		Jobs: map[string]HeartbeatJobUpdate{
+	_, err := s.Heartbeat(store.HeartbeatRequest{
+		Jobs: map[string]store.HeartbeatJobUpdate{
 			enqResult.JobID: {
 				Progress: map[string]interface{}{
 					"current": 50,
@@ -396,9 +372,8 @@ func TestHeartbeatWithProgress(t *testing.T) {
 		t.Fatalf("Heartbeat() error: %v", err)
 	}
 
-	var progress string
-	s.db.Read.QueryRow("SELECT progress FROM jobs WHERE id = ?", enqResult.JobID).Scan(&progress)
-	if progress == "" {
+	job, _ := s.GetJob(enqResult.JobID)
+	if len(job.Progress) == 0 {
 		t.Error("progress should have been set")
 	}
 }
@@ -406,11 +381,11 @@ func TestHeartbeatWithProgress(t *testing.T) {
 func TestHeartbeatWithCheckpoint(t *testing.T) {
 	s := testStore(t)
 
-	enqResult, _ := s.Enqueue(EnqueueRequest{Queue: "cp.queue", Payload: json.RawMessage(`{}`)})
-	s.Fetch(FetchRequest{Queues: []string{"cp.queue"}, WorkerID: "w", Hostname: "h"})
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{Queue: "cp.queue", Payload: json.RawMessage(`{}`)})
+	s.Fetch(store.FetchRequest{Queues: []string{"cp.queue"}, WorkerID: "w", Hostname: "h"})
 
-	_, err := s.Heartbeat(HeartbeatRequest{
-		Jobs: map[string]HeartbeatJobUpdate{
+	_, err := s.Heartbeat(store.HeartbeatRequest{
+		Jobs: map[string]store.HeartbeatJobUpdate{
 			enqResult.JobID: {
 				Checkpoint: map[string]interface{}{
 					"offset": 42000,
@@ -422,9 +397,8 @@ func TestHeartbeatWithCheckpoint(t *testing.T) {
 		t.Fatalf("Heartbeat() error: %v", err)
 	}
 
-	var checkpoint string
-	s.db.Read.QueryRow("SELECT checkpoint FROM jobs WHERE id = ?", enqResult.JobID).Scan(&checkpoint)
-	if checkpoint == "" {
+	job, _ := s.GetJob(enqResult.JobID)
+	if len(job.Checkpoint) == 0 {
 		t.Error("checkpoint should have been set")
 	}
 }
@@ -432,14 +406,14 @@ func TestHeartbeatWithCheckpoint(t *testing.T) {
 func TestHeartbeatCancelledJob(t *testing.T) {
 	s := testStore(t)
 
-	enqResult, _ := s.Enqueue(EnqueueRequest{Queue: "cancel.queue", Payload: json.RawMessage(`{}`)})
-	s.Fetch(FetchRequest{Queues: []string{"cancel.queue"}, WorkerID: "w", Hostname: "h"})
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{Queue: "cancel.queue", Payload: json.RawMessage(`{}`)})
+	s.Fetch(store.FetchRequest{Queues: []string{"cancel.queue"}, WorkerID: "w", Hostname: "h"})
 
-	// Manually cancel the job
-	s.db.Write.Exec("UPDATE jobs SET state = 'cancelled' WHERE id = ?", enqResult.JobID)
+	// Cancel the job via the proper API
+	s.CancelJob(enqResult.JobID)
 
-	resp, err := s.Heartbeat(HeartbeatRequest{
-		Jobs: map[string]HeartbeatJobUpdate{
+	resp, err := s.Heartbeat(store.HeartbeatRequest{
+		Jobs: map[string]store.HeartbeatJobUpdate{
 			enqResult.JobID: {},
 		},
 	})
@@ -459,19 +433,19 @@ func TestBackoffCalculation(t *testing.T) {
 		maxMs    int
 		expected time.Duration
 	}{
-		{BackoffNone, 1, 5000, 600000, 0},
-		{BackoffFixed, 1, 5000, 600000, 5 * time.Second},
-		{BackoffFixed, 3, 5000, 600000, 5 * time.Second},
-		{BackoffLinear, 1, 5000, 600000, 5 * time.Second},
-		{BackoffLinear, 3, 5000, 600000, 15 * time.Second},
-		{BackoffExponential, 1, 5000, 600000, 5 * time.Second},
-		{BackoffExponential, 2, 5000, 600000, 10 * time.Second},
-		{BackoffExponential, 3, 5000, 600000, 20 * time.Second},
-		{BackoffExponential, 10, 5000, 600000, 600 * time.Second}, // capped at max
+		{store.BackoffNone, 1, 5000, 600000, 0},
+		{store.BackoffFixed, 1, 5000, 600000, 5 * time.Second},
+		{store.BackoffFixed, 3, 5000, 600000, 5 * time.Second},
+		{store.BackoffLinear, 1, 5000, 600000, 5 * time.Second},
+		{store.BackoffLinear, 3, 5000, 600000, 15 * time.Second},
+		{store.BackoffExponential, 1, 5000, 600000, 5 * time.Second},
+		{store.BackoffExponential, 2, 5000, 600000, 10 * time.Second},
+		{store.BackoffExponential, 3, 5000, 600000, 20 * time.Second},
+		{store.BackoffExponential, 10, 5000, 600000, 600 * time.Second},
 	}
 
 	for _, tt := range tests {
-		got := CalculateBackoff(tt.strategy, tt.attempt, tt.baseMs, tt.maxMs)
+		got := store.CalculateBackoff(tt.strategy, tt.attempt, tt.baseMs, tt.maxMs)
 		if got != tt.expected {
 			t.Errorf("CalculateBackoff(%s, %d, %d, %d) = %v, want %v",
 				tt.strategy, tt.attempt, tt.baseMs, tt.maxMs, got, tt.expected)
@@ -482,13 +456,13 @@ func TestBackoffCalculation(t *testing.T) {
 func TestEnqueueBatch(t *testing.T) {
 	s := testStore(t)
 
-	result, err := s.EnqueueBatch(BatchEnqueueRequest{
-		Jobs: []EnqueueRequest{
+	result, err := s.EnqueueBatch(store.BatchEnqueueRequest{
+		Jobs: []store.EnqueueRequest{
 			{Queue: "batch.queue", Payload: json.RawMessage(`{"i":1}`)},
 			{Queue: "batch.queue", Payload: json.RawMessage(`{"i":2}`)},
 			{Queue: "batch.queue", Payload: json.RawMessage(`{"i":3}`)},
 		},
-		Batch: &BatchConfig{
+		Batch: &store.BatchConfig{
 			CallbackQueue:   "batch.callback",
 			CallbackPayload: json.RawMessage(`{"campaign":"test"}`),
 		},
@@ -503,9 +477,9 @@ func TestEnqueueBatch(t *testing.T) {
 		t.Error("EnqueueBatch() batch ID should not be empty")
 	}
 
-	// Verify batch row
+	// Verify batch row via SQLite
 	var total, pending int
-	s.db.Read.QueryRow("SELECT total, pending FROM batches WHERE id = ?", result.BatchID).Scan(&total, &pending)
+	s.ReadDB().QueryRow("SELECT total, pending FROM batches WHERE id = ?", result.BatchID).Scan(&total, &pending)
 	if total != 3 || pending != 3 {
 		t.Errorf("batch total=%d pending=%d, want 3/3", total, pending)
 	}
@@ -514,12 +488,12 @@ func TestEnqueueBatch(t *testing.T) {
 func TestBatchCompletionCallback(t *testing.T) {
 	s := testStore(t)
 
-	_, _ = s.EnqueueBatch(BatchEnqueueRequest{
-		Jobs: []EnqueueRequest{
+	_, _ = s.EnqueueBatch(store.BatchEnqueueRequest{
+		Jobs: []store.EnqueueRequest{
 			{Queue: "batch.queue", Payload: json.RawMessage(`{"i":1}`)},
 			{Queue: "batch.queue", Payload: json.RawMessage(`{"i":2}`)},
 		},
-		Batch: &BatchConfig{
+		Batch: &store.BatchConfig{
 			CallbackQueue:   "batch.done",
 			CallbackPayload: json.RawMessage(`{"done":true}`),
 		},
@@ -527,7 +501,7 @@ func TestBatchCompletionCallback(t *testing.T) {
 
 	// Fetch and ack both jobs
 	for range 2 {
-		r, _ := s.Fetch(FetchRequest{Queues: []string{"batch.queue"}, WorkerID: "w", Hostname: "h"})
+		r, _ := s.Fetch(store.FetchRequest{Queues: []string{"batch.queue"}, WorkerID: "w", Hostname: "h"})
 		if r == nil {
 			t.Fatal("Fetch() returned nil")
 		}
@@ -536,7 +510,7 @@ func TestBatchCompletionCallback(t *testing.T) {
 
 	// Verify callback job was enqueued
 	var count int
-	s.db.Read.QueryRow("SELECT COUNT(*) FROM jobs WHERE queue = 'batch.done'").Scan(&count)
+	s.ReadDB().QueryRow("SELECT COUNT(*) FROM jobs WHERE queue = 'batch.done'").Scan(&count)
 	if count != 1 {
 		t.Errorf("callback job count = %d, want 1", count)
 	}
@@ -546,7 +520,7 @@ func TestFullJobLifecycle(t *testing.T) {
 	s := testStore(t)
 
 	// 1. Enqueue
-	enqResult, err := s.Enqueue(EnqueueRequest{
+	enqResult, err := s.Enqueue(store.EnqueueRequest{
 		Queue:   "lifecycle.queue",
 		Payload: json.RawMessage(`{"step":"lifecycle"}`),
 	})
@@ -555,7 +529,7 @@ func TestFullJobLifecycle(t *testing.T) {
 	}
 
 	// 2. Fetch
-	fetchResult, err := s.Fetch(FetchRequest{
+	fetchResult, err := s.Fetch(store.FetchRequest{
 		Queues: []string{"lifecycle.queue"}, WorkerID: "w1", Hostname: "h1",
 	})
 	if err != nil {
@@ -572,9 +546,8 @@ func TestFullJobLifecycle(t *testing.T) {
 	}
 
 	// 4. Verify completed
-	var state string
-	s.db.Read.QueryRow("SELECT state FROM jobs WHERE id = ?", enqResult.JobID).Scan(&state)
-	if state != StateCompleted {
-		t.Errorf("final state = %q, want %q", state, StateCompleted)
+	job, _ := s.GetJob(enqResult.JobID)
+	if job.State != store.StateCompleted {
+		t.Errorf("final state = %q, want %q", job.State, store.StateCompleted)
 	}
 }

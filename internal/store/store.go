@@ -3,123 +3,80 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"time"
 )
 
-// Writer abstracts write operations so Raft can be inserted later.
-// For Phase 1 (single-node), DirectWriter executes against SQLite directly.
-type Writer interface {
-	Execute(query string, args ...interface{}) (sql.Result, error)
-	ExecuteTx(fn func(tx *sql.Tx) error) error
-}
-
 // Store is the main data access layer for Jobbie.
+// Writes go through Raft consensus via the Applier; reads come from local SQLite.
 type Store struct {
-	db     *DB
-	writer Writer
-	async  *AsyncWriter
-
-	// Prepared statements for hot path
-	stmtInsertJob    *sql.Stmt
-	stmtCheckUnique  *sql.Stmt
-	stmtInsertUnique *sql.Stmt
+	applier Applier
+	sqliteR *sql.DB // read-only SQLite connection (materialized view)
 }
 
-// NewStore creates a new Store with the given DB.
-// It uses a DirectWriter that writes to SQLite immediately.
-func NewStore(db *DB) *Store {
-	s := &Store{
-		db:     db,
-		writer: &DirectWriter{db: db.Write},
-		async:  NewAsyncWriter(db.Write),
-	}
-	s.prepareStatements()
-	return s
-}
-
-// NewStoreWithWriter creates a Store with a custom Writer (e.g. BatchWriter).
-func NewStoreWithWriter(db *DB, writer Writer) *Store {
-	s := &Store{
-		db:     db,
-		writer: writer,
-		async:  NewAsyncWriter(db.Write),
-	}
-	s.prepareStatements()
-	return s
-}
-
-func (s *Store) prepareStatements() {
-	var err error
-
-	s.stmtInsertJob, err = s.db.Write.Prepare(
-		`INSERT INTO jobs (id, queue, state, payload, priority, max_retries, retry_backoff, retry_base_delay_ms, retry_max_delay_ms, unique_key, tags, scheduled_at, expire_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-	)
-	if err != nil {
-		panic(fmt.Sprintf("prepare insert job: %v", err))
-	}
-
-	s.stmtCheckUnique, err = s.db.Write.Prepare(
-		`SELECT job_id FROM unique_locks WHERE queue = ? AND unique_key = ? AND expires_at > strftime('%Y-%m-%dT%H:%M:%f', 'now')`,
-	)
-	if err != nil {
-		panic(fmt.Sprintf("prepare check unique: %v", err))
-	}
-
-	s.stmtInsertUnique, err = s.db.Write.Prepare(
-		`INSERT OR REPLACE INTO unique_locks (queue, unique_key, job_id, expires_at) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%f', 'now', '+' || ? || ' seconds'))`,
-	)
-	if err != nil {
-		panic(fmt.Sprintf("prepare insert unique: %v", err))
+// NewStore creates a new Store backed by a Raft cluster.
+func NewStore(applier Applier, sqliteR *sql.DB) *Store {
+	return &Store{
+		applier: applier,
+		sqliteR: sqliteR,
 	}
 }
 
-// Close stops the async writer and closes prepared statements.
+// Close is a no-op — the Cluster owns the lifecycle of Pebble and SQLite.
 func (s *Store) Close() error {
-	if s.async != nil {
-		s.async.Stop()
-	}
-	if s.stmtInsertJob != nil {
-		s.stmtInsertJob.Close()
-	}
-	if s.stmtCheckUnique != nil {
-		s.stmtCheckUnique.Close()
-	}
-	if s.stmtInsertUnique != nil {
-		s.stmtInsertUnique.Close()
-	}
 	return nil
 }
 
-// FlushAsync blocks until all pending async operations have been executed.
-func (s *Store) FlushAsync() {
-	if s.async != nil {
-		s.async.Flush()
-	}
-}
+// FlushAsync is a no-op in the Raft architecture — writes are synchronous.
+func (s *Store) FlushAsync() {}
 
-// DirectWriter executes SQL directly against the SQLite write connection.
-type DirectWriter struct {
-	db *sql.DB
-}
-
-func (w *DirectWriter) Execute(query string, args ...interface{}) (sql.Result, error) {
-	return w.db.Exec(query, args...)
-}
-
-func (w *DirectWriter) ExecuteTx(fn func(tx *sql.Tx) error) error {
-	tx, err := w.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	if err := fn(tx); err != nil {
-		return err
-	}
-
-	return tx.Commit()
-}
-
-// ReadDB returns the read database connection for queries.
+// ReadDB returns the read-only SQLite connection for queries.
 func (s *Store) ReadDB() *sql.DB {
-	return s.db.Read
+	return s.sqliteR
+}
+
+// applyOp submits an operation through Raft and returns the result.
+func (s *Store) applyOp(opType OpType, data any) *OpResult {
+	return s.applier.Apply(opType, data)
+}
+
+// applyOpResult submits an operation and extracts a typed result.
+func applyOpResult[T any](s *Store, opType OpType, data any) (*T, error) {
+	result := s.applyOp(opType, data)
+	if result.Err != nil {
+		return nil, result.Err
+	}
+	if result.Data == nil {
+		return nil, nil
+	}
+	typed, ok := result.Data.(*T)
+	if !ok {
+		return nil, fmt.Errorf("unexpected result type: %T", result.Data)
+	}
+	return typed, nil
+}
+
+// Maintenance operations (used by the scheduler).
+
+// Promote moves scheduled/retrying jobs to pending when their time has passed.
+func (s *Store) Promote() error {
+	now := time.Now()
+	return s.applyOp(OpPromote, PromoteOp{NowNs: uint64(now.UnixNano())}).Err
+}
+
+// Reclaim resets active jobs with expired leases back to pending.
+func (s *Store) Reclaim() error {
+	now := time.Now()
+	return s.applyOp(OpReclaim, ReclaimOp{NowNs: uint64(now.UnixNano())}).Err
+}
+
+// CleanUniqueLocks removes expired unique locks.
+func (s *Store) CleanUniqueLocks() error {
+	now := time.Now()
+	return s.applyOp(OpCleanUnique, CleanUniqueOp{NowNs: uint64(now.UnixNano())}).Err
+}
+
+// CleanRateLimits removes old rate limit window entries.
+func (s *Store) CleanRateLimits() error {
+	cutoff := time.Now().Add(-5 * time.Minute)
+	return s.applyOp(OpCleanRateLimit, CleanRateLimitOp{CutoffNs: uint64(cutoff.UnixNano())}).Err
 }

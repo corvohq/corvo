@@ -1,10 +1,11 @@
-package store
+package store_test
 
 import (
 	"encoding/json"
 	"testing"
 
 	"github.com/user/jobbie/internal/search"
+	"github.com/user/jobbie/internal/store"
 )
 
 func TestBulkRetryByIDs(t *testing.T) {
@@ -13,13 +14,13 @@ func TestBulkRetryByIDs(t *testing.T) {
 	maxRetries := 1
 	var deadIDs []string
 	for range 3 {
-		r, _ := s.Enqueue(EnqueueRequest{Queue: "bulk.retry", Payload: json.RawMessage(`{}`), MaxRetries: &maxRetries})
-		s.Fetch(FetchRequest{Queues: []string{"bulk.retry"}, WorkerID: "w", Hostname: "h"})
+		r, _ := s.Enqueue(store.EnqueueRequest{Queue: "bulk.retry", Payload: json.RawMessage(`{}`), MaxRetries: &maxRetries})
+		s.Fetch(store.FetchRequest{Queues: []string{"bulk.retry"}, WorkerID: "w", Hostname: "h"})
 		s.Fail(r.JobID, "err", "")
 		deadIDs = append(deadIDs, r.JobID)
 	}
 
-	result, err := s.BulkAction(BulkRequest{JobIDs: deadIDs, Action: "retry"})
+	result, err := s.BulkAction(store.BulkRequest{JobIDs: deadIDs, Action: "retry"})
 	if err != nil {
 		t.Fatalf("BulkAction: %v", err)
 	}
@@ -30,7 +31,7 @@ func TestBulkRetryByIDs(t *testing.T) {
 	// Verify all are pending
 	for _, id := range deadIDs {
 		j, _ := s.GetJob(id)
-		if j.State != StatePending {
+		if j.State != store.StatePending {
 			t.Errorf("job %s state = %q, want pending", id, j.State)
 		}
 	}
@@ -41,11 +42,11 @@ func TestBulkDeleteByIDs(t *testing.T) {
 
 	var ids []string
 	for range 3 {
-		r, _ := s.Enqueue(EnqueueRequest{Queue: "bulk.del", Payload: json.RawMessage(`{}`)})
+		r, _ := s.Enqueue(store.EnqueueRequest{Queue: "bulk.del", Payload: json.RawMessage(`{}`)})
 		ids = append(ids, r.JobID)
 	}
 
-	result, err := s.BulkAction(BulkRequest{JobIDs: ids, Action: "delete"})
+	result, err := s.BulkAction(store.BulkRequest{JobIDs: ids, Action: "delete"})
 	if err != nil {
 		t.Fatalf("BulkAction: %v", err)
 	}
@@ -59,11 +60,11 @@ func TestBulkCancelByIDs(t *testing.T) {
 
 	var ids []string
 	for range 2 {
-		r, _ := s.Enqueue(EnqueueRequest{Queue: "bulk.cancel", Payload: json.RawMessage(`{}`)})
+		r, _ := s.Enqueue(store.EnqueueRequest{Queue: "bulk.cancel", Payload: json.RawMessage(`{}`)})
 		ids = append(ids, r.JobID)
 	}
 
-	result, err := s.BulkAction(BulkRequest{JobIDs: ids, Action: "cancel"})
+	result, err := s.BulkAction(store.BulkRequest{JobIDs: ids, Action: "cancel"})
 	if err != nil {
 		t.Fatalf("BulkAction: %v", err)
 	}
@@ -77,11 +78,11 @@ func TestBulkMove(t *testing.T) {
 
 	var ids []string
 	for range 2 {
-		r, _ := s.Enqueue(EnqueueRequest{Queue: "bulk.src", Payload: json.RawMessage(`{}`)})
+		r, _ := s.Enqueue(store.EnqueueRequest{Queue: "bulk.src", Payload: json.RawMessage(`{}`)})
 		ids = append(ids, r.JobID)
 	}
 
-	result, err := s.BulkAction(BulkRequest{
+	result, err := s.BulkAction(store.BulkRequest{
 		JobIDs:      ids,
 		Action:      "move",
 		MoveToQueue: "bulk.dst",
@@ -104,11 +105,11 @@ func TestBulkChangePriority(t *testing.T) {
 
 	var ids []string
 	for range 2 {
-		r, _ := s.Enqueue(EnqueueRequest{Queue: "bulk.prio", Payload: json.RawMessage(`{}`)})
+		r, _ := s.Enqueue(store.EnqueueRequest{Queue: "bulk.prio", Payload: json.RawMessage(`{}`)})
 		ids = append(ids, r.JobID)
 	}
 
-	result, err := s.BulkAction(BulkRequest{
+	result, err := s.BulkAction(store.BulkRequest{
 		JobIDs:   ids,
 		Action:   "change_priority",
 		Priority: "critical",
@@ -121,8 +122,8 @@ func TestBulkChangePriority(t *testing.T) {
 	}
 
 	j, _ := s.GetJob(ids[0])
-	if j.Priority != PriorityCritical {
-		t.Errorf("priority = %d, want %d", j.Priority, PriorityCritical)
+	if j.Priority != store.PriorityCritical {
+		t.Errorf("priority = %d, want %d", j.Priority, store.PriorityCritical)
 	}
 }
 
@@ -131,13 +132,13 @@ func TestBulkByFilter(t *testing.T) {
 
 	maxRetries := 1
 	for range 3 {
-		r, _ := s.Enqueue(EnqueueRequest{Queue: "bulk.filter", Payload: json.RawMessage(`{}`), MaxRetries: &maxRetries})
-		s.Fetch(FetchRequest{Queues: []string{"bulk.filter"}, WorkerID: "w", Hostname: "h"})
+		r, _ := s.Enqueue(store.EnqueueRequest{Queue: "bulk.filter", Payload: json.RawMessage(`{}`), MaxRetries: &maxRetries})
+		s.Fetch(store.FetchRequest{Queues: []string{"bulk.filter"}, WorkerID: "w", Hostname: "h"})
 		s.Fail(r.JobID, "err", "")
 	}
 
 	filter := search.Filter{Queue: "bulk.filter", State: []string{"dead"}}
-	result, err := s.BulkAction(BulkRequest{Filter: &filter, Action: "retry"})
+	result, err := s.BulkAction(store.BulkRequest{Filter: &filter, Action: "retry"})
 	if err != nil {
 		t.Fatalf("BulkAction: %v", err)
 	}
@@ -149,7 +150,7 @@ func TestBulkByFilter(t *testing.T) {
 func TestBulkEmptyResult(t *testing.T) {
 	s := testStore(t)
 
-	result, err := s.BulkAction(BulkRequest{JobIDs: []string{}, Action: "retry"})
+	result, err := s.BulkAction(store.BulkRequest{JobIDs: []string{}, Action: "retry"})
 	if err != nil {
 		t.Fatalf("BulkAction: %v", err)
 	}
@@ -161,7 +162,7 @@ func TestBulkEmptyResult(t *testing.T) {
 func TestBulkUnknownAction(t *testing.T) {
 	s := testStore(t)
 
-	_, err := s.BulkAction(BulkRequest{JobIDs: []string{"job_123"}, Action: "explode"})
+	_, err := s.BulkAction(store.BulkRequest{JobIDs: []string{"job_123"}, Action: "explode"})
 	if err == nil {
 		t.Error("expected error for unknown action")
 	}

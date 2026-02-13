@@ -1,0 +1,12 @@
+version: v1
+plugins:
+  - plugin: go
+    out: .
+    opt:
+      - paths=import
+      - module=github.com/user/jobbie
+  - plugin: connect-go
+    out: .
+    opt:
+      - paths=import
+      - module=github.com/user/jobbie

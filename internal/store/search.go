@@ -37,7 +37,7 @@ type JobSummary struct {
 	FailedAt    *string         `json:"failed_at,omitempty"`
 }
 
-// SearchJobs executes a search query and returns matching jobs.
+// SearchJobs executes a search query against local SQLite.
 func (s *Store) SearchJobs(filter search.Filter) (*SearchResult, error) {
 	start := time.Now()
 
@@ -48,12 +48,12 @@ func (s *Store) SearchJobs(filter search.Filter) (*SearchResult, error) {
 
 	// Get total count
 	var total int
-	if err := s.db.Read.QueryRow(countQuery, countArgs...).Scan(&total); err != nil {
+	if err := s.sqliteR.QueryRow(countQuery, countArgs...).Scan(&total); err != nil {
 		return nil, fmt.Errorf("count search results: %w", err)
 	}
 
 	// Execute search
-	rows, err := s.db.Read.Query(query, args...)
+	rows, err := s.sqliteR.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search jobs: %w", err)
 	}

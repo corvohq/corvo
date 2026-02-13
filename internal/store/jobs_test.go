@@ -1,14 +1,16 @@
-package store
+package store_test
 
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/user/jobbie/internal/store"
 )
 
 func TestGetJob(t *testing.T) {
 	s := testStore(t)
 
-	enqResult, _ := s.Enqueue(EnqueueRequest{
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{
 		Queue:   "get.queue",
 		Payload: json.RawMessage(`{"key":"value"}`),
 		Tags:    json.RawMessage(`{"env":"test"}`),
@@ -24,8 +26,8 @@ func TestGetJob(t *testing.T) {
 	if job.Queue != "get.queue" {
 		t.Errorf("queue = %q, want %q", job.Queue, "get.queue")
 	}
-	if job.State != StatePending {
-		t.Errorf("state = %q, want %q", job.State, StatePending)
+	if job.State != store.StatePending {
+		t.Errorf("state = %q, want %q", job.State, store.StatePending)
 	}
 	if string(job.Payload) != `{"key":"value"}` {
 		t.Errorf("payload = %s", job.Payload)
@@ -39,12 +41,12 @@ func TestGetJobWithErrors(t *testing.T) {
 	s := testStore(t)
 
 	maxRetries := 3
-	enqResult, _ := s.Enqueue(EnqueueRequest{
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{
 		Queue:      "err.queue",
 		Payload:    json.RawMessage(`{}`),
 		MaxRetries: &maxRetries,
 	})
-	s.Fetch(FetchRequest{Queues: []string{"err.queue"}, WorkerID: "w", Hostname: "h"})
+	s.Fetch(store.FetchRequest{Queues: []string{"err.queue"}, WorkerID: "w", Hostname: "h"})
 	s.Fail(enqResult.JobID, "first error", "trace1")
 
 	job, err := s.GetJob(enqResult.JobID)
@@ -71,17 +73,17 @@ func TestRetryJob(t *testing.T) {
 	s := testStore(t)
 
 	maxRetries := 1
-	enqResult, _ := s.Enqueue(EnqueueRequest{
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{
 		Queue:      "retry.queue",
 		Payload:    json.RawMessage(`{}`),
 		MaxRetries: &maxRetries,
 	})
-	s.Fetch(FetchRequest{Queues: []string{"retry.queue"}, WorkerID: "w", Hostname: "h"})
+	s.Fetch(store.FetchRequest{Queues: []string{"retry.queue"}, WorkerID: "w", Hostname: "h"})
 	s.Fail(enqResult.JobID, "error", "")
 
 	// Job should be dead
 	job, _ := s.GetJob(enqResult.JobID)
-	if job.State != StateDead {
+	if job.State != store.StateDead {
 		t.Fatalf("job state = %q, want dead", job.State)
 	}
 
@@ -91,7 +93,7 @@ func TestRetryJob(t *testing.T) {
 	}
 
 	job, _ = s.GetJob(enqResult.JobID)
-	if job.State != StatePending {
+	if job.State != store.StatePending {
 		t.Errorf("job state after retry = %q, want pending", job.State)
 	}
 	if job.Attempt != 0 {
@@ -102,7 +104,7 @@ func TestRetryJob(t *testing.T) {
 func TestCancelPendingJob(t *testing.T) {
 	s := testStore(t)
 
-	enqResult, _ := s.Enqueue(EnqueueRequest{
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{
 		Queue:   "cancel.queue",
 		Payload: json.RawMessage(`{}`),
 	})
@@ -111,12 +113,12 @@ func TestCancelPendingJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CancelJob: %v", err)
 	}
-	if status != StateCancelled {
-		t.Errorf("status = %q, want %q", status, StateCancelled)
+	if status != store.StateCancelled {
+		t.Errorf("status = %q, want %q", status, store.StateCancelled)
 	}
 
 	job, _ := s.GetJob(enqResult.JobID)
-	if job.State != StateCancelled {
+	if job.State != store.StateCancelled {
 		t.Errorf("job state = %q, want cancelled", job.State)
 	}
 }
@@ -124,11 +126,11 @@ func TestCancelPendingJob(t *testing.T) {
 func TestCancelActiveJob(t *testing.T) {
 	s := testStore(t)
 
-	enqResult, _ := s.Enqueue(EnqueueRequest{
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{
 		Queue:   "cancel.active",
 		Payload: json.RawMessage(`{}`),
 	})
-	s.Fetch(FetchRequest{Queues: []string{"cancel.active"}, WorkerID: "w", Hostname: "h"})
+	s.Fetch(store.FetchRequest{Queues: []string{"cancel.active"}, WorkerID: "w", Hostname: "h"})
 
 	status, err := s.CancelJob(enqResult.JobID)
 	if err != nil {
@@ -142,7 +144,7 @@ func TestCancelActiveJob(t *testing.T) {
 func TestMoveJob(t *testing.T) {
 	s := testStore(t)
 
-	enqResult, _ := s.Enqueue(EnqueueRequest{
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{
 		Queue:   "source.queue",
 		Payload: json.RawMessage(`{}`),
 	})
@@ -160,7 +162,7 @@ func TestMoveJob(t *testing.T) {
 func TestDeleteJob(t *testing.T) {
 	s := testStore(t)
 
-	enqResult, _ := s.Enqueue(EnqueueRequest{
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{
 		Queue:   "del.queue",
 		Payload: json.RawMessage(`{}`),
 	})

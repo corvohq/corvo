@@ -25,7 +25,7 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.store.Enqueue(req)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
+		writeStoreError(w, err, http.StatusInternalServerError, "INTERNAL_ERROR")
 		return
 	}
 
@@ -58,7 +58,7 @@ func (s *Server) handleEnqueueBatch(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.store.EnqueueBatch(req)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
+		writeStoreError(w, err, http.StatusInternalServerError, "INTERNAL_ERROR")
 		return
 	}
 	writeJSON(w, http.StatusCreated, result)
@@ -88,7 +88,7 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	for {
 		result, err := s.store.Fetch(req)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
+			writeStoreError(w, err, http.StatusInternalServerError, "INTERNAL_ERROR")
 			return
 		}
 		if result != nil {
@@ -113,6 +113,42 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleFetchBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Queues        []string `json:"queues"`
+		WorkerID      string   `json:"worker_id"`
+		Hostname      string   `json:"hostname"`
+		LeaseDuration int      `json:"timeout"`
+		Count         int      `json:"count"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
+		return
+	}
+	if len(req.Queues) == 0 {
+		writeError(w, http.StatusBadRequest, "queues is required", "VALIDATION_ERROR")
+		return
+	}
+	if req.Count <= 0 {
+		req.Count = 1
+	}
+	if req.Count > 512 {
+		req.Count = 512
+	}
+
+	jobs, err := s.store.FetchBatch(store.FetchRequest{
+		Queues:        req.Queues,
+		WorkerID:      req.WorkerID,
+		Hostname:      req.Hostname,
+		LeaseDuration: req.LeaseDuration,
+	}, req.Count)
+	if err != nil {
+		writeStoreError(w, err, http.StatusInternalServerError, "INTERNAL_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+}
+
 func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	jobID := chi.URLParam(r, "job_id")
 
@@ -122,10 +158,46 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	decodeJSON(r, &body)
 
 	if err := s.store.Ack(jobID, body.Result); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error(), "ACK_ERROR")
+		writeStoreError(w, err, http.StatusBadRequest, "ACK_ERROR")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleAckBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Acks []struct {
+			JobID  string          `json:"job_id"`
+			Result json.RawMessage `json:"result"`
+		} `json:"acks"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
+		return
+	}
+	if len(req.Acks) == 0 {
+		writeError(w, http.StatusBadRequest, "acks array is required", "VALIDATION_ERROR")
+		return
+	}
+
+	acks := make([]store.AckOp, 0, len(req.Acks))
+	for _, ack := range req.Acks {
+		if ack.JobID == "" {
+			writeError(w, http.StatusBadRequest, "job_id is required for each ack", "VALIDATION_ERROR")
+			return
+		}
+		acks = append(acks, store.AckOp{
+			JobID:  ack.JobID,
+			Result: ack.Result,
+		})
+	}
+
+	acked, err := s.store.AckBatch(acks)
+	if err != nil {
+		writeStoreError(w, err, http.StatusBadRequest, "ACK_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"acked": acked})
 }
 
 func (s *Server) handleFail(w http.ResponseWriter, r *http.Request) {
@@ -142,7 +214,7 @@ func (s *Server) handleFail(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.store.Fail(jobID, body.Error, body.Backtrace)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error(), "FAIL_ERROR")
+		writeStoreError(w, err, http.StatusBadRequest, "FAIL_ERROR")
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -157,7 +229,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.store.Heartbeat(req)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
+		writeStoreError(w, err, http.StatusInternalServerError, "INTERNAL_ERROR")
 		return
 	}
 	writeJSON(w, http.StatusOK, result)

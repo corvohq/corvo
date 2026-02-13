@@ -3,29 +3,48 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/user/jobbie/internal/rpcconnect"
 	"github.com/user/jobbie/internal/store"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // Server is the HTTP server for Jobbie.
 type Server struct {
 	store      *store.Store
+	cluster    ClusterInfo
 	httpServer *http.Server
 	router     chi.Router
 }
 
+// ClusterInfo contains cluster state methods used by HTTP handlers/middleware.
+type ClusterInfo interface {
+	IsLeader() bool
+	LeaderAddr() string
+	ClusterStatus() map[string]any
+	State() string
+	EventLog(afterSeq uint64, limit int) ([]map[string]any, error)
+}
+
 // New creates a new Server.
-func New(s *store.Store, bindAddr string) *Server {
-	srv := &Server{store: s}
+func New(s *store.Store, cluster ClusterInfo, bindAddr string) *Server {
+	srv := &Server{store: s, cluster: cluster}
 	srv.router = srv.buildRouter()
 	srv.httpServer = &http.Server{
 		Addr:    bindAddr,
-		Handler: srv.router,
+		Handler: h2c.NewHandler(srv.router, &http2.Server{}),
 	}
 	return srv
 }
@@ -40,39 +59,55 @@ func (s *Server) buildRouter() chi.Router {
 	r.Use(corsMiddleware)
 
 	r.Route("/api/v1", func(r chi.Router) {
-		// Worker endpoints
-		r.Post("/enqueue", s.handleEnqueue)
-		r.Post("/enqueue/batch", s.handleEnqueueBatch)
-		r.Post("/fetch", s.handleFetch)
-		r.Post("/ack/{job_id}", s.handleAck)
-		r.Post("/fail/{job_id}", s.handleFail)
-		r.Post("/heartbeat", s.handleHeartbeat)
-
-		// Queue management
+		// Read endpoints
 		r.Get("/queues", s.handleListQueues)
-		r.Post("/queues/{name}/pause", s.handlePauseQueue)
-		r.Post("/queues/{name}/resume", s.handleResumeQueue)
-		r.Post("/queues/{name}/clear", s.handleClearQueue)
-		r.Post("/queues/{name}/drain", s.handleDrainQueue)
-		r.Post("/queues/{name}/concurrency", s.handleSetConcurrency)
-		r.Post("/queues/{name}/throttle", s.handleSetThrottle)
-		r.Delete("/queues/{name}/throttle", s.handleRemoveThrottle)
-		r.Delete("/queues/{name}", s.handleDeleteQueue)
-
-		// Job management
 		r.Get("/jobs/{id}", s.handleGetJob)
-		r.Post("/jobs/{id}/retry", s.handleRetryJob)
-		r.Post("/jobs/{id}/cancel", s.handleCancelJob)
-		r.Post("/jobs/{id}/move", s.handleMoveJob)
-		r.Delete("/jobs/{id}", s.handleDeleteJob)
-
-		// Search and bulk
 		r.Post("/jobs/search", s.handleSearch)
-		r.Post("/jobs/bulk", s.handleBulk)
-
-		// Admin
 		r.Get("/workers", s.handleListWorkers)
 		r.Get("/cluster/status", s.handleClusterStatus)
+		r.Get("/cluster/events", s.handleClusterEvents)
+
+		// Write endpoints (leader only when clustered)
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireLeader)
+
+			// Worker endpoints
+			r.Post("/enqueue", s.handleEnqueue)
+			r.Post("/enqueue/batch", s.handleEnqueueBatch)
+			r.Post("/fetch", s.handleFetch)
+			r.Post("/fetch/batch", s.handleFetchBatch)
+			r.Post("/ack/batch", s.handleAckBatch)
+			r.Post("/ack/{job_id}", s.handleAck)
+			r.Post("/fail/{job_id}", s.handleFail)
+			r.Post("/heartbeat", s.handleHeartbeat)
+
+			// Queue management
+			r.Post("/queues/{name}/pause", s.handlePauseQueue)
+			r.Post("/queues/{name}/resume", s.handleResumeQueue)
+			r.Post("/queues/{name}/clear", s.handleClearQueue)
+			r.Post("/queues/{name}/drain", s.handleDrainQueue)
+			r.Post("/queues/{name}/concurrency", s.handleSetConcurrency)
+			r.Post("/queues/{name}/throttle", s.handleSetThrottle)
+			r.Delete("/queues/{name}/throttle", s.handleRemoveThrottle)
+			r.Delete("/queues/{name}", s.handleDeleteQueue)
+
+			// Job management
+			r.Post("/jobs/{id}/retry", s.handleRetryJob)
+			r.Post("/jobs/{id}/cancel", s.handleCancelJob)
+			r.Post("/jobs/{id}/move", s.handleMoveJob)
+			r.Delete("/jobs/{id}", s.handleDeleteJob)
+
+			// Bulk
+			r.Post("/jobs/bulk", s.handleBulk)
+		})
+
+	})
+
+	// Worker lifecycle RPC (Connect: protobuf and JSON fallback).
+	rpcPath, rpcHandler := rpcconnect.NewHandler(s.store)
+	r.Group(func(r chi.Router) {
+		r.Use(s.requireLeader)
+		r.Mount(strings.TrimSuffix(rpcPath, "/"), rpcHandler)
 	})
 
 	r.Get("/healthz", s.handleHealthz)
@@ -94,7 +129,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 // Handler returns the http.Handler for testing.
 func (s *Server) Handler() http.Handler {
-	return s.router
+	return s.httpServer.Handler
 }
 
 // JSON response helpers
@@ -107,6 +142,24 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, msg string, code string) {
 	writeJSON(w, status, map[string]string{"error": msg, "code": code})
+}
+
+func writeStoreError(w http.ResponseWriter, err error, fallbackStatus int, fallbackCode string) {
+	if store.IsOverloadedError(err) {
+		if ms, ok := store.OverloadRetryAfterMs(err); ok && ms > 0 {
+			secs := float64(ms) / 1000.0
+			w.Header().Set("Retry-After", fmt.Sprintf("%.3f", secs))
+			writeJSON(w, http.StatusTooManyRequests, map[string]any{
+				"error":          err.Error(),
+				"code":           "OVERLOADED",
+				"retry_after_ms": ms,
+			})
+			return
+		}
+		writeError(w, http.StatusTooManyRequests, err.Error(), "OVERLOADED")
+		return
+	}
+	writeError(w, fallbackStatus, err.Error(), fallbackCode)
 }
 
 func decodeJSON(r *http.Request, v interface{}) error {
@@ -141,4 +194,100 @@ func corsMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) requireLeader(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.cluster == nil || s.cluster.IsLeader() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.Header.Get("X-Jobbie-Forwarded") == "1" {
+			writeError(w, http.StatusServiceUnavailable, "leader forwarding loop detected", "FORWARD_LOOP")
+			return
+		}
+
+		leader := s.cluster.LeaderAddr()
+		if leader == "" {
+			writeError(w, http.StatusServiceUnavailable, "leader unavailable", "LEADER_UNAVAILABLE")
+			return
+		}
+
+		target, err := s.leaderTargetURL(r, leader)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err.Error(), "LEADER_UNAVAILABLE")
+			return
+		}
+
+		if err := s.proxyToLeader(w, r, target); err != nil {
+			slog.Warn("leader proxy failed", "target", target.String(), "error", err)
+			writeError(w, http.StatusServiceUnavailable, "leader proxy unavailable", "LEADER_UNAVAILABLE")
+		}
+	})
+}
+
+func (s *Server) leaderTargetURL(r *http.Request, leaderAddr string) (*url.URL, error) {
+	if strings.HasPrefix(leaderAddr, "http://") || strings.HasPrefix(leaderAddr, "https://") {
+		u, err := url.Parse(strings.TrimRight(leaderAddr, "/"))
+		if err != nil {
+			return nil, err
+		}
+		return u, nil
+	}
+
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+
+	leaderHost, leaderPort, err := net.SplitHostPort(leaderAddr)
+	if err != nil {
+		return nil, err
+	}
+	if leaderHost == "" || leaderHost == "0.0.0.0" || leaderHost == "::" {
+		leaderHost = r.Host
+		if h, _, err := net.SplitHostPort(r.Host); err == nil {
+			leaderHost = h
+		}
+	}
+
+	// Best-effort: forward to leader host on the same HTTP port as this node.
+	httpPort := ""
+	if _, p, err := net.SplitHostPort(s.httpServer.Addr); err == nil {
+		httpPort = p
+	}
+	if httpPort == "" {
+		// Fallback to raft port if HTTP port isn't parseable.
+		httpPort = leaderPort
+	}
+	host := net.JoinHostPort(leaderHost, httpPort)
+
+	return &url.URL{
+		Scheme: scheme,
+		Host:   host,
+	}, nil
+}
+
+func (s *Server) proxyToLeader(w http.ResponseWriter, r *http.Request, target *url.URL) error {
+	if target == nil {
+		return errors.New("missing leader target")
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	var proxyErr error
+	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		proxyErr = err
+		writeError(rw, http.StatusServiceUnavailable, "leader proxy unavailable", "LEADER_UNAVAILABLE")
+	}
+	origDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		origDirector(req)
+		req.Header.Set("X-Jobbie-Forwarded", "1")
+	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		resp.Header.Set("X-Jobbie-Forwarded", "1")
+		return nil
+	}
+	proxy.ServeHTTP(w, r)
+	return proxyErr
 }

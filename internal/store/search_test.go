@@ -1,18 +1,19 @@
-package store
+package store_test
 
 import (
 	"encoding/json"
 	"testing"
 
 	"github.com/user/jobbie/internal/search"
+	"github.com/user/jobbie/internal/store"
 )
 
 func TestSearchJobsByQueue(t *testing.T) {
 	s := testStore(t)
 
-	s.Enqueue(EnqueueRequest{Queue: "search.q1", Payload: json.RawMessage(`{}`)})
-	s.Enqueue(EnqueueRequest{Queue: "search.q1", Payload: json.RawMessage(`{}`)})
-	s.Enqueue(EnqueueRequest{Queue: "search.q2", Payload: json.RawMessage(`{}`)})
+	s.Enqueue(store.EnqueueRequest{Queue: "search.q1", Payload: json.RawMessage(`{}`)})
+	s.Enqueue(store.EnqueueRequest{Queue: "search.q1", Payload: json.RawMessage(`{}`)})
+	s.Enqueue(store.EnqueueRequest{Queue: "search.q2", Payload: json.RawMessage(`{}`)})
 
 	result, err := s.SearchJobs(search.Filter{Queue: "search.q1"})
 	if err != nil {
@@ -30,11 +31,11 @@ func TestSearchJobsByState(t *testing.T) {
 	s := testStore(t)
 
 	maxRetries := 1
-	s.Enqueue(EnqueueRequest{Queue: "search.state", Payload: json.RawMessage(`{}`), MaxRetries: &maxRetries})
-	s.Enqueue(EnqueueRequest{Queue: "search.state", Payload: json.RawMessage(`{}`), MaxRetries: &maxRetries})
+	s.Enqueue(store.EnqueueRequest{Queue: "search.state", Payload: json.RawMessage(`{}`), MaxRetries: &maxRetries})
+	s.Enqueue(store.EnqueueRequest{Queue: "search.state", Payload: json.RawMessage(`{}`), MaxRetries: &maxRetries})
 
 	// Fetch and fail one to make it dead
-	r, _ := s.Fetch(FetchRequest{Queues: []string{"search.state"}, WorkerID: "w", Hostname: "h"})
+	r, _ := s.Fetch(store.FetchRequest{Queues: []string{"search.state"}, WorkerID: "w", Hostname: "h"})
 	s.Fail(r.JobID, "err", "")
 
 	result, err := s.SearchJobs(search.Filter{Queue: "search.state", State: []string{"pending"}})
@@ -49,8 +50,8 @@ func TestSearchJobsByState(t *testing.T) {
 func TestSearchJobsByPayloadContains(t *testing.T) {
 	s := testStore(t)
 
-	s.Enqueue(EnqueueRequest{Queue: "search.payload", Payload: json.RawMessage(`{"email":"alice@example.com"}`)})
-	s.Enqueue(EnqueueRequest{Queue: "search.payload", Payload: json.RawMessage(`{"email":"bob@example.com"}`)})
+	s.Enqueue(store.EnqueueRequest{Queue: "search.payload", Payload: json.RawMessage(`{"email":"alice@example.com"}`)})
+	s.Enqueue(store.EnqueueRequest{Queue: "search.payload", Payload: json.RawMessage(`{"email":"bob@example.com"}`)})
 
 	result, err := s.SearchJobs(search.Filter{PayloadContains: "alice"})
 	if err != nil {
@@ -65,7 +66,7 @@ func TestSearchJobsPagination(t *testing.T) {
 	s := testStore(t)
 
 	for range 5 {
-		s.Enqueue(EnqueueRequest{Queue: "search.page", Payload: json.RawMessage(`{}`)})
+		s.Enqueue(store.EnqueueRequest{Queue: "search.page", Payload: json.RawMessage(`{}`)})
 	}
 
 	// Page 1
@@ -105,8 +106,8 @@ func TestSearchJobsPagination(t *testing.T) {
 func TestSearchJobsByTags(t *testing.T) {
 	s := testStore(t)
 
-	s.Enqueue(EnqueueRequest{Queue: "search.tags", Payload: json.RawMessage(`{}`), Tags: json.RawMessage(`{"tenant":"acme"}`)})
-	s.Enqueue(EnqueueRequest{Queue: "search.tags", Payload: json.RawMessage(`{}`), Tags: json.RawMessage(`{"tenant":"other"}`)})
+	s.Enqueue(store.EnqueueRequest{Queue: "search.tags", Payload: json.RawMessage(`{}`), Tags: json.RawMessage(`{"tenant":"acme"}`)})
+	s.Enqueue(store.EnqueueRequest{Queue: "search.tags", Payload: json.RawMessage(`{}`), Tags: json.RawMessage(`{"tenant":"other"}`)})
 
 	result, err := s.SearchJobs(search.Filter{Tags: map[string]string{"tenant": "acme"}})
 	if err != nil {
@@ -119,7 +120,7 @@ func TestSearchJobsByTags(t *testing.T) {
 
 func TestSearchDurationMs(t *testing.T) {
 	s := testStore(t)
-	s.Enqueue(EnqueueRequest{Queue: "search.dur", Payload: json.RawMessage(`{}`)})
+	s.Enqueue(store.EnqueueRequest{Queue: "search.dur", Payload: json.RawMessage(`{}`)})
 
 	result, _ := s.SearchJobs(search.Filter{})
 	if result.DurationMs < 0 {

@@ -2,26 +2,48 @@ package server
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
+	"connectrpc.com/connect"
+	"github.com/user/jobbie/internal/raft"
+	jobbiev1 "github.com/user/jobbie/internal/rpcconnect/gen/jobbie/v1"
+	"github.com/user/jobbie/internal/rpcconnect/gen/jobbie/v1/jobbiev1connect"
 	"github.com/user/jobbie/internal/store"
+	"golang.org/x/net/http2"
 )
+
+type mockCluster struct {
+	isLeader   bool
+	leaderAddr string
+}
+
+func (m mockCluster) IsLeader() bool                { return m.isLeader }
+func (m mockCluster) LeaderAddr() string            { return m.leaderAddr }
+func (m mockCluster) ClusterStatus() map[string]any { return map[string]any{"mode": "cluster"} }
+func (m mockCluster) State() string                 { return "follower" }
+func (m mockCluster) EventLog(afterSeq uint64, limit int) ([]map[string]any, error) {
+	return []map[string]any{{"seq": 1, "type": "enqueued"}}, nil
+}
 
 func testServer(t *testing.T) (*Server, *store.Store) {
 	t.Helper()
-	db, err := store.Open(t.TempDir())
+	da, err := raft.NewDirectApplier(t.TempDir())
 	if err != nil {
-		t.Fatalf("Open: %v", err)
+		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { da.Close() })
 
-	s := store.NewStore(db)
+	s := store.NewStore(da, da.SQLiteDB())
 	t.Cleanup(func() { s.Close() })
-	srv := New(s, ":0")
+	srv := New(s, nil, ":0")
 	return srv, s
 }
 
@@ -67,6 +89,39 @@ func TestEnqueueEndpoint(t *testing.T) {
 	decodeResponse(t, rr, &result)
 	if result.JobID == "" {
 		t.Error("job_id is empty")
+	}
+}
+
+func TestEnqueueEndpointUniqueFallback(t *testing.T) {
+	srv, _ := testServer(t)
+	req := map[string]any{
+		"queue":         "unique.q",
+		"payload":       map[string]string{"hello": "world"},
+		"unique_key":    "u-1",
+		"unique_period": 60,
+	}
+
+	first := doRequest(srv, "POST", "/api/v1/enqueue", req)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, body: %s", first.Code, first.Body.String())
+	}
+	var firstResult store.EnqueueResult
+	decodeResponse(t, first, &firstResult)
+	if firstResult.UniqueExisting {
+		t.Fatalf("first enqueue unexpectedly marked unique_existing")
+	}
+
+	second := doRequest(srv, "POST", "/api/v1/enqueue", req)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, body: %s", second.Code, second.Body.String())
+	}
+	var secondResult store.EnqueueResult
+	decodeResponse(t, second, &secondResult)
+	if !secondResult.UniqueExisting {
+		t.Fatalf("second enqueue should be unique_existing")
+	}
+	if secondResult.JobID != firstResult.JobID {
+		t.Fatalf("unique duplicate job_id mismatch: got %s want %s", secondResult.JobID, firstResult.JobID)
 	}
 }
 
@@ -131,6 +186,99 @@ func TestFetchAndAckEndpoints(t *testing.T) {
 	})
 	if rr.Code != http.StatusOK {
 		t.Fatalf("ack status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestFetchBatchEndpoint(t *testing.T) {
+	srv, _ := testServer(t)
+
+	for i := 0; i < 2; i++ {
+		doRequest(srv, "POST", "/api/v1/enqueue", map[string]interface{}{
+			"queue":   "fetch-batch.q",
+			"payload": map[string]int{"i": i},
+		})
+	}
+
+	rr := doRequest(srv, "POST", "/api/v1/fetch/batch", map[string]interface{}{
+		"queues":    []string{"fetch-batch.q"},
+		"worker_id": "wb",
+		"hostname":  "h1",
+		"timeout":   1,
+		"count":     2,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("fetch batch status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+
+	var out struct {
+		Jobs []store.FetchResult `json:"jobs"`
+	}
+	decodeResponse(t, rr, &out)
+	if len(out.Jobs) != 2 {
+		t.Fatalf("jobs = %d, want 2", len(out.Jobs))
+	}
+}
+
+func TestAckBatchEndpoint(t *testing.T) {
+	srv, s := testServer(t)
+
+	doRequest(srv, "POST", "/api/v1/enqueue", map[string]interface{}{
+		"queue":   "ack-batch.q",
+		"payload": map[string]string{"i": "1"},
+	})
+	doRequest(srv, "POST", "/api/v1/enqueue", map[string]interface{}{
+		"queue":   "ack-batch.q",
+		"payload": map[string]string{"i": "2"},
+	})
+
+	rr := doRequest(srv, "POST", "/api/v1/fetch", map[string]interface{}{
+		"queues":    []string{"ack-batch.q"},
+		"worker_id": "w1",
+		"hostname":  "h1",
+		"timeout":   1,
+	})
+	var job1 store.FetchResult
+	decodeResponse(t, rr, &job1)
+
+	rr = doRequest(srv, "POST", "/api/v1/fetch", map[string]interface{}{
+		"queues":    []string{"ack-batch.q"},
+		"worker_id": "w1",
+		"hostname":  "h1",
+		"timeout":   1,
+	})
+	var job2 store.FetchResult
+	decodeResponse(t, rr, &job2)
+
+	rr = doRequest(srv, "POST", "/api/v1/ack/batch", map[string]interface{}{
+		"acks": []map[string]interface{}{
+			{"job_id": job1.JobID, "result": map[string]bool{"ok": true}},
+			{"job_id": job2.JobID, "result": map[string]bool{"ok": true}},
+		},
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("ack batch status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Acked int `json:"acked"`
+	}
+	decodeResponse(t, rr, &resp)
+	if resp.Acked != 2 {
+		t.Fatalf("acked = %d, want 2", resp.Acked)
+	}
+
+	j1, err := s.GetJob(job1.JobID)
+	if err != nil {
+		t.Fatalf("get job1: %v", err)
+	}
+	if j1.State != store.StateCompleted {
+		t.Fatalf("job1 state = %s, want %s", j1.State, store.StateCompleted)
+	}
+	j2, err := s.GetJob(job2.JobID)
+	if err != nil {
+		t.Fatalf("get job2: %v", err)
+	}
+	if j2.State != store.StateCompleted {
+		t.Fatalf("job2 state = %s, want %s", j2.State, store.StateCompleted)
 	}
 }
 
@@ -274,6 +422,27 @@ func TestClusterStatusEndpoint(t *testing.T) {
 	}
 }
 
+func TestClusterEventsEndpoint(t *testing.T) {
+	da, err := raft.NewDirectApplier(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewDirectApplier: %v", err)
+	}
+	t.Cleanup(func() { da.Close() })
+	s := store.NewStore(da, da.SQLiteDB())
+	srv := New(s, mockCluster{isLeader: true}, ":0")
+	rr := doRequest(srv, "GET", "/api/v1/cluster/events?limit=10", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("cluster events status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Events []map[string]any `json:"events"`
+	}
+	decodeResponse(t, rr, &out)
+	if len(out.Events) == 0 {
+		t.Fatalf("expected events")
+	}
+}
+
 func TestWorkersEndpoint(t *testing.T) {
 	srv, _ := testServer(t)
 	rr := doRequest(srv, "GET", "/api/v1/workers", nil)
@@ -290,5 +459,184 @@ func TestCORSHeaders(t *testing.T) {
 	}
 	if rr.Header().Get("Access-Control-Allow-Origin") != "*" {
 		t.Error("missing CORS header")
+	}
+}
+
+func TestWriteProxyToLeader(t *testing.T) {
+	leaderSrv, leaderStore := testServer(t)
+	leaderTS := httptest.NewServer(leaderSrv.Handler())
+	defer leaderTS.Close()
+
+	leaderURL, err := url.Parse(leaderTS.URL)
+	if err != nil {
+		t.Fatalf("parse leader URL: %v", err)
+	}
+
+	da, err := raft.NewDirectApplier(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewDirectApplier: %v", err)
+	}
+	defer da.Close()
+	followerStore := store.NewStore(da, da.SQLiteDB())
+	defer followerStore.Close()
+
+	followerSrv := New(followerStore, mockCluster{
+		isLeader:   false,
+		leaderAddr: leaderURL.String(),
+	}, ":0")
+	followerTS := httptest.NewServer(followerSrv.Handler())
+	defer followerTS.Close()
+
+	body, _ := json.Marshal(map[string]any{
+		"queue":   "proxy.q",
+		"payload": map[string]string{"k": "v"},
+	})
+	resp, err := http.Post(followerTS.URL+"/api/v1/enqueue", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST enqueue via follower: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(data))
+	}
+
+	var result store.EnqueueResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode enqueue response: %v", err)
+	}
+	if result.JobID == "" {
+		t.Fatal("empty job ID")
+	}
+	if _, err := leaderStore.GetJob(result.JobID); err != nil {
+		t.Fatalf("job not created on leader: %v", err)
+	}
+}
+
+func TestConnectWorkerLifecycle(t *testing.T) {
+	srv, s := testServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	client := jobbiev1connect.NewWorkerServiceClient(ts.Client(), ts.URL)
+
+	enqResp, err := client.Enqueue(context.Background(), connect.NewRequest(&jobbiev1.EnqueueRequest{
+		Queue:       "connect.q",
+		PayloadJson: `{"hello":"connect"}`,
+	}))
+	if err != nil {
+		t.Fatalf("connect enqueue: %v", err)
+	}
+	jobID := enqResp.Msg.GetJobId()
+	if jobID == "" {
+		t.Fatal("empty job_id")
+	}
+
+	fetchResp, err := client.Fetch(context.Background(), connect.NewRequest(&jobbiev1.FetchRequest{
+		Queues:        []string{"connect.q"},
+		WorkerId:      "w1",
+		Hostname:      "h1",
+		LeaseDuration: 10,
+	}))
+	if err != nil {
+		t.Fatalf("connect fetch: %v", err)
+	}
+	if !fetchResp.Msg.GetFound() {
+		t.Fatal("fetch returned not found")
+	}
+	if fetchResp.Msg.GetJobId() != jobID {
+		t.Fatalf("fetched job_id = %s want %s", fetchResp.Msg.GetJobId(), jobID)
+	}
+
+	if _, err := client.Ack(context.Background(), connect.NewRequest(&jobbiev1.AckRequest{
+		JobId:      jobID,
+		ResultJson: `{"ok":true}`,
+	})); err != nil {
+		t.Fatalf("connect ack: %v", err)
+	}
+
+	job, err := s.GetJob(jobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.State != store.StateCompleted {
+		t.Fatalf("state = %s want completed", job.State)
+	}
+}
+
+func TestConnectWorkerLifecycleStream(t *testing.T) {
+	srv, s := testServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	tr := &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+	httpClient := &http.Client{Transport: tr}
+	client := jobbiev1connect.NewWorkerServiceClient(httpClient, ts.URL)
+	if _, err := client.Enqueue(context.Background(), connect.NewRequest(&jobbiev1.EnqueueRequest{
+		Queue:       "connect.stream.q",
+		PayloadJson: `{}`,
+	})); err != nil {
+		t.Fatalf("connect enqueue 1: %v", err)
+	}
+	if _, err := client.Enqueue(context.Background(), connect.NewRequest(&jobbiev1.EnqueueRequest{
+		Queue:       "connect.stream.q",
+		PayloadJson: `{}`,
+	})); err != nil {
+		t.Fatalf("connect enqueue 2: %v", err)
+	}
+
+	stream := client.StreamLifecycle(context.Background())
+	defer stream.CloseRequest()
+
+	if err := stream.Send(&jobbiev1.LifecycleStreamRequest{
+		RequestId:     1,
+		Queues:        []string{"connect.stream.q"},
+		WorkerId:      "w1",
+		Hostname:      "h1",
+		LeaseDuration: 10,
+		FetchCount:    2,
+	}); err != nil {
+		t.Fatalf("stream send fetch: %v", err)
+	}
+	fetchResp, err := stream.Receive()
+	if err != nil {
+		t.Fatalf("stream receive fetch: %v", err)
+	}
+	if len(fetchResp.GetJobs()) != 2 {
+		t.Fatalf("fetched jobs = %d, want 2", len(fetchResp.GetJobs()))
+	}
+
+	acks := make([]*jobbiev1.AckBatchItem, 0, 2)
+	for _, job := range fetchResp.GetJobs() {
+		acks = append(acks, &jobbiev1.AckBatchItem{JobId: job.GetJobId(), ResultJson: `{"ok":true}`})
+	}
+	if err := stream.Send(&jobbiev1.LifecycleStreamRequest{
+		RequestId: 2,
+		Acks:      acks,
+	}); err != nil {
+		t.Fatalf("stream send ack: %v", err)
+	}
+	ackResp, err := stream.Receive()
+	if err != nil {
+		t.Fatalf("stream receive ack: %v", err)
+	}
+	if ackResp.GetAcked() != 2 {
+		t.Fatalf("acked = %d, want 2", ackResp.GetAcked())
+	}
+
+	for _, job := range fetchResp.GetJobs() {
+		got, err := s.GetJob(job.GetJobId())
+		if err != nil {
+			t.Fatalf("GetJob: %v", err)
+		}
+		if got.State != store.StateCompleted {
+			t.Fatalf("job %s state = %s want completed", job.GetJobId(), got.State)
+		}
 	}
 }

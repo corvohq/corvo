@@ -2,25 +2,27 @@ package scheduler
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/user/jobbie/internal/raft"
 	"github.com/user/jobbie/internal/store"
 )
 
-func testSetup(t *testing.T) (*store.Store, *Scheduler, *store.DB) {
+func testSetup(t *testing.T) (*store.Store, *Scheduler, *sql.DB) {
 	t.Helper()
-	db, err := store.Open(t.TempDir())
+	da, err := raft.NewDirectApplier(t.TempDir())
 	if err != nil {
-		t.Fatalf("Open() error: %v", err)
+		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { da.Close() })
 
-	s := store.NewStore(db)
+	s := store.NewStore(da, da.SQLiteDB())
 	t.Cleanup(func() { s.Close() })
-	sched := New(db.Write, DefaultConfig())
-	return s, sched, db
+	sched := New(s, nil, DefaultConfig())
+	return s, sched, da.SQLiteDB()
 }
 
 func TestPromoteScheduledJobs(t *testing.T) {
@@ -39,7 +41,7 @@ func TestPromoteScheduledJobs(t *testing.T) {
 
 	// Verify it's scheduled
 	var state string
-	db.Read.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
+	db.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
 	if state != "scheduled" {
 		t.Fatalf("job state = %q, want 'scheduled'", state)
 	}
@@ -48,7 +50,7 @@ func TestPromoteScheduledJobs(t *testing.T) {
 	sched.RunOnce()
 
 	// Verify it's now pending
-	db.Read.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
+	db.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
 	if state != "pending" {
 		t.Errorf("job state after promote = %q, want 'pending'", state)
 	}
@@ -59,10 +61,10 @@ func TestPromoteRetryingJobs(t *testing.T) {
 
 	maxRetries := 3
 	result, _ := s.Enqueue(store.EnqueueRequest{
-		Queue:          "retry.queue",
-		Payload:        json.RawMessage(`{}`),
-		MaxRetries:     &maxRetries,
-		RetryBackoff:   "none",
+		Queue:        "retry.queue",
+		Payload:      json.RawMessage(`{}`),
+		MaxRetries:   &maxRetries,
+		RetryBackoff: "none",
 	})
 	s.Fetch(store.FetchRequest{Queues: []string{"retry.queue"}, WorkerID: "w", Hostname: "h"})
 	s.Fail(result.JobID, "err", "")
@@ -72,7 +74,7 @@ func TestPromoteRetryingJobs(t *testing.T) {
 	sched.RunOnce()
 
 	var state string
-	db.Read.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
+	db.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
 	if state != "pending" {
 		t.Errorf("job state after promote = %q, want 'pending'", state)
 	}
@@ -92,13 +94,13 @@ func TestReclaimExpiredLeases(t *testing.T) {
 		LeaseDuration: 1, // 1 second lease
 	})
 
-	// Set lease to expired
-	db.Write.Exec("UPDATE jobs SET lease_expires_at = strftime('%Y-%m-%dT%H:%M:%f', 'now', '-10 seconds') WHERE id = ?", result.JobID)
+	// Wait for lease to expire.
+	time.Sleep(1100 * time.Millisecond)
 
 	sched.RunOnce()
 
 	var state string
-	db.Read.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
+	db.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
 	if state != "pending" {
 		t.Errorf("job state after reclaim = %q, want 'pending'", state)
 	}
@@ -108,51 +110,28 @@ func TestCleanExpiredUniqueLocks(t *testing.T) {
 	_, sched, db := testSetup(t)
 
 	// Insert an expired unique lock
-	db.Write.Exec(
+	db.Exec(
 		"INSERT INTO unique_locks (queue, unique_key, job_id, expires_at) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%f', 'now', '-10 seconds'))",
 		"q", "k", "j",
 	)
 
 	var count int
-	db.Read.QueryRow("SELECT COUNT(*) FROM unique_locks").Scan(&count)
+	db.QueryRow("SELECT COUNT(*) FROM unique_locks").Scan(&count)
 	if count != 1 {
 		t.Fatalf("unique_locks count = %d, want 1", count)
 	}
 
 	sched.RunOnce()
 
-	db.Read.QueryRow("SELECT COUNT(*) FROM unique_locks").Scan(&count)
+	db.QueryRow("SELECT COUNT(*) FROM unique_locks").Scan(&count)
 	if count != 0 {
 		t.Errorf("unique_locks count after cleanup = %d, want 0", count)
 	}
 }
 
-func TestCleanOldEvents(t *testing.T) {
-	_, sched, db := testSetup(t)
-	sched.config.EventRetention = 1 * time.Second
-
-	// Insert an old event
-	db.Write.Exec(
-		"INSERT INTO events (type, created_at) VALUES ('test', strftime('%Y-%m-%dT%H:%M:%f', 'now', '-10 seconds'))",
-	)
-
-	var count int
-	db.Read.QueryRow("SELECT COUNT(*) FROM events").Scan(&count)
-	if count != 1 {
-		t.Fatalf("events count = %d, want 1", count)
-	}
-
-	sched.RunOnce()
-
-	db.Read.QueryRow("SELECT COUNT(*) FROM events").Scan(&count)
-	if count != 0 {
-		t.Errorf("events count after cleanup = %d, want 0", count)
-	}
-}
-
 func TestSchedulerGracefulStop(t *testing.T) {
-	_, _, db := testSetup(t)
-	sched := New(db.Write, Config{Interval: 50 * time.Millisecond})
+	s, _, _ := testSetup(t)
+	sched := New(s, nil, Config{Interval: 50 * time.Millisecond})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

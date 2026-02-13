@@ -5,21 +5,22 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/user/jobbie/internal/raft"
 	"github.com/user/jobbie/internal/server"
 	"github.com/user/jobbie/internal/store"
 )
 
 func testClient(t *testing.T) *Client {
 	t.Helper()
-	db, err := store.Open(t.TempDir())
+	da, err := raft.NewDirectApplier(t.TempDir())
 	if err != nil {
-		t.Fatalf("Open: %v", err)
+		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { da.Close() })
 
-	s := store.NewStore(db)
+	s := store.NewStore(da, da.SQLiteDB())
 	t.Cleanup(func() { s.Close() })
-	srv := server.New(s, ":0")
+	srv := server.New(s, nil, ":0")
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 

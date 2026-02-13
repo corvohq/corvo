@@ -2,40 +2,68 @@ package scheduler
 
 import (
 	"context"
-	"database/sql"
 	"log/slog"
 	"time"
+
+	"github.com/user/jobbie/internal/store"
 )
 
 // Config holds scheduler configuration.
 type Config struct {
-	Interval       time.Duration // how often to run sweep (default 1s)
-	EventRetention time.Duration // how long to keep events (default 24h)
+	Interval               time.Duration // base tick cadence (default 1s)
+	PromoteInterval        time.Duration // promote scheduled/retrying jobs
+	ReclaimInterval        time.Duration // reclaim expired leases
+	CleanUniqueInterval    time.Duration // clean expired unique locks
+	CleanRateLimitInterval time.Duration // clean old rate limit windows
 }
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		Interval:       1 * time.Second,
-		EventRetention: 24 * time.Hour,
+		Interval:               1 * time.Second,
+		PromoteInterval:        1 * time.Second,
+		ReclaimInterval:        1 * time.Second,
+		CleanUniqueInterval:    30 * time.Second,
+		CleanRateLimitInterval: 30 * time.Second,
 	}
+}
+
+// LeaderCheck is an optional interface that, if provided, restricts the scheduler
+// to only run on the Raft leader node.
+type LeaderCheck interface {
+	IsLeader() bool
 }
 
 // Scheduler runs periodic maintenance tasks.
 type Scheduler struct {
-	writeDB *sql.DB
-	config  Config
+	store       *store.Store
+	leaderCheck LeaderCheck
+	config      Config
+	lastPromote time.Time
+	lastReclaim time.Time
+	lastUnique  time.Time
+	lastRate    time.Time
 }
 
-// New creates a new Scheduler.
-func New(writeDB *sql.DB, config Config) *Scheduler {
+// New creates a new Scheduler. If leaderCheck is nil, the scheduler always runs.
+func New(s *store.Store, leaderCheck LeaderCheck, config Config) *Scheduler {
+	def := DefaultConfig()
 	if config.Interval == 0 {
-		config.Interval = 1 * time.Second
+		config.Interval = def.Interval
 	}
-	if config.EventRetention == 0 {
-		config.EventRetention = 24 * time.Hour
+	if config.PromoteInterval == 0 {
+		config.PromoteInterval = def.PromoteInterval
 	}
-	return &Scheduler{writeDB: writeDB, config: config}
+	if config.ReclaimInterval == 0 {
+		config.ReclaimInterval = def.ReclaimInterval
+	}
+	if config.CleanUniqueInterval == 0 {
+		config.CleanUniqueInterval = def.CleanUniqueInterval
+	}
+	if config.CleanRateLimitInterval == 0 {
+		config.CleanRateLimitInterval = def.CleanRateLimitInterval
+	}
+	return &Scheduler{store: s, leaderCheck: leaderCheck, config: config}
 }
 
 // Run starts the scheduler loop. It blocks until the context is cancelled.
@@ -50,95 +78,46 @@ func (s *Scheduler) Run(ctx context.Context) {
 			slog.Info("scheduler stopped")
 			return
 		case <-ticker.C:
-			s.tick()
+			s.tick(false)
 		}
 	}
 }
 
-func (s *Scheduler) tick() {
-	s.promoteScheduledJobs()
-	s.reclaimExpiredLeases()
-	s.cleanExpiredUniqueLocks()
-	s.cleanOldEvents()
-	s.cleanOldRateLimitEntries()
-}
-
-// promoteScheduledJobs moves scheduled/retrying jobs to pending when their scheduled_at time has passed.
-func (s *Scheduler) promoteScheduledJobs() {
-	result, err := s.writeDB.Exec(`
-		UPDATE jobs SET state = 'pending', scheduled_at = NULL
-		WHERE state IN ('scheduled', 'retrying')
-		  AND scheduled_at <= strftime('%Y-%m-%dT%H:%M:%f', 'now', '+0.001 seconds')
-	`)
-	if err != nil {
-		slog.Error("promote scheduled jobs", "error", err)
+func (s *Scheduler) tick(force bool) {
+	// Only run on the leader node
+	if s.leaderCheck != nil && !s.leaderCheck.IsLeader() {
 		return
 	}
-	if n, _ := result.RowsAffected(); n > 0 {
-		slog.Debug("promoted jobs", "count", n)
-	}
-}
 
-// reclaimExpiredLeases resets active jobs whose leases have expired back to pending.
-func (s *Scheduler) reclaimExpiredLeases() {
-	result, err := s.writeDB.Exec(`
-		UPDATE jobs SET state = 'pending', worker_id = NULL, hostname = NULL, lease_expires_at = NULL
-		WHERE state = 'active'
-		  AND lease_expires_at < strftime('%Y-%m-%dT%H:%M:%f', 'now')
-	`)
-	if err != nil {
-		slog.Error("reclaim expired leases", "error", err)
-		return
-	}
-	if n, _ := result.RowsAffected(); n > 0 {
-		slog.Warn("reclaimed expired leases", "count", n)
-	}
-}
+	now := time.Now()
 
-// cleanExpiredUniqueLocks removes unique locks that have expired.
-func (s *Scheduler) cleanExpiredUniqueLocks() {
-	result, err := s.writeDB.Exec(`
-		DELETE FROM unique_locks WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%f', 'now')
-	`)
-	if err != nil {
-		slog.Error("clean expired unique locks", "error", err)
-		return
+	if force || now.Sub(s.lastPromote) >= s.config.PromoteInterval {
+		if err := s.store.Promote(); err != nil {
+			slog.Error("promote scheduled jobs", "error", err)
+		}
+		s.lastPromote = now
 	}
-	if n, _ := result.RowsAffected(); n > 0 {
-		slog.Debug("cleaned expired unique locks", "count", n)
+	if force || now.Sub(s.lastReclaim) >= s.config.ReclaimInterval {
+		if err := s.store.Reclaim(); err != nil {
+			slog.Error("reclaim expired leases", "error", err)
+		}
+		s.lastReclaim = now
 	}
-}
-
-// cleanOldEvents removes events older than the retention period.
-func (s *Scheduler) cleanOldEvents() {
-	retentionSeconds := int(s.config.EventRetention.Seconds())
-	result, err := s.writeDB.Exec(`
-		DELETE FROM events WHERE created_at < strftime('%Y-%m-%dT%H:%M:%f', 'now', '-' || ? || ' seconds')
-	`, retentionSeconds)
-	if err != nil {
-		slog.Error("clean old events", "error", err)
-		return
+	if force || now.Sub(s.lastUnique) >= s.config.CleanUniqueInterval {
+		if err := s.store.CleanUniqueLocks(); err != nil {
+			slog.Error("clean expired unique locks", "error", err)
+		}
+		s.lastUnique = now
 	}
-	if n, _ := result.RowsAffected(); n > 0 {
-		slog.Debug("cleaned old events", "count", n)
-	}
-}
-
-// cleanOldRateLimitEntries removes rate limit window entries older than 5 minutes.
-func (s *Scheduler) cleanOldRateLimitEntries() {
-	result, err := s.writeDB.Exec(`
-		DELETE FROM rate_limit_window WHERE fetched_at < strftime('%Y-%m-%dT%H:%M:%f', 'now', '-300 seconds')
-	`)
-	if err != nil {
-		slog.Error("clean old rate limit entries", "error", err)
-		return
-	}
-	if n, _ := result.RowsAffected(); n > 0 {
-		slog.Debug("cleaned old rate limit entries", "count", n)
+	if force || now.Sub(s.lastRate) >= s.config.CleanRateLimitInterval {
+		if err := s.store.CleanRateLimits(); err != nil {
+			slog.Error("clean old rate limit entries", "error", err)
+		}
+		s.lastRate = now
 	}
 }
 
 // RunOnce executes a single scheduler tick. Useful for testing.
 func (s *Scheduler) RunOnce() {
-	s.tick()
+	s.tick(true)
 }

@@ -1,6 +1,6 @@
 # Jobbie
 
-An open-source, language-agnostic job processing system built in Go with embedded SQLite and Raft consensus.
+An open-source, language-agnostic job processing system built in Go with a Pebble + SQLite hybrid storage engine and Raft consensus.
 
 Single binary. Single process. Automatic clustering. Great UI. Built for Kubernetes. Thin HTTP clients for every language.
 
@@ -15,7 +15,7 @@ Jobbie takes the best ideas from both, gives away every feature for free in OSS,
 ## Design principles
 
 1. **Smart server, dumb clients** — all job lifecycle logic (retries, backoff, unique enforcement, priority routing, rate limiting, scheduling) lives in the server. Clients are thin HTTP wrappers. Fixing a bug in the server is one deploy; fixing a bug in a client is N upgrades across N teams.
-2. **Single binary, single process, zero dependencies** — `jobbie server` starts everything: the HTTP API, the web UI, the scheduler, and an embedded SQLite database. No external database, message broker, or infrastructure to set up.
+2. **Single binary, single process, zero dependencies** — `jobbie server` starts everything: the HTTP API, the web UI, the scheduler, and embedded Pebble + SQLite storage. No external database, message broker, or infrastructure to set up.
 3. **Clustering that manages itself** — run 3 replicas and Jobbie handles Raft leader election, data replication, and automatic failover. No external coordination service (no Consul, no etcd, no Zookeeper).
 4. **Language-agnostic by default** — the wire protocol is HTTP/JSON. A client library is ~100–200 lines in any language. You can enqueue a job with `curl`.
 5. **Kubernetes-native** — graceful shutdown, horizontal scaling, health checks, and StatefulSet clustering are first-class, not afterthoughts.
@@ -59,25 +59,33 @@ Everything pgboss and Faktory Enterprise offer, in a single free OSS package:
 ┌──────────────────────────────────────────────────────────────────────┐
 │  Jobbie Server (single Go binary)                                    │
 │                                                                      │
-│  ┌─────────────────┐  ┌──────────────┐  ┌────────────────────────┐  │
-│  │ Embedded SQLite  │  │  HTTP API    │  │  Web UI (embedded SPA) │  │
-│  │ (in-process)     │  │  :8080       │  │  :8080/ui              │  │
-│  │                  │  │              │  │                        │  │
-│  │  WAL mode        │  │  JSON API    │  │  Real-time via SSE     │  │
-│  │  json_extract()  │  │  for all     │  │                        │  │
-│  │  SQL txns        │  │  operations  │  │                        │  │
-│  └────────┬─────────┘  └──────┬───────┘  └────────────────────────┘  │
-│           │                   │                                      │
-│  ┌────────┴───────────────────┴──────────────────────────────────┐   │
-│  │  Jobbie Core                                                  │   │
-│  │  - Job lifecycle engine (enqueue, retry, backoff, DLQ)        │   │
-│  │  - Unique job enforcement (atomic SQL transactions)           │   │
-│  │  - Scheduler (cron + delayed jobs)                            │   │
-│  │  - Batch tracker                                              │   │
-│  │  - Rate limiter                                               │   │
-│  │  - Raft consensus (leader election, replication, failover)    │   │
-│  │  - Metrics collector (Prometheus)                             │   │
-│  └───────────────────────────────────────────────────────────────┘   │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐     │
+│  │  HTTP API    │  │  Web UI      │  │  RPC (internal)        │     │
+│  │  :8080       │  │  :8080/ui    │  │  cluster comms         │     │
+│  └──────┬───────┘  └──────┬───────┘  └────────────┬───────────┘     │
+│         │                 │                        │                 │
+│  ┌──────┴─────────────────┴────────────────────────┴──────────────┐  │
+│  │  Store Layer (same public API for all callers)                 │  │
+│  │  - Writes: serialize Op → raft.Apply() → FSM                  │  │
+│  │  - Reads: query local SQLite directly                         │  │
+│  └──────┬──────────────────────────────────────────┬──────────────┘  │
+│         │                                          │                 │
+│  ┌──────┴──────────────────┐  ┌────────────────────┴──────────────┐  │
+│  │  Raft Consensus         │  │  Scheduler (leader-only)          │  │
+│  │  (hashicorp/raft)       │  │  - Cron evaluation                │  │
+│  │  - Leader election      │  │  - Delayed job promotion          │  │
+│  │  - Log replication      │  │  - Lease reclamation              │  │
+│  │  - Automatic failover   │  │  - Expired job cleanup            │  │
+│  └──────┬──────────────────┘  └───────────────────────────────────┘  │
+│         │                                                            │
+│  ┌──────┴──────────────────────────────────────────────────────────┐  │
+│  │  FSM (Finite State Machine) — applied on every node             │  │
+│  │  ┌─────────────────────┐  ┌──────────────────────────────────┐  │  │
+│  │  │ Pebble (LSM-tree)   │  │ SQLite (materialized view)       │  │  │
+│  │  │ Source of truth      │  │ Rich queries, search, dashboard  │  │  │
+│  │  │ Pure Go, no CGO     │  │ WAL mode, json_extract()         │  │  │
+│  │  └─────────────────────┘  └──────────────────────────────────┘  │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
 │                                                                      │
 │  Exposed ports:                                                      │
 │    :8080  — HTTP API + UI + worker protocol (public)                 │
@@ -96,20 +104,53 @@ Everything pgboss and Faktory Enterprise offer, in a single free OSS package:
    └────────────────────────────────────┘
 ```
 
+### Write and read paths
+
+```
+Write (enqueue, fetch, ack, fail, heartbeat):
+  Client → HTTP/RPC → Store.Enqueue()
+    → Cluster.Apply(opType, data)
+      → admission control (per-queue + global in-flight limits)
+      → applyCh (buffered pending queue)
+      → applyLoop (group-commit batching with adaptive timer)
+      → applyExecLoop → flushApplyBatch (sub-batch splitting)
+        → raft.Apply(batch) → FSM.Apply():
+                                ├─ Pebble batch (source of truth)
+                                └─ SQLite mirror (materialized view, async or sync)
+
+Read (search, get job, list queues, list workers):
+  Client → HTTP → Store.SearchJobs() → SQLite read (local, no Raft round-trip)
+```
+
+- **Writes**: serialize as Op → admission control → group-commit batch → raft.Apply → FSM applies to Pebble + SQLite on all nodes
+- **Reads**: query local SQLite directly (any node)
+- **Fetch** is a write (claims a job) → goes through Raft
+- **Leader forwarding**: followers proxy write requests to the leader internally (transparent to clients)
+- **Determinism**: all timestamps pre-computed by leader (FSM never calls `time.Now()`)
+- **Backpressure**: overloaded requests are rejected with `429 Too Many Requests` and a dynamic `Retry-After` header
+
 ### Components
 
-**Embedded SQLite** (in-process via mattn/go-sqlite3, no child process)
-- SQLite is compiled into the Go binary via CGo — truly single process
-- WAL mode for concurrent reads during writes
-- All job state, queues, indexes, and metadata stored in SQL tables
-- SQL transactions provide atomicity for complex features (unique jobs, rate limiting, batch tracking)
-- Durable by default — WAL with `synchronous=FULL`
+**Pebble** (CockroachDB's pure-Go LSM-tree KV store — source of truth)
+- All job state stored as sorted key-value pairs with byte-sortable keys
+- Handles the write-heavy hot path (enqueue, fetch, ack, fail)
+- Pure Go — no CGO dependency for the write path
+- Atomic batch writes for multi-key operations
+- Prefix iteration for efficient queue scanning (fetch = seek to `p|{queue}\x00`, first key is highest-priority oldest job)
+
+**SQLite** (local materialized view per node)
+- Mirrors Pebble state for rich queries: search, dashboard, management UI
+- WAL mode for concurrent reads
+- `json_extract()` for payload search, full SQL query builder for filters
+- Updated inside FSM Apply alongside Pebble — if SQLite write fails, log error but don't fail Raft apply (SQLite is rebuildable from Pebble)
 
 **Raft consensus** (hashicorp/raft, built into the binary)
 - All write operations (enqueue, ack, fail, state transitions) go through Raft log
+- FSM applies each committed entry to both Pebble (source of truth) and SQLite (materialized view)
 - Reads served directly from local SQLite (no Raft round-trip)
-- Snapshots are full SQLite database copies
+- Snapshots: Pebble checkpoint (hard links, nearly free) + SQLite VACUUM INTO backup
 - Log compaction keeps disk usage bounded
+- Configurable Raft log/stable store backend via `--raft-store`: `bolt` (default, BoltDB), `badger` (BadgerDB), or `pebble`
 
 **Jobbie HTTP Server** (Go, net/http + chi router)
 - Serves the worker protocol (enqueue, fetch, ack, fail, heartbeat, progress)
@@ -155,6 +196,10 @@ Search and bulk operations:
 
 Server and cluster:
 - `jobbie server` — start the server
+- `jobbie server --bootstrap` — bootstrap a new single-node cluster
+- `jobbie server --join <addr>` — join an existing cluster
+- `jobbie server --raft-bind :9000` — Raft transport address
+- `jobbie server --node-id node-1` — unique node ID
 - `jobbie status` — show queue stats + cluster health
 - `jobbie top` — live TUI dashboard (active workers, jobs, throughput)
 - `jobbie workers` — list connected workers
@@ -623,7 +668,7 @@ GET    /api/v1/events                  — SSE stream for real-time UI updates
 
 ## SQLite schema
 
-All job state lives in SQLite. The server uses SQL transactions for atomic operations.
+SQLite serves as a local materialized view of the Pebble source of truth on each node. It is updated inside the Raft FSM Apply alongside Pebble writes. All read queries (search, dashboard, job detail) hit SQLite directly with no Raft round-trip. If SQLite becomes corrupted or stale, it can be rebuilt from Pebble.
 
 ### Tables
 
@@ -740,17 +785,6 @@ CREATE TABLE workers (
     started_at      TEXT NOT NULL
 );
 
--- Event log (ring buffer for SSE, capped by periodic cleanup)
-CREATE TABLE events (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    type       TEXT NOT NULL,                            -- enqueued, started, completed, failed, dead, cancelled, etc.
-    job_id     TEXT,
-    queue      TEXT,
-    data       TEXT,                                     -- JSON
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
-);
-CREATE INDEX idx_events_created ON events(created_at);
-
 -- Queue stats (rolling counters, updated on each state transition)
 CREATE TABLE queue_stats (
     queue      TEXT PRIMARY KEY,
@@ -806,16 +840,16 @@ Every search filter from the API maps to SQL:
 No secondary index sets to maintain, no Lua scan loops. SQLite's query planner handles index selection automatically.
 
 **Performance expectations:**
-- Indexed queries (queue + state): <5ms for up to 100k jobs
+- Read queries (indexed, queue + state): <5ms for up to 100k jobs
 - Payload search via `json_extract`: ~50ms per 100k jobs (SQLite json is fast)
 - `payload LIKE` substring search: ~100ms per 100k jobs
 - `payload_jq` expressions: translated to `json_extract` at query time
 - The response includes `"duration_ms"` so users can see query cost
-- Write throughput: ~2,000-5,000 jobs/sec per shard with `synchronous=FULL` via **write batching** — a background `BatchWriter` groups concurrent `ExecuteTx` calls into a single SQLite transaction, amortizing the ~4-6ms fsync cost across the entire batch. Without batching, individual writes are limited to ~145 ops/sec. With `--shards N`, throughput scales sub-linearly — near-linear up to ~8 shards, diminishing after ~16 as disk I/O (fsync) becomes the shared bottleneck. Clustered nodes can use `synchronous=NORMAL` (Raft provides durability) for ~2x per-shard throughput. See [Sharding](#sharding) for details.
+- Write throughput: Pebble handles the write-heavy hot path with LSM-tree batch writes, removing SQLite's single-writer bottleneck. Raft serializes writes across the cluster; single-node throughput is bounded by Pebble + SQLite materialized view update speed. Clustered nodes can use `synchronous=NORMAL` for SQLite (Raft provides durability via quorum).
 
-### Atomic operations via SQL transactions
+### Atomic operations
 
-Complex features are implemented as SQL transactions:
+Complex features are implemented as atomic Pebble batch writes inside the Raft FSM, with SQLite updated in the same Apply call. The SQL examples below show the SQLite materialized view updates:
 
 **Enqueue with unique check:**
 ```sql
@@ -899,6 +933,30 @@ DELETE FROM jobs WHERE state = 'completed'
 
 ---
 
+## Pebble key layout
+
+Pebble is the source of truth for all job state. Keys are byte-sortable. Prefix + `\x00` separator + big-endian integers:
+
+| Key Pattern | Value | Purpose |
+|---|---|---|
+| `j\|{job_id}` | Job JSON | Full job data |
+| `je\|{job_id}\x00{attempt:4BE}` | JobError JSON | Error per failed attempt |
+| `p\|{queue}\x00{priority:1B}{created_ns:8BE}{job_id}` | empty | Pending sorted set (FIFO within priority) |
+| `a\|{queue}\x00{job_id}` | lease_expires_ns:8BE | Active set |
+| `s\|{queue}\x00{scheduled_ns:8BE}{job_id}` | empty | Scheduled sorted set |
+| `r\|{queue}\x00{retry_ns:8BE}{job_id}` | empty | Retrying sorted set |
+| `qc\|{queue}` | QueueConfig JSON | Queue config (paused, concurrency, rate) |
+| `qn\|{queue}` | empty | Queue name registry |
+| `u\|{queue}\x00{unique_key}` | `{job_id}\|{expires_ns:8BE}` | Unique lock with TTL |
+| `l\|{queue}\x00{fetched_ns:8BE}{random:8BE}` | empty | Rate limit sliding window |
+| `b\|{batch_id}` | Batch JSON | Batch counters + callback |
+| `w\|{worker_id}` | Worker JSON | Worker registry |
+| `sc\|{schedule_id}` | Schedule JSON | Cron schedule |
+
+**Fetch = Seek to `p|{queue}\x00`**, first key is highest-priority oldest job. Delete pending key, add active key. This is an O(1) seek — no SQL query, no index scan.
+
+---
+
 ## Priority system
 
 Three tiers: `critical` (0), `high` (1), `normal` (2, default).
@@ -941,7 +999,7 @@ INSERT INTO jobs (...) VALUES (...);
 --    (or let the expires_at act as safety net)
 ```
 
-No race conditions — SQLite serializes transactions. The unique constraint on `(queue, unique_key)` is enforced at the database level.
+No race conditions — Raft serializes all writes through a single FSM Apply, and the unique lock is checked atomically in Pebble before the enqueue proceeds.
 
 ---
 
@@ -1242,18 +1300,19 @@ Server enforces this in the fetch query — the fetch transaction checks `SELECT
 Jobbie servers cluster automatically using hashicorp/raft for consensus and SQLite for storage. The user runs 3+ instances; Jobbie handles leader election, data replication, and automatic failover. No external coordination service required.
 
 ```
-┌──────────────────────┐   ┌──────────────────────┐   ┌──────────────────────┐
-│  Jobbie-0 (leader)   │   │  Jobbie-1 (follower)  │   │  Jobbie-2 (follower)  │
-│                      │   │                       │   │                       │
-│  ┌────────────────┐  │   │  ┌────────────────┐   │   │  ┌────────────────┐   │
-│  │ SQLite (WAL)   │  │   │  │ SQLite (WAL)   │   │   │  │ SQLite (WAL)   │   │
-│  │ via Raft FSM   │  │   │  │ via Raft FSM   │   │   │  │ via Raft FSM   │   │
-│  └────────────────┘  │   │  └────────────────┘   │   │  └────────────────┘   │
-│                      │   │                       │   │                       │
-│  HTTP API ✓          │   │  HTTP API ✓            │   │  HTTP API ✓            │
-│  Scheduler ✓         │   │  Scheduler ✗ (standby) │   │  Scheduler ✗ (standby) │
-│  Accepts writes ✓    │   │  Proxies writes →      │   │  Proxies writes →      │
-└──────────────────────┘   └───────────────────────┘   └───────────────────────┘
+┌──────────────────────────┐ ┌──────────────────────────┐ ┌──────────────────────────┐
+│  Jobbie-0 (leader)        │ │  Jobbie-1 (follower)      │ │  Jobbie-2 (follower)      │
+│                           │ │                           │ │                           │
+│  ┌──────────────────────┐ │ │  ┌──────────────────────┐ │ │  ┌──────────────────────┐ │
+│  │ Pebble (source)      │ │ │  │ Pebble (source)      │ │ │  │ Pebble (source)      │ │
+│  │ SQLite (view)        │ │ │  │ SQLite (view)        │ │ │  │ SQLite (view)        │ │
+│  │ via Raft FSM         │ │ │  │ via Raft FSM         │ │ │  │ via Raft FSM         │ │
+│  └──────────────────────┘ │ │  └──────────────────────┘ │ │  └──────────────────────┘ │
+│                           │ │                           │ │                           │
+│  HTTP API ✓               │ │  HTTP API ✓               │ │  HTTP API ✓               │
+│  Scheduler ✓              │ │  Scheduler ✗ (standby)    │ │  Scheduler ✗ (standby)    │
+│  Accepts writes ✓         │ │  Proxies writes → leader  │ │  Proxies writes → leader  │
+└──────────────────────────┘ └──────────────────────────┘ └──────────────────────────┘
          ▲                          ▲                           ▲
          └──────────────────────────┴───────────────────────────┘
                           Load balancer / k8s Service
@@ -1269,7 +1328,7 @@ Jobbie servers cluster automatically using hashicorp/raft for consensus and SQLi
 **Write path (through Raft):**
 ```
 Client → HTTP POST /api/v1/enqueue → any Jobbie node
-  → If leader: serialize SQL command → raft.Apply() → committed to quorum → applied to local SQLite → respond
+  → If leader: serialize Op → raft.Apply() → committed to quorum → FSM applies to Pebble + SQLite → respond
   → If follower: proxy request to leader internally → leader applies via Raft → respond
 ```
 
@@ -1280,76 +1339,105 @@ Client → HTTP GET /api/v1/jobs/search → any Jobbie node
   → Reads may be slightly stale on followers (typically <1ms)
 ```
 
-**Raft FSM (Finite State Machine) — ~600 lines of glue:**
+**Raft FSM (Finite State Machine):**
 
 ```go
-type JobbieFSM struct {
-    db *sql.DB  // local SQLite
+// internal/raft/fsm.go
+type FSM struct {
+    pebble *pebble.DB
+    sqlite *sql.DB  // materialized view, updated in Apply
 }
 
 // Apply is called by Raft when a log entry is committed by quorum.
-// Every write to SQLite goes through here.
-func (f *JobbieFSM) Apply(log *raft.Log) interface{} {
-    var cmd Command
-    json.Unmarshal(log.Data, &cmd)
-    switch cmd.Type {
-    case "execute":
-        result, err := f.db.Exec(cmd.SQL, cmd.Args...)
-        return &ApplyResult{Result: result, Error: err}
-    case "execute_multi":
-        tx, _ := f.db.Begin()
-        for _, stmt := range cmd.Statements {
-            tx.Exec(stmt.SQL, stmt.Args...)
-        }
-        tx.Commit()
-        return &ApplyResult{}
+// Writes to both Pebble (source of truth) and SQLite (materialized view).
+func (f *FSM) Apply(log *raft.Log) interface{} {
+    var op Op
+    json.Unmarshal(log.Data, &op)
+    switch op.Type {
+    case OpEnqueue:  return f.applyEnqueue(op.Data)
+    case OpFetch:    return f.applyFetch(op.Data)
+    case OpAck:      return f.applyAck(op.Data)
+    case OpFail:     return f.applyFail(op.Data)
+    // ... one case per OpType
     }
     return nil
 }
+```
 
-// Snapshot creates a point-in-time copy of the SQLite database.
-// Used for log compaction and bootstrapping new nodes.
-func (f *JobbieFSM) Snapshot() (raft.FSMSnapshot, error) {
-    return &sqliteSnapshot{db: f.db}, nil
-}
+Each `apply*` function:
+1. Deserialize op data
+2. Read current state from Pebble
+3. Pebble batch: write mutations
+4. Commit Pebble batch
+5. SQLite tx: mirror mutations (if SQLite write fails, log error but don't fail — SQLite is rebuildable)
+6. Return result
 
-// Restore replaces the local SQLite from a snapshot (new node joining).
-func (f *JobbieFSM) Restore(rc io.ReadCloser) error {
-    return restoreSQLiteFromReader(f.db, rc)
+```go
+// Snapshot: Pebble checkpoint (hard links, nearly free) + SQLite VACUUM INTO.
+func (f *FSM) Snapshot() (raft.FSMSnapshot, error)
+
+// Restore: Replace Pebble data dir + SQLite file from snapshot.
+func (f *FSM) Restore(rc io.ReadCloser) error
+```
+
+**Raft operations:**
+
+```go
+// internal/raft/ops.go
+type Op struct {
+    Type OpType          `json:"t"`
+    Data json.RawMessage `json:"d"`
 }
 ```
 
-**Store layer (abstraction over Raft + SQLite):**
+OpTypes: `Enqueue`, `EnqueueBatch`, `Fetch`, `Ack`, `Fail`, `Heartbeat`, `RetryJob`, `CancelJob`, `MoveJob`, `DeleteJob`, `PauseQueue`, `ResumeQueue`, `ClearQueue`, `DeleteQueue`, `SetConcurrency`, `SetThrottle`, `RemoveThrottle`, `Promote`, `Reclaim`, `BulkAction`, `CleanUnique`, `CleanRateLimit`
+
+**Cluster setup:**
+
+```go
+// internal/raft/cluster.go
+type Cluster struct {
+    raft      *raft.Raft
+    fsm       *FSM
+    applyCh   chan *applyRequest   // pending queue (buffered, ApplyMaxPending)
+    applyExec chan []*applyRequest // batched pipeline (capacity 4)
+    inFlight  map[string]int      // per-key admission counters
+    inFlightN int                 // global in-flight count
+    queueHist *durationHistogram  // queue wait time histogram
+    applyHist *durationHistogram  // raft apply time histogram
+}
+
+func NewCluster(cfg ClusterConfig) (*Cluster, error)
+func (c *Cluster) Apply(opType OpType, data any) *OpResult  // admission + group-commit batching
+func (c *Cluster) IsLeader() bool
+func (c *Cluster) LeaderAddr() string
+func (c *Cluster) SQLiteReadDB() *sql.DB  // for read queries
+func (c *Cluster) ClusterStatus() map[string]any  // includes histograms + in-flight stats
+func (c *Cluster) Shutdown() error
+```
+
+**Store layer (same public API, routes writes through Raft):**
 
 ```go
 type Store struct {
-    raft *raft.Raft
-    fsm  *JobbieFSM
+    cluster *raft.Cluster  // writes
+    sqliteR *sql.DB        // reads (materialized view)
 }
 
-// Execute sends a write through Raft consensus.
-// Blocks until committed by quorum.
-func (s *Store) Execute(sql string, args ...interface{}) error {
-    cmd := Command{Type: "execute", SQL: sql, Args: args}
-    data, _ := json.Marshal(cmd)
-    f := s.raft.Apply(data, 5*time.Second)
-    return f.Error()
-}
+// Write: serialize Op → cluster.Apply()
+func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error)
+func (s *Store) Fetch(req FetchRequest) (*FetchResult, error)
 
-// Query reads directly from local SQLite (no Raft round-trip).
-func (s *Store) Query(sql string, args ...interface{}) (*sql.Rows, error) {
-    return s.fsm.db.Query(sql, args...)
-}
-
-func (s *Store) IsLeader() bool {
-    return s.raft.State() == raft.Leader
-}
+// Read: query local SQLite directly
+func (s *Store) GetJob(id string) (*Job, error)
+func (s *Store) SearchJobs(filter search.Filter) (*SearchResult, error)
+func (s *Store) ListQueues() ([]QueueInfo, error)
 ```
 
-This pattern is battle-tested — it's essentially what rqlite does, and hashicorp/raft powers Consul, Nomad, and Vault in production.
+hashicorp/raft powers Consul, Nomad, and Vault in production. Pebble powers CockroachDB.
 
 **Peer discovery:**
-- Static: `--peers jobbie-1:9400,jobbie-2:9400`
+- Bootstrap: `--bootstrap` creates a single-node cluster, `--join <addr>` joins an existing one
 - Kubernetes: `--discover=dns` resolves peers via headless service DNS
   (`jobbie-0.jobbie.ns.svc.cluster.local`, `jobbie-1.jobbie...`, etc.)
 
@@ -1364,8 +1452,8 @@ This pattern is battle-tested — it's essentially what rqlite does, and hashico
 1. All writes go through Raft leader
 2. Leader replicates log entries to followers
 3. Once a quorum (2 of 3) acknowledges, the write is committed
-4. Each node applies committed entries to its local SQLite
-5. All nodes have identical SQLite databases
+4. Each node applies committed entries to Pebble + SQLite via FSM
+5. All nodes have identical Pebble + SQLite state
 ```
 
 **Write proxying:**
@@ -1397,9 +1485,10 @@ This pattern is battle-tested — it's essentially what rqlite does, and hashico
 **Snapshots and compaction:**
 - Raft log grows indefinitely without snapshots
 - Jobbie takes periodic snapshots (configurable, default every 10,000 log entries)
-- A snapshot is a complete copy of the SQLite database file
+- A snapshot includes a Pebble checkpoint (hard links, nearly free) + SQLite VACUUM INTO backup, tar/gzip'd for transport
 - After a snapshot, old log entries are discarded
 - New nodes joining the cluster receive the latest snapshot + recent log entries
+- Restore replaces both the Pebble data dir and SQLite file from the snapshot
 
 ### Ports
 
@@ -1431,7 +1520,7 @@ spec:
       containers:
         - name: jobbie
           image: jobbie:latest
-          args: ["server", "--cluster", "--discover=dns"]
+          args: ["server", "--discover=dns", "--raft-bind", ":9400"]
           ports:
             - containerPort: 8080
               name: api
@@ -1488,207 +1577,34 @@ spec:
 
 ```
 Mode 1: Single node (default)
-  $ jobbie server --data-dir /var/lib/jobbie
-  → Embedded SQLite, everything in one process, no clustering overhead
+  $ jobbie server --bootstrap --data-dir /var/lib/jobbie
+  → Pebble + SQLite, everything in one process, no clustering overhead
   → Raft runs in single-node mode (commits locally, no quorum needed)
+  → Durable by default: pebbleNoSync=false, raftNoSync=false (every write fsync'd)
   → Good for: dev, staging, small production, single server
-  → ~5,000 jobs/sec
 
-Mode 2: Single node, sharded (higher throughput)
-  $ jobbie server --shards 4
-  → 4 independent SQLite databases, one write lock each
-  → Queues hashed to shards automatically, or manually pinned
-  → Good for: high-throughput single server, no HA needed
-  → Near-linear to ~8 shards, diminishing after ~16 (disk I/O ceiling)
-  → 4 shards ≈ 18,000 j/s, 8 shards ≈ 32,000 j/s (NVMe SSD)
-
-Mode 3: Clustered (automatic HA)
-  $ jobbie server --cluster --peers node2:9400,node3:9400
-  or in k8s: --cluster --discover=dns
+Mode 2: Clustered (automatic HA)
+  $ jobbie server --join node1:9400 --raft-bind :9400 --node-id node-2
+  or in k8s: --discover=dns
   → 3-node Raft group, automatic leader election + failover
-  → Combines with --shards for HA + throughput
+  → Each node has its own Pebble + SQLite, kept in sync via Raft
+  → Throughput-optimized: pebbleNoSync=true, raftNoSync=true (quorum provides durability)
   → Good for: production HA, medium-to-large scale
-  → ~5,000 jobs/sec per shard (FULL sync), ~8-10K with NORMAL sync (Raft provides durability)
 
-Mode 4: Federated clusters (horizontal scaling)
+Mode 3: Federated clusters (horizontal scaling)
   → Multiple independent Jobbie clusters, each handling a subset of queues
   → Queues are assigned to clusters; workers/producers point at the right cluster
   → No code changes — just deployment configuration
-  → Good for: extreme throughput beyond single-cluster sharding ceiling
-  → Scales: N clusters × shards per cluster
+  → Good for: extreme throughput beyond single-cluster capacity
 
-Mode 5: Jobbie Cloud (managed)
+Mode 4: Jobbie Cloud (managed)
   → Customers configure workers with an API key + URL
   → Infrastructure is Jobbie's problem
 ```
 
-### Sharding
-
-SQLite is single-writer — even with WAL mode, only one write transaction proceeds at a time. This is the source of the ~5,000 jobs/sec ceiling. Sharding breaks through it by running multiple independent SQLite databases within a single Jobbie process, each with its own WAL and write lock.
-
-**Why this works:** queues are naturally independent. There is no cross-queue state in Jobbie — enqueue, fetch, ack, and fail all operate within a single queue. This is the exact property needed for sharding. Each shard handles a subset of queues, and they never coordinate.
-
-**Scaling limits:** sharding is sub-linear because all shards share the underlying disk. The main bottleneck is fsync — each write with `synchronous=FULL` flushes the WAL to disk, and concurrent fsyncs from multiple shards compete for disk I/O. On a good NVMe SSD:
-
-| Shards | Throughput (FULL sync) | Throughput (NORMAL sync, clustered) | Scaling efficiency |
-|--------|----------------------|-------------------------------------|-------------------|
-| 1      | ~5,000 j/s           | ~8,000-10,000 j/s                   | baseline          |
-| 4      | ~18,000 j/s          | ~32,000 j/s                         | ~90%              |
-| 8      | ~32,000 j/s          | ~55,000 j/s                         | ~80%              |
-| 16     | ~50,000 j/s          | ~80,000 j/s                         | ~60%              |
-| 32+    | diminishing          | diminishing                         | disk-bound        |
-
-These are estimates — actual throughput depends on disk hardware (NVMe >> SATA SSD), payload size, and read/write ratio.
-
-In clustered mode, Raft replicates data to multiple nodes before acknowledging writes. This means individual nodes can safely use `synchronous=NORMAL` (fsync less frequently) since durability is guaranteed by the Raft quorum, not a single node's disk. This roughly doubles per-shard throughput.
-
-For most workloads, 4-8 shards on a single node provides more than enough throughput. Beyond ~16 shards, federation (multiple clusters) is more effective than adding shards.
-
-#### Shard topology
-
-```
-Single Jobbie process, --shards 4:
-
-┌──────────────────────────────────────────────────────────────────────┐
-│  Jobbie Server                                                       │
-│                                                                      │
-│  ┌─────────────────┐  ┌───────────────────────────────────────────┐ │
-│  │  HTTP API        │  │  Shard Router                             │ │
-│  │  (all requests)  │──│  queue name → hash → shard index          │ │
-│  └─────────────────┘  └───────┬───────┬───────┬───────┬───────────┘ │
-│                               │       │       │       │             │
-│                          ┌────┴──┐┌───┴───┐┌──┴────┐┌─┴─────┐      │
-│                          │Shard 0││Shard 1││Shard 2││Shard 3│      │
-│                          │.db    ││.db    ││.db    ││.db    │      │
-│                          │       ││       ││       ││       │      │
-│                          │~5k j/s││~5k j/s││~5k j/s││~5k j/s│      │
-│                          └───────┘└───────┘└───────┘└───────┘      │
-│                                                                      │
-│  On disk:                                                            │
-│    /data/shard-0.db  /data/shard-1.db  /data/shard-2.db  ...        │
-│                                                                      │
-│  Total throughput: ~18,000 jobs/sec (4 shards, NVMe, FULL sync)      │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-#### Queue-to-shard mapping
-
-**Automatic (default):** hash the queue name to a shard index. Zero configuration.
-
-```bash
-jobbie server --shards 4
-```
-
-Queue `emails.send` → hash → shard 2. Queue `agents.research` → hash → shard 0. Deterministic and stable — the same queue always maps to the same shard.
-
-**Manual:** pin queues to specific shards for control.
-
-```yaml
-# jobbie.yaml
-shards:
-  count: 3
-  mapping:
-    - queues: ["agents.*", "llm.*"]         # AI workloads isolated on shard 0
-    - queues: ["emails.*", "notifs.*"]      # messaging on shard 1
-    - queues: ["*"]                         # everything else on shard 2
-```
-
-Manual mapping is useful when you want to isolate workloads — a burst of AI agent jobs won't affect email processing throughput.
-
-#### Job ID routing
-
-Ack, fail, and heartbeat are keyed by job ID, not queue name. The shard router needs to know which shard a job lives on without a lookup. This is solved by encoding the shard index in the job ID at generation time:
-
-```
-job_s0_01HX7Y2K3M...     ← shard 0
-job_s2_01HX7Y2K3N...     ← shard 2
-```
-
-The server generates job IDs at enqueue time and controls the format. When the ID comes back in ack/fail/heartbeat, the router extracts the shard index from the prefix and dispatches to the correct database. No API changes, no lookup tables.
-
-For unsharded mode (single shard, `--shards 1` or default), the ID format stays unchanged: `job_01HX7Y2K3M...`. The `_s{N}_` segment is only added when sharding is enabled.
-
-#### Cross-shard operations
-
-Most operations are single-queue and route to a single shard. A few operations span shards:
-
-| Operation | Single-shard? | Cross-shard handling |
-|---|---|---|
-| Enqueue | Yes (one queue) | — |
-| Fetch | Mostly (one queue set) | If queues span shards, fan out to each shard |
-| Ack / Fail | Yes (job ID encodes shard) | — |
-| Heartbeat | No (batch of job IDs) | Group by shard, issue parallel queries |
-| Search | Depends on filter | If queue filter → single shard. Otherwise → fan out, merge |
-| Queue list | No (all queues) | Fan out, merge |
-| Bulk ops | Depends on filter | Same as search |
-| Dashboard stats | No (aggregate) | Fan out, merge |
-
-Fan-out queries execute in parallel across shards and merge results. For dashboard/stats this is cheap — each shard returns a small result set. For unfiltered search across all shards, results are merged with cursor-based pagination (each shard maintains its own cursor, the router merges sorted results).
-
-#### Sharding + Raft clustering
-
-Sharding and clustering are orthogonal. A clustered Jobbie deployment with shards works as follows:
-
-```
-3-node cluster, 4 shards each:
-
-  Node 0 (leader)        Node 1 (follower)     Node 2 (follower)
-  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-  │ shard-0.db      │    │ shard-0.db      │    │ shard-0.db      │
-  │ shard-1.db      │◄──►│ shard-1.db      │◄──►│ shard-1.db      │
-  │ shard-2.db      │    │ shard-2.db      │    │ shard-2.db      │
-  │ shard-3.db      │    │ shard-3.db      │    │ shard-3.db      │
-  └─────────────────┘    └─────────────────┘    └─────────────────┘
-         ▲                                              ▲
-         └────────────── Raft consensus ────────────────┘
-```
-
-A single Raft group manages all shards. Each Raft log entry is tagged with a shard index. The FSM dispatches `Apply` calls to the correct shard's database. While the Raft log is sequential, the FSM can apply entries to different shards concurrently since they're independent databases with independent write locks.
-
-Snapshots include all shard databases. A joining node receives the full set.
-
-#### Multi-tenant sharding
-
-In multi-tenant deployments (Enterprise/Cloud), namespace is the primary shard key rather than queue name. Each tenant gets its own SQLite database:
-
-```
-/data/
-  ns_acme.db          ← tenant "acme" — their own emails.send, agents.research, etc.
-  ns_bigcorp.db       ← tenant "bigcorp" — their own emails.send, no collision
-  ns_startup.db       ← tenant "startup"
-```
-
-This provides:
-- **True tenant isolation** — separate files, separate write locks, separate WALs
-- **Parallel writes across tenants** — tenant A's burst doesn't block tenant B
-- **Noisy-neighbor protection** — each database has its own I/O and lock contention
-- **Per-tenant backup/restore** — `cp ns_acme.db backup/`
-- **Per-tenant migration** — move a tenant between clusters by copying a file
-
-Queue names only need to be unique within a namespace, which they naturally are. No collision between tenant A's `emails.send` and tenant B's `emails.send` — they live in different databases.
-
-For a large tenant that needs more throughput, sub-sharding splits their namespace across multiple databases:
-
-```
-/data/
-  ns_acme_s0.db       ← acme shard 0
-  ns_acme_s1.db       ← acme shard 1
-  ns_smallco.db       ← small tenant, single database is fine
-```
-
-Job IDs in multi-tenant mode encode the namespace and optional shard:
-
-```
-job_acme_01HX7Y2K3M...         ← tenant "acme", single shard
-job_acme_s0_01HX7Y2K3N...      ← tenant "acme", shard 0
-job_bigcorp_01HX7Y2K3P...      ← tenant "bigcorp"
-```
-
-The API layer extracts the namespace from the auth context (API key → namespace). The shard router uses the namespace to find the correct database. Workers interact with a single namespace and never see cross-tenant data.
-
 ### Federated clusters
 
-When a single cluster with sharding isn't enough, scale by running multiple independent clusters. Each cluster handles a subset of queues (or namespaces in multi-tenant mode).
+When a single cluster isn't enough, scale by running multiple independent clusters. Each cluster handles a subset of queues (or namespaces in multi-tenant mode).
 
 ```
                     ┌──────────────────────────────┐
@@ -1699,13 +1615,10 @@ When a single cluster with sharding isn't enough, scale by running multiple inde
               ┌────────────┴──┐     ┌─────┴───────────┐
               │  Cluster A    │     │  Cluster B       │
               │  (3 nodes)    │     │  (3 nodes)       │
-              │  4 shards     │     │  4 shards        │
               │               │     │                  │
               │  emails.*     │     │  reports.*       │
               │  notifs.*     │     │  sync.*          │
               │               │     │  analytics.*     │
-              │  ~32,000 j/s  │     │  ~32,000 j/s     │
-              │  (8 shards)   │     │  (8 shards)      │
               └───────────────┘     └──────────────────┘
 ```
 
@@ -1718,9 +1631,142 @@ Future work could add a **federation gateway** — a thin proxy that routes requ
 
 ---
 
+## Durability model
+
+Jobbie treats Pebble as rebuildable materialized state and uses the Raft log as the durability anchor.
+
+Current default behavior in all modes:
+
+```
+pebbleNoSync  = true
+raftNoSync    = true
+```
+
+This maximizes throughput and accepts power-loss risk of recent, un-fsync'd writes.
+
+### Durable mode
+
+Use `--durable` when power-loss durability is required:
+
+```
+pebbleNoSync  = true
+raftNoSync    = false
+```
+
+This enables Raft fsync per write and has a significant throughput/latency cost.
+`--durable` should be enabled only when that tradeoff is explicitly required.
+
+### Why not sync Pebble instead of Raft?
+
+`pebbleNoSync=false` with `raftNoSync=true` can make local Pebble state survive entries that Raft log storage loses on power loss, causing logical divergence on restart. For this reason, durability is controlled via Raft fsync, not Pebble fsync.
+
+### Early snapshot on leader startup
+
+After leader election, the server forces an immediate Raft snapshot. This minimizes the "pre-first-snapshot window" — the period where a crash could leave the Raft log and Pebble state inconsistent (Raft log replayed onto stale Pebble data). By snapshotting immediately, the recovery baseline is up-to-date.
+
+```go
+if cluster.IsLeader() {
+    cluster.Raft().Snapshot()  // force snapshot immediately
+}
+```
+
+### SQLite mirror durability
+
+SQLite is a materialized view — not the source of truth. If the SQLite mirror write fails, the error is logged but the Raft apply succeeds (Pebble is the source of truth). SQLite can be rebuilt from Pebble at any time.
+
+In async mirror mode (`--sqlite-mirror-async`, default for new deployments), SQLite writes are batched in a background goroutine for higher throughput. This means SQLite may lag behind Pebble by a few milliseconds. Read queries during this window may see slightly stale data, but writes are never lost.
+
+---
+
+## Write pipeline and backpressure
+
+All writes flow through a multi-stage pipeline that provides group-commit batching, admission control, and backpressure under load.
+
+### Pipeline stages
+
+```
+1. Cluster.Apply(opType, data)
+   │
+   ├─ Admission control: per-queue and global in-flight limits
+   │  (reject with OverloadedError + Retry-After if limits exceeded)
+   │
+   ├─ applyCh (buffered channel, capacity = ApplyMaxPending)
+   │  (reject with OverloadedError if full)
+   │
+   ├─ applyLoop (group-commit batcher)
+   │  Collects requests into batches, flushes on:
+   │  - Batch full (ApplyBatchMax, default 512)
+   │  - Adaptive timer fires (ApplyBatchMinWait → ApplyBatchWindow)
+   │  - Pressure heuristics shorten the timer under load
+   │
+   ├─ applyExec channel (capacity 4, pipelining)
+   │
+   ├─ applyExecLoop → flushApplyBatch
+   │  - Splits large batches into sub-batches (ApplySubBatchMax, default 128)
+   │  - Single-request batches skip multi-op marshaling
+   │  - Marshals batch as single Raft log entry → raft.Apply()
+   │
+   └─ FSM.Apply (on all nodes)
+      ├─ Pebble batch write
+      └─ SQLite mirror (sync or async)
+```
+
+### Admission control
+
+Each `Apply()` call acquires an admission slot before entering the pipeline. Two limits are enforced:
+
+| Limit | Default | Scope | Purpose |
+|---|---|---|---|
+| `ApplyMaxInFlight` | 96 | Per admission key (queue) | Prevent one hot queue from starving others |
+| `ApplyMaxTotalInFly` | 2048 | Global across all keys | Bound total memory and pipeline depth |
+
+The **admission key** is derived from the operation type. Queue-scoped operations (enqueue, fetch, pause, etc.) use `q:{queue_name}`. Operations that span multiple queues or are global use `g:*`.
+
+When a limit is hit, `Apply()` returns an `OverloadedError` with a dynamic `Retry-After` value (1–10ms) based on current backlog and in-flight ratios. The HTTP layer translates this to a `429 Too Many Requests` response.
+
+### Group-commit batching
+
+The `applyLoop` goroutine collects incoming requests and flushes them as a single Raft log entry. This amortizes the cost of Raft consensus (disk fsync + network round-trip) across many operations.
+
+The batch timer is adaptive:
+- **Low load** (few pending requests): flush quickly (`ApplyBatchMinWait`, default 100µs) for low latency
+- **Medium load** (batch size reaches `ApplyBatchExtendAt`, default 32): extend timer to `ApplyBatchWindow` (default 8ms) to collect more requests
+- **High load** (global in-flight > 75% capacity): shorten timer to flush immediately, prioritizing throughput over batching efficiency
+- **Extreme load** (global in-flight > 90%): minimum timer (20µs), near-immediate flush
+
+### Sub-batch splitting
+
+Large batches (> `ApplySubBatchMax`, default 128) are split into smaller sub-batches before calling `raft.Apply()`. This prevents a single massive Raft log entry from blocking the FSM for too long, keeping tail latencies bounded.
+
+### Configuration
+
+All pipeline parameters are configurable via `ClusterConfig`:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `ApplyBatchMax` | 512 | Max requests per batch |
+| `ApplyBatchWindow` | 8ms | Max time to wait before flushing a partial batch |
+| `ApplyBatchMinWait` | 100µs | Initial wait for low-load latency |
+| `ApplyBatchExtendAt` | 32 | Batch size threshold to widen timer |
+| `ApplyMaxPending` | 4096 | Max pending requests in queue (backpressure) |
+| `ApplyMaxInFlight` | 96 | Max in-flight per admission key |
+| `ApplyMaxTotalInFly` | 2048 | Max in-flight globally |
+| `ApplySubBatchMax` | 128 | Max requests per raft.Apply execution |
+
+### Observability
+
+The pipeline tracks two latency histograms:
+
+- **Queue time** (`queueHist`): time from `Apply()` call to batch execution start. Measures queuing/batching delay.
+- **Apply time** (`applyHist`): time for `raft.Apply()` to complete. Measures Raft consensus + FSM execution.
+
+Both histograms expose p50/p90/p99/avg and per-bucket counts via the `/api/v1/cluster/status` endpoint.
+
+---
+
 ## The UI
 
-Served by the Jobbie server as an embedded SPA (via Go's `embed.FS`). Real-time updates via SSE from the `events` table.
+Served by the Jobbie server as an embedded SPA (via Go's `embed.FS`). Real-time updates via SSE.
 
 ### Dashboard
 
@@ -2043,22 +2089,45 @@ jobbie/
 │   └── jobbie/
 │       └── main.go              # Entry point — server, CLI subcommands
 ├── internal/
+│   ├── kv/
+│   │   ├── keys.go              # Pebble key construction + prefix constants
+│   │   ├── keys_test.go         # Round-trip + sort-order tests
+│   │   ├── encoding.go          # Big-endian integer encoding
+│   │   └── encoding_test.go     # Encoding tests
+│   ├── raft/
+│   │   ├── ops.go               # Op/OpType definitions, per-op data structs
+│   │   ├── fsm.go               # FSM struct, Apply dispatch
+│   │   ├── fsm_ops.go           # One apply* function per OpType
+│   │   ├── fsm_snapshot.go      # Snapshot + Restore (Pebble checkpoint + SQLite backup)
+│   │   ├── fsm_sqlite.go        # SQLite materialized view sync helpers
+│   │   ├── eventlog.go          # Per-job lifecycle event log (optional, Pebble-backed)
+│   │   ├── cluster.go           # Raft node setup, apply pipeline, admission control
+│   │   ├── cluster_test.go      # Single + multi-node tests
+│   │   ├── config.go            # ClusterConfig struct (batch, admission, durability params)
+│   │   ├── raft_store.go        # Raft log/stable store abstraction (bolt, badger, pebble)
+│   │   ├── raft_store_badger.go # BadgerDB Raft log store implementation
+│   │   ├── raft_store_pebble.go # Pebble Raft log store implementation
+│   │   └── transport.go         # TCP transport config
 │   ├── server/
-│   │   ├── server.go            # HTTP server setup, middleware, routing
+│   │   ├── server.go            # HTTP server setup, middleware, routing, leader proxy
 │   │   ├── handlers_worker.go   # enqueue, fetch, ack, fail, heartbeat
 │   │   ├── handlers_manage.go   # queues, jobs, search, bulk operations
-│   │   └── handlers_admin.go    # cluster status, metrics, events SSE
+│   │   └── handlers_admin.go    # cluster status, metrics, healthz
 │   ├── store/
-│   │   ├── store.go             # Store struct (Raft + SQLite integration)
-│   │   ├── fsm.go               # Raft FSM: Apply, Snapshot, Restore
-│   │   ├── schema.go            # SQLite schema + migrations
-│   │   └── queries.go           # Job lifecycle SQL (enqueue, fetch, ack, etc.)
-│   ├── cluster/
-│   │   ├── raft.go              # Raft setup, bootstrap, join
-│   │   ├── transport.go         # Raft transport over TCP
-│   │   └── discovery.go         # DNS-based peer discovery for k8s
+│   │   ├── store.go             # Store struct (holds *raft.Cluster + *sql.DB for reads)
+│   │   ├── db.go                # OpenMaterializedView() — single SQLite setup
+│   │   ├── enqueue.go           # Build Op → cluster.Apply()
+│   │   ├── fetch.go             # Build Op → cluster.Apply()
+│   │   ├── ack.go               # Build Op → cluster.Apply()
+│   │   ├── fail.go              # Build Op → cluster.Apply()
+│   │   ├── heartbeat.go         # Build Op → cluster.Apply()
+│   │   ├── jobs.go              # GetJob reads SQLite; mutations through Raft
+│   │   ├── queues.go            # ListQueues reads SQLite; mutations through Raft
+│   │   ├── bulk.go              # Filter from SQLite → bulk op through Raft
+│   │   ├── search.go            # SQL query builder for search filters
+│   │   └── models.go            # All types (Job, Queue, Batch, etc.)
 │   ├── scheduler/
-│   │   └── scheduler.go         # Cron evaluation, delayed job promotion
+│   │   └── scheduler.go         # Cron evaluation, delayed job promotion (leader-only)
 │   ├── search/
 │   │   └── builder.go           # Build SQL WHERE clauses from search filters
 │   └── worker/
@@ -2074,7 +2143,7 @@ jobbie/
 ├── ui/                          # SPA (React/Solid/Svelte)
 │   └── dist/                    # Built assets, embedded via go:embed
 ├── migrations/
-│   └── 001_initial.sql          # SQLite schema
+│   └── 001_initial.sql          # SQLite materialized view schema
 ├── deploy/
 │   ├── Dockerfile
 │   ├── docker-compose.yml       # Single node quick start
@@ -2129,18 +2198,18 @@ docker run -d -p 8080:8080 -v jobbie-data:/data jobbie/jobbie
 services:
   jobbie-0:
     image: jobbie/jobbie
-    command: server --cluster --peers jobbie-1:9400,jobbie-2:9400
+    command: server --bootstrap --node-id node-0 --raft-bind :9400
     ports: ["8080:8080"]
     volumes: ["jobbie-0-data:/data"]
 
   jobbie-1:
     image: jobbie/jobbie
-    command: server --cluster --peers jobbie-0:9400,jobbie-2:9400
+    command: server --join jobbie-0:9400 --node-id node-1 --raft-bind :9400
     volumes: ["jobbie-1-data:/data"]
 
   jobbie-2:
     image: jobbie/jobbie
-    command: server --cluster --peers jobbie-0:9400,jobbie-1:9400
+    command: server --join jobbie-0:9400 --node-id node-2 --raft-bind :9400
     volumes: ["jobbie-2-data:/data"]
 
 volumes:
@@ -2188,33 +2257,50 @@ The boundary is clear: **OSS handles all job processing features. Cloud handles 
 
 ## Implementation plan
 
-### Phase 1 — Core (MVP)
+### Phase 1 — KV Key Encoding + Raft FSM
 
-- [ ] Go project scaffold (`cmd/jobbie`, `internal/server`, `internal/store`, etc.)
-- [ ] SQLite schema + migrations (mattn/go-sqlite3, WAL mode)
-- [ ] Raft FSM integration (hashicorp/raft, ~600 lines: Apply, Snapshot, Restore)
-- [ ] Store layer (writes through Raft, reads from local SQLite)
+- [ ] `internal/kv/`: key construction, prefix constants, big-endian encoding
+- [ ] Thorough sort-order tests for all key patterns
+- [ ] `internal/raft/ops.go`: Op/OpType definitions, per-op data structs
+- [ ] `internal/raft/fsm.go`: FSM struct, Apply dispatch
+- [ ] `internal/raft/fsm_ops.go`: one apply* function per OpType (Pebble batch writes)
+- [ ] `internal/raft/fsm_sqlite.go`: SQLite materialized view sync helpers
+- [ ] Test FSM directly (no networking) — Pebble + SQLite in temp dir, apply ops, verify state
+
+### Phase 2 — Raft Cluster + Store Refactor
+
+- [ ] `internal/raft/cluster.go`: Raft node setup, bootstrap, peer management
+- [ ] `internal/raft/config.go`, `transport.go`: cluster config, TCP transport
+- [ ] `internal/raft/fsm_snapshot.go`: Pebble checkpoint + SQLite VACUUM INTO, restore
+- [ ] Single-node bootstrap test, snapshot/restore test
+- [ ] Refactor `store.Store` to hold `*raft.Cluster` + `*sql.DB` for reads
+- [ ] Each store write method → build Op → cluster.Apply()
+- [ ] Read methods unchanged (query local SQLite)
+- [ ] Simplify `db.go` to `OpenMaterializedView()` — single SQLite, no events.db
+
+### Phase 3 — Core (MVP)
+
 - [ ] HTTP API: enqueue, enqueue/batch, fetch, ack, fail, heartbeat
 - [ ] Job lifecycle: pending → active → completed/failed/dead
 - [ ] Retries with configurable backoff (none, fixed, linear, exponential)
-- [ ] Priority (3 tiers via `ORDER BY priority ASC, created_at ASC`)
-- [ ] Unique jobs (unique_locks table + SQL transactions)
+- [ ] Priority (3 tiers via Pebble key sort order)
+- [ ] Unique jobs (Pebble unique lock keys with TTL)
 - [ ] Dead letter queue
 - [ ] Lease management + automatic reclamation
-- [ ] Scheduler: delayed job promotion + lease expiry sweep
+- [ ] Scheduler: delayed job promotion + lease expiry sweep (leader-only)
 - [ ] Queue management: pause, resume, clear, drain, delete
 - [ ] Job operations: cancel, delete, move to queue
-- [ ] Search API: full SQL-backed filter (queue, state, tags, timestamps, json_extract, payload_contains, etc.)
-- [ ] Bulk operations API: retry, delete, cancel, move, requeue, change_priority (by IDs + by filter)
+- [ ] Search API: full SQL-backed filter (query local SQLite materialized view)
+- [ ] Bulk operations API: filter from SQLite → bulk op through Raft
+- [ ] Server: leader proxy middleware (followers proxy writes to leader)
 - [ ] Graceful shutdown (SIGTERM handling)
-- [ ] Web UI: dashboard, queue detail with search/filter, job detail, bulk actions
-- [ ] CLI: full management commands + search + piped bulk operations
-- [ ] TypeScript client library
+- [ ] CLI: full management commands + new flags (--bootstrap, --join, --raft-bind, --node-id)
 - [ ] Go client library (in `pkg/client/`)
+- [ ] TypeScript client library
 - [ ] Docker image
 - [ ] Integration tests
 
-### Phase 2 — Production ready
+### Phase 4 — Production ready
 
 - [ ] payload_jq filter (translate jq subset to json_extract queries)
 - [ ] Async bulk operations (>10k jobs — background processing with progress SSE)
@@ -2223,45 +2309,39 @@ The boundary is clear: **OSS handles all job processing features. Cloud handles 
 - [ ] Progress reporting
 - [ ] Cancellation (pending + active via heartbeat)
 - [ ] Concurrency control (per-worker + per-queue / singleton queues)
-- [ ] Rate limiting / throttling (sliding window via rate_limit_window table)
+- [ ] Rate limiting / throttling (Pebble sliding window keys)
 - [ ] Batches with completion callbacks
 - [ ] Job expiration (TTL)
 - [ ] Real-time UI updates via SSE
 - [ ] Prometheus metrics endpoint
-- [ ] Sharding: shard router, multiple SQLite databases, queue-to-shard mapping (hash + manual config)
-- [ ] Sharding: job ID format with shard index prefix (`job_s{N}_...`)
-- [ ] Sharding: cross-shard fan-out for search, queue list, dashboard stats
-- [ ] Sharding: `--shards N` server flag + `shards` config in jobbie.yaml
+- [ ] Web UI: dashboard, queue detail with search/filter, job detail, bulk actions
 - [ ] Python client library
 - [ ] Helm chart (single node)
 
-### Phase 3 — Clustering + Ecosystem
+### Phase 5 — Clustering + Ecosystem
 
 - [ ] Multi-node Raft clustering (bootstrap, join, remove)
 - [ ] Write proxying (follower → Raft leader)
 - [ ] Automatic failover + rejoin
-- [ ] Raft snapshots + log compaction (all shards)
-- [ ] Shard-tagged Raft log entries, concurrent FSM apply across shards
+- [ ] Raft snapshots + log compaction
 - [ ] DNS-based peer discovery for Kubernetes
 - [ ] Helm chart (clustered StatefulSet)
 - [ ] Webhooks on job lifecycle events
 - [ ] Job dependencies (job B waits for job A)
-- [ ] UI: cluster status view, Raft log monitoring, per-shard throughput
+- [ ] UI: cluster status view, Raft state monitoring
 - [ ] Rust client library
 - [ ] Haskell client library
 - [ ] OpenTelemetry integration (trace job from enqueue to complete)
 - [ ] Chaos tests (kill nodes, verify recovery)
+- [ ] 3-node in-process cluster tests, leader election, failover, snapshot transfer
+- [ ] Throughput benchmarks vs old architecture
 
-### Phase 4 — Enterprise + Cloud
+### Phase 6 — Enterprise + Cloud
 
-- [ ] Multi-tenancy: namespace-per-database (SQLite file per tenant)
-- [ ] Namespace-aware shard router (namespace as primary shard key)
-- [ ] Job ID format with namespace prefix (`job_{ns}_...`, `job_{ns}_s{N}_...`)
+- [ ] Multi-tenancy (namespace isolation)
 - [ ] Auth (API keys → namespace mapping, SSO)
 - [ ] RBAC (per-namespace, per-queue permissions)
-- [ ] Per-tenant sub-sharding for large tenants
-- [ ] Per-tenant backup/restore (copy SQLite files)
-- [ ] Per-tenant migration between clusters
+- [ ] Per-tenant backup/restore
 - [ ] Managed infrastructure (Cloud)
 - [ ] Billing and usage metering
 - [ ] Audit logging
