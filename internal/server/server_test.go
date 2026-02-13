@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -886,6 +887,33 @@ func TestClusterEventsEndpoint(t *testing.T) {
 	decodeResponse(t, rr, &out)
 	if len(out.Events) == 0 {
 		t.Fatalf("expected events")
+	}
+}
+
+func TestPrometheusMetricsEndpoint(t *testing.T) {
+	srv, _ := testServer(t)
+	doRequest(srv, "POST", "/api/v1/enqueue", map[string]any{
+		"queue":   "metrics.q",
+		"payload": map[string]any{"x": 1},
+	})
+
+	rr := doRequest(srv, "GET", "/api/v1/metrics", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	if ct := rr.Header().Get("Content-Type"); !strings.Contains(ct, "text/plain") {
+		t.Fatalf("content-type = %q, want text/plain", ct)
+	}
+	body := rr.Body.String()
+	for _, needle := range []string{
+		"jobbie_throughput_enqueued_total",
+		"jobbie_queues_total",
+		"jobbie_queue_jobs",
+		"jobbie_jobs",
+	} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("metrics body missing %q", needle)
+		}
 	}
 }
 

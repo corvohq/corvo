@@ -62,6 +62,37 @@ func TestSearchJobsByPayloadContains(t *testing.T) {
 	}
 }
 
+func TestSearchJobsByPayloadJQ(t *testing.T) {
+	s := testStore(t)
+
+	s.Enqueue(store.EnqueueRequest{Queue: "search.jq", Payload: json.RawMessage(`{"email":"alice@example.com","amount":120,"tags":["vip","beta"]}`)})
+	s.Enqueue(store.EnqueueRequest{Queue: "search.jq", Payload: json.RawMessage(`{"email":"bob@example.com","amount":80,"tags":["free"]}`)})
+
+	resEq, err := s.SearchJobs(search.Filter{Queue: "search.jq", PayloadJQ: `.email == "alice@example.com"`})
+	if err != nil {
+		t.Fatalf("SearchJobs eq: %v", err)
+	}
+	if resEq.Total != 1 {
+		t.Fatalf("eq total = %d, want 1", resEq.Total)
+	}
+
+	resNum, err := s.SearchJobs(search.Filter{Queue: "search.jq", PayloadJQ: `.amount > 100`})
+	if err != nil {
+		t.Fatalf("SearchJobs numeric: %v", err)
+	}
+	if resNum.Total != 1 {
+		t.Fatalf("numeric total = %d, want 1", resNum.Total)
+	}
+
+	resContains, err := s.SearchJobs(search.Filter{Queue: "search.jq", PayloadJQ: `.tags | contains("vip")`})
+	if err != nil {
+		t.Fatalf("SearchJobs contains: %v", err)
+	}
+	if resContains.Total != 1 {
+		t.Fatalf("contains total = %d, want 1", resContains.Total)
+	}
+}
+
 func TestSearchJobsPagination(t *testing.T) {
 	s := testStore(t)
 

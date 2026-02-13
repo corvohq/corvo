@@ -94,6 +94,7 @@ export interface SearchFilter {
   priority?: string;
   tags?: Record<string, string>;
   payload_contains?: string;
+  payload_jq?: string;
   created_after?: string;
   created_before?: string;
   error_contains?: string;

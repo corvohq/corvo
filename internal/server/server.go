@@ -75,6 +75,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/cluster/status", s.handleClusterStatus)
 		r.Get("/cluster/events", s.handleClusterEvents)
 		r.Get("/events", s.handleSSE)
+		r.Get("/metrics", s.handlePrometheusMetrics)
 		r.Get("/metrics/throughput", s.handleThroughput)
 		r.Get("/usage/summary", s.handleUsageSummary)
 		r.Get("/budgets", s.handleListBudgets)

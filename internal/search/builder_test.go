@@ -51,6 +51,45 @@ func TestBuildQueryWithPayloadContains(t *testing.T) {
 	}
 }
 
+func TestBuildQueryWithPayloadJQEquality(t *testing.T) {
+	query, _, args, _, err := BuildQuery(Filter{PayloadJQ: `.template == "welcome"`})
+	if err != nil {
+		t.Fatalf("BuildQuery: %v", err)
+	}
+	if !strings.Contains(query, "json_extract(j.payload") {
+		t.Error("query should include json_extract payload_jq clause")
+	}
+	if len(args) < 4 {
+		t.Fatalf("args len = %d, want >= 4", len(args))
+	}
+	if args[0] != "$.template" {
+		t.Fatalf("arg[0] = %v, want $.template", args[0])
+	}
+	if args[1] != "welcome" {
+		t.Fatalf("arg[1] = %v, want welcome", args[1])
+	}
+}
+
+func TestBuildQueryWithPayloadJQContains(t *testing.T) {
+	query, _, args, _, err := BuildQuery(Filter{PayloadJQ: `.tags | contains("vip")`})
+	if err != nil {
+		t.Fatalf("BuildQuery: %v", err)
+	}
+	if !strings.Contains(query, "json_each") {
+		t.Error("query should include json_each for contains")
+	}
+	if args[0] != "$.tags" || args[1] != "vip" {
+		t.Fatalf("unexpected args: %#v", args[:2])
+	}
+}
+
+func TestBuildQueryWithPayloadJQInvalid(t *testing.T) {
+	_, _, _, _, err := BuildQuery(Filter{PayloadJQ: `.template ~~ "x"`})
+	if err == nil {
+		t.Fatal("expected error for invalid payload_jq")
+	}
+}
+
 func TestBuildQueryWithTimeRange(t *testing.T) {
 	now := time.Now()
 	query, _, _, _, _ := BuildQuery(Filter{CreatedAfter: &now, CreatedBefore: &now})

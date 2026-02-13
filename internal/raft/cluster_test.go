@@ -250,6 +250,64 @@ func TestClusterLateJoinAfterSnapshot(t *testing.T) {
 	waitForJobCount(t, c3.SQLiteReadDB(), jobs, 12*time.Second)
 }
 
+func TestClusterLateJoinAfterSnapshotThenFailoverReplication(t *testing.T) {
+	addr1 := testRaftAddr(t)
+	addr2 := testRaftAddr(t)
+	addr3 := testRaftAddr(t)
+
+	c1 := testCluster(t, "node-1", addr1, true)
+	defer func() {
+		if c1 != nil {
+			c1.Shutdown()
+		}
+	}()
+	if err := c1.WaitForLeader(5 * time.Second); err != nil {
+		t.Fatalf("node-1 WaitForLeader: %v", err)
+	}
+
+	c2 := testCluster(t, "node-2", addr2, false)
+	defer c2.Shutdown()
+	addVoterWithRetry(t, c1, "node-2", addr2)
+
+	s1 := store.NewStore(c1, c1.SQLiteReadDB())
+	const jobs = 100
+	for i := 0; i < jobs; i++ {
+		if _, err := s1.Enqueue(store.EnqueueRequest{
+			Queue:   "raft.snapshot.failover",
+			Payload: json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
+		}); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+	waitForJobCount(t, c2.SQLiteReadDB(), jobs, 8*time.Second)
+
+	if err := c1.Raft().Snapshot().Error(); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	c3 := testCluster(t, "node-3", addr3, false)
+	defer c3.Shutdown()
+	addVoterWithRetry(t, c1, "node-3", addr3)
+	waitForJobCount(t, c3.SQLiteReadDB(), jobs, 12*time.Second)
+
+	// Fail leader and ensure replication still works across remaining nodes.
+	c1.Shutdown()
+	c1 = nil
+	remaining := []*Cluster{c2, c3}
+	newLeader := waitForLeaderFrom(t, remaining, 10*time.Second)
+	newLeaderStore := store.NewStore(newLeader, newLeader.SQLiteReadDB())
+	enq, err := newLeaderStore.Enqueue(store.EnqueueRequest{
+		Queue:   "raft.snapshot.failover",
+		Payload: json.RawMessage(`{"post_failover":true}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue after failover: %v", err)
+	}
+
+	waitForJob(t, store.NewStore(c2, c2.SQLiteReadDB()), enq.JobID, 8*time.Second)
+	waitForJob(t, store.NewStore(c3, c3.SQLiteReadDB()), enq.JobID, 8*time.Second)
+}
+
 func TestPrepareFSMForRecoveryClearsPebbleWhenNoSnapshot(t *testing.T) {
 	root := t.TempDir()
 	pebbleDir := filepath.Join(root, "pebble")

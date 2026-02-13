@@ -15,6 +15,7 @@ type Filter struct {
 	Priority        string            `json:"priority,omitempty"`
 	Tags            map[string]string `json:"tags,omitempty"`
 	PayloadContains string            `json:"payload_contains,omitempty"`
+	PayloadJQ       string            `json:"payload_jq,omitempty"`
 	CreatedAfter    *time.Time        `json:"created_after,omitempty"`
 	CreatedBefore   *time.Time        `json:"created_before,omitempty"`
 	ScheduledAfter  *time.Time        `json:"scheduled_after,omitempty"`
@@ -83,6 +84,14 @@ func BuildQuery(f Filter) (query string, countQuery string, args []interface{}, 
 	if f.PayloadContains != "" {
 		conditions = append(conditions, "j.payload LIKE '%' || ? || '%'")
 		queryArgs = append(queryArgs, f.PayloadContains)
+	}
+	if strings.TrimSpace(f.PayloadJQ) != "" {
+		clause, args, err := translatePayloadJQ(strings.TrimSpace(f.PayloadJQ))
+		if err != nil {
+			return "", "", nil, nil, err
+		}
+		conditions = append(conditions, clause)
+		queryArgs = append(queryArgs, args...)
 	}
 
 	addTimeFilter(&conditions, &queryArgs, "j.created_at", f.CreatedAfter, f.CreatedBefore)

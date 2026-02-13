@@ -15,6 +15,7 @@ var (
 	searchState           string
 	searchPriority        string
 	searchPayloadContains string
+	searchPayloadJQ       string
 	searchErrorContains   string
 	searchTag             string
 	searchCreatedAfter    string
@@ -40,6 +41,9 @@ var searchCmd = &cobra.Command{
 		}
 		if searchPayloadContains != "" {
 			filter["payload_contains"] = searchPayloadContains
+		}
+		if searchPayloadJQ != "" {
+			filter["payload_jq"] = searchPayloadJQ
 		}
 		if searchErrorContains != "" {
 			filter["error_contains"] = searchErrorContains
@@ -149,6 +153,7 @@ func init() {
 	searchCmd.Flags().StringVar(&searchState, "state", "", "Filter by state (comma-separated)")
 	searchCmd.Flags().StringVar(&searchPriority, "priority", "", "Filter by priority")
 	searchCmd.Flags().StringVar(&searchPayloadContains, "payload-contains", "", "Payload substring search")
+	searchCmd.Flags().StringVar(&searchPayloadJQ, "payload-jq", "", "Payload jq-style filter (subset)")
 	searchCmd.Flags().StringVar(&searchErrorContains, "error-contains", "", "Error substring search")
 	searchCmd.Flags().StringVar(&searchTag, "tag", "", "Filter by tag (key=value)")
 	searchCmd.Flags().StringVar(&searchCreatedAfter, "created-after", "", "Filter by created after (RFC3339)")

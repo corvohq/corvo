@@ -75,3 +75,16 @@ func (t *ThroughputTracker) Snapshot() []ThroughputBucket {
 	}
 	return result
 }
+
+// Totals returns cumulative counts across all retained throughput buckets.
+func (t *ThroughputTracker) Totals() (enqueued, completed, failed int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.advance()
+	for i := 0; i < throughputBuckets; i++ {
+		enqueued += t.buckets[i].Enqueued
+		completed += t.buckets[i].Completed
+		failed += t.buckets[i].Failed
+	}
+	return enqueued, completed, failed
+}
