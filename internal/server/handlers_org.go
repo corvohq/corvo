@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/store"
 )
 
 func (s *Server) handleGetOrg(w http.ResponseWriter, r *http.Request) {
@@ -186,7 +186,7 @@ func (s *Server) handleCreateOrgAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := "key_" + store.NewJobID()[4:] // reuse sortable ID generation
-	rawKey := "jb_" + id[4:]            // full key starts with jb_ prefix
+	rawKey := "sk_" + id[4:]            // full key starts with sk_ (secret key) prefix
 	prefix := rawKey[:8]
 	keyHash := hashAPIKey(rawKey)
 	now := time.Now().UTC().Format(time.RFC3339Nano)

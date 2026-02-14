@@ -14,10 +14,10 @@ export default defineConfig({
     lib: {
       entry: path.resolve(__dirname, "src/lib.ts"),
       formats: ["es"],
-      fileName: "jobbie-ui",
+      fileName: "corvo-ui",
     },
     outDir: "dist/lib",
-    cssFileName: "jobbie-ui",
+    cssFileName: "corvo-ui",
     rollupOptions: {
       external: [
         "react",

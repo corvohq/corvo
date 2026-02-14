@@ -1,4 +1,4 @@
-// Library entry point — exports jobbie UI pages and SSE provider
+// Library entry point — exports corvo UI pages and SSE provider
 // for embedding in the Corvo Cloud console.
 import "./app.css";
 

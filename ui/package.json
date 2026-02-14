@@ -5,9 +5,9 @@
   "type": "module",
   "exports": {
     ".": {
-      "import": "./dist/lib/jobbie-ui.js"
+      "import": "./dist/lib/corvo-ui.js"
     },
-    "./style.css": "./dist/lib/jobbie-ui.css"
+    "./style.css": "./dist/lib/corvo-ui.css"
   },
   "scripts": {
     "dev": "vite",

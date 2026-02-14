@@ -18,19 +18,19 @@ Create your first admin key:
 ```bash
 curl -s -X POST http://localhost:8080/api/v1/auth/keys \
   -H 'Content-Type: application/json' \
-  -d '{"name":"admin","key":"jb_dev_admin_123","role":"admin","namespace":"default"}'
+  -d '{"name":"admin","key":"sk_dev_admin_123","role":"admin","namespace":"default"}'
 ```
 
 Use the key:
 
 ```bash
-curl -s http://localhost:8080/api/v1/queues -H 'X-API-Key: jb_dev_admin_123'
+curl -s http://localhost:8080/api/v1/queues -H 'X-API-Key: sk_dev_admin_123'
 ```
 
 Or with Bearer:
 
 ```bash
-curl -s http://localhost:8080/api/v1/queues -H 'Authorization: Bearer jb_dev_admin_123'
+curl -s http://localhost:8080/api/v1/queues -H 'Authorization: Bearer sk_dev_admin_123'
 ```
 
 ---
@@ -39,18 +39,18 @@ curl -s http://localhost:8080/api/v1/queues -H 'Authorization: Bearer jb_dev_adm
 
 ### Key format
 
-Keys should be generated with sufficient entropy (32+ bytes, base62 encoded). Convention: prefix with `jb_` and an environment hint for easy identification.
+Keys should be generated with sufficient entropy (32+ bytes, base62 encoded). Convention: prefix with `sk_` and an environment hint for easy identification.
 
 ```
-jb_prod_a1b2c3d4e5f6...    # production
-jb_dev_x9y8z7w6v5u4...     # development
-jb_test_m3n4o5p6q7r8...    # testing
+sk_prod_a1b2c3d4e5f6...    # production
+sk_dev_x9y8z7w6v5u4...     # development
+sk_test_m3n4o5p6q7r8...    # testing
 ```
 
 Corvo can auto-generate keys if `key` is omitted in create requests, but supplying your own is recommended. Example:
 
 ```bash
-openssl rand -base64 32 | tr -d '=/+' | sed 's/^/jb_prod_/'
+openssl rand -base64 32 | tr -d '=/+' | sed 's/^/sk_prod_/'
 ```
 
 ### Key management API
@@ -66,7 +66,7 @@ Create/update body:
 ```json
 {
   "name": "email-workers",
-  "key": "jb_prod_abc123...",
+  "key": "sk_prod_abc123...",
   "namespace": "default",
   "role": "worker",
   "queue_scope": "emails.*",
