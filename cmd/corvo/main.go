@@ -72,6 +72,7 @@ var (
 	discoverDNSName     string
 	otelEnabled         bool
 	otelEndpoint        string
+	adminPassword       string
 	licenseKey          string
 	licensePublicKey    string
 	oidcIssuerURL       string
@@ -102,6 +103,7 @@ func init() {
 	serverCmd.Flags().DurationVar(&shutdownTimeout, "shutdown-timeout", 500*time.Millisecond, "Graceful HTTP shutdown timeout before force-close (e.g. 500ms, 2s)")
 	serverCmd.Flags().BoolVar(&otelEnabled, "otel-enabled", false, "Enable OpenTelemetry tracing")
 	serverCmd.Flags().StringVar(&otelEndpoint, "otel-endpoint", "", "OTLP HTTP endpoint (host:port) for traces; if empty uses stdout exporter")
+	serverCmd.Flags().StringVar(&adminPassword, "admin-password", "", "Global admin password for UI/API access (or set CORVO_ADMIN_PASSWORD)")
 	serverCmd.Flags().StringVar(&licenseKey, "license-key", "", "Enterprise license token (or set CORVO_LICENSE_KEY)")
 	serverCmd.Flags().StringVar(&licensePublicKey, "license-public-key", "", "Base64 Ed25519 public key for license validation (or set CORVO_LICENSE_PUBLIC_KEY)")
 	serverCmd.Flags().StringVar(&oidcIssuerURL, "oidc-issuer-url", "", "OIDC issuer URL (enterprise sso feature)")
@@ -291,6 +293,16 @@ func runServer(cmd *cobra.Command, args []string) error {
 		uiFS = sub
 	}
 	opts := []server.Option{}
+	ap := strings.TrimSpace(adminPassword)
+	if ap == "" {
+		ap = strings.TrimSpace(os.Getenv("CORVO_ADMIN_PASSWORD"))
+	}
+	if ap != "" {
+		opts = append(opts, server.WithAdminPassword(ap))
+		slog.Info("admin password configured")
+	} else {
+		slog.Warn("no admin password set — if API keys are created you may be locked out; use --admin-password or CORVO_ADMIN_PASSWORD")
+	}
 	var lic *enterprise.License
 	lk := strings.TrimSpace(licenseKey)
 	if lk == "" {

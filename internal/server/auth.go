@@ -89,6 +89,23 @@ func (s *Server) resolvePrincipal(r *http.Request) (authPrincipal, int, string, 
 			return p, 0, "", ""
 		}
 	}
+	// Admin password bypass — always grants full admin access.
+	if s.adminPassword != "" {
+		pw := strings.TrimSpace(r.Header.Get("X-API-Key"))
+		if pw == "" {
+			if authz := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(strings.ToLower(authz), "bearer ") {
+				pw = strings.TrimSpace(authz[len("Bearer "):])
+			}
+		}
+		if pw == s.adminPassword {
+			p := authPrincipal{Name: "admin", Namespace: "default", Role: "admin"}
+			ns := strings.TrimSpace(r.Header.Get("X-Corvo-Namespace"))
+			if ns != "" {
+				p.Namespace = ns
+			}
+			return p, 0, "", ""
+		}
+	}
 	db := s.store.ReadDB()
 	var keyCount int
 	if err := db.QueryRow("SELECT COUNT(*) FROM api_keys WHERE enabled = 1").Scan(&keyCount); err != nil {

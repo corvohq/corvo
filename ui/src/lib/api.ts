@@ -1,3 +1,28 @@
+const API_KEY_STORAGE_KEY = "corvo_api_key";
+
+export function getStoredApiKey(): string | null {
+  return localStorage.getItem(API_KEY_STORAGE_KEY);
+}
+
+export function setStoredApiKey(key: string): void {
+  localStorage.setItem(API_KEY_STORAGE_KEY, key);
+}
+
+export function clearStoredApiKey(): void {
+  localStorage.removeItem(API_KEY_STORAGE_KEY);
+}
+
+// Fires when the server requires auth and we have no valid key.
+type AuthListener = () => void;
+const authListeners = new Set<AuthListener>();
+export function onAuthRequired(fn: AuthListener): () => void {
+  authListeners.add(fn);
+  return () => authListeners.delete(fn);
+}
+function fireAuthRequired() {
+  authListeners.forEach((fn) => fn());
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -11,12 +36,17 @@ export async function api<T>(
   path: string,
   opts?: RequestInit,
 ): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(opts?.headers as Record<string, string>),
+  };
+  const apiKey = getStoredApiKey();
+  if (apiKey) {
+    headers["X-API-Key"] = apiKey;
+  }
   const res = await fetch(`/api/v1${path}`, {
     ...opts,
-    headers: {
-      "Content-Type": "application/json",
-      ...opts?.headers,
-    },
+    headers,
   });
   if (!res.ok) {
     let body: { error: string; code: string };
@@ -24,6 +54,24 @@ export async function api<T>(
       body = await res.json();
     } catch {
       body = { error: res.statusText, code: "UNKNOWN" };
+    }
+    // If we got 401, try to recover.
+    if (res.status === 401) {
+      // If we sent a stored key, it may be stale — clear it and retry
+      // without auth (works when the server has zero keys configured).
+      if (apiKey) {
+        clearStoredApiKey();
+        const { "X-API-Key": _, ...retryHeaders } = headers;
+        const retry = await fetch(`/api/v1${path}`, {
+          ...opts,
+          headers: retryHeaders,
+        });
+        if (retry.ok) {
+          return retry.json();
+        }
+      }
+      // Server requires auth and we have no valid key — prompt the user.
+      fireAuthRequired();
     }
     throw new ApiError(res.status, body);
   }

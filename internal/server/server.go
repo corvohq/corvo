@@ -46,8 +46,9 @@ type Server struct {
 	oidcAuth    *oidcAuthenticator
 	samlAuth    *samlHeaderAuthenticator
 	reqMetrics  *requestMetrics
-	rateLimiter *rateLimiter
-	streamCfg   *rpcconnect.StreamConfig
+	rateLimiter   *rateLimiter
+	streamCfg     *rpcconnect.StreamConfig
+	adminPassword string
 }
 
 // Option mutates server behavior.
@@ -57,6 +58,14 @@ type Option func(*Server) error
 func WithEnterpriseLicense(lic *enterprise.License) Option {
 	return func(s *Server) error {
 		s.license = lic
+		return nil
+	}
+}
+
+// WithAdminPassword sets a global admin password that always grants full access.
+func WithAdminPassword(pw string) Option {
+	return func(s *Server) error {
+		s.adminPassword = pw
 		return nil
 	}
 }
@@ -293,41 +302,40 @@ func (s *Server) buildRouter() chi.Router {
 // mountUI serves the embedded SPA. Static assets are served directly;
 // any other /ui/* path gets index.html for client-side routing.
 func (s *Server) mountUI(r chi.Router) {
-	fileServer := http.FileServer(http.FS(s.uiFS))
+	// Read index.html once at startup for SPA fallback.
+	indexHTML, _ := fs.ReadFile(s.uiFS, "index.html")
 
 	r.Get("/ui/*", func(w http.ResponseWriter, r *http.Request) {
 		// Strip /ui/ prefix and check if the file exists.
-		path := strings.TrimPrefix(r.URL.Path, "/ui/")
-		if path == "" {
-			path = "index.html"
+		uiPath := strings.TrimPrefix(r.URL.Path, "/ui/")
+		if uiPath == "" {
+			uiPath = "index.html"
 		}
 
-		// Try to open the file. If it exists, serve it.
-		f, err := s.uiFS.Open(path)
+		// Try to open the file. If it exists, serve it directly.
+		f, err := s.uiFS.Open(uiPath)
 		if err == nil {
-			f.Close()
-			// Set cache headers: hashed assets get long-lived cache, index.html always revalidates.
-			if strings.HasPrefix(path, "assets/") {
-				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-			} else if path == "index.html" {
-				w.Header().Set("Cache-Control", "no-cache")
+			defer f.Close()
+			stat, _ := f.Stat()
+			if stat != nil && !stat.IsDir() {
+				if strings.HasPrefix(uiPath, "assets/") {
+					w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+				} else {
+					w.Header().Set("Cache-Control", "no-cache")
+				}
+				http.ServeContent(w, r, stat.Name(), stat.ModTime(), f.(io.ReadSeeker))
+				return
 			}
-			// Serve via file server (with /ui/ prefix stripped).
-			http.StripPrefix("/ui/", fileServer).ServeHTTP(w, r)
-			return
 		}
 
-		// File not found — serve index.html for SPA routing.
-		f, err = s.uiFS.Open("index.html")
-		if err != nil {
+		// File not found — serve index.html for SPA client-side routing.
+		if indexHTML == nil {
 			http.NotFound(w, r)
 			return
 		}
-		f.Close()
-
 		w.Header().Set("Cache-Control", "no-cache")
-		r.URL.Path = "/ui/index.html"
-		http.StripPrefix("/ui/", fileServer).ServeHTTP(w, r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(indexHTML)
 	})
 
 	// Redirect bare /ui to /ui/
