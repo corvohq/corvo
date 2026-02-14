@@ -752,7 +752,7 @@ func openMaterializedView(path string) (*sql.DB, error) {
 	db.SetConnMaxLifetime(5 * time.Minute)
 	for _, pragma := range []string{
 		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
+		"PRAGMA synchronous=OFF",
 		"PRAGMA foreign_keys=ON",
 		"PRAGMA busy_timeout=5000",
 	} {
