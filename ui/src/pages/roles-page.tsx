@@ -81,7 +81,24 @@ export default function RolesPage() {
     setPermissions((prev) => prev.filter((_, i) => i !== index));
   }
 
-  const allActions = ["read", "write", "delete", "pause", "resume", "drain", "clear", "retry", "cancel", "approve", "reject", "hold"];
+  const allResources = [
+    "*",
+    "jobs",
+    "queues",
+    "budgets",
+    "approval-policies",
+    "webhooks",
+    "auth",
+    "namespaces",
+    "settings",
+    "admin",
+    "workers",
+    "audit-logs",
+    "org",
+    "billing",
+  ];
+
+  const allActions = ["*", "read", "write", "delete", "pause", "resume", "drain", "clear", "retry", "cancel", "approve", "reject", "hold"];
 
   function handleSave() {
     const name = newName.trim();
@@ -247,34 +264,51 @@ export default function RolesPage() {
               Permissions
             </label>
             {permissions.map((perm, idx) => (
-              <div key={idx} className="mb-2 flex items-start gap-2">
-                <input
-                  type="text"
-                  value={perm.resource}
-                  onChange={(e) => updatePermission(idx, "resource", e.target.value)}
-                  placeholder="Resource (e.g. queues, jobs, *)"
-                  className="rounded-lg border border-border bg-muted px-3 py-1.5 text-sm text-foreground w-48"
-                />
+              <div key={idx} className="mb-3 flex items-start gap-2">
+                <div className="w-48 shrink-0">
+                  <select
+                    value={perm.resource}
+                    onChange={(e) => updatePermission(idx, "resource", e.target.value)}
+                    className="rounded-lg border border-border bg-muted px-3 py-1.5 text-sm text-foreground w-full"
+                  >
+                    <option value="">Select resource...</option>
+                    {allResources.map((r) => (
+                      <option key={r} value={r}>
+                        {r === "*" ? "All resources" : r}
+                      </option>
+                    ))}
+                  </select>
+                </div>
                 <div className="flex flex-wrap gap-1">
-                  {allActions.map((action) => (
-                    <label
-                      key={action}
-                      className="flex items-center gap-1 rounded bg-muted px-2 py-1 text-xs text-foreground cursor-pointer"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={perm.actions.includes(action)}
-                        onChange={(e) => {
-                          const next = e.target.checked
-                            ? [...perm.actions, action]
-                            : perm.actions.filter((a) => a !== action);
-                          updatePermission(idx, "actions", next);
-                        }}
-                        className="rounded"
-                      />
-                      {action}
-                    </label>
-                  ))}
+                  {allActions.map((action) => {
+                    const isWildcard = action === "*";
+                    const hasWildcard = perm.actions.includes("*");
+                    return (
+                      <label
+                        key={action}
+                        className="flex items-center gap-1 rounded bg-muted px-2 py-1 text-xs text-foreground cursor-pointer"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={perm.actions.includes(action)}
+                          disabled={!isWildcard && hasWildcard}
+                          onChange={(e) => {
+                            let next: string[];
+                            if (isWildcard) {
+                              next = e.target.checked ? ["*"] : [];
+                            } else {
+                              next = e.target.checked
+                                ? [...perm.actions.filter((a) => a !== "*"), action]
+                                : perm.actions.filter((a) => a !== action);
+                            }
+                            updatePermission(idx, "actions", next);
+                          }}
+                          className="rounded"
+                        />
+                        {isWildcard ? "all" : action}
+                      </label>
+                    );
+                  })}
                 </div>
                 {permissions.length > 1 && (
                   <button
