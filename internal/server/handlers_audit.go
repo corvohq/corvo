@@ -100,5 +100,21 @@ func (s *Server) handleListAuditLogs(w http.ResponseWriter, r *http.Request) {
 		}
 		logs = append(logs, e)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"audit_logs": logs})
+
+	// Count total matching rows for pagination.
+	countQuery := fmt.Sprintf(
+		"SELECT COUNT(*) FROM audit_logs WHERE %s",
+		strings.Join(where, " AND "),
+	)
+	var total int
+	if err := s.store.ReadDB().QueryRow(countQuery, args[:len(args)-2]...).Scan(&total); err != nil {
+		total = len(logs)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"audit_logs": logs,
+		"total":      total,
+		"limit":      limit,
+		"offset":     offset,
+	})
 }
