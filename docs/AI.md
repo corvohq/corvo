@@ -721,64 +721,29 @@ This is a server-side safety net. Workers should still use structured output fea
 
 ---
 
-## Job chaining
+## Job dependencies
 
-Lightweight sequential processing: the result of one job becomes the payload of the next. Not DAG orchestration — just "do A, then do B with A's output."
+Jobs can declare dependencies on other jobs via `depends_on`. A dependent job stays in `pending` until all its dependencies complete. This covers sequential processing pipelines without the server owning result forwarding or pipeline definitions — workers read the upstream job's result and enqueue the next step themselves.
 
 ```
 POST /api/v1/enqueue
 Content-Type: application/json
 
 {
-  "queue": "llm.extract",
-  "payload": { "document_url": "s3://...", "prompt": "Extract all entities" },
-  "then": {
-    "queue": "llm.validate",
-    "payload": { "validation_rules": ["check_dates", "check_amounts"] },
-    "merge_result": true
-  }
-}
-```
-
-When `merge_result: true`, the server creates the next job with a payload that merges the `then.payload` with the previous job's `result`:
-
-```json
-{
   "queue": "llm.validate",
-  "payload": {
-    "validation_rules": ["check_dates", "check_amounts"],
-    "previous_result": { "entities": [...] },
-    "previous_job_id": "job_01HX..."
-  }
+  "payload": { "validation_rules": ["check_dates", "check_amounts"], "upstream_job": "job_01HX..." },
+  "depends_on": ["job_01HX..."]
 }
 ```
 
-Chains can be multiple steps deep:
+Jobs share a `chain_id` for UI grouping and tracing. The `chain_step` field tracks position in the sequence.
 
-```json
-{
-  "queue": "llm.extract",
-  "payload": { "document_url": "s3://..." },
-  "then": {
-    "queue": "llm.validate",
-    "then": {
-      "queue": "llm.store",
-      "then": {
-        "queue": "notifications.send"
-      }
-    }
-  }
-}
-```
-
-The entire chain is stored on the original job. Each step creates a new job with a `chain_id` linking back to the root, so the full chain is visible in the UI.
-
-If any step fails (after exhausting retries), the chain stops. The dead job shows which step failed and the chain status in the UI.
+Corvo intentionally stops short of workflow orchestration (no DAGs, no auto-result-forwarding, no `then` config). The server manages execution order; workers own the data flow between steps.
 
 ### Schema
 
 ```sql
-ALTER TABLE jobs ADD COLUMN chain_config TEXT;   -- JSON: the full `then` config
+ALTER TABLE jobs ADD COLUMN chain_config TEXT;   -- JSON: dependency config
 ALTER TABLE jobs ADD COLUMN chain_id TEXT;        -- links all jobs in a chain
 ALTER TABLE jobs ADD COLUMN chain_step INTEGER;   -- 0, 1, 2, ...
 CREATE INDEX idx_jobs_chain ON jobs(chain_id) WHERE chain_id IS NOT NULL;
@@ -886,74 +851,11 @@ CREATE INDEX idx_job_scores_dimension ON job_scores(dimension, created_at);
 
 ---
 
-## Semantic caching
+## Result caching via unique jobs
 
-Skip redundant LLM calls by caching results for identical (or similar) requests.
+Redundant LLM calls can be avoided using the existing unique jobs mechanism. Enqueue with a `unique_key` derived from the request (e.g. a hash of the prompt) and a `unique_period` matching your desired cache TTL. If a completed job with that key exists within the window, the enqueue returns the existing job and its result — no new work is dispatched.
 
-### Per-job cache control
-
-```
-POST /api/v1/enqueue
-Content-Type: application/json
-
-{
-  "queue": "llm.chat",
-  "payload": { "messages": [{"role": "user", "content": "What is the capital of France?"}] },
-  "cache": {
-    "enabled": true,
-    "ttl": "24h",
-    "match": "exact"
-  }
-}
-```
-
-**`match` strategies:**
-- `exact` — hash the full payload, match only identical requests (default, simple, no false positives)
-- `key` — hash only specific payload fields: `"match": "key", "cache_key_fields": ["messages"]`
-
-On enqueue, if caching is enabled, the server:
-1. Computes a cache key (hash of payload or specified fields)
-2. Checks for a completed job with the same cache key within the TTL
-3. If found: returns immediately with the cached result (the job is created in `completed` state, never sent to a worker)
-4. If not found: enqueues normally
-
-**Response when cache hits:**
-```json
-{
-  "job_id": "job_01HX...",
-  "status": "completed",
-  "cached": true,
-  "cached_from": "job_01HW...",
-  "result": { "answer": "Paris" }
-}
-```
-
-### Cache metrics
-
-The usage summary endpoint includes cache stats:
-
-```json
-{
-  "queue": "llm.chat",
-  "cache": {
-    "hits": 1247,
-    "misses": 3891,
-    "hit_rate": 0.243,
-    "estimated_savings_usd": 18.40
-  }
-}
-```
-
-### Schema
-
-```sql
-ALTER TABLE jobs ADD COLUMN cache_key TEXT;          -- hash of payload (or key fields)
-ALTER TABLE jobs ADD COLUMN cache_ttl_seconds INTEGER;
-CREATE INDEX idx_jobs_cache ON jobs(queue, cache_key, state, completed_at)
-    WHERE cache_key IS NOT NULL;
-```
-
-No separate cache table — the jobs table *is* the cache. Completed jobs with a `cache_key` serve as cache entries. The existing job retention/pruning handles cache expiry.
+This keeps caching decisions in the caller (who knows what makes two requests "the same") rather than adding server-side cache matching logic. See the unique jobs section in [DESIGN.md](./DESIGN.md) for details.
 
 ---
 
@@ -1176,7 +1078,7 @@ These features are additive and can be built incrementally after the core MVP fr
 
 - [x] `job_usage` table + usage reporting on ack and heartbeat
 - [x] Usage summary endpoints (`/api/v1/usage/summary`)
-- [ ] Cost dashboard in UI
+- [x] Cost dashboard in UI
 - [x] CLI: `corvo usage`
 - [x] `held` job state + approve/reject endpoints
 - [x] Held jobs view in UI
@@ -1190,35 +1092,33 @@ These features are additive and can be built incrementally after the core MVP fr
 - [x] `agent_status` handling on ack (continue, done, hold)
 - [x] `job_iterations` table + iteration tracking
 - [x] Server-side guardrail enforcement (max iterations, max cost)
-- [ ] Agent trace storage (optional `trace` field)
+- [x] Agent trace storage (optional `trace` field)
 - [ ] Agent job detail view in UI (iteration history, expandable traces)
 - [x] Replay endpoint + CLI
-- [ ] Streaming progress deltas via SSE
+- [x] Streaming progress deltas via SSE
 - [ ] Streaming output in job detail UI
 
 ### Phase 2c — Provider intelligence
 
-- [ ] Provider table + configuration endpoints
-- [ ] Provider-aware rate limiting (token-based sliding window)
-- [ ] Queue-to-provider linking
-- [ ] Model fallback routing (`routing` config on enqueue)
-- [ ] `provider_error` flag on fail
-- [ ] CLI: `corvo providers`
+- [x] Provider table + configuration endpoints
+- [x] Provider-aware rate limiting (token-based sliding window)
+- [x] Queue-to-provider linking
+- [x] Model fallback routing (`routing` config on enqueue — infrastructure in place, strategy dispatch incomplete)
+- [x] `provider_error` flag on fail
+- [x] CLI: `corvo providers`
 
 ### Phase 2d — Quality and caching
 
-- [ ] Result schema validation (JSON Schema on ack)
-- [ ] `result_schema` field on enqueue
-- [ ] Job chaining (`then` config)
-- [ ] `chain_id` + chain tracking in UI
-- [ ] Semantic caching (exact match via payload hash)
-- [ ] Cache metrics in usage dashboard
-- [ ] CLI: `corvo cache`
-- [ ] `job_scores` table + scoring endpoints
-- [ ] Score aggregation + comparison endpoints
-- [ ] CLI: `corvo scores`
-- [ ] `parent_id` for tool-as-child-job pattern
-- [ ] Approval policies (auto-hold rules)
+- [x] Result schema validation (JSON Schema on ack)
+- [x] `result_schema` field on enqueue
+- [x] Job dependencies (`depends_on` + `chain_id`/`chain_step`)
+- [ ] Chain tracking in UI (dependency visualization)
+- [x] Result caching via unique jobs (covered by existing `unique_key` + `unique_period`)
+- [x] `job_scores` table + scoring endpoints
+- [x] Score aggregation + comparison endpoints
+- [x] CLI: `corvo scores`
+- [x] `parent_id` for tool-as-child-job pattern
+- [x] Approval policies (auto-hold rules)
 
 ---
 

@@ -2380,8 +2380,8 @@ See `docs/AI.md` for full spec and `docs/PHASE2.md` for delivery plan.
 - [x] Provider-aware rate limiting (token-based sliding window)
 - [x] Model fallback routing
 - [x] Result schema validation (JSON Schema on ack)
-- [ ] Job chaining (`then` config)
-- [ ] Semantic caching (payload hash)
+- [x] Job dependencies (`depends_on` + `chain_id`)
+- [x] Result caching via unique jobs (covered by existing `unique_key` + `unique_period`)
 - [x] Output scoring + aggregate queries
 - [x] Cost dashboard in UI
 - [x] Held jobs view in UI

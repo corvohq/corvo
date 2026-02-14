@@ -88,14 +88,14 @@ Benchmark gates:
 
 Files: `docs/AI.md`, `internal/store/*`, `internal/server/*`, `pkg/client/*`, `cmd/corvo/*`, UI files
 
-- [ ] Usage accounting:
+- [x] Usage accounting:
   - [x] `job_usage` storage + usage reporting via ack/heartbeat
   - [x] Usage summary API (`GET /api/v1/usage/summary`)
   - [x] Usage summary CLI (`corvo usage`)
 - [x] Budget enforcement:
   - [x] Budget table + checks on fetch/ack paths
   - [x] Queue/namespace/per-job budget APIs + CLI (`corvo budget`)
-- [ ] Human-in-the-loop baseline:
+- [x] Human-in-the-loop baseline:
   - [x] `held` state and approve/reject API
   - [x] CLI (`corvo held`, `corvo approve`, `corvo reject`)
   - [x] UI held-jobs view

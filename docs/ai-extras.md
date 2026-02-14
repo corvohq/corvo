@@ -27,8 +27,8 @@ Out of scope:
 - Next: expand predicates (cost range, payload field matches, tag patterns, queue patterns), add dry-run mode, add policy hit diagnostics endpoint.
 
 2. Trace UI improvements
-- Status: trace storage and display implemented.
-- Next: iteration-to-iteration diff and tool/action timeline view in job detail.
+- Status: trace storage implemented (migration 007). Agent job detail UI with iteration history not yet built.
+- Next: agent job detail view with iteration history, expandable traces, iteration-to-iteration diff, and tool/action timeline.
 
 3. Exact-match caching at enqueue
 - Status: usage has cache token metrics; enqueue cache-hit behavior not implemented.
