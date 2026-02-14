@@ -16,9 +16,7 @@ var (
 	enqAgentMaxIterations    int
 	enqAgentMaxCostUSD       float64
 	enqAgentIterationTimeout string
-	enqResultSchema          string
 	enqParentID              string
-	enqRouting               string
 	replayFromIteration      int
 )
 
@@ -62,14 +60,8 @@ var enqueueCmd = &cobra.Command{
 			}
 			body["agent"] = agent
 		}
-		if enqResultSchema != "" {
-			body["result_schema"] = json.RawMessage(enqResultSchema)
-		}
 		if enqParentID != "" {
 			body["parent_id"] = enqParentID
-		}
-		if enqRouting != "" {
-			body["routing"] = json.RawMessage(enqRouting)
 		}
 
 		data, status, err := apiRequest("POST", "/api/v1/enqueue", body)
@@ -328,9 +320,7 @@ func init() {
 	enqueueCmd.Flags().IntVar(&enqAgentMaxIterations, "agent-max-iterations", 0, "Agent max iterations (enables agent mode)")
 	enqueueCmd.Flags().Float64Var(&enqAgentMaxCostUSD, "agent-max-cost-usd", 0, "Agent max total USD cost guardrail")
 	enqueueCmd.Flags().StringVar(&enqAgentIterationTimeout, "agent-iteration-timeout", "", "Agent per-iteration timeout (e.g. 2m)")
-	enqueueCmd.Flags().StringVar(&enqResultSchema, "result-schema", "", "Result JSON schema as JSON string")
 	enqueueCmd.Flags().StringVar(&enqParentID, "parent-id", "", "Parent job ID (for tool child jobs)")
-	enqueueCmd.Flags().StringVar(&enqRouting, "routing", "", "Routing config as JSON string")
 	replayCmd.Flags().IntVar(&replayFromIteration, "from", 0, "Replay from this agent iteration (required)")
 
 	addClientFlags(enqueueCmd, inspectCmd, retryCmd, cancelCmd, holdCmd, approveCmd, rejectCmd, replayCmd, iterationsCmd, heldCmd, moveCmd, deleteCmd)

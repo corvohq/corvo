@@ -286,16 +286,15 @@ func (s *Server) handleFail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Error         string `json:"error"`
-		Backtrace     string `json:"backtrace"`
-		ProviderError bool   `json:"provider_error"`
+		Error     string `json:"error"`
+		Backtrace string `json:"backtrace"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
 		return
 	}
 
-	result, err := s.store.Fail(jobID, body.Error, body.Backtrace, body.ProviderError)
+	result, err := s.store.Fail(jobID, body.Error, body.Backtrace, false)
 	if err != nil {
 		writeStoreError(w, err, http.StatusBadRequest, "FAIL_ERROR")
 		return

@@ -551,33 +551,6 @@ func TestFailEndpoint(t *testing.T) {
 	}
 }
 
-func TestFailEndpointProviderError(t *testing.T) {
-	srv, s := testServer(t)
-
-	doRequest(srv, "POST", "/api/v1/enqueue", map[string]interface{}{
-		"queue": "fail.provider.q", "payload": map[string]string{},
-	})
-	rr := doRequest(srv, "POST", "/api/v1/fetch", map[string]interface{}{
-		"queues": []string{"fail.provider.q"}, "worker_id": "w", "hostname": "h", "timeout": 1,
-	})
-	var fetchResult store.FetchResult
-	decodeResponse(t, rr, &fetchResult)
-
-	rr = doRequest(srv, "POST", "/api/v1/fail/"+fetchResult.JobID, map[string]interface{}{
-		"error":          "provider timeout",
-		"provider_error": true,
-	})
-	if rr.Code != http.StatusOK {
-		t.Fatalf("fail status = %d, body: %s", rr.Code, rr.Body.String())
-	}
-	j, err := s.GetJob(fetchResult.JobID)
-	if err != nil {
-		t.Fatalf("get job: %v", err)
-	}
-	if !j.ProviderError {
-		t.Fatalf("provider_error = false, want true")
-	}
-}
 
 
 func TestQueueEndpoints(t *testing.T) {

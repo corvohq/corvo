@@ -284,6 +284,7 @@ func (s *Server) auditLogMiddleware(next http.Handler) http.Handler {
 		// Audit logs are for user/operator actions, not worker polling.
 		switch r.URL.Path {
 		case "/api/v1/jobs/search",
+			"/api/v1/enqueue", "/api/v1/enqueue/batch",
 			"/api/v1/fetch", "/api/v1/fetch/batch",
 			"/api/v1/heartbeat",
 			"/api/v1/ack/batch":
