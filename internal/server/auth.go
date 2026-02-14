@@ -280,6 +280,19 @@ func (s *Server) auditLogMiddleware(next http.Handler) http.Handler {
 		if r.Method == http.MethodGet || r.Method == http.MethodHead || s.store == nil || s.store.ReadDB() == nil {
 			return
 		}
+		// Skip worker hot-path and read-only POST routes from audit logs.
+		// Audit logs are for user/operator actions, not worker polling.
+		switch r.URL.Path {
+		case "/api/v1/jobs/search",
+			"/api/v1/fetch", "/api/v1/fetch/batch",
+			"/api/v1/heartbeat",
+			"/api/v1/ack/batch":
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/v1/ack/") ||
+			strings.HasPrefix(r.URL.Path, "/api/v1/fail/") {
+			return
+		}
 		p := principalFromContext(r.Context())
 		meta, _ := json.Marshal(map[string]any{
 			"duration_ms": time.Since(start).Milliseconds(),
