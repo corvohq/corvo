@@ -14,6 +14,7 @@ import WorkersPage from "@/pages/workers-page";
 import ClusterPage from "@/pages/cluster-page";
 import ScheduledJobs from "@/pages/scheduled-jobs";
 import EventsPage from "@/pages/events-page";
+import SettingsPage from "@/pages/settings";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -48,6 +49,7 @@ export default function App() {
               <Route path="/ui/cluster" element={<ClusterPage />} />
               <Route path="/ui/scheduled" element={<ScheduledJobs />} />
               <Route path="/ui/events" element={<EventsPage />} />
+              <Route path="/ui/settings" element={<SettingsPage />} />
             </Route>
           </Routes>
         </BrowserRouter>

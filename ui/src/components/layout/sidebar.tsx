@@ -12,6 +12,7 @@ import {
   Network,
   Clock,
   Radio,
+  Settings,
 } from "lucide-react";
 
 const navItems = [
@@ -24,6 +25,7 @@ const navItems = [
   { to: "/ui/cost", icon: DollarSign, label: "Cost" },
   { to: "/ui/workers", icon: Users, label: "Workers" },
   { to: "/ui/cluster", icon: Network, label: "Cluster" },
+  { to: "/ui/settings", icon: Settings, label: "Settings" },
 ];
 
 interface SidebarProps {
