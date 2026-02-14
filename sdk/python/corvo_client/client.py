@@ -1,12 +1,43 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
 
 class CorvoError(Exception):
     pass
+
+
+@dataclass
+class ChainStep:
+    queue: str
+    payload: Any
+
+
+@dataclass
+class ChainConfig:
+    steps: List[ChainStep]
+    on_failure: Optional[str] = None
+    on_exit: Optional[ChainStep] = None
+
+
+@dataclass
+class EnqueueOptions:
+    queue: str
+    payload: Any
+    priority: Optional[str] = None
+    unique_key: Optional[str] = None
+    unique_period: Optional[int] = None
+    max_retries: Optional[int] = None
+    scheduled_at: Optional[str] = None
+    tags: Optional[Dict[str, str]] = None
+    expire_after: Optional[str] = None
+    retry_backoff: Optional[str] = None
+    retry_base_delay: Optional[str] = None
+    retry_max_delay: Optional[str] = None
+    chain: Optional[ChainConfig] = None
 
 
 class CorvoClient:
@@ -32,6 +63,10 @@ class CorvoClient:
     def enqueue(self, queue: str, payload: Any, **kwargs: Any) -> Dict[str, Any]:
         body = {"queue": queue, "payload": payload}
         body.update(kwargs)
+        return self._request("POST", "/api/v1/enqueue", body)
+
+    def enqueue_with(self, opts: EnqueueOptions) -> Dict[str, Any]:
+        body = {k: v for k, v in asdict(opts).items() if v is not None}
         return self._request("POST", "/api/v1/enqueue", body)
 
     def get_job(self, job_id: str) -> Dict[str, Any]:

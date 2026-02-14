@@ -89,6 +89,33 @@ export type HeartbeatResult = {
   canceled: string[];
 };
 
+export type ChainStep = {
+  queue: string;
+  payload: unknown;
+};
+
+export type ChainConfig = {
+  steps: ChainStep[];
+  on_failure?: "stop" | "continue";
+  on_exit?: ChainStep;
+};
+
+export type EnqueueOptions = {
+  queue: string;
+  payload: unknown;
+  priority?: string;
+  unique_key?: string;
+  unique_period?: number;
+  max_retries?: number;
+  scheduled_at?: string;
+  tags?: Record<string, string>;
+  expire_after?: string;
+  retry_backoff?: string;
+  retry_base_delay?: string;
+  retry_max_delay?: string;
+  chain?: ChainConfig;
+};
+
 export type AuthOptions = {
   headers?: Record<string, string>;
   bearerToken?: string;
@@ -112,6 +139,13 @@ export class CorvoClient {
     return this.request("/api/v1/enqueue", {
       method: "POST",
       body: JSON.stringify({ queue, payload, ...extra }),
+    });
+  }
+
+  async enqueueWith(opts: EnqueueOptions): Promise<EnqueueResult> {
+    return this.request("/api/v1/enqueue", {
+      method: "POST",
+      body: JSON.stringify(opts),
     });
   }
 
