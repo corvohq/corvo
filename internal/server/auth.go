@@ -69,7 +69,11 @@ func (s *Server) resolvePrincipal(r *http.Request) (authPrincipal, int, string, 
 	if s.store == nil || s.store.ReadDB() == nil {
 		return defaults, 0, "", ""
 	}
-	if s.oidcAuth != nil {
+	s.authMu.RLock()
+	oidc := s.oidcAuth
+	saml := s.samlAuth
+	s.authMu.RUnlock()
+	if oidc != nil {
 		if p, ok := s.resolveOIDCPrincipal(r); ok {
 			if !s.isAuthorized(p, r.Method, r.URL.Path) {
 				return authPrincipal{}, http.StatusForbidden, "FORBIDDEN", "insufficient role permissions"
@@ -77,7 +81,7 @@ func (s *Server) resolvePrincipal(r *http.Request) (authPrincipal, int, string, 
 			return p, 0, "", ""
 		}
 	}
-	if s.samlAuth != nil {
+	if saml != nil {
 		if p, ok := s.resolveSAMLPrincipal(r); ok {
 			if !s.isAuthorized(p, r.Method, r.URL.Path) {
 				return authPrincipal{}, http.StatusForbidden, "FORBIDDEN", "insufficient role permissions"

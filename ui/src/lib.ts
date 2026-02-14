@@ -14,6 +14,10 @@ export { default as WorkersPage } from "@/pages/workers-page";
 export { default as ClusterPage } from "@/pages/cluster-page";
 export { default as CostDashboard } from "@/pages/cost-dashboard";
 export { default as EventsPage } from "@/pages/events-page";
+export { default as AuditLogsPage } from "@/pages/audit-logs";
+export { default as RolesPage } from "@/pages/roles-page";
+export { default as NamespacesPage } from "@/pages/namespaces-page";
+export { default as SSOPage } from "@/pages/sso-page";
 
 // SSE provider — wraps children with real-time query invalidation
 export { useSSE } from "@/hooks/use-events";

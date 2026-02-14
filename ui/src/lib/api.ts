@@ -99,3 +99,90 @@ export function createApiKey(name: string): Promise<ApiKey> {
 export function deleteApiKey(id: string): Promise<{ status: string }> {
   return del<{ status: string }>(`/org/api-keys/${id}`);
 }
+
+// --- Audit log types and functions ---
+
+export interface AuditLog {
+  id: number;
+  namespace: string;
+  principal: string | null;
+  role: string | null;
+  method: string;
+  path: string;
+  status_code: number;
+  metadata?: { duration_ms?: number; query?: string };
+  created_at: string;
+}
+
+export function listAuditLogs(
+  params?: Record<string, string>,
+): Promise<{ audit_logs: AuditLog[] }> {
+  const qs = params ? `?${new URLSearchParams(params).toString()}` : "";
+  return api<{ audit_logs: AuditLog[] }>(`/audit-logs${qs}`);
+}
+
+// --- RBAC role types and functions ---
+
+export interface AuthPermission {
+  resource: string;
+  actions: string[];
+}
+
+export interface AuthRole {
+  name: string;
+  permissions: AuthPermission[];
+  created_at: string;
+  updated_at?: string;
+}
+
+export function listAuthRoles(): Promise<AuthRole[]> {
+  return api<AuthRole[]>("/auth/roles");
+}
+
+export function setAuthRole(
+  name: string,
+  permissions: AuthPermission[],
+): Promise<{ status: string }> {
+  return post<{ status: string }>("/auth/roles", { name, permissions });
+}
+
+export function deleteAuthRole(name: string): Promise<{ status: string }> {
+  return del<{ status: string }>(`/auth/roles/${name}`);
+}
+
+// --- Namespace types and functions ---
+
+export interface Namespace {
+  name: string;
+  created_at: string;
+}
+
+export function listNamespaces(): Promise<Namespace[]> {
+  return api<Namespace[]>("/namespaces");
+}
+
+export function createNamespace(name: string): Promise<{ status: string }> {
+  return post<{ status: string }>("/namespaces", { name });
+}
+
+export function deleteNamespace(name: string): Promise<{ status: string }> {
+  return del<{ status: string }>(`/namespaces/${name}`);
+}
+
+// --- SSO settings types and functions ---
+
+export interface SSOSettings {
+  provider: string;
+  oidc_issuer_url: string;
+  oidc_client_id: string;
+  saml_enabled: boolean;
+  updated_at?: string;
+}
+
+export function getSSOSettings(): Promise<SSOSettings> {
+  return api<SSOSettings>("/settings/sso");
+}
+
+export function setSSOSettings(settings: Omit<SSOSettings, "updated_at">): Promise<{ status: string }> {
+  return post<{ status: string }>("/settings/sso", settings);
+}

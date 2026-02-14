@@ -137,6 +137,8 @@ func (db *DB) migrate() error {
 		{version: 7, path: "migrations/007_agent_trace.sql"},
 		{version: 8, path: "migrations/008_approval_policies.sql"},
 		{version: 9, path: "migrations/009_settings.sql"},
+		{version: 10, path: "migrations/010_namespaces.sql"},
+		{version: 11, path: "migrations/011_sso_settings.sql"},
 	}
 
 	for _, m := range migrationsToApply {

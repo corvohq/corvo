@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"net/http/httputil"
 	"net/url"
 	"sort"
@@ -41,6 +42,7 @@ type Server struct {
 	webhookStop chan struct{}
 	webhookDone chan struct{}
 	license     *enterprise.License
+	authMu      sync.RWMutex
 	oidcAuth    *oidcAuthenticator
 	samlAuth    *samlHeaderAuthenticator
 	reqMetrics  *requestMetrics
@@ -185,8 +187,11 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/approval-policies", s.handleListApprovalPolicies)
 		r.Get("/webhooks", s.handleListWebhooks)
 		r.Get("/auth/keys", s.handleListAPIKeys)
+		r.Get("/audit-logs", s.requireEnterpriseFeature("audit", s.handleListAuditLogs))
 		r.Get("/auth/roles", s.requireEnterpriseFeature("rbac", s.handleListAuthRoles))
 		r.Get("/auth/keys/{key_hash}/roles", s.requireEnterpriseFeature("rbac", s.handleListAPIKeyRoles))
+		r.Get("/namespaces", s.requireEnterpriseFeature("namespaces", s.handleListNamespaces))
+		r.Get("/settings/sso", s.requireEnterpriseFeature("sso", s.handleGetSSOSettings))
 		r.Get("/org", s.handleGetOrg)
 		r.Get("/org/members", s.handleListMembers)
 		r.Get("/org/api-keys", s.handleListOrgAPIKeys)
@@ -228,6 +233,9 @@ func (s *Server) buildRouter() chi.Router {
 			r.Delete("/auth/roles/{name}", s.requireEnterpriseFeature("rbac", s.handleDeleteAuthRole))
 			r.Post("/auth/keys/{key_hash}/roles", s.requireEnterpriseFeature("rbac", s.handleAssignAPIKeyRole))
 			r.Delete("/auth/keys/{key_hash}/roles/{role}", s.requireEnterpriseFeature("rbac", s.handleUnassignAPIKeyRole))
+			r.Post("/namespaces", s.requireEnterpriseFeature("namespaces", s.handleCreateNamespace))
+			r.Delete("/namespaces/{name}", s.requireEnterpriseFeature("namespaces", s.handleDeleteNamespace))
+			r.Post("/settings/sso", s.requireEnterpriseFeature("sso", s.handleSetSSOSettings))
 			r.Get("/admin/backup", s.handleTenantBackup)
 			r.Post("/admin/restore", s.handleTenantRestore)
 
