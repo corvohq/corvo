@@ -124,20 +124,28 @@ type clusterVoter interface {
 	AddVoter(nodeID, addr string) error
 }
 
+type clusterShardVoter interface {
+	AddVoterForShard(shard int, nodeID, addr string) error
+	ShardCount() int
+}
+
 func (s *Server) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
 	if s.cluster == nil {
 		writeError(w, http.StatusNotImplemented, "cluster join unavailable", "UNSUPPORTED")
 		return
 	}
-	cv, ok := s.cluster.(clusterVoter)
-	if !ok {
+	cv, hasCV := s.cluster.(clusterVoter)
+	sv, hasSV := s.cluster.(clusterShardVoter)
+	if !hasCV && !hasSV {
 		writeError(w, http.StatusNotImplemented, "cluster membership unavailable", "UNSUPPORTED")
 		return
 	}
 
 	var req struct {
-		NodeID string `json:"node_id"`
-		Addr   string `json:"addr"`
+		NodeID     string `json:"node_id"`
+		Addr       string `json:"addr"`
+		Shard      *int   `json:"shard,omitempty"`
+		ShardCount *int   `json:"shard_count,omitempty"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
@@ -148,6 +156,46 @@ func (s *Server) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if hasSV {
+		if req.ShardCount != nil && *req.ShardCount != sv.ShardCount() {
+			writeError(w, http.StatusConflict, "shard_count mismatch", "SHARD_COUNT_MISMATCH")
+			return
+		}
+		shard := 0
+		if req.Shard != nil {
+			shard = *req.Shard
+		}
+		if err := sv.AddVoterForShard(shard, req.NodeID, req.Addr); err != nil {
+			msg := err.Error()
+			if strings.Contains(msg, "already") || strings.Contains(msg, "exists") || strings.Contains(msg, "voter") {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"status":      "ok",
+					"added":       false,
+					"node_id":     req.NodeID,
+					"addr":        req.Addr,
+					"shard":       shard,
+					"shard_count": sv.ShardCount(),
+				})
+				return
+			}
+			writeError(w, http.StatusBadRequest, msg, "JOIN_ERROR")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":      "ok",
+			"added":       true,
+			"node_id":     req.NodeID,
+			"addr":        req.Addr,
+			"shard":       shard,
+			"shard_count": sv.ShardCount(),
+		})
+		return
+	}
+
+	if !hasCV {
+		writeError(w, http.StatusNotImplemented, "cluster membership unavailable", "UNSUPPORTED")
+		return
+	}
 	if err := cv.AddVoter(req.NodeID, req.Addr); err != nil {
 		msg := err.Error()
 		if strings.Contains(msg, "already") || strings.Contains(msg, "exists") || strings.Contains(msg, "voter") {

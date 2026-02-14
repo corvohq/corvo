@@ -22,6 +22,8 @@ const (
 	PrefixEventLog    = "ev|"  // ev|{seq:8BE}
 	KeyEventCursor    = "evc|" // evc|last_seq
 	PrefixBudget      = "bg|"  // bg|{scope}\x00{target}
+	PrefixProvider    = "pv|"  // pv|{name}
+	PrefixQueueProv   = "qp|"  // qp|{queue}
 )
 
 const sep = '\x00'
@@ -241,4 +243,24 @@ func BudgetKey(scope, target string) []byte {
 // BudgetPrefix returns scan prefix for budgets: bg|
 func BudgetPrefix() []byte {
 	return []byte(PrefixBudget)
+}
+
+// ProviderKey returns the Pebble key for a provider config: pv|{name}
+func ProviderKey(name string) []byte {
+	return append([]byte(PrefixProvider), name...)
+}
+
+// ProviderPrefix returns scan prefix for providers: pv|
+func ProviderPrefix() []byte {
+	return []byte(PrefixProvider)
+}
+
+// QueueProviderKey returns the Pebble key for a queue-provider mapping: qp|{queue}
+func QueueProviderKey(queue string) []byte {
+	return append([]byte(PrefixQueueProv), queue...)
+}
+
+// QueueProviderPrefix returns scan prefix for queue-provider mappings: qp|
+func QueueProviderPrefix() []byte {
+	return []byte(PrefixQueueProv)
 }

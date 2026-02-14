@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -57,6 +58,55 @@ func (m *mockClusterWithVoter) AddVoter(nodeID, addr string) error {
 	}
 	m.added = append(m.added, nodeID+"@"+addr)
 	return nil
+}
+
+type mockShardCluster struct {
+	mockCluster
+	addErr       error
+	added        []string
+	shardCount   int
+	localShards  map[int]bool
+	shardLeaders map[int]string
+}
+
+func (m *mockShardCluster) AddVoterForShard(shard int, nodeID, addr string) error {
+	if m.addErr != nil {
+		return m.addErr
+	}
+	m.added = append(m.added, nodeID+"@"+addr+"#"+strconv.Itoa(shard))
+	return nil
+}
+
+func (m *mockShardCluster) ShardCount() int {
+	if m.shardCount <= 0 {
+		return 1
+	}
+	return m.shardCount
+}
+
+func (m *mockShardCluster) IsLeaderForShard(shard int) bool {
+	return m.localShards[shard]
+}
+
+func (m *mockShardCluster) LeaderAddrForShard(shard int) string {
+	return m.shardLeaders[shard]
+}
+
+func (m *mockShardCluster) ShardForQueue(queue string) int {
+	if strings.Contains(queue, "q1") || strings.Contains(queue, "s1") {
+		return 1
+	}
+	return 0
+}
+
+func (m *mockShardCluster) ShardForJobID(jobID string) (int, bool) {
+	if strings.HasPrefix(jobID, "s01_") {
+		return 1, true
+	}
+	if strings.HasPrefix(jobID, "s00_") {
+		return 0, true
+	}
+	return 0, false
 }
 
 func testServer(t *testing.T) (*Server, *store.Store) {
@@ -1286,6 +1336,49 @@ func TestClusterJoinEndpoint(t *testing.T) {
 	}
 }
 
+func TestClusterJoinEndpointShard(t *testing.T) {
+	_, s := testServer(t)
+	cl := &mockShardCluster{
+		mockCluster: mockCluster{isLeader: true},
+		shardCount:  2,
+		localShards: map[int]bool{0: true, 1: true},
+	}
+	srv := New(s, cl, ":0", nil)
+
+	rr := doRequest(srv, "POST", "/api/v1/cluster/join", map[string]any{
+		"node_id":     "node-2-s01",
+		"addr":        "127.0.0.1:9401",
+		"shard":       1,
+		"shard_count": 2,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("join status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	if len(cl.added) != 1 || !strings.HasSuffix(cl.added[0], "#1") {
+		t.Fatalf("expected shard add voter call, got %v", cl.added)
+	}
+}
+
+func TestClusterJoinEndpointShardCountMismatch(t *testing.T) {
+	_, s := testServer(t)
+	cl := &mockShardCluster{
+		mockCluster: mockCluster{isLeader: true},
+		shardCount:  2,
+		localShards: map[int]bool{0: true, 1: true},
+	}
+	srv := New(s, cl, ":0", nil)
+
+	rr := doRequest(srv, "POST", "/api/v1/cluster/join", map[string]any{
+		"node_id":     "node-2-s01",
+		"addr":        "127.0.0.1:9401",
+		"shard":       1,
+		"shard_count": 4,
+	})
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("join status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestPrometheusMetricsEndpoint(t *testing.T) {
 	srv, _ := testServer(t)
 	doRequest(srv, "POST", "/api/v1/enqueue", map[string]any{
@@ -1380,6 +1473,72 @@ func TestWriteProxyToLeader(t *testing.T) {
 	}
 	if _, err := leaderStore.GetJob(result.JobID); err != nil {
 		t.Fatalf("job not created on leader: %v", err)
+	}
+}
+
+func TestWriteRejectsMixedShardLeaders(t *testing.T) {
+	da, err := raft.NewDirectApplier(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewDirectApplier: %v", err)
+	}
+	defer da.Close()
+	s := store.NewStore(da, da.SQLiteDB())
+	defer s.Close()
+
+	cl := &mockShardCluster{
+		mockCluster: mockCluster{isLeader: false},
+		shardCount:  2,
+		localShards: map[int]bool{
+			0: false,
+			1: false,
+		},
+		shardLeaders: map[int]string{
+			0: "http://leader-a:8080",
+			1: "http://leader-b:8080",
+		},
+	}
+	srv := New(s, cl, ":0", nil)
+	rr := doRequest(srv, "POST", "/api/v1/enqueue/batch", map[string]any{
+		"jobs": []map[string]any{
+			{"queue": "q0", "payload": map[string]any{}},
+			{"queue": "q1", "payload": map[string]any{}},
+		},
+	})
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestWriteRejectsMixedLocalRemoteShardLeaders(t *testing.T) {
+	da, err := raft.NewDirectApplier(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewDirectApplier: %v", err)
+	}
+	defer da.Close()
+	s := store.NewStore(da, da.SQLiteDB())
+	defer s.Close()
+
+	cl := &mockShardCluster{
+		mockCluster: mockCluster{isLeader: false},
+		shardCount:  2,
+		localShards: map[int]bool{
+			0: true,
+			1: false,
+		},
+		shardLeaders: map[int]string{
+			0: "http://127.0.0.1:28080",
+			1: "http://127.0.0.1:28081",
+		},
+	}
+	srv := New(s, cl, ":0", nil)
+	rr := doRequest(srv, "POST", "/api/v1/enqueue/batch", map[string]any{
+		"jobs": []map[string]any{
+			{"queue": "q0", "payload": map[string]any{}},
+			{"queue": "q1", "payload": map[string]any{}},
+		},
+	})
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
 	}
 }
 

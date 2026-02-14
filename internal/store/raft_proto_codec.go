@@ -40,6 +40,9 @@ type DecodedRaftOp struct {
 	CleanRate    *CleanRateLimitOp
 	SetBudget    *SetBudgetOp
 	DeleteBudget *DeleteBudgetOp
+	SetProvider      *SetProviderOp
+	DeleteProvider   *DeleteProviderOp
+	SetQueueProvider *SetQueueProviderOp
 	Multi        []*DecodedRaftOp
 }
 
@@ -76,8 +79,11 @@ type pbOp struct {
 	BulkAction   *pbBulkActionOp   `protobuf:"bytes,24,opt,name=bulk_action,json=bulkAction,proto3" json:"bulk_action,omitempty"`
 	CleanUnique  *pbCleanUniqueOp  `protobuf:"bytes,25,opt,name=clean_unique,json=cleanUnique,proto3" json:"clean_unique,omitempty"`
 	CleanRate    *pbCleanRateOp    `protobuf:"bytes,26,opt,name=clean_rate,json=cleanRate,proto3" json:"clean_rate,omitempty"`
-	SetBudget    *pbSetBudgetOp    `protobuf:"bytes,27,opt,name=set_budget,json=setBudget,proto3" json:"set_budget,omitempty"`
-	DeleteBudget *pbDeleteBudgetOp `protobuf:"bytes,28,opt,name=delete_budget,json=deleteBudget,proto3" json:"delete_budget,omitempty"`
+	SetBudget        *pbSetBudgetOp        `protobuf:"bytes,27,opt,name=set_budget,json=setBudget,proto3" json:"set_budget,omitempty"`
+	DeleteBudget     *pbDeleteBudgetOp     `protobuf:"bytes,28,opt,name=delete_budget,json=deleteBudget,proto3" json:"delete_budget,omitempty"`
+	SetProvider      *pbSetProviderOp      `protobuf:"bytes,29,opt,name=set_provider,json=setProvider,proto3" json:"set_provider,omitempty"`
+	DeleteProvider   *pbDeleteProviderOp   `protobuf:"bytes,30,opt,name=delete_provider,json=deleteProvider,proto3" json:"delete_provider,omitempty"`
+	SetQueueProvider *pbSetQueueProviderOp `protobuf:"bytes,31,opt,name=set_queue_provider,json=setQueueProvider,proto3" json:"set_queue_provider,omitempty"`
 }
 
 func (m *pbOp) Reset()         { *m = pbOp{} }
@@ -590,6 +596,24 @@ func buildPBOp(opType OpType, data any) (*pbOp, error) {
 			return nil, fmt.Errorf("delete budget op type mismatch: %T", data)
 		}
 		op.DeleteBudget = toPBDeleteBudget(v)
+	case OpSetProvider:
+		v, ok := data.(SetProviderOp)
+		if !ok {
+			return nil, fmt.Errorf("set provider op type mismatch: %T", data)
+		}
+		op.SetProvider = toPBSetProvider(v)
+	case OpDeleteProvider:
+		v, ok := data.(DeleteProviderOp)
+		if !ok {
+			return nil, fmt.Errorf("delete provider op type mismatch: %T", data)
+		}
+		op.DeleteProvider = toPBDeleteProvider(v)
+	case OpSetQueueProvider:
+		v, ok := data.(SetQueueProviderOp)
+		if !ok {
+			return nil, fmt.Errorf("set queue provider op type mismatch: %T", data)
+		}
+		op.SetQueueProvider = toPBSetQueueProvider(v)
 	case OpMulti:
 		v, ok := data.(MultiOp)
 		if !ok {
@@ -769,6 +793,24 @@ func buildPBSubOp(sub Op) (*pbOp, error) {
 			return nil, err
 		}
 		op.DeleteBudget = toPBDeleteBudget(v)
+	case OpSetProvider:
+		var v SetProviderOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.SetProvider = toPBSetProvider(v)
+	case OpDeleteProvider:
+		var v DeleteProviderOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.DeleteProvider = toPBDeleteProvider(v)
+	case OpSetQueueProvider:
+		var v SetQueueProviderOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.SetQueueProvider = toPBSetQueueProvider(v)
 	default:
 		return nil, fmt.Errorf("unsupported multi sub-op type: %d", sub.Type)
 	}
@@ -916,6 +958,21 @@ func fromPBOp(op *pbOp) (*DecodedRaftOp, error) {
 	if op.DeleteBudget != nil {
 		v := fromPBDeleteBudget(op.DeleteBudget)
 		out.DeleteBudget = &v
+		return out, nil
+	}
+	if op.SetProvider != nil {
+		v := fromPBSetProvider(op.SetProvider)
+		out.SetProvider = &v
+		return out, nil
+	}
+	if op.DeleteProvider != nil {
+		v := fromPBDeleteProvider(op.DeleteProvider)
+		out.DeleteProvider = &v
+		return out, nil
+	}
+	if op.SetQueueProvider != nil {
+		v := fromPBSetQueueProvider(op.SetQueueProvider)
+		out.SetQueueProvider = &v
 		return out, nil
 	}
 	return nil, fmt.Errorf("protobuf op %d missing payload", op.Type)
@@ -1340,6 +1397,38 @@ func fromPBCleanRate(op *pbCleanRateOp) CleanRateLimitOp {
 	return CleanRateLimitOp{CutoffNs: op.CutoffNs}
 }
 
+type pbSetProviderOp struct {
+	Name           string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	RPMLimit       int32  `protobuf:"varint,2,opt,name=rpm_limit,json=rpmLimit,proto3" json:"rpm_limit,omitempty"`
+	HasRPMLimit    bool   `protobuf:"varint,3,opt,name=has_rpm_limit,json=hasRpmLimit,proto3" json:"has_rpm_limit,omitempty"`
+	InputTPMLimit  int32  `protobuf:"varint,4,opt,name=input_tpm_limit,json=inputTpmLimit,proto3" json:"input_tpm_limit,omitempty"`
+	HasInputTPM    bool   `protobuf:"varint,5,opt,name=has_input_tpm,json=hasInputTpm,proto3" json:"has_input_tpm,omitempty"`
+	OutputTPMLimit int32  `protobuf:"varint,6,opt,name=output_tpm_limit,json=outputTpmLimit,proto3" json:"output_tpm_limit,omitempty"`
+	HasOutputTPM   bool   `protobuf:"varint,7,opt,name=has_output_tpm,json=hasOutputTpm,proto3" json:"has_output_tpm,omitempty"`
+	CreatedAt      string `protobuf:"bytes,8,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+}
+
+func (m *pbSetProviderOp) Reset()         { *m = pbSetProviderOp{} }
+func (m *pbSetProviderOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbSetProviderOp) ProtoMessage()    {}
+
+type pbDeleteProviderOp struct {
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+}
+
+func (m *pbDeleteProviderOp) Reset()         { *m = pbDeleteProviderOp{} }
+func (m *pbDeleteProviderOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbDeleteProviderOp) ProtoMessage()    {}
+
+type pbSetQueueProviderOp struct {
+	Queue    string `protobuf:"bytes,1,opt,name=queue,proto3" json:"queue,omitempty"`
+	Provider string `protobuf:"bytes,2,opt,name=provider,proto3" json:"provider,omitempty"`
+}
+
+func (m *pbSetQueueProviderOp) Reset()         { *m = pbSetQueueProviderOp{} }
+func (m *pbSetQueueProviderOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbSetQueueProviderOp) ProtoMessage()    {}
+
 func toPBSetBudget(op SetBudgetOp) *pbSetBudgetOp {
 	out := &pbSetBudgetOp{
 		ID:        op.ID,
@@ -1390,4 +1479,60 @@ func fromPBDeleteBudget(op *pbDeleteBudgetOp) DeleteBudgetOp {
 		Scope:  op.Scope,
 		Target: op.Target,
 	}
+}
+
+func toPBSetProvider(op SetProviderOp) *pbSetProviderOp {
+	out := &pbSetProviderOp{
+		Name:      op.Name,
+		CreatedAt: op.CreatedAt,
+	}
+	if op.RPMLimit != nil {
+		out.HasRPMLimit = true
+		out.RPMLimit = int32(*op.RPMLimit)
+	}
+	if op.InputTPMLimit != nil {
+		out.HasInputTPM = true
+		out.InputTPMLimit = int32(*op.InputTPMLimit)
+	}
+	if op.OutputTPMLimit != nil {
+		out.HasOutputTPM = true
+		out.OutputTPMLimit = int32(*op.OutputTPMLimit)
+	}
+	return out
+}
+
+func fromPBSetProvider(op *pbSetProviderOp) SetProviderOp {
+	out := SetProviderOp{
+		Name:      op.Name,
+		CreatedAt: op.CreatedAt,
+	}
+	if op.HasRPMLimit {
+		v := int(op.RPMLimit)
+		out.RPMLimit = &v
+	}
+	if op.HasInputTPM {
+		v := int(op.InputTPMLimit)
+		out.InputTPMLimit = &v
+	}
+	if op.HasOutputTPM {
+		v := int(op.OutputTPMLimit)
+		out.OutputTPMLimit = &v
+	}
+	return out
+}
+
+func toPBDeleteProvider(op DeleteProviderOp) *pbDeleteProviderOp {
+	return &pbDeleteProviderOp{Name: op.Name}
+}
+
+func fromPBDeleteProvider(op *pbDeleteProviderOp) DeleteProviderOp {
+	return DeleteProviderOp{Name: op.Name}
+}
+
+func toPBSetQueueProvider(op SetQueueProviderOp) *pbSetQueueProviderOp {
+	return &pbSetQueueProviderOp{Queue: op.Queue, Provider: op.Provider}
+}
+
+func fromPBSetQueueProvider(op *pbSetQueueProviderOp) SetQueueProviderOp {
+	return SetQueueProviderOp{Queue: op.Queue, Provider: op.Provider}
 }

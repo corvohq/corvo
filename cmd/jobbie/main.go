@@ -19,6 +19,7 @@ import (
 	"github.com/user/jobbie/internal/enterprise"
 	"github.com/user/jobbie/internal/observability"
 	raftcluster "github.com/user/jobbie/internal/raft"
+	rpcsvc "github.com/user/jobbie/internal/rpcconnect"
 	"github.com/user/jobbie/internal/scheduler"
 	"github.com/user/jobbie/internal/server"
 	"github.com/user/jobbie/internal/store"
@@ -139,9 +140,6 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if discoverMode != "" && discoverMode != "dns" {
 		return fmt.Errorf("unsupported discover mode %q", discoverMode)
 	}
-	if raftShards > 1 && (joinAddr != "" || discoverMode != "") {
-		return fmt.Errorf("multi-raft sharding currently does not support join/discovery")
-	}
 
 	// Pebble is treated as rebuildable materialized state; keep Pebble fsync
 	// disabled for throughput in all modes. Durability is controlled by Raft.
@@ -241,7 +239,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		}
 		joinTargets = append(joinTargets, targets...)
 	}
-	if raftShards == 1 && !bootstrap && len(joinTargets) > 0 {
+	if !bootstrap && len(joinTargets) > 0 {
 		var joined bool
 		var lastErr error
 		for _, target := range joinTargets {
@@ -250,7 +248,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 				slog.Warn("join attempt failed", "target", target, "error", err)
 				continue
 			}
-			slog.Info("joined cluster", "target", target, "node_id", nodeID)
+			slog.Info("joined cluster", "target", target, "node_id", nodeID, "raft_shards", raftShards)
 			joined = true
 			break
 		}
@@ -346,6 +344,12 @@ func runServer(cmd *cobra.Command, args []string) error {
 		WriteRPS:   rateLimitWriteRPS,
 		WriteBurst: rateLimitWriteBurst,
 	}))
+	if raftShards > 1 {
+		opts = append(opts, server.WithRPCStreamConfig(rpcsvc.StreamConfig{
+			MaxInFlight:    2048 * raftShards,
+			MaxOpenStreams: 4096 * raftShards,
+		}))
+	}
 	srv := server.New(s, cluster, bindAddr, uiFS, opts...)
 	go func() {
 		if err := srv.Start(); err != nil && err != http.ErrServerClosed {

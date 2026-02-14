@@ -1,12 +1,19 @@
 package raft
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"net"
+	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,18 +35,13 @@ func NewMultiCluster(base ClusterConfig, shardCount int) (*MultiCluster, error) 
 	if shardCount < 2 {
 		return nil, fmt.Errorf("shardCount must be >= 2")
 	}
-	if strings.TrimSpace(base.JoinAddr) != "" {
-		return nil, fmt.Errorf("join is not supported with multi-raft sharding yet")
-	}
-	if !base.Bootstrap {
-		return nil, fmt.Errorf("multi-raft sharding currently requires bootstrap=true")
-	}
 	host, port, err := splitHostPort(base.RaftBind)
 	if err != nil {
 		return nil, fmt.Errorf("parse raft bind %q: %w", base.RaftBind, err)
 	}
 
 	rootDir := base.DataDir
+	// Multi-shard always uses a shared SQLite so cross-shard reads work.
 	sharedSQLite := strings.TrimSpace(base.SQLitePath)
 	if sharedSQLite == "" {
 		sharedSQLite = filepath.Join(rootDir, "jobbie.db")
@@ -55,6 +57,7 @@ func NewMultiCluster(base ClusterConfig, shardCount int) (*MultiCluster, error) 
 		cfg.DataDir = filepath.Join(rootDir, fmt.Sprintf("shard-%02d", i))
 		cfg.RaftBind = net.JoinHostPort(host, fmt.Sprintf("%d", port+i))
 		cfg.RaftAdvertise = "" // derive from bind per shard
+		cfg.JoinAddr = ""
 		cfg.SQLitePath = sharedSQLite
 		shard, err := NewCluster(cfg)
 		if err != nil {
@@ -112,6 +115,9 @@ func (m *MultiCluster) shardIndexForJobID(jobID string) int {
 	if strings.TrimSpace(jobID) == "" {
 		return -1
 	}
+	if idx, ok := parseShardTag(jobID, len(m.shards)); ok {
+		return idx
+	}
 	if v, ok := m.cache.Load(jobID); ok {
 		if idx, ok := v.(int); ok && idx >= 0 && idx < len(m.shards) {
 			return idx
@@ -127,6 +133,34 @@ func (m *MultiCluster) shardIndexForJobID(jobID string) int {
 		}
 	}
 	return -1
+}
+
+func tagJobIDForShard(jobID string, idx int) string {
+	if idx < 0 {
+		return jobID
+	}
+	if _, ok := parseShardTag(jobID, idx+1); ok {
+		return jobID
+	}
+	return fmt.Sprintf("s%02d_%s", idx, jobID)
+}
+
+func parseShardTag(jobID string, shardCount int) (int, bool) {
+	if len(jobID) < 4 || jobID[0] != 's' {
+		return -1, false
+	}
+	us := strings.IndexByte(jobID, '_')
+	if us < 2 {
+		return -1, false
+	}
+	n, err := strconv.Atoi(jobID[1:us])
+	if err != nil || n < 0 {
+		return -1, false
+	}
+	if shardCount > 0 && n >= shardCount {
+		return -1, false
+	}
+	return n, true
 }
 
 func (m *MultiCluster) shardsForQueues(queues []string) map[int][]string {
@@ -153,6 +187,7 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 			return &store.OpResult{Err: fmt.Errorf("enqueue op type mismatch: %T", data)}
 		}
 		idx := m.shardIndexForQueue(op.Queue)
+		op.JobID = tagJobIDForShard(op.JobID, idx)
 		res := m.shards[idx].Apply(opType, op)
 		if res != nil && res.Err == nil {
 			m.cacheJobShard(op.JobID, idx)
@@ -169,6 +204,7 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 		groups := make(map[int][]store.EnqueueOp)
 		for _, j := range op.Jobs {
 			idx := m.shardIndexForQueue(j.Queue)
+			j.JobID = tagJobIDForShard(j.JobID, idx)
 			groups[idx] = append(groups[idx], j)
 		}
 		if op.Batch != nil && len(groups) > 1 {
@@ -195,7 +231,13 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 			return &store.OpResult{Err: fmt.Errorf("fetch op type mismatch: %T", data)}
 		}
 		groups := m.shardsForQueues(op.Queues)
-		for idx, qs := range groups {
+		shardIDs := make([]int, 0, len(groups))
+		for idx := range groups {
+			shardIDs = append(shardIDs, idx)
+		}
+		sort.Ints(shardIDs)
+		for _, idx := range shardIDs {
+			qs := groups[idx]
 			sub := op
 			sub.Queues = qs
 			res := m.shards[idx].Apply(opType, sub)
@@ -215,7 +257,13 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 		groups := m.shardsForQueues(op.Queues)
 		remaining := op.Count
 		merged := make([]store.FetchResult, 0, op.Count)
-		for idx, qs := range groups {
+		shardIDs := make([]int, 0, len(groups))
+		for idx := range groups {
+			shardIDs = append(shardIDs, idx)
+		}
+		sort.Ints(shardIDs)
+		for _, idx := range shardIDs {
+			qs := groups[idx]
 			if remaining <= 0 {
 				break
 			}
@@ -240,11 +288,16 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 			return &store.OpResult{Err: fmt.Errorf("ack op type mismatch: %T", data)}
 		}
 		if idx := m.shardIndexForJobID(op.JobID); idx >= 0 {
-			return m.shards[idx].Apply(opType, op)
+			res := m.shards[idx].Apply(opType, op)
+			if res != nil && res.Err == nil {
+				m.cache.Delete(op.JobID)
+			}
+			return res
 		}
 		for _, s := range m.shards {
 			res := s.Apply(opType, op)
 			if res.Err == nil {
+				m.cache.Delete(op.JobID)
 				return res
 			}
 		}
@@ -275,19 +328,12 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 			}
 		}
 		for _, a := range unknown {
-			acked := false
-			for i, s := range m.shards {
+			for _, s := range m.shards {
 				res := s.Apply(store.OpAck, a)
 				if res.Err == nil {
-					m.cacheJobShard(a.JobID, i)
 					total++
-					acked = true
 					break
 				}
-			}
-			if !acked {
-				// Best-effort batch behavior: keep going.
-				continue
 			}
 		}
 		return &store.OpResult{Data: total}
@@ -297,11 +343,16 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 			return &store.OpResult{Err: fmt.Errorf("fail op type mismatch: %T", data)}
 		}
 		if idx := m.shardIndexForJobID(op.JobID); idx >= 0 {
-			return m.shards[idx].Apply(opType, op)
+			res := m.shards[idx].Apply(opType, op)
+			if res != nil && res.Err == nil {
+				m.cache.Delete(op.JobID)
+			}
+			return res
 		}
 		for _, s := range m.shards {
 			res := s.Apply(opType, op)
 			if res.Err == nil {
+				m.cache.Delete(op.JobID)
 				return res
 			}
 		}
@@ -314,16 +365,33 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 		if idx := m.shardIndexForJobID(op.JobID); idx >= 0 {
 			return m.shards[idx].Apply(opType, op)
 		}
-		return m.shards[0].Apply(opType, op)
+		for _, s := range m.shards {
+			res := s.Apply(opType, op)
+			if res.Err == nil {
+				return res
+			}
+		}
+		return &store.OpResult{Err: fmt.Errorf("job %s not found on any shard", op.JobID)}
 	case store.OpCancelJob:
 		op, ok := data.(store.CancelJobOp)
 		if !ok {
 			return &store.OpResult{Err: fmt.Errorf("cancel op type mismatch: %T", data)}
 		}
 		if idx := m.shardIndexForJobID(op.JobID); idx >= 0 {
-			return m.shards[idx].Apply(opType, op)
+			res := m.shards[idx].Apply(opType, op)
+			if res != nil && res.Err == nil {
+				m.cache.Delete(op.JobID)
+			}
+			return res
 		}
-		return m.shards[0].Apply(opType, op)
+		for _, s := range m.shards {
+			res := s.Apply(opType, op)
+			if res.Err == nil {
+				m.cache.Delete(op.JobID)
+				return res
+			}
+		}
+		return &store.OpResult{Err: fmt.Errorf("job %s not found on any shard", op.JobID)}
 	case store.OpMoveJob:
 		op, ok := data.(store.MoveJobOp)
 		if !ok {
@@ -332,16 +400,33 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 		if idx := m.shardIndexForJobID(op.JobID); idx >= 0 {
 			return m.shards[idx].Apply(opType, op)
 		}
-		return m.shards[0].Apply(opType, op)
+		for _, s := range m.shards {
+			res := s.Apply(opType, op)
+			if res.Err == nil {
+				return res
+			}
+		}
+		return &store.OpResult{Err: fmt.Errorf("job %s not found on any shard", op.JobID)}
 	case store.OpDeleteJob:
 		op, ok := data.(store.DeleteJobOp)
 		if !ok {
 			return &store.OpResult{Err: fmt.Errorf("delete op type mismatch: %T", data)}
 		}
 		if idx := m.shardIndexForJobID(op.JobID); idx >= 0 {
-			return m.shards[idx].Apply(opType, op)
+			res := m.shards[idx].Apply(opType, op)
+			if res != nil && res.Err == nil {
+				m.cache.Delete(op.JobID)
+			}
+			return res
 		}
-		return m.shards[0].Apply(opType, op)
+		for _, s := range m.shards {
+			res := s.Apply(opType, op)
+			if res.Err == nil {
+				m.cache.Delete(op.JobID)
+				return res
+			}
+		}
+		return &store.OpResult{Err: fmt.Errorf("job %s not found on any shard", op.JobID)}
 	case store.OpHeartbeat:
 		op, ok := data.(store.HeartbeatOp)
 		if !ok {
@@ -351,7 +436,15 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 		for jobID, upd := range op.Jobs {
 			idx := m.shardIndexForJobID(jobID)
 			if idx < 0 {
-				idx = 0
+				// Unknown shard: broadcast to all shards so the owning
+				// one picks it up. Each shard silently ignores unknown jobs.
+				for i := range m.shards {
+					if grouped[i] == nil {
+						grouped[i] = make(map[string]store.HeartbeatJobOp)
+					}
+					grouped[i][jobID] = upd
+				}
+				continue
 			}
 			if grouped[idx] == nil {
 				grouped[idx] = make(map[string]store.HeartbeatJobOp)
@@ -399,11 +492,31 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 
 func (m *MultiCluster) SQLiteReadDB() *sql.DB { return m.readDB }
 func (m *MultiCluster) IsLeader() bool        { return len(m.shards) > 0 && m.shards[0].IsLeader() }
+func (m *MultiCluster) ShardCount() int       { return len(m.shards) }
 func (m *MultiCluster) LeaderAddr() string {
 	if len(m.shards) == 0 {
 		return ""
 	}
 	return m.shards[0].LeaderAddr()
+}
+func (m *MultiCluster) IsLeaderForShard(shard int) bool {
+	if shard < 0 || shard >= len(m.shards) {
+		return false
+	}
+	return m.shards[shard].IsLeader()
+}
+func (m *MultiCluster) LeaderAddrForShard(shard int) string {
+	if shard < 0 || shard >= len(m.shards) {
+		return ""
+	}
+	return m.shards[shard].LeaderAddr()
+}
+func (m *MultiCluster) ShardForQueue(queue string) int {
+	return m.shardIndexForQueue(queue)
+}
+func (m *MultiCluster) ShardForJobID(jobID string) (int, bool) {
+	idx := m.shardIndexForJobID(jobID)
+	return idx, idx >= 0
 }
 func (m *MultiCluster) State() string {
 	if len(m.shards) == 0 {
@@ -433,8 +546,61 @@ func (m *MultiCluster) WaitForLeader(timeout time.Duration) error {
 	}
 	return nil
 }
-func (m *MultiCluster) JoinCluster(string) error {
-	return fmt.Errorf("multi-raft join is not supported yet")
+func (m *MultiCluster) AddVoterForShard(shard int, nodeID, addr string) error {
+	if shard < 0 || shard >= len(m.shards) {
+		return fmt.Errorf("invalid shard index %d", shard)
+	}
+	return m.shards[shard].AddVoter(nodeID, addr)
+}
+
+func (m *MultiCluster) JoinCluster(leaderAddr string) error {
+	if strings.TrimSpace(leaderAddr) == "" {
+		return fmt.Errorf("leader address is required")
+	}
+	base := strings.TrimSpace(leaderAddr)
+	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+		base = "http://" + base
+	}
+	u, err := neturl.Parse(strings.TrimRight(base, "/"))
+	if err != nil {
+		return fmt.Errorf("parse leader address: %w", err)
+	}
+	joinURL := strings.TrimRight(u.String(), "/") + "/api/v1/cluster/join"
+	timeout := 10 * time.Second
+	if len(m.shards) > 0 && m.shards[0].config.ApplyTimeout > 0 {
+		timeout = m.shards[0].config.ApplyTimeout
+	}
+	client := &http.Client{Timeout: timeout}
+
+	for i, shard := range m.shards {
+		body, _ := json.Marshal(map[string]any{
+			"node_id":     shard.config.NodeID,
+			"addr":        string(shard.transport.LocalAddr()),
+			"shard":       i,
+			"shard_count": len(m.shards),
+		})
+		req, err := http.NewRequest(http.MethodPost, joinURL, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("create shard %d join request: %w", i, err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		res, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("shard %d join request: %w", i, err)
+		}
+		if res.StatusCode/100 != 2 {
+			var payload map[string]any
+			b, _ := io.ReadAll(io.LimitReader(res.Body, 32*1024))
+			_ = json.Unmarshal(b, &payload)
+			_ = res.Body.Close()
+			if msg, ok := payload["error"].(string); ok && msg != "" {
+				return fmt.Errorf("shard %d join rejected: %s", i, msg)
+			}
+			return fmt.Errorf("shard %d join rejected: status %d", i, res.StatusCode)
+		}
+		_ = res.Body.Close()
+	}
+	return nil
 }
 func (m *MultiCluster) SnapshotAfterFirstApply(timeout time.Duration) error {
 	for _, s := range m.shards {

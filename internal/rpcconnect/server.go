@@ -301,29 +301,33 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 		}
 		frameHadError := false
 		acquired := false
-		if cfg.AcquireTimeout <= 0 {
-			select {
-			case s.frameSem <- struct{}{}:
-				acquired = true
-			case <-ctx.Done():
-				return nil
-			}
-		} else {
-			acquireTimer := time.NewTimer(cfg.AcquireTimeout)
-			select {
-			case s.frameSem <- struct{}{}:
-				acquired = true
-			case <-ctx.Done():
-				acquireTimer.Stop()
-				return nil
-			case <-acquireTimer.C:
-				frameHadError = true
-				resp.Error = "OVERLOADED: lifecycle stream saturated"
-			}
-			if !acquireTimer.Stop() {
+		idleFetchSleep := false
+		needWork := len(req.GetAcks()) > 0 || int(req.GetFetchCount()) > 0 || len(req.GetEnqueues()) > 0
+		if needWork {
+			if cfg.AcquireTimeout <= 0 {
 				select {
+				case s.frameSem <- struct{}{}:
+					acquired = true
+				case <-ctx.Done():
+					return nil
+				}
+			} else {
+				acquireTimer := time.NewTimer(cfg.AcquireTimeout)
+				select {
+				case s.frameSem <- struct{}{}:
+					acquired = true
+				case <-ctx.Done():
+					acquireTimer.Stop()
+					return nil
 				case <-acquireTimer.C:
-				default:
+					frameHadError = true
+					resp.Error = "OVERLOADED: lifecycle stream saturated"
+				}
+				if !acquireTimer.Stop() {
+					select {
+					case <-acquireTimer.C:
+					default:
+					}
 				}
 			}
 		}
@@ -376,20 +380,7 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 					Hostname:      req.GetHostname(),
 					LeaseDuration: int(req.GetLeaseDuration()),
 				}
-				// Lifecycle streams need a short bounded poll:
-				// - too short (no wait) spins hot on empty queues
-				// - too long (lease-length wait) delays ACK turns
-				// Keep frame wait small and independent of lease duration.
-				const lifecyclePollTimeout = 100 * time.Millisecond
-				var jobs []store.FetchResult
-				err := waitForFetch(ctx, lifecyclePollTimeout, func() (bool, error) {
-					r, err := s.store.FetchBatch(fetchReq, n)
-					if err != nil {
-						return false, err
-					}
-					jobs = r
-					return len(jobs) > 0, nil
-				})
+				jobs, err := s.store.FetchBatch(fetchReq, n)
 				if err != nil {
 					frameHadError = true
 					if store.IsOverloadedError(err) {
@@ -413,6 +404,9 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 						})
 					}
 					resp.Jobs = respJobs
+					if len(respJobs) == 0 {
+						idleFetchSleep = true
+					}
 				}
 			}
 		}
@@ -456,6 +450,15 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 		}
 		if acquired {
 			<-s.frameSem
+		}
+		// If fetch was empty, sleep outside semaphore so idle long-polling
+		// streams do not consume global in-flight slots.
+		if idleFetchSleep {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(100 * time.Millisecond):
+			}
 		}
 
 		// Strike tracking: consecutive hard errors trigger progressive delay.

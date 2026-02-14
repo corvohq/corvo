@@ -37,18 +37,24 @@ func (s *Store) SetProvider(req SetProviderRequest) (*Provider, error) {
 		return nil, fmt.Errorf("output_tpm_limit must be >= 0")
 	}
 	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.sqliteR.Exec(`INSERT INTO providers (name, rpm_limit, input_tpm_limit, output_tpm_limit, created_at)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(name) DO UPDATE SET
-			rpm_limit = excluded.rpm_limit,
-			input_tpm_limit = excluded.input_tpm_limit,
-			output_tpm_limit = excluded.output_tpm_limit`,
-		name, req.RPMLimit, req.InputTPMLimit, req.OutputTPMLimit, createdAt,
-	)
-	if err != nil {
+	op := SetProviderOp{
+		Name:           name,
+		RPMLimit:       req.RPMLimit,
+		InputTPMLimit:  req.InputTPMLimit,
+		OutputTPMLimit: req.OutputTPMLimit,
+		CreatedAt:      createdAt,
+	}
+	if err := s.applyOp(OpSetProvider, op).Err; err != nil {
 		return nil, err
 	}
-	return s.GetProvider(name)
+	s.providerConfigState.Store(1)
+	return &Provider{
+		Name:           op.Name,
+		RPMLimit:       op.RPMLimit,
+		InputTPMLimit:  op.InputTPMLimit,
+		OutputTPMLimit: op.OutputTPMLimit,
+		CreatedAt:      op.CreatedAt,
+	}, nil
 }
 
 func (s *Store) GetProvider(name string) (*Provider, error) {
@@ -95,11 +101,10 @@ func (s *Store) DeleteProvider(name string) error {
 	if name == "" {
 		return fmt.Errorf("name is required")
 	}
-	_, err := s.sqliteR.Exec("DELETE FROM providers WHERE name = ?", name)
-	if err != nil {
+	if err := s.applyOp(OpDeleteProvider, DeleteProviderOp{Name: name}).Err; err != nil {
 		return err
 	}
-	_, _ = s.sqliteR.Exec("UPDATE queues SET provider = NULL WHERE provider = ?", name)
+	s.refreshProviderConfigState()
 	return nil
 }
 
@@ -114,20 +119,14 @@ func (s *Store) SetQueueProvider(queue, provider string) error {
 			return err
 		}
 	}
-	_, err := s.sqliteR.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", queue)
-	if err != nil {
-		return err
-	}
-	var providerVal any
-	if provider != "" {
-		providerVal = provider
-	}
-	_, err = s.sqliteR.Exec("UPDATE queues SET provider = ? WHERE name = ?", providerVal, queue)
-	return err
+	return s.applyOp(OpSetQueueProvider, SetQueueProviderOp{Queue: queue, Provider: provider}).Err
 }
 
 func (s *Store) enforceFetchProviders(queues []string) ([]string, error) {
 	if len(queues) == 0 {
+		return queues, nil
+	}
+	if !s.hasAnyProvidersConfigured() {
 		return queues, nil
 	}
 	now := time.Now().UTC()
@@ -143,6 +142,37 @@ func (s *Store) enforceFetchProviders(queues []string) ([]string, error) {
 		}
 	}
 	return allowed, nil
+}
+
+func (s *Store) hasAnyProvidersConfigured() bool {
+	switch s.providerConfigState.Load() {
+	case 0:
+		return false
+	case 1:
+		return true
+	default:
+		return s.refreshProviderConfigState()
+	}
+}
+
+func (s *Store) refreshProviderConfigState() bool {
+	if s.sqliteR == nil {
+		s.providerConfigState.Store(0)
+		return false
+	}
+	var one int
+	err := s.sqliteR.QueryRow("SELECT 1 FROM providers LIMIT 1").Scan(&one)
+	if err == sql.ErrNoRows {
+		s.providerConfigState.Store(0)
+		return false
+	}
+	if err != nil {
+		// Fail-open to preserve existing behavior on transient sqlite issues.
+		s.providerConfigState.Store(1)
+		return true
+	}
+	s.providerConfigState.Store(1)
+	return true
 }
 
 func (s *Store) queueAllowedByProviderLimit(queue, windowStart string) (bool, error) {

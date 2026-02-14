@@ -492,6 +492,34 @@ func sqliteDeleteBudget(db sqlExecer, scope, target string) error {
 	return err
 }
 
+func sqliteUpsertProvider(db sqlExecer, p store.Provider) error {
+	_, err := db.Exec(`INSERT INTO providers (name, rpm_limit, input_tpm_limit, output_tpm_limit, created_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET
+			rpm_limit = excluded.rpm_limit,
+			input_tpm_limit = excluded.input_tpm_limit,
+			output_tpm_limit = excluded.output_tpm_limit`,
+		p.Name, p.RPMLimit, p.InputTPMLimit, p.OutputTPMLimit, p.CreatedAt,
+	)
+	return err
+}
+
+func sqliteDeleteProvider(db sqlExecer, name string) error {
+	db.Exec("UPDATE queues SET provider = NULL WHERE provider = ?", name)
+	_, err := db.Exec("DELETE FROM providers WHERE name = ?", name)
+	return err
+}
+
+func sqliteSetQueueProvider(db sqlExecer, queue, provider string) error {
+	db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", queue)
+	var providerVal any
+	if provider != "" {
+		providerVal = provider
+	}
+	_, err := db.Exec("UPDATE queues SET provider = ? WHERE name = ?", providerVal, queue)
+	return err
+}
+
 func sqliteDeleteJob(db sqlExecer, jobID string) error {
 	db.Exec("DELETE FROM job_errors WHERE job_id = ?", jobID)
 	_, err := db.Exec("DELETE FROM jobs WHERE id = ?", jobID)
@@ -754,6 +782,25 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 			}
 			if err := sqliteUpsertBudget(tx, b); err != nil {
 				retErr = fmt.Errorf("upsert budget: %w", err)
+				return retErr
+			}
+		case bytes.HasPrefix(key, []byte(kv.PrefixProvider)):
+			var p store.Provider
+			if err := json.Unmarshal(val, &p); err != nil {
+				continue
+			}
+			if p.Name == "" {
+				p.Name = string(key[len(kv.PrefixProvider):])
+			}
+			if err := sqliteUpsertProvider(tx, p); err != nil {
+				retErr = fmt.Errorf("upsert provider: %w", err)
+				return retErr
+			}
+		case bytes.HasPrefix(key, []byte(kv.PrefixQueueProv)):
+			queue := string(key[len(kv.PrefixQueueProv):])
+			provider := string(val)
+			if err := sqliteSetQueueProvider(tx, queue, provider); err != nil {
+				retErr = fmt.Errorf("set queue provider: %w", err)
 				return retErr
 			}
 		}

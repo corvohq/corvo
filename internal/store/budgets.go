@@ -90,6 +90,7 @@ func (s *Store) SetBudget(req SetBudgetRequest) (*Budget, error) {
 	if err := s.applyOp(OpSetBudget, op).Err; err != nil {
 		return nil, err
 	}
+	s.budgetConfigState.Store(1)
 	return &Budget{
 		ID:        op.ID,
 		Scope:     op.Scope,
@@ -106,7 +107,11 @@ func (s *Store) DeleteBudget(scope, target string) error {
 	if err != nil {
 		return err
 	}
-	return s.applyOp(OpDeleteBudget, DeleteBudgetOp{Scope: scope, Target: target}).Err
+	if err := s.applyOp(OpDeleteBudget, DeleteBudgetOp{Scope: scope, Target: target}).Err; err != nil {
+		return err
+	}
+	s.refreshBudgetConfigState()
+	return nil
 }
 
 func (s *Store) GetBudget(scope, target string) (*Budget, error) {
@@ -151,6 +156,9 @@ func (s *Store) enforceFetchBudgets(queues []string) ([]string, error) {
 	if len(queues) == 0 {
 		return queues, nil
 	}
+	if !s.hasAnyBudgetsConfigured() {
+		return queues, nil
+	}
 	allowed := make([]string, 0, len(queues))
 	for _, queue := range queues {
 		ok, err := s.queueAllowedByBudget(queue)
@@ -162,6 +170,37 @@ func (s *Store) enforceFetchBudgets(queues []string) ([]string, error) {
 		}
 	}
 	return allowed, nil
+}
+
+func (s *Store) hasAnyBudgetsConfigured() bool {
+	switch s.budgetConfigState.Load() {
+	case 0:
+		return false
+	case 1:
+		return true
+	default:
+		return s.refreshBudgetConfigState()
+	}
+}
+
+func (s *Store) refreshBudgetConfigState() bool {
+	if s.sqliteR == nil {
+		s.budgetConfigState.Store(0)
+		return false
+	}
+	var one int
+	err := s.sqliteR.QueryRow("SELECT 1 FROM budgets LIMIT 1").Scan(&one)
+	if err == sql.ErrNoRows {
+		s.budgetConfigState.Store(0)
+		return false
+	}
+	if err != nil {
+		// Fail-open: preserve behavior when sqlite mirror is temporarily unavailable.
+		s.budgetConfigState.Store(1)
+		return true
+	}
+	s.budgetConfigState.Store(1)
+	return true
 }
 
 func (s *Store) queueAllowedByBudget(queue string) (bool, error) {

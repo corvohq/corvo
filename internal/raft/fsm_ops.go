@@ -1796,6 +1796,74 @@ func (f *FSM) applyDeleteBudgetOp(op store.DeleteBudgetOp) *store.OpResult {
 	return &store.OpResult{Data: nil}
 }
 
+// --- Provider operations ---
+
+func (f *FSM) applySetProvider(data json.RawMessage) *store.OpResult {
+	var op store.SetProviderOp
+	if err := json.Unmarshal(data, &op); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	return f.applySetProviderOp(op)
+}
+
+func (f *FSM) applySetProviderOp(op store.SetProviderOp) *store.OpResult {
+	doc := store.Provider{
+		Name:           op.Name,
+		RPMLimit:       op.RPMLimit,
+		InputTPMLimit:  op.InputTPMLimit,
+		OutputTPMLimit: op.OutputTPMLimit,
+		CreatedAt:      op.CreatedAt,
+	}
+	b, err := json.Marshal(doc)
+	if err != nil {
+		return &store.OpResult{Err: err}
+	}
+	if err := f.pebble.Set(kv.ProviderKey(op.Name), b, f.writeOpts); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	f.syncSQLite(func(db sqlExecer) error {
+		return sqliteUpsertProvider(db, doc)
+	})
+	return &store.OpResult{Data: nil}
+}
+
+func (f *FSM) applyDeleteProvider(data json.RawMessage) *store.OpResult {
+	var op store.DeleteProviderOp
+	if err := json.Unmarshal(data, &op); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	return f.applyDeleteProviderOp(op)
+}
+
+func (f *FSM) applyDeleteProviderOp(op store.DeleteProviderOp) *store.OpResult {
+	if err := f.pebble.Delete(kv.ProviderKey(op.Name), f.writeOpts); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	f.syncSQLite(func(db sqlExecer) error {
+		return sqliteDeleteProvider(db, op.Name)
+	})
+	return &store.OpResult{Data: nil}
+}
+
+func (f *FSM) applySetQueueProvider(data json.RawMessage) *store.OpResult {
+	var op store.SetQueueProviderOp
+	if err := json.Unmarshal(data, &op); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	return f.applySetQueueProviderOp(op)
+}
+
+func (f *FSM) applySetQueueProviderOp(op store.SetQueueProviderOp) *store.OpResult {
+	val := []byte(op.Provider)
+	if err := f.pebble.Set(kv.QueueProviderKey(op.Queue), val, f.writeOpts); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	f.syncSQLite(func(db sqlExecer) error {
+		return sqliteSetQueueProvider(db, op.Queue, op.Provider)
+	})
+	return &store.OpResult{Data: nil}
+}
+
 // --- DeleteJob ---
 
 func (f *FSM) applyDeleteJob(data json.RawMessage) *store.OpResult {

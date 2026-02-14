@@ -1,16 +1,19 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -42,6 +45,7 @@ type Server struct {
 	samlAuth    *samlHeaderAuthenticator
 	reqMetrics  *requestMetrics
 	rateLimiter *rateLimiter
+	streamCfg   *rpcconnect.StreamConfig
 }
 
 // Option mutates server behavior.
@@ -86,6 +90,15 @@ func WithRateLimit(cfg RateLimitConfig) Option {
 	}
 }
 
+// WithRPCStreamConfig overrides lifecycle stream admission settings.
+func WithRPCStreamConfig(cfg rpcconnect.StreamConfig) Option {
+	return func(s *Server) error {
+		c := cfg
+		s.streamCfg = &c
+		return nil
+	}
+}
+
 // ClusterInfo contains cluster state methods used by HTTP handlers/middleware.
 type ClusterInfo interface {
 	IsLeader() bool
@@ -95,6 +108,16 @@ type ClusterInfo interface {
 	EventLog(afterSeq uint64, limit int) ([]map[string]any, error)
 	RebuildSQLiteFromPebble() error
 }
+
+type shardLeaderInfo interface {
+	ShardCount() int
+	IsLeaderForShard(shard int) bool
+	LeaderAddrForShard(shard int) string
+	ShardForQueue(queue string) int
+	ShardForJobID(jobID string) (int, bool)
+}
+
+var errMixedShardLeaders = errors.New("request spans local and remote shard leaders; split request by shard")
 
 // New creates a new Server.
 // If uiAssets is non-nil the embedded SPA will be served at /ui/.
@@ -232,7 +255,11 @@ func (s *Server) buildRouter() chi.Router {
 	})
 
 	// Worker lifecycle RPC (Connect: protobuf and JSON fallback).
-	rpcPath, rpcHandler := rpcconnect.NewHandler(s.store)
+	var rpcOpts []func(*rpcconnect.Server)
+	if s.streamCfg != nil {
+		rpcOpts = append(rpcOpts, rpcconnect.WithStreamConfig(*s.streamCfg))
+	}
+	rpcPath, rpcHandler := rpcconnect.NewHandler(s.store, rpcOpts...)
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireLeader)
 		r.Mount(strings.TrimSuffix(rpcPath, "/"), rpcHandler)
@@ -490,7 +517,20 @@ func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) requireLeader(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.cluster == nil || s.cluster.IsLeader() {
+		if s.cluster == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		leaders, isLeader, err := s.resolveRequestLeaders(r)
+		if err != nil {
+			if errors.Is(err, errMixedShardLeaders) {
+				writeError(w, http.StatusConflict, err.Error(), "SHARD_LEADER_CONFLICT")
+				return
+			}
+			writeError(w, http.StatusBadRequest, err.Error(), "VALIDATION_ERROR")
+			return
+		}
+		if isLeader {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -499,11 +539,15 @@ func (s *Server) requireLeader(next http.Handler) http.Handler {
 			return
 		}
 
-		leader := s.cluster.LeaderAddr()
-		if leader == "" {
+		if len(leaders) == 0 {
 			writeError(w, http.StatusServiceUnavailable, "leader unavailable", "LEADER_UNAVAILABLE")
 			return
 		}
+		if len(leaders) > 1 {
+			writeError(w, http.StatusConflict, "request spans shards with different leaders; split request by shard", "SHARD_LEADER_CONFLICT")
+			return
+		}
+		leader := leaders[0]
 
 		target, err := s.leaderTargetURL(r, leader)
 		if err != nil {
@@ -516,6 +560,218 @@ func (s *Server) requireLeader(next http.Handler) http.Handler {
 			writeError(w, http.StatusServiceUnavailable, "leader proxy unavailable", "LEADER_UNAVAILABLE")
 		}
 	})
+}
+
+func (s *Server) resolveRequestLeaders(r *http.Request) ([]string, bool, error) {
+	sharded, ok := s.cluster.(shardLeaderInfo)
+	if !ok || sharded.ShardCount() <= 1 {
+		if s.cluster.IsLeader() {
+			return nil, true, nil
+		}
+		leader := strings.TrimSpace(s.cluster.LeaderAddr())
+		if leader == "" {
+			return nil, false, nil
+		}
+		return []string{leader}, false, nil
+	}
+
+	shards, err := s.requestShardTargets(r, sharded)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(shards) == 0 {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/") {
+			// ConnectRPC or other non-API paths: pass through.
+			// The handler routes per-operation via MultiCluster.Apply.
+			return nil, true, nil
+		}
+		for i := 0; i < sharded.ShardCount(); i++ {
+			shards = append(shards, i)
+		}
+	}
+
+	leadersSet := map[string]struct{}{}
+	allLocal := true
+	anyLocal := false
+	for _, shard := range shards {
+		if shard < 0 || shard >= sharded.ShardCount() {
+			continue
+		}
+		if sharded.IsLeaderForShard(shard) {
+			anyLocal = true
+			continue
+		}
+		allLocal = false
+		leader := strings.TrimSpace(sharded.LeaderAddrForShard(shard))
+		if leader == "" {
+			return nil, false, nil
+		}
+		leadersSet[leader] = struct{}{}
+	}
+	if allLocal {
+		return nil, true, nil
+	}
+	if anyLocal && len(leadersSet) > 0 {
+		return nil, false, errMixedShardLeaders
+	}
+	out := make([]string, 0, len(leadersSet))
+	for leader := range leadersSet {
+		out = append(out, leader)
+	}
+	return out, false, nil
+}
+
+func (s *Server) requestShardTargets(r *http.Request, sharded shardLeaderInfo) ([]int, error) {
+	path := r.URL.Path
+	method := r.Method
+	shards := map[int]struct{}{}
+	addQueue := func(queue string) {
+		queue = strings.TrimSpace(queue)
+		if queue == "" {
+			return
+		}
+		shards[sharded.ShardForQueue(queue)] = struct{}{}
+	}
+	addJob := func(jobID string) {
+		jobID = strings.TrimSpace(jobID)
+		if jobID == "" {
+			return
+		}
+		if idx, ok := sharded.ShardForJobID(jobID); ok {
+			shards[idx] = struct{}{}
+		}
+	}
+
+	if strings.HasPrefix(path, "/api/v1/queues/") {
+		principal := principalFromContext(r.Context())
+		addQueue(namespaceQueue(principal.Namespace, chi.URLParam(r, "name")))
+		return sortedShards(shards), nil
+	}
+	if strings.HasPrefix(path, "/api/v1/jobs/") {
+		addJob(chi.URLParam(r, "id"))
+		return sortedShards(shards), nil
+	}
+	if strings.HasPrefix(path, "/api/v1/ack/") {
+		addJob(chi.URLParam(r, "job_id"))
+		return sortedShards(shards), nil
+	}
+	if strings.HasPrefix(path, "/api/v1/fail/") {
+		addJob(chi.URLParam(r, "job_id"))
+		return sortedShards(shards), nil
+	}
+	if method == http.MethodDelete && path == "/api/v1/auth/keys" {
+		return nil, nil
+	}
+
+	// Don't parse body for non-API paths (e.g. ConnectRPC streaming/protobuf).
+	// io.ReadAll on a bidi stream body deadlocks, and protobuf isn't JSON.
+	if !strings.HasPrefix(path, "/api/v1/") {
+		return nil, nil
+	}
+
+	body, err := decodeJSONBodyMap(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) == 0 {
+		return nil, nil
+	}
+	principal := principalFromContext(r.Context())
+	switch path {
+	case "/api/v1/enqueue":
+		addQueue(namespaceQueue(principal.Namespace, getString(body, "queue")))
+	case "/api/v1/enqueue/batch":
+		for _, item := range getSlice(body, "jobs") {
+			addQueue(namespaceQueue(principal.Namespace, getString(item, "queue")))
+		}
+	case "/api/v1/fetch", "/api/v1/fetch/batch":
+		for _, queue := range getStringList(body, "queues") {
+			addQueue(namespaceQueue(principal.Namespace, queue))
+		}
+	case "/api/v1/ack/batch":
+		for _, item := range getSlice(body, "acks") {
+			addJob(getString(item, "job_id"))
+		}
+	case "/api/v1/heartbeat":
+		for jobID := range getMap(body, "jobs") {
+			addJob(jobID)
+		}
+	}
+	return sortedShards(shards), nil
+}
+
+func decodeJSONBodyMap(r *http.Request) (map[string]any, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+	buf, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	_ = r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(buf))
+	if len(bytes.TrimSpace(buf)) == 0 {
+		return nil, nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal(buf, &out); err != nil {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func sortedShards(in map[int]struct{}) []int {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]int, 0, len(in))
+	for idx := range in {
+		out = append(out, idx)
+	}
+	sort.Ints(out)
+	return out
+}
+
+func getString(m map[string]any, key string) string {
+	v, _ := m[key].(string)
+	return v
+}
+
+func getMap(m map[string]any, key string) map[string]any {
+	v, _ := m[key].(map[string]any)
+	return v
+}
+
+func getSlice(m map[string]any, key string) []map[string]any {
+	raw, _ := m[key].([]any)
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(raw))
+	for _, item := range raw {
+		asMap, _ := item.(map[string]any)
+		if len(asMap) == 0 {
+			continue
+		}
+		out = append(out, asMap)
+	}
+	return out
+}
+
+func getStringList(m map[string]any, key string) []string {
+	raw, _ := m[key].([]any)
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		v, _ := item.(string)
+		if strings.TrimSpace(v) == "" {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
 }
 
 func (s *Server) leaderTargetURL(r *http.Request, leaderAddr string) (*url.URL, error) {
