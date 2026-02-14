@@ -144,7 +144,10 @@ func (s *Server) resolvePrincipal(r *http.Request) (authPrincipal, int, string, 
 	if !s.isAuthorized(p, r.Method, r.URL.Path) {
 		return authPrincipal{}, http.StatusForbidden, "FORBIDDEN", "insufficient role permissions"
 	}
-	_, _ = db.Exec("UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?", time.Now().UTC().Format(time.RFC3339Nano), p.KeyHash)
+	s.store.UpdateAPIKeyLastUsed(store.UpdateAPIKeyUsedOp{
+		KeyHash: p.KeyHash,
+		Now:     time.Now().UTC().Format(time.RFC3339Nano),
+	})
 	return p, 0, "", ""
 }
 
@@ -238,10 +241,16 @@ func (s *Server) auditLogMiddleware(next http.Handler) http.Handler {
 			"duration_ms": time.Since(start).Milliseconds(),
 			"query":       r.URL.RawQuery,
 		})
-		_, _ = s.store.ReadDB().Exec(`
-			INSERT INTO audit_logs (namespace, principal, role, method, path, status_code, metadata, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, p.Namespace, p.Name, p.Role, r.Method, r.URL.Path, ww.status, string(meta), time.Now().UTC().Format(time.RFC3339Nano))
+		s.store.InsertAuditLog(store.InsertAuditLogOp{
+			Namespace:  p.Namespace,
+			Principal:  p.Name,
+			Role:       p.Role,
+			Method:     r.Method,
+			Path:       r.URL.Path,
+			StatusCode: ww.status,
+			Metadata:   string(meta),
+			CreatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+		})
 	})
 }
 
@@ -331,24 +340,21 @@ func (s *Server) upsertAPIKey(name, key, namespace, role, queueScope, expiresAt 
 		}
 	}
 	h := hashAPIKey(key)
-	_, err := s.store.ReadDB().Exec(`
-		INSERT INTO api_keys (key_hash, name, namespace, role, queue_scope, enabled, created_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))
-		ON CONFLICT(key_hash) DO UPDATE SET
-			name = excluded.name,
-			namespace = excluded.namespace,
-			role = excluded.role,
-			queue_scope = excluded.queue_scope,
-			enabled = excluded.enabled,
-			expires_at = excluded.expires_at
-	`, h, name, namespace, role, strings.TrimSpace(queueScope), boolToInt(enabled), time.Now().UTC().Format(time.RFC3339Nano), strings.TrimSpace(expiresAt))
-	if err != nil {
+	if err := s.store.UpsertAPIKey(store.UpsertAPIKeyOp{
+		KeyHash:    h,
+		Name:       name,
+		Namespace:  namespace,
+		Role:       role,
+		QueueScope: strings.TrimSpace(queueScope),
+		Enabled:    boolToInt(enabled),
+		CreatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+		ExpiresAt:  strings.TrimSpace(expiresAt),
+	}); err != nil {
 		return "", err
 	}
 	return key, nil
 }
 
 func (s *Server) deleteAPIKey(keyHash string) error {
-	_, err := s.store.ReadDB().Exec("DELETE FROM api_keys WHERE key_hash = ?", strings.TrimSpace(keyHash))
-	return err
+	return s.store.DeleteAPIKey(strings.TrimSpace(keyHash))
 }

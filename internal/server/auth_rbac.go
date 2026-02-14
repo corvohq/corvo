@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/user/corvo/internal/store"
 )
 
 type authPermission struct {
@@ -152,12 +153,11 @@ func (s *Server) handleSetAuthRole(w http.ResponseWriter, r *http.Request) {
 	}
 	raw, _ := json.Marshal(req.Permissions)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.store.ReadDB().Exec(`
-		INSERT INTO auth_roles (name, permissions, created_at, updated_at)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT(name) DO UPDATE SET permissions = excluded.permissions, updated_at = excluded.updated_at
-	`, strings.TrimSpace(req.Name), string(raw), now, now)
-	if err != nil {
+	if err := s.store.SetAuthRole(store.SetAuthRoleOp{
+		Name:        strings.TrimSpace(req.Name),
+		Permissions: string(raw),
+		Now:         now,
+	}); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "AUTH_ERROR")
 		return
 	}
@@ -170,12 +170,10 @@ func (s *Server) handleDeleteAuthRole(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "role name is required", "VALIDATION_ERROR")
 		return
 	}
-	_, err := s.store.ReadDB().Exec(`DELETE FROM auth_roles WHERE name = ?`, name)
-	if err != nil {
+	if err := s.store.DeleteAuthRole(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "AUTH_ERROR")
 		return
 	}
-	_, _ = s.store.ReadDB().Exec(`DELETE FROM auth_key_roles WHERE role_name = ?`, name)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted"})
 }
 
@@ -193,11 +191,11 @@ func (s *Server) handleAssignAPIKeyRole(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "key_hash and role are required", "VALIDATION_ERROR")
 		return
 	}
-	_, err := s.store.ReadDB().Exec(`
-		INSERT INTO auth_key_roles (key_hash, role_name, created_at) VALUES (?, ?, ?)
-		ON CONFLICT(key_hash, role_name) DO NOTHING
-	`, keyHash, role, time.Now().UTC().Format(time.RFC3339Nano))
-	if err != nil {
+	if err := s.store.AssignAPIKeyRole(store.AssignAPIKeyRoleOp{
+		KeyHash: keyHash,
+		Role:    role,
+		Now:     time.Now().UTC().Format(time.RFC3339Nano),
+	}); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "AUTH_ERROR")
 		return
 	}
@@ -211,8 +209,7 @@ func (s *Server) handleUnassignAPIKeyRole(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "key_hash and role are required", "VALIDATION_ERROR")
 		return
 	}
-	_, err := s.store.ReadDB().Exec(`DELETE FROM auth_key_roles WHERE key_hash = ? AND role_name = ?`, keyHash, role)
-	if err != nil {
+	if err := s.store.UnassignAPIKeyRole(keyHash, role); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "AUTH_ERROR")
 		return
 	}

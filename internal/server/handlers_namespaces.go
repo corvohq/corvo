@@ -45,8 +45,7 @@ func (s *Server) handleCreateNamespace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid namespace name: must be lowercase alphanumeric with hyphens, 1-63 characters", "VALIDATION_ERROR")
 		return
 	}
-	_, err := s.store.ReadDB().Exec("INSERT INTO namespaces (name) VALUES (?)", req.Name)
-	if err != nil {
+	if err := s.store.CreateNamespace(req.Name); err != nil {
 		writeError(w, http.StatusConflict, "namespace already exists", "CONFLICT")
 		return
 	}
@@ -59,14 +58,8 @@ func (s *Server) handleDeleteNamespace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "cannot delete the default namespace", "VALIDATION_ERROR")
 		return
 	}
-	result, err := s.store.ReadDB().Exec("DELETE FROM namespaces WHERE name = ?", name)
-	if err != nil {
+	if err := s.store.DeleteNamespace(name); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "STORE_ERROR")
-		return
-	}
-	n, _ := result.RowsAffected()
-	if n == 0 {
-		writeError(w, http.StatusNotFound, "namespace not found", "NOT_FOUND")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted"})

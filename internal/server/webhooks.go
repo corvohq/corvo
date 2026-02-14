@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -93,22 +92,18 @@ func (s *Server) upsertWebhook(in webhookConfig) error {
 		in.RetryLimit = 3
 	}
 	eventsJSON, _ := json.Marshal(in.Events)
-	_, err := s.store.ReadDB().Exec(`
-		INSERT INTO webhooks (id, url, events, secret, enabled, retry_limit, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%f','now'))
-		ON CONFLICT(id) DO UPDATE SET
-			url = excluded.url,
-			events = excluded.events,
-			secret = excluded.secret,
-			enabled = excluded.enabled,
-			retry_limit = excluded.retry_limit
-	`, in.ID, in.URL, string(eventsJSON), in.Secret, boolToInt(in.Enabled), in.RetryLimit)
-	return err
+	return s.store.UpsertWebhook(store.UpsertWebhookOp{
+		ID:         in.ID,
+		URL:        in.URL,
+		Events:     string(eventsJSON),
+		Secret:     in.Secret,
+		Enabled:    boolToInt(in.Enabled),
+		RetryLimit: in.RetryLimit,
+	})
 }
 
 func (s *Server) deleteWebhook(id string) error {
-	_, err := s.store.ReadDB().Exec("DELETE FROM webhooks WHERE id = ?", id)
-	return err
+	return s.store.DeleteWebhook(id)
 }
 
 func (s *Server) webhookDispatcherLoop() {
@@ -211,19 +206,12 @@ func (s *Server) deliverWebhook(h webhookConfig, ev map[string]any) {
 		time.Sleep(time.Duration(attempt*attempt) * 200 * time.Millisecond)
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	var errVal any
-	if lastErr == "" {
-		errVal = nil
-	} else {
-		errVal = lastErr
-	}
-	_, err := s.store.ReadDB().Exec(
-		"UPDATE webhooks SET last_status_code = ?, last_error = ?, last_delivery_at = ? WHERE id = ?",
-		statusCode, errVal, now, h.ID,
-	)
-	if err != nil {
-		slog.Debug("webhook status update failed", "id", h.ID, "error", err)
-	}
+	s.store.UpdateWebhookStatus(store.UpdateWebhookStatusOp{
+		ID:             h.ID,
+		LastStatusCode: statusCode,
+		LastError:      lastErr,
+		LastDeliveryAt: now,
+	})
 }
 
 func boolToInt(v bool) int {

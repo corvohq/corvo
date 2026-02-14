@@ -126,6 +126,34 @@ func (f *FSM) applyByType(opType store.OpType, data json.RawMessage) *store.OpRe
 		return f.applyDeleteProvider(data)
 	case store.OpSetQueueProvider:
 		return f.applySetQueueProvider(data)
+	case store.OpCreateNamespace:
+		return f.applyCreateNamespace(data)
+	case store.OpDeleteNamespace:
+		return f.applyDeleteNamespace(data)
+	case store.OpSetAuthRole:
+		return f.applySetAuthRole(data)
+	case store.OpDeleteAuthRole:
+		return f.applyDeleteAuthRole(data)
+	case store.OpAssignAPIKeyRole:
+		return f.applyAssignAPIKeyRole(data)
+	case store.OpUnassignAPIKeyRole:
+		return f.applyUnassignAPIKeyRole(data)
+	case store.OpSetSSOSettings:
+		return f.applySetSSOSettings(data)
+	case store.OpUpsertAPIKey:
+		return f.applyUpsertAPIKey(data)
+	case store.OpDeleteAPIKey:
+		return f.applyDeleteAPIKey(data)
+	case store.OpInsertAuditLog:
+		return f.applyInsertAuditLog(data)
+	case store.OpUpdateAPIKeyUsed:
+		return f.applyUpdateAPIKeyUsed(data)
+	case store.OpUpsertWebhook:
+		return f.applyUpsertWebhook(data)
+	case store.OpDeleteWebhook:
+		return f.applyDeleteWebhook(data)
+	case store.OpUpdateWebhookStatus:
+		return f.applyUpdateWebhookStatus(data)
 	default:
 		return &store.OpResult{Err: fmt.Errorf("unknown op type: %d", opType)}
 	}
@@ -283,6 +311,76 @@ func (f *FSM) applyDecoded(op *store.DecodedRaftOp) *store.OpResult {
 			return f.applySetQueueProviderOp(*op.SetQueueProvider)
 		}
 		return &store.OpResult{Err: fmt.Errorf("set queue provider op missing payload")}
+	case store.OpCreateNamespace:
+		if op.CreateNamespace != nil {
+			return f.applyCreateNamespaceOp(*op.CreateNamespace)
+		}
+		return &store.OpResult{Err: fmt.Errorf("create namespace op missing payload")}
+	case store.OpDeleteNamespace:
+		if op.DeleteNamespace != nil {
+			return f.applyDeleteNamespaceOp(*op.DeleteNamespace)
+		}
+		return &store.OpResult{Err: fmt.Errorf("delete namespace op missing payload")}
+	case store.OpSetAuthRole:
+		if op.SetAuthRole != nil {
+			return f.applySetAuthRoleOp(*op.SetAuthRole)
+		}
+		return &store.OpResult{Err: fmt.Errorf("set auth role op missing payload")}
+	case store.OpDeleteAuthRole:
+		if op.DeleteAuthRole != nil {
+			return f.applyDeleteAuthRoleOp(*op.DeleteAuthRole)
+		}
+		return &store.OpResult{Err: fmt.Errorf("delete auth role op missing payload")}
+	case store.OpAssignAPIKeyRole:
+		if op.AssignAPIKeyRole != nil {
+			return f.applyAssignAPIKeyRoleOp(*op.AssignAPIKeyRole)
+		}
+		return &store.OpResult{Err: fmt.Errorf("assign api key role op missing payload")}
+	case store.OpUnassignAPIKeyRole:
+		if op.UnassignAPIKeyRole != nil {
+			return f.applyUnassignAPIKeyRoleOp(*op.UnassignAPIKeyRole)
+		}
+		return &store.OpResult{Err: fmt.Errorf("unassign api key role op missing payload")}
+	case store.OpSetSSOSettings:
+		if op.SetSSOSettings != nil {
+			return f.applySetSSOSettingsOp(*op.SetSSOSettings)
+		}
+		return &store.OpResult{Err: fmt.Errorf("set sso settings op missing payload")}
+	case store.OpUpsertAPIKey:
+		if op.UpsertAPIKey != nil {
+			return f.applyUpsertAPIKeyOp(*op.UpsertAPIKey)
+		}
+		return &store.OpResult{Err: fmt.Errorf("upsert api key op missing payload")}
+	case store.OpDeleteAPIKey:
+		if op.DeleteAPIKey != nil {
+			return f.applyDeleteAPIKeyOp(*op.DeleteAPIKey)
+		}
+		return &store.OpResult{Err: fmt.Errorf("delete api key op missing payload")}
+	case store.OpInsertAuditLog:
+		if op.InsertAuditLog != nil {
+			return f.applyInsertAuditLogOp(*op.InsertAuditLog)
+		}
+		return &store.OpResult{Err: fmt.Errorf("insert audit log op missing payload")}
+	case store.OpUpdateAPIKeyUsed:
+		if op.UpdateAPIKeyUsed != nil {
+			return f.applyUpdateAPIKeyUsedOp(*op.UpdateAPIKeyUsed)
+		}
+		return &store.OpResult{Err: fmt.Errorf("update api key used op missing payload")}
+	case store.OpUpsertWebhook:
+		if op.UpsertWebhook != nil {
+			return f.applyUpsertWebhookOp(*op.UpsertWebhook)
+		}
+		return &store.OpResult{Err: fmt.Errorf("upsert webhook op missing payload")}
+	case store.OpDeleteWebhook:
+		if op.DeleteWebhook != nil {
+			return f.applyDeleteWebhookOp(*op.DeleteWebhook)
+		}
+		return &store.OpResult{Err: fmt.Errorf("delete webhook op missing payload")}
+	case store.OpUpdateWebhookStatus:
+		if op.UpdateWebhookStatus != nil {
+			return f.applyUpdateWebhookStatusOp(*op.UpdateWebhookStatus)
+		}
+		return &store.OpResult{Err: fmt.Errorf("update webhook status op missing payload")}
 	default:
 		return &store.OpResult{Err: fmt.Errorf("unknown op type: %d", op.Type)}
 	}

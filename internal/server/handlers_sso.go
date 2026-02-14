@@ -4,6 +4,11 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/user/corvo/internal/store"
 )
 
 func (s *Server) handleGetSSOSettings(w http.ResponseWriter, r *http.Request) {
@@ -44,22 +49,31 @@ func (s *Server) handleSetSSOSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Provider == "oidc" {
+		if strings.TrimSpace(req.OIDCIssuerURL) == "" || strings.TrimSpace(req.OIDCClientID) == "" {
+			writeError(w, http.StatusBadRequest, "oidc_issuer_url and oidc_client_id are required for OIDC provider", "VALIDATION_ERROR")
+			return
+		}
+		u, err := url.Parse(req.OIDCIssuerURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			writeError(w, http.StatusBadRequest, "oidc_issuer_url must be a valid http:// or https:// URL", "VALIDATION_ERROR")
+			return
+		}
+	}
+
 	samlInt := 0
 	if req.SAMLEnabled {
 		samlInt = 1
 	}
 
-	_, err := s.store.ReadDB().Exec(`
-		INSERT INTO sso_settings (id, provider, oidc_issuer_url, oidc_client_id, saml_enabled, updated_at)
-		VALUES ('singleton', ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%f', 'now'))
-		ON CONFLICT(id) DO UPDATE SET
-			provider = excluded.provider,
-			oidc_issuer_url = excluded.oidc_issuer_url,
-			oidc_client_id = excluded.oidc_client_id,
-			saml_enabled = excluded.saml_enabled,
-			updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')
-	`, req.Provider, req.OIDCIssuerURL, req.OIDCClientID, samlInt)
-	if err != nil {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := s.store.SetSSOSettings(store.SetSSOSettingsOp{
+		Provider:      req.Provider,
+		OIDCIssuerURL: req.OIDCIssuerURL,
+		OIDCClientID:  req.OIDCClientID,
+		SAMLEnabled:   samlInt,
+		Now:           now,
+	}); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "STORE_ERROR")
 		return
 	}

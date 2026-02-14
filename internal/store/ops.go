@@ -39,6 +39,22 @@ const (
 	OpSetProvider        OpType = 28
 	OpDeleteProvider     OpType = 29
 	OpSetQueueProvider   OpType = 30
+
+	// Enterprise ops (SQLite-only, no Pebble keys).
+	OpCreateNamespace     OpType = 31
+	OpDeleteNamespace     OpType = 32
+	OpSetAuthRole         OpType = 33
+	OpDeleteAuthRole      OpType = 34
+	OpAssignAPIKeyRole    OpType = 35
+	OpUnassignAPIKeyRole  OpType = 36
+	OpSetSSOSettings      OpType = 37
+	OpUpsertAPIKey        OpType = 38
+	OpDeleteAPIKey        OpType = 39
+	OpInsertAuditLog      OpType = 40
+	OpUpdateAPIKeyUsed    OpType = 41
+	OpUpsertWebhook       OpType = 42
+	OpDeleteWebhook       OpType = 43
+	OpUpdateWebhookStatus OpType = 44
 )
 
 // Op is the Raft log entry payload.
@@ -275,4 +291,94 @@ type DeleteProviderOp struct {
 type SetQueueProviderOp struct {
 	Queue    string `json:"queue"`
 	Provider string `json:"provider"`
+}
+
+// Enterprise Op structs (SQLite-only config/metadata).
+
+type CreateNamespaceOp struct {
+	Name string `json:"name"`
+}
+
+type DeleteNamespaceOp struct {
+	Name string `json:"name"`
+}
+
+type SetAuthRoleOp struct {
+	Name        string `json:"name"`
+	Permissions string `json:"permissions"` // JSON-encoded []authPermission
+	Now         string `json:"now"`
+}
+
+type DeleteAuthRoleOp struct {
+	Name string `json:"name"`
+}
+
+type AssignAPIKeyRoleOp struct {
+	KeyHash string `json:"key_hash"`
+	Role    string `json:"role"`
+	Now     string `json:"now"`
+}
+
+type UnassignAPIKeyRoleOp struct {
+	KeyHash string `json:"key_hash"`
+	Role    string `json:"role"`
+}
+
+type SetSSOSettingsOp struct {
+	Provider      string `json:"provider"`
+	OIDCIssuerURL string `json:"oidc_issuer_url"`
+	OIDCClientID  string `json:"oidc_client_id"`
+	SAMLEnabled   int    `json:"saml_enabled"`
+	Now           string `json:"now"`
+}
+
+type UpsertAPIKeyOp struct {
+	KeyHash    string `json:"key_hash"`
+	Name       string `json:"name"`
+	Namespace  string `json:"namespace"`
+	Role       string `json:"role"`
+	QueueScope string `json:"queue_scope"`
+	Enabled    int    `json:"enabled"`
+	CreatedAt  string `json:"created_at"`
+	ExpiresAt  string `json:"expires_at"`
+}
+
+type DeleteAPIKeyOp struct {
+	KeyHash string `json:"key_hash"`
+}
+
+type InsertAuditLogOp struct {
+	Namespace  string `json:"namespace"`
+	Principal  string `json:"principal"`
+	Role       string `json:"role"`
+	Method     string `json:"method"`
+	Path       string `json:"path"`
+	StatusCode int    `json:"status_code"`
+	Metadata   string `json:"metadata"`
+	CreatedAt  string `json:"created_at"`
+}
+
+type UpdateAPIKeyUsedOp struct {
+	KeyHash string `json:"key_hash"`
+	Now     string `json:"now"`
+}
+
+type UpsertWebhookOp struct {
+	ID         string `json:"id"`
+	URL        string `json:"url"`
+	Events     string `json:"events"` // JSON-encoded []string
+	Secret     string `json:"secret"`
+	Enabled    int    `json:"enabled"`
+	RetryLimit int    `json:"retry_limit"`
+}
+
+type DeleteWebhookOp struct {
+	ID string `json:"id"`
+}
+
+type UpdateWebhookStatusOp struct {
+	ID             string `json:"id"`
+	LastStatusCode int    `json:"last_status_code"`
+	LastError      string `json:"last_error"`
+	LastDeliveryAt string `json:"last_delivery_at"`
 }

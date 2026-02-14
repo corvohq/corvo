@@ -1205,6 +1205,22 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_ns ON audit_logs(namespace, created_at);
 
+CREATE TABLE IF NOT EXISTS namespaces (
+    name       TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+);
+INSERT OR IGNORE INTO namespaces (name) VALUES ('default');
+
+CREATE TABLE IF NOT EXISTS sso_settings (
+    id              TEXT PRIMARY KEY DEFAULT 'singleton',
+    provider        TEXT NOT NULL DEFAULT '',
+    oidc_issuer_url TEXT NOT NULL DEFAULT '',
+    oidc_client_id  TEXT NOT NULL DEFAULT '',
+    saml_enabled    INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+);
+INSERT OR IGNORE INTO sso_settings (id) VALUES ('singleton');
+
 `
 
 // WaitForLeader blocks until the cluster has a leader or timeout.

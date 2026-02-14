@@ -43,6 +43,20 @@ type DecodedRaftOp struct {
 	SetProvider      *SetProviderOp
 	DeleteProvider   *DeleteProviderOp
 	SetQueueProvider *SetQueueProviderOp
+	CreateNamespace     *CreateNamespaceOp
+	DeleteNamespace     *DeleteNamespaceOp
+	SetAuthRole         *SetAuthRoleOp
+	DeleteAuthRole      *DeleteAuthRoleOp
+	AssignAPIKeyRole    *AssignAPIKeyRoleOp
+	UnassignAPIKeyRole  *UnassignAPIKeyRoleOp
+	SetSSOSettings      *SetSSOSettingsOp
+	UpsertAPIKey        *UpsertAPIKeyOp
+	DeleteAPIKey        *DeleteAPIKeyOp
+	InsertAuditLog      *InsertAuditLogOp
+	UpdateAPIKeyUsed    *UpdateAPIKeyUsedOp
+	UpsertWebhook       *UpsertWebhookOp
+	DeleteWebhook       *DeleteWebhookOp
+	UpdateWebhookStatus *UpdateWebhookStatusOp
 	Multi        []*DecodedRaftOp
 }
 
@@ -83,7 +97,21 @@ type pbOp struct {
 	DeleteBudget     *pbDeleteBudgetOp     `protobuf:"bytes,28,opt,name=delete_budget,json=deleteBudget,proto3" json:"delete_budget,omitempty"`
 	SetProvider      *pbSetProviderOp      `protobuf:"bytes,29,opt,name=set_provider,json=setProvider,proto3" json:"set_provider,omitempty"`
 	DeleteProvider   *pbDeleteProviderOp   `protobuf:"bytes,30,opt,name=delete_provider,json=deleteProvider,proto3" json:"delete_provider,omitempty"`
-	SetQueueProvider *pbSetQueueProviderOp `protobuf:"bytes,31,opt,name=set_queue_provider,json=setQueueProvider,proto3" json:"set_queue_provider,omitempty"`
+	SetQueueProvider    *pbSetQueueProviderOp    `protobuf:"bytes,31,opt,name=set_queue_provider,json=setQueueProvider,proto3" json:"set_queue_provider,omitempty"`
+	CreateNamespace     *pbCreateNamespaceOp     `protobuf:"bytes,32,opt,name=create_namespace,json=createNamespace,proto3" json:"create_namespace,omitempty"`
+	DeleteNamespace     *pbDeleteNamespaceOp     `protobuf:"bytes,33,opt,name=delete_namespace,json=deleteNamespace,proto3" json:"delete_namespace,omitempty"`
+	SetAuthRole         *pbSetAuthRoleOp         `protobuf:"bytes,34,opt,name=set_auth_role,json=setAuthRole,proto3" json:"set_auth_role,omitempty"`
+	DeleteAuthRole      *pbDeleteAuthRoleOp      `protobuf:"bytes,35,opt,name=delete_auth_role,json=deleteAuthRole,proto3" json:"delete_auth_role,omitempty"`
+	AssignAPIKeyRole    *pbAssignAPIKeyRoleOp    `protobuf:"bytes,36,opt,name=assign_api_key_role,json=assignApiKeyRole,proto3" json:"assign_api_key_role,omitempty"`
+	UnassignAPIKeyRole  *pbUnassignAPIKeyRoleOp  `protobuf:"bytes,37,opt,name=unassign_api_key_role,json=unassignApiKeyRole,proto3" json:"unassign_api_key_role,omitempty"`
+	SetSSOSettings      *pbSetSSOSettingsOp      `protobuf:"bytes,38,opt,name=set_sso_settings,json=setSsoSettings,proto3" json:"set_sso_settings,omitempty"`
+	UpsertAPIKey        *pbUpsertAPIKeyOp        `protobuf:"bytes,39,opt,name=upsert_api_key,json=upsertApiKey,proto3" json:"upsert_api_key,omitempty"`
+	DeleteAPIKey        *pbDeleteAPIKeyOp        `protobuf:"bytes,40,opt,name=delete_api_key,json=deleteApiKey,proto3" json:"delete_api_key,omitempty"`
+	InsertAuditLog      *pbInsertAuditLogOp      `protobuf:"bytes,41,opt,name=insert_audit_log,json=insertAuditLog,proto3" json:"insert_audit_log,omitempty"`
+	UpdateAPIKeyUsed    *pbUpdateAPIKeyUsedOp    `protobuf:"bytes,42,opt,name=update_api_key_used,json=updateApiKeyUsed,proto3" json:"update_api_key_used,omitempty"`
+	UpsertWebhook       *pbUpsertWebhookOp       `protobuf:"bytes,43,opt,name=upsert_webhook,json=upsertWebhook,proto3" json:"upsert_webhook,omitempty"`
+	DeleteWebhook       *pbDeleteWebhookOp       `protobuf:"bytes,44,opt,name=delete_webhook,json=deleteWebhook,proto3" json:"delete_webhook,omitempty"`
+	UpdateWebhookStatus *pbUpdateWebhookStatusOp `protobuf:"bytes,45,opt,name=update_webhook_status,json=updateWebhookStatus,proto3" json:"update_webhook_status,omitempty"`
 }
 
 func (m *pbOp) Reset()         { *m = pbOp{} }
@@ -616,6 +644,90 @@ func buildPBOp(opType OpType, data any) (*pbOp, error) {
 			return nil, fmt.Errorf("set queue provider op type mismatch: %T", data)
 		}
 		op.SetQueueProvider = toPBSetQueueProvider(v)
+	case OpCreateNamespace:
+		v, ok := data.(CreateNamespaceOp)
+		if !ok {
+			return nil, fmt.Errorf("create namespace op type mismatch: %T", data)
+		}
+		op.CreateNamespace = toPBCreateNamespace(v)
+	case OpDeleteNamespace:
+		v, ok := data.(DeleteNamespaceOp)
+		if !ok {
+			return nil, fmt.Errorf("delete namespace op type mismatch: %T", data)
+		}
+		op.DeleteNamespace = toPBDeleteNamespace(v)
+	case OpSetAuthRole:
+		v, ok := data.(SetAuthRoleOp)
+		if !ok {
+			return nil, fmt.Errorf("set auth role op type mismatch: %T", data)
+		}
+		op.SetAuthRole = toPBSetAuthRole(v)
+	case OpDeleteAuthRole:
+		v, ok := data.(DeleteAuthRoleOp)
+		if !ok {
+			return nil, fmt.Errorf("delete auth role op type mismatch: %T", data)
+		}
+		op.DeleteAuthRole = toPBDeleteAuthRole(v)
+	case OpAssignAPIKeyRole:
+		v, ok := data.(AssignAPIKeyRoleOp)
+		if !ok {
+			return nil, fmt.Errorf("assign api key role op type mismatch: %T", data)
+		}
+		op.AssignAPIKeyRole = toPBAssignAPIKeyRole(v)
+	case OpUnassignAPIKeyRole:
+		v, ok := data.(UnassignAPIKeyRoleOp)
+		if !ok {
+			return nil, fmt.Errorf("unassign api key role op type mismatch: %T", data)
+		}
+		op.UnassignAPIKeyRole = toPBUnassignAPIKeyRole(v)
+	case OpSetSSOSettings:
+		v, ok := data.(SetSSOSettingsOp)
+		if !ok {
+			return nil, fmt.Errorf("set sso settings op type mismatch: %T", data)
+		}
+		op.SetSSOSettings = toPBSetSSOSettings(v)
+	case OpUpsertAPIKey:
+		v, ok := data.(UpsertAPIKeyOp)
+		if !ok {
+			return nil, fmt.Errorf("upsert api key op type mismatch: %T", data)
+		}
+		op.UpsertAPIKey = toPBUpsertAPIKey(v)
+	case OpDeleteAPIKey:
+		v, ok := data.(DeleteAPIKeyOp)
+		if !ok {
+			return nil, fmt.Errorf("delete api key op type mismatch: %T", data)
+		}
+		op.DeleteAPIKey = toPBDeleteAPIKey(v)
+	case OpInsertAuditLog:
+		v, ok := data.(InsertAuditLogOp)
+		if !ok {
+			return nil, fmt.Errorf("insert audit log op type mismatch: %T", data)
+		}
+		op.InsertAuditLog = toPBInsertAuditLog(v)
+	case OpUpdateAPIKeyUsed:
+		v, ok := data.(UpdateAPIKeyUsedOp)
+		if !ok {
+			return nil, fmt.Errorf("update api key used op type mismatch: %T", data)
+		}
+		op.UpdateAPIKeyUsed = toPBUpdateAPIKeyUsed(v)
+	case OpUpsertWebhook:
+		v, ok := data.(UpsertWebhookOp)
+		if !ok {
+			return nil, fmt.Errorf("upsert webhook op type mismatch: %T", data)
+		}
+		op.UpsertWebhook = toPBUpsertWebhook(v)
+	case OpDeleteWebhook:
+		v, ok := data.(DeleteWebhookOp)
+		if !ok {
+			return nil, fmt.Errorf("delete webhook op type mismatch: %T", data)
+		}
+		op.DeleteWebhook = toPBDeleteWebhook(v)
+	case OpUpdateWebhookStatus:
+		v, ok := data.(UpdateWebhookStatusOp)
+		if !ok {
+			return nil, fmt.Errorf("update webhook status op type mismatch: %T", data)
+		}
+		op.UpdateWebhookStatus = toPBUpdateWebhookStatus(v)
 	case OpMulti:
 		v, ok := data.(MultiOp)
 		if !ok {
@@ -813,6 +925,90 @@ func buildPBSubOp(sub Op) (*pbOp, error) {
 			return nil, err
 		}
 		op.SetQueueProvider = toPBSetQueueProvider(v)
+	case OpCreateNamespace:
+		var v CreateNamespaceOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.CreateNamespace = toPBCreateNamespace(v)
+	case OpDeleteNamespace:
+		var v DeleteNamespaceOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.DeleteNamespace = toPBDeleteNamespace(v)
+	case OpSetAuthRole:
+		var v SetAuthRoleOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.SetAuthRole = toPBSetAuthRole(v)
+	case OpDeleteAuthRole:
+		var v DeleteAuthRoleOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.DeleteAuthRole = toPBDeleteAuthRole(v)
+	case OpAssignAPIKeyRole:
+		var v AssignAPIKeyRoleOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.AssignAPIKeyRole = toPBAssignAPIKeyRole(v)
+	case OpUnassignAPIKeyRole:
+		var v UnassignAPIKeyRoleOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.UnassignAPIKeyRole = toPBUnassignAPIKeyRole(v)
+	case OpSetSSOSettings:
+		var v SetSSOSettingsOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.SetSSOSettings = toPBSetSSOSettings(v)
+	case OpUpsertAPIKey:
+		var v UpsertAPIKeyOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.UpsertAPIKey = toPBUpsertAPIKey(v)
+	case OpDeleteAPIKey:
+		var v DeleteAPIKeyOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.DeleteAPIKey = toPBDeleteAPIKey(v)
+	case OpInsertAuditLog:
+		var v InsertAuditLogOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.InsertAuditLog = toPBInsertAuditLog(v)
+	case OpUpdateAPIKeyUsed:
+		var v UpdateAPIKeyUsedOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.UpdateAPIKeyUsed = toPBUpdateAPIKeyUsed(v)
+	case OpUpsertWebhook:
+		var v UpsertWebhookOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.UpsertWebhook = toPBUpsertWebhook(v)
+	case OpDeleteWebhook:
+		var v DeleteWebhookOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.DeleteWebhook = toPBDeleteWebhook(v)
+	case OpUpdateWebhookStatus:
+		var v UpdateWebhookStatusOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.UpdateWebhookStatus = toPBUpdateWebhookStatus(v)
 	default:
 		return nil, fmt.Errorf("unsupported multi sub-op type: %d", sub.Type)
 	}
@@ -975,6 +1171,76 @@ func fromPBOp(op *pbOp) (*DecodedRaftOp, error) {
 	if op.SetQueueProvider != nil {
 		v := fromPBSetQueueProvider(op.SetQueueProvider)
 		out.SetQueueProvider = &v
+		return out, nil
+	}
+	if op.CreateNamespace != nil {
+		v := fromPBCreateNamespace(op.CreateNamespace)
+		out.CreateNamespace = &v
+		return out, nil
+	}
+	if op.DeleteNamespace != nil {
+		v := fromPBDeleteNamespace(op.DeleteNamespace)
+		out.DeleteNamespace = &v
+		return out, nil
+	}
+	if op.SetAuthRole != nil {
+		v := fromPBSetAuthRole(op.SetAuthRole)
+		out.SetAuthRole = &v
+		return out, nil
+	}
+	if op.DeleteAuthRole != nil {
+		v := fromPBDeleteAuthRole(op.DeleteAuthRole)
+		out.DeleteAuthRole = &v
+		return out, nil
+	}
+	if op.AssignAPIKeyRole != nil {
+		v := fromPBAssignAPIKeyRole(op.AssignAPIKeyRole)
+		out.AssignAPIKeyRole = &v
+		return out, nil
+	}
+	if op.UnassignAPIKeyRole != nil {
+		v := fromPBUnassignAPIKeyRole(op.UnassignAPIKeyRole)
+		out.UnassignAPIKeyRole = &v
+		return out, nil
+	}
+	if op.SetSSOSettings != nil {
+		v := fromPBSetSSOSettings(op.SetSSOSettings)
+		out.SetSSOSettings = &v
+		return out, nil
+	}
+	if op.UpsertAPIKey != nil {
+		v := fromPBUpsertAPIKey(op.UpsertAPIKey)
+		out.UpsertAPIKey = &v
+		return out, nil
+	}
+	if op.DeleteAPIKey != nil {
+		v := fromPBDeleteAPIKey(op.DeleteAPIKey)
+		out.DeleteAPIKey = &v
+		return out, nil
+	}
+	if op.InsertAuditLog != nil {
+		v := fromPBInsertAuditLog(op.InsertAuditLog)
+		out.InsertAuditLog = &v
+		return out, nil
+	}
+	if op.UpdateAPIKeyUsed != nil {
+		v := fromPBUpdateAPIKeyUsed(op.UpdateAPIKeyUsed)
+		out.UpdateAPIKeyUsed = &v
+		return out, nil
+	}
+	if op.UpsertWebhook != nil {
+		v := fromPBUpsertWebhook(op.UpsertWebhook)
+		out.UpsertWebhook = &v
+		return out, nil
+	}
+	if op.DeleteWebhook != nil {
+		v := fromPBDeleteWebhook(op.DeleteWebhook)
+		out.DeleteWebhook = &v
+		return out, nil
+	}
+	if op.UpdateWebhookStatus != nil {
+		v := fromPBUpdateWebhookStatus(op.UpdateWebhookStatus)
+		out.UpdateWebhookStatus = &v
 		return out, nil
 	}
 	return nil, fmt.Errorf("protobuf op %d missing payload", op.Type)
@@ -1541,4 +1807,322 @@ func toPBSetQueueProvider(op SetQueueProviderOp) *pbSetQueueProviderOp {
 
 func fromPBSetQueueProvider(op *pbSetQueueProviderOp) SetQueueProviderOp {
 	return SetQueueProviderOp{Queue: op.Queue, Provider: op.Provider}
+}
+
+// Enterprise pb struct types.
+
+type pbCreateNamespaceOp struct {
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+}
+
+func (m *pbCreateNamespaceOp) Reset()         { *m = pbCreateNamespaceOp{} }
+func (m *pbCreateNamespaceOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbCreateNamespaceOp) ProtoMessage()    {}
+
+type pbDeleteNamespaceOp struct {
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+}
+
+func (m *pbDeleteNamespaceOp) Reset()         { *m = pbDeleteNamespaceOp{} }
+func (m *pbDeleteNamespaceOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbDeleteNamespaceOp) ProtoMessage()    {}
+
+type pbSetAuthRoleOp struct {
+	Name        string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Permissions string `protobuf:"bytes,2,opt,name=permissions,proto3" json:"permissions,omitempty"`
+	Now         string `protobuf:"bytes,3,opt,name=now,proto3" json:"now,omitempty"`
+}
+
+func (m *pbSetAuthRoleOp) Reset()         { *m = pbSetAuthRoleOp{} }
+func (m *pbSetAuthRoleOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbSetAuthRoleOp) ProtoMessage()    {}
+
+type pbDeleteAuthRoleOp struct {
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+}
+
+func (m *pbDeleteAuthRoleOp) Reset()         { *m = pbDeleteAuthRoleOp{} }
+func (m *pbDeleteAuthRoleOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbDeleteAuthRoleOp) ProtoMessage()    {}
+
+type pbAssignAPIKeyRoleOp struct {
+	KeyHash string `protobuf:"bytes,1,opt,name=key_hash,json=keyHash,proto3" json:"key_hash,omitempty"`
+	Role    string `protobuf:"bytes,2,opt,name=role,proto3" json:"role,omitempty"`
+	Now     string `protobuf:"bytes,3,opt,name=now,proto3" json:"now,omitempty"`
+}
+
+func (m *pbAssignAPIKeyRoleOp) Reset()         { *m = pbAssignAPIKeyRoleOp{} }
+func (m *pbAssignAPIKeyRoleOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbAssignAPIKeyRoleOp) ProtoMessage()    {}
+
+type pbUnassignAPIKeyRoleOp struct {
+	KeyHash string `protobuf:"bytes,1,opt,name=key_hash,json=keyHash,proto3" json:"key_hash,omitempty"`
+	Role    string `protobuf:"bytes,2,opt,name=role,proto3" json:"role,omitempty"`
+}
+
+func (m *pbUnassignAPIKeyRoleOp) Reset()         { *m = pbUnassignAPIKeyRoleOp{} }
+func (m *pbUnassignAPIKeyRoleOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbUnassignAPIKeyRoleOp) ProtoMessage()    {}
+
+type pbSetSSOSettingsOp struct {
+	Provider      string `protobuf:"bytes,1,opt,name=provider,proto3" json:"provider,omitempty"`
+	OIDCIssuerURL string `protobuf:"bytes,2,opt,name=oidc_issuer_url,json=oidcIssuerUrl,proto3" json:"oidc_issuer_url,omitempty"`
+	OIDCClientID  string `protobuf:"bytes,3,opt,name=oidc_client_id,json=oidcClientId,proto3" json:"oidc_client_id,omitempty"`
+	SAMLEnabled   int32  `protobuf:"varint,4,opt,name=saml_enabled,json=samlEnabled,proto3" json:"saml_enabled,omitempty"`
+	Now           string `protobuf:"bytes,5,opt,name=now,proto3" json:"now,omitempty"`
+}
+
+func (m *pbSetSSOSettingsOp) Reset()         { *m = pbSetSSOSettingsOp{} }
+func (m *pbSetSSOSettingsOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbSetSSOSettingsOp) ProtoMessage()    {}
+
+type pbUpsertAPIKeyOp struct {
+	KeyHash    string `protobuf:"bytes,1,opt,name=key_hash,json=keyHash,proto3" json:"key_hash,omitempty"`
+	Name       string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	Namespace  string `protobuf:"bytes,3,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Role       string `protobuf:"bytes,4,opt,name=role,proto3" json:"role,omitempty"`
+	QueueScope string `protobuf:"bytes,5,opt,name=queue_scope,json=queueScope,proto3" json:"queue_scope,omitempty"`
+	Enabled    int32  `protobuf:"varint,6,opt,name=enabled,proto3" json:"enabled,omitempty"`
+	CreatedAt  string `protobuf:"bytes,7,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	ExpiresAt  string `protobuf:"bytes,8,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+}
+
+func (m *pbUpsertAPIKeyOp) Reset()         { *m = pbUpsertAPIKeyOp{} }
+func (m *pbUpsertAPIKeyOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbUpsertAPIKeyOp) ProtoMessage()    {}
+
+type pbDeleteAPIKeyOp struct {
+	KeyHash string `protobuf:"bytes,1,opt,name=key_hash,json=keyHash,proto3" json:"key_hash,omitempty"`
+}
+
+func (m *pbDeleteAPIKeyOp) Reset()         { *m = pbDeleteAPIKeyOp{} }
+func (m *pbDeleteAPIKeyOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbDeleteAPIKeyOp) ProtoMessage()    {}
+
+type pbInsertAuditLogOp struct {
+	Namespace  string `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Principal  string `protobuf:"bytes,2,opt,name=principal,proto3" json:"principal,omitempty"`
+	Role       string `protobuf:"bytes,3,opt,name=role,proto3" json:"role,omitempty"`
+	Method     string `protobuf:"bytes,4,opt,name=method,proto3" json:"method,omitempty"`
+	Path       string `protobuf:"bytes,5,opt,name=path,proto3" json:"path,omitempty"`
+	StatusCode int32  `protobuf:"varint,6,opt,name=status_code,json=statusCode,proto3" json:"status_code,omitempty"`
+	Metadata   string `protobuf:"bytes,7,opt,name=metadata,proto3" json:"metadata,omitempty"`
+	CreatedAt  string `protobuf:"bytes,8,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+}
+
+func (m *pbInsertAuditLogOp) Reset()         { *m = pbInsertAuditLogOp{} }
+func (m *pbInsertAuditLogOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbInsertAuditLogOp) ProtoMessage()    {}
+
+type pbUpdateAPIKeyUsedOp struct {
+	KeyHash string `protobuf:"bytes,1,opt,name=key_hash,json=keyHash,proto3" json:"key_hash,omitempty"`
+	Now     string `protobuf:"bytes,2,opt,name=now,proto3" json:"now,omitempty"`
+}
+
+func (m *pbUpdateAPIKeyUsedOp) Reset()         { *m = pbUpdateAPIKeyUsedOp{} }
+func (m *pbUpdateAPIKeyUsedOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbUpdateAPIKeyUsedOp) ProtoMessage()    {}
+
+type pbUpsertWebhookOp struct {
+	ID         string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	URL        string `protobuf:"bytes,2,opt,name=url,proto3" json:"url,omitempty"`
+	Events     string `protobuf:"bytes,3,opt,name=events,proto3" json:"events,omitempty"`
+	Secret     string `protobuf:"bytes,4,opt,name=secret,proto3" json:"secret,omitempty"`
+	Enabled    int32  `protobuf:"varint,5,opt,name=enabled,proto3" json:"enabled,omitempty"`
+	RetryLimit int32  `protobuf:"varint,6,opt,name=retry_limit,json=retryLimit,proto3" json:"retry_limit,omitempty"`
+}
+
+func (m *pbUpsertWebhookOp) Reset()         { *m = pbUpsertWebhookOp{} }
+func (m *pbUpsertWebhookOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbUpsertWebhookOp) ProtoMessage()    {}
+
+type pbDeleteWebhookOp struct {
+	ID string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+}
+
+func (m *pbDeleteWebhookOp) Reset()         { *m = pbDeleteWebhookOp{} }
+func (m *pbDeleteWebhookOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbDeleteWebhookOp) ProtoMessage()    {}
+
+type pbUpdateWebhookStatusOp struct {
+	ID             string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	LastStatusCode int32  `protobuf:"varint,2,opt,name=last_status_code,json=lastStatusCode,proto3" json:"last_status_code,omitempty"`
+	LastError      string `protobuf:"bytes,3,opt,name=last_error,json=lastError,proto3" json:"last_error,omitempty"`
+	LastDeliveryAt string `protobuf:"bytes,4,opt,name=last_delivery_at,json=lastDeliveryAt,proto3" json:"last_delivery_at,omitempty"`
+}
+
+func (m *pbUpdateWebhookStatusOp) Reset()         { *m = pbUpdateWebhookStatusOp{} }
+func (m *pbUpdateWebhookStatusOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbUpdateWebhookStatusOp) ProtoMessage()    {}
+
+// Enterprise toPB/fromPB conversion functions.
+
+func toPBCreateNamespace(op CreateNamespaceOp) *pbCreateNamespaceOp {
+	return &pbCreateNamespaceOp{Name: op.Name}
+}
+func fromPBCreateNamespace(op *pbCreateNamespaceOp) CreateNamespaceOp {
+	return CreateNamespaceOp{Name: op.Name}
+}
+
+func toPBDeleteNamespace(op DeleteNamespaceOp) *pbDeleteNamespaceOp {
+	return &pbDeleteNamespaceOp{Name: op.Name}
+}
+func fromPBDeleteNamespace(op *pbDeleteNamespaceOp) DeleteNamespaceOp {
+	return DeleteNamespaceOp{Name: op.Name}
+}
+
+func toPBSetAuthRole(op SetAuthRoleOp) *pbSetAuthRoleOp {
+	return &pbSetAuthRoleOp{Name: op.Name, Permissions: op.Permissions, Now: op.Now}
+}
+func fromPBSetAuthRole(op *pbSetAuthRoleOp) SetAuthRoleOp {
+	return SetAuthRoleOp{Name: op.Name, Permissions: op.Permissions, Now: op.Now}
+}
+
+func toPBDeleteAuthRole(op DeleteAuthRoleOp) *pbDeleteAuthRoleOp {
+	return &pbDeleteAuthRoleOp{Name: op.Name}
+}
+func fromPBDeleteAuthRole(op *pbDeleteAuthRoleOp) DeleteAuthRoleOp {
+	return DeleteAuthRoleOp{Name: op.Name}
+}
+
+func toPBAssignAPIKeyRole(op AssignAPIKeyRoleOp) *pbAssignAPIKeyRoleOp {
+	return &pbAssignAPIKeyRoleOp{KeyHash: op.KeyHash, Role: op.Role, Now: op.Now}
+}
+func fromPBAssignAPIKeyRole(op *pbAssignAPIKeyRoleOp) AssignAPIKeyRoleOp {
+	return AssignAPIKeyRoleOp{KeyHash: op.KeyHash, Role: op.Role, Now: op.Now}
+}
+
+func toPBUnassignAPIKeyRole(op UnassignAPIKeyRoleOp) *pbUnassignAPIKeyRoleOp {
+	return &pbUnassignAPIKeyRoleOp{KeyHash: op.KeyHash, Role: op.Role}
+}
+func fromPBUnassignAPIKeyRole(op *pbUnassignAPIKeyRoleOp) UnassignAPIKeyRoleOp {
+	return UnassignAPIKeyRoleOp{KeyHash: op.KeyHash, Role: op.Role}
+}
+
+func toPBSetSSOSettings(op SetSSOSettingsOp) *pbSetSSOSettingsOp {
+	return &pbSetSSOSettingsOp{
+		Provider:      op.Provider,
+		OIDCIssuerURL: op.OIDCIssuerURL,
+		OIDCClientID:  op.OIDCClientID,
+		SAMLEnabled:   int32(op.SAMLEnabled),
+		Now:           op.Now,
+	}
+}
+func fromPBSetSSOSettings(op *pbSetSSOSettingsOp) SetSSOSettingsOp {
+	return SetSSOSettingsOp{
+		Provider:      op.Provider,
+		OIDCIssuerURL: op.OIDCIssuerURL,
+		OIDCClientID:  op.OIDCClientID,
+		SAMLEnabled:   int(op.SAMLEnabled),
+		Now:           op.Now,
+	}
+}
+
+func toPBUpsertAPIKey(op UpsertAPIKeyOp) *pbUpsertAPIKeyOp {
+	return &pbUpsertAPIKeyOp{
+		KeyHash:    op.KeyHash,
+		Name:       op.Name,
+		Namespace:  op.Namespace,
+		Role:       op.Role,
+		QueueScope: op.QueueScope,
+		Enabled:    int32(op.Enabled),
+		CreatedAt:  op.CreatedAt,
+		ExpiresAt:  op.ExpiresAt,
+	}
+}
+func fromPBUpsertAPIKey(op *pbUpsertAPIKeyOp) UpsertAPIKeyOp {
+	return UpsertAPIKeyOp{
+		KeyHash:    op.KeyHash,
+		Name:       op.Name,
+		Namespace:  op.Namespace,
+		Role:       op.Role,
+		QueueScope: op.QueueScope,
+		Enabled:    int(op.Enabled),
+		CreatedAt:  op.CreatedAt,
+		ExpiresAt:  op.ExpiresAt,
+	}
+}
+
+func toPBDeleteAPIKey(op DeleteAPIKeyOp) *pbDeleteAPIKeyOp {
+	return &pbDeleteAPIKeyOp{KeyHash: op.KeyHash}
+}
+func fromPBDeleteAPIKey(op *pbDeleteAPIKeyOp) DeleteAPIKeyOp {
+	return DeleteAPIKeyOp{KeyHash: op.KeyHash}
+}
+
+func toPBInsertAuditLog(op InsertAuditLogOp) *pbInsertAuditLogOp {
+	return &pbInsertAuditLogOp{
+		Namespace:  op.Namespace,
+		Principal:  op.Principal,
+		Role:       op.Role,
+		Method:     op.Method,
+		Path:       op.Path,
+		StatusCode: int32(op.StatusCode),
+		Metadata:   op.Metadata,
+		CreatedAt:  op.CreatedAt,
+	}
+}
+func fromPBInsertAuditLog(op *pbInsertAuditLogOp) InsertAuditLogOp {
+	return InsertAuditLogOp{
+		Namespace:  op.Namespace,
+		Principal:  op.Principal,
+		Role:       op.Role,
+		Method:     op.Method,
+		Path:       op.Path,
+		StatusCode: int(op.StatusCode),
+		Metadata:   op.Metadata,
+		CreatedAt:  op.CreatedAt,
+	}
+}
+
+func toPBUpdateAPIKeyUsed(op UpdateAPIKeyUsedOp) *pbUpdateAPIKeyUsedOp {
+	return &pbUpdateAPIKeyUsedOp{KeyHash: op.KeyHash, Now: op.Now}
+}
+func fromPBUpdateAPIKeyUsed(op *pbUpdateAPIKeyUsedOp) UpdateAPIKeyUsedOp {
+	return UpdateAPIKeyUsedOp{KeyHash: op.KeyHash, Now: op.Now}
+}
+
+func toPBUpsertWebhook(op UpsertWebhookOp) *pbUpsertWebhookOp {
+	return &pbUpsertWebhookOp{
+		ID:         op.ID,
+		URL:        op.URL,
+		Events:     op.Events,
+		Secret:     op.Secret,
+		Enabled:    int32(op.Enabled),
+		RetryLimit: int32(op.RetryLimit),
+	}
+}
+func fromPBUpsertWebhook(op *pbUpsertWebhookOp) UpsertWebhookOp {
+	return UpsertWebhookOp{
+		ID:         op.ID,
+		URL:        op.URL,
+		Events:     op.Events,
+		Secret:     op.Secret,
+		Enabled:    int(op.Enabled),
+		RetryLimit: int(op.RetryLimit),
+	}
+}
+
+func toPBDeleteWebhook(op DeleteWebhookOp) *pbDeleteWebhookOp {
+	return &pbDeleteWebhookOp{ID: op.ID}
+}
+func fromPBDeleteWebhook(op *pbDeleteWebhookOp) DeleteWebhookOp {
+	return DeleteWebhookOp{ID: op.ID}
+}
+
+func toPBUpdateWebhookStatus(op UpdateWebhookStatusOp) *pbUpdateWebhookStatusOp {
+	return &pbUpdateWebhookStatusOp{
+		ID:             op.ID,
+		LastStatusCode: int32(op.LastStatusCode),
+		LastError:      op.LastError,
+		LastDeliveryAt: op.LastDeliveryAt,
+	}
+}
+func fromPBUpdateWebhookStatus(op *pbUpdateWebhookStatusOp) UpdateWebhookStatusOp {
+	return UpdateWebhookStatusOp{
+		ID:             op.ID,
+		LastStatusCode: int(op.LastStatusCode),
+		LastError:      op.LastError,
+		LastDeliveryAt: op.LastDeliveryAt,
+	}
 }

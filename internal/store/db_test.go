@@ -100,8 +100,8 @@ func TestMigrationIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query migration version: %v", err)
 	}
-	if version != 8 {
-		t.Errorf("migration version = %d, want 8", version)
+	if version != 11 {
+		t.Errorf("migration version = %d, want 11", version)
 	}
 }
 
