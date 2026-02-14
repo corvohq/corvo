@@ -193,6 +193,8 @@ type pbAckOp struct {
 	AgentStatus string         `protobuf:"bytes,6,opt,name=agent_status,json=agentStatus,proto3" json:"agent_status,omitempty"`
 	HoldReason  string         `protobuf:"bytes,7,opt,name=hold_reason,json=holdReason,proto3" json:"hold_reason,omitempty"`
 	Trace       []byte         `protobuf:"bytes,8,opt,name=trace,proto3" json:"trace,omitempty"`
+	StepStatus  string         `protobuf:"bytes,9,opt,name=step_status,json=stepStatus,proto3" json:"step_status,omitempty"`
+	ExitReason  string         `protobuf:"bytes,10,opt,name=exit_reason,json=exitReason,proto3" json:"exit_reason,omitempty"`
 }
 
 func (m *pbAckOp) Reset()         { *m = pbAckOp{} }
@@ -1171,6 +1173,8 @@ func toPBAck(op AckOp) *pbAckOp {
 		AgentStatus: op.AgentStatus,
 		HoldReason:  op.HoldReason,
 		Trace:       append([]byte(nil), op.Trace...),
+		StepStatus:  op.StepStatus,
+		ExitReason:  op.ExitReason,
 	}
 }
 
@@ -1184,6 +1188,8 @@ func fromPBAck(op *pbAckOp) AckOp {
 		AgentStatus: op.AgentStatus,
 		HoldReason:  op.HoldReason,
 		Trace:       append([]byte(nil), op.Trace...),
+		StepStatus:  op.StepStatus,
+		ExitReason:  op.ExitReason,
 	}
 }
 

@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -27,8 +28,9 @@ type EnqueueRequest struct {
 	ChainID        string          `json:"chain_id,omitempty"`
 	ChainStep      *int            `json:"chain_step,omitempty"`
 	ChainConfig    json.RawMessage `json:"chain_config,omitempty"`
-	DependsOn      []string        `json:"depends_on,omitempty"`
-	Routing        *RoutingConfig  `json:"routing,omitempty"`
+	DependsOn      []string         `json:"depends_on,omitempty"`
+	Routing        *RoutingConfig   `json:"routing,omitempty"`
+	Chain          *ChainDefinition `json:"chain,omitempty"`
 }
 
 // EnqueueResult is the response from enqueuing a job.
@@ -72,6 +74,34 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 		}
 	}
 
+	// Validate and set up chain if provided.
+	var chainID string
+	var chainStep *int
+	var chainConfig json.RawMessage
+	if req.Chain != nil {
+		if len(req.Chain.Steps) < 2 {
+			return nil, fmt.Errorf("chain requires at least 2 steps")
+		}
+		if req.Chain.Steps[0].Queue != req.Queue {
+			return nil, fmt.Errorf("first chain step queue %q must match enqueue queue %q", req.Chain.Steps[0].Queue, req.Queue)
+		}
+		for i, step := range req.Chain.Steps {
+			if step.Queue == "" {
+				return nil, fmt.Errorf("chain step %d has empty queue", i)
+			}
+		}
+		if req.Chain.OnFailure != nil && req.Chain.OnFailure.Queue == "" {
+			return nil, fmt.Errorf("chain on_failure has empty queue")
+		}
+		if req.Chain.OnExit != nil && req.Chain.OnExit.Queue == "" {
+			return nil, fmt.Errorf("chain on_exit has empty queue")
+		}
+		chainID = NewChainID()
+		step0 := 0
+		chainStep = &step0
+		chainConfig, _ = json.Marshal(req.Chain)
+	}
+
 	state := StatePending
 	if req.ScheduledAt != nil {
 		state = StateScheduled
@@ -83,6 +113,16 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 			t := now.Add(d).UTC()
 			expireAt = &t
 		}
+	}
+
+	// If chain is set, use generated chain fields; otherwise use raw request fields.
+	opChainID := req.ChainID
+	opChainStep := req.ChainStep
+	opChainConfig := mergeDependsOnChainConfig(req.ChainConfig, req.DependsOn)
+	if req.Chain != nil {
+		opChainID = chainID
+		opChainStep = chainStep
+		opChainConfig = chainConfig
 	}
 
 	op := EnqueueOp{
@@ -106,9 +146,9 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 		Agent:        normalizeAgentConfig(req.Agent),
 		ResultSchema: req.ResultSchema,
 		ParentID:     req.ParentID,
-		ChainID:      req.ChainID,
-		ChainStep:    req.ChainStep,
-		ChainConfig:  mergeDependsOnChainConfig(req.ChainConfig, req.DependsOn),
+		ChainID:      opChainID,
+		ChainStep:    opChainStep,
+		ChainConfig:  opChainConfig,
 		Routing:      normalizeRoutingConfig(req.Routing),
 	}
 

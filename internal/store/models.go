@@ -24,6 +24,25 @@ const (
 	AgentStatusHold     = "hold"
 )
 
+// Step statuses for chain progression.
+const (
+	StepStatusContinue = "continue"
+	StepStatusExit     = "exit"
+)
+
+// ChainDefinition describes a sequential pipeline of jobs.
+type ChainDefinition struct {
+	Steps     []ChainStep `json:"steps"`
+	OnFailure *ChainStep  `json:"on_failure,omitempty"`
+	OnExit    *ChainStep  `json:"on_exit,omitempty"`
+}
+
+// ChainStep is a single step in a chain definition.
+type ChainStep struct {
+	Queue   string          `json:"queue"`
+	Payload json.RawMessage `json:"payload,omitempty"`
+}
+
 // Priority levels (lower = higher priority)
 const (
 	PriorityCritical = 0

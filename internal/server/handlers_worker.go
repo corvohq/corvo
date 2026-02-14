@@ -24,6 +24,21 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 		req.Payload = json.RawMessage(`{}`)
 	}
 	req.Queue = namespaceQueue(principal.Namespace, req.Queue)
+	if req.Chain != nil {
+		for i := range req.Chain.Steps {
+			if req.Chain.Steps[i].Queue == "" {
+				writeError(w, http.StatusBadRequest, "chain step has empty queue", "VALIDATION_ERROR")
+				return
+			}
+			req.Chain.Steps[i].Queue = namespaceQueue(principal.Namespace, req.Chain.Steps[i].Queue)
+		}
+		if req.Chain.OnFailure != nil {
+			req.Chain.OnFailure.Queue = namespaceQueue(principal.Namespace, req.Chain.OnFailure.Queue)
+		}
+		if req.Chain.OnExit != nil {
+			req.Chain.OnExit.Queue = namespaceQueue(principal.Namespace, req.Chain.OnExit.Queue)
+		}
+	}
 
 	result, err := s.store.Enqueue(req)
 	if err != nil {
@@ -203,6 +218,8 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 		Usage       *store.UsageReport `json:"usage"`
 		AgentStatus string             `json:"agent_status"`
 		HoldReason  string             `json:"hold_reason"`
+		StepStatus  string             `json:"step_status"`
+		ExitReason  string             `json:"exit_reason"`
 	}
 	decodeJSON(r, &body)
 
@@ -214,6 +231,8 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 		Usage:       body.Usage,
 		AgentStatus: body.AgentStatus,
 		HoldReason:  body.HoldReason,
+		StepStatus:  body.StepStatus,
+		ExitReason:  body.ExitReason,
 	}); err != nil {
 		writeStoreError(w, err, http.StatusBadRequest, "ACK_ERROR")
 		return

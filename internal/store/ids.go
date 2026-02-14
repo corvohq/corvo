@@ -49,3 +49,8 @@ func NewBatchID() string {
 func NewScheduleID() string {
 	return "sched_" + newSortableID()
 }
+
+// NewChainID generates a new chain ID with the "chn_" prefix.
+func NewChainID() string {
+	return "chn_" + newSortableID()
+}

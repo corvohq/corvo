@@ -156,6 +156,8 @@ type AckOp struct {
 	Usage       *UsageReport    `json:"usage,omitempty"`
 	AgentStatus string          `json:"agent_status,omitempty"`
 	HoldReason  string          `json:"hold_reason,omitempty"`
+	StepStatus  string          `json:"step_status,omitempty"`
+	ExitReason  string          `json:"exit_reason,omitempty"`
 	NowNs       uint64          `json:"now_ns"`
 }
 

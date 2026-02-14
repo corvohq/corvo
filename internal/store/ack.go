@@ -15,6 +15,8 @@ type AckRequest struct {
 	Usage       *UsageReport
 	AgentStatus string
 	HoldReason  string
+	StepStatus  string
+	ExitReason  string
 }
 
 // Ack marks a job as completed via Raft consensus.
@@ -66,6 +68,13 @@ func (s *Store) AckJob(req AckRequest) error {
 		}
 	}
 
+	stepStatus := strings.TrimSpace(strings.ToLower(req.StepStatus))
+	switch stepStatus {
+	case "", StepStatusContinue, StepStatusExit:
+	default:
+		return fmt.Errorf("invalid step_status %q", req.StepStatus)
+	}
+
 	now := time.Now()
 	op := AckOp{
 		JobID:       req.JobID,
@@ -75,6 +84,8 @@ func (s *Store) AckJob(req AckRequest) error {
 		Usage:       normUsage,
 		AgentStatus: status,
 		HoldReason:  strings.TrimSpace(req.HoldReason),
+		StepStatus:  stepStatus,
+		ExitReason:  strings.TrimSpace(req.ExitReason),
 		NowNs:       uint64(now.UnixNano()),
 	}
 

@@ -1033,6 +1033,12 @@ func (f *FSM) applyAckOp(op store.AckOp) *store.OpResult {
 		batch.Delete(kv.UniqueKey(job.Queue, *job.UniqueKey), f.writeOpts)
 	}
 
+	// Chain progression: advance to next step on completion.
+	var chainNextJob *store.Job
+	if nextState == store.StateCompleted && len(job.ChainConfig) > 0 {
+		chainNextJob = f.progressChain(batch, job, op, now)
+	}
+
 	// Update batch counter
 	var callbackJobID string
 	if nextState == store.StateCompleted && job.BatchID != nil {
@@ -1072,6 +1078,11 @@ func (f *FSM) applyAckOp(op store.AckOp) *store.OpResult {
 		}
 		if nextState == store.StateCompleted && job.BatchID != nil {
 			sqliteUpdateBatch(db, *job.BatchID, "success", callbackJobID)
+		}
+		if chainNextJob != nil {
+			if err := sqliteUpsertJobDoc(db, *chainNextJob); err != nil {
+				return err
+			}
 		}
 		if err := sqliteInsertUsage(db, op.JobID, job.Queue, job.Attempt, "ack", op.Usage, nowStr); err != nil {
 			return err
@@ -1440,15 +1451,173 @@ func (f *FSM) applyFailOp(op store.FailOp) *store.OpResult {
 		}
 	}
 
+	// Chain failure: spawn on_failure handler when job goes dead.
+	var chainFailJob *store.Job
+	if job.State == store.StateDead && len(job.ChainConfig) > 0 {
+		chainFailJob = f.progressChainFailure(batch, job, op, time.Unix(0, int64(op.NowNs)))
+	}
+
 	if err := batch.Commit(f.writeOpts); err != nil {
 		return &store.OpResult{Err: fmt.Errorf("pebble commit fail: %w", err)}
 	}
 
 	f.syncSQLite(func(db sqlExecer) error {
-		return sqliteFailJob(db, job, op, errDoc, callbackJobID)
+		if err := sqliteFailJob(db, job, op, errDoc, callbackJobID); err != nil {
+			return err
+		}
+		if chainFailJob != nil {
+			return sqliteUpsertJobDoc(db, *chainFailJob)
+		}
+		return nil
 	})
 
 	return &store.OpResult{Data: &result}
+}
+
+// --- Chain progression ---
+
+// progressChain advances a chain to the next step or runs the on_exit handler.
+// It writes the new job into the pebble batch and returns the job for SQLite sync.
+func (f *FSM) progressChain(batch *pebble.Batch, job store.Job, op store.AckOp, now time.Time) *store.Job {
+	if job.ChainStep == nil {
+		return nil
+	}
+	currentStep := *job.ChainStep
+	// Guard: negative steps are exit/failure handlers — don't recurse.
+	if currentStep < 0 {
+		return nil
+	}
+
+	var chain store.ChainDefinition
+	if err := json.Unmarshal(job.ChainConfig, &chain); err != nil {
+		return nil
+	}
+
+	stepStatus := op.StepStatus
+	if stepStatus == "" {
+		stepStatus = store.StepStatusContinue
+	}
+
+	var nextStep *store.ChainStep
+	var nextStepIndex int
+
+	switch stepStatus {
+	case store.StepStatusContinue:
+		nextIdx := currentStep + 1
+		if nextIdx < len(chain.Steps) {
+			nextStep = &chain.Steps[nextIdx]
+			nextStepIndex = nextIdx
+		} else {
+			// Last step completed — run on_exit if configured.
+			if chain.OnExit != nil {
+				nextStep = chain.OnExit
+				nextStepIndex = -1 // on_exit sentinel
+			}
+		}
+	case store.StepStatusExit:
+		if chain.OnExit != nil {
+			nextStep = chain.OnExit
+			nextStepIndex = -1 // on_exit sentinel
+		}
+	}
+
+	if nextStep == nil {
+		return nil
+	}
+
+	return f.enqueueChainStep(batch, job, nextStep, nextStepIndex, op.Result, now)
+}
+
+// progressChainFailure spawns the on_failure handler when a chain job goes dead.
+func (f *FSM) progressChainFailure(batch *pebble.Batch, job store.Job, op store.FailOp, now time.Time) *store.Job {
+	if job.ChainStep == nil {
+		return nil
+	}
+	currentStep := *job.ChainStep
+	// Guard: negative steps are exit/failure handlers — don't recurse.
+	if currentStep < 0 {
+		return nil
+	}
+
+	var chain store.ChainDefinition
+	if err := json.Unmarshal(job.ChainConfig, &chain); err != nil {
+		return nil
+	}
+	if chain.OnFailure == nil {
+		return nil
+	}
+
+	// Build failure payload.
+	failPayload := map[string]any{
+		"failed_job_id": op.JobID,
+		"failed_step":   currentStep,
+		"error":         op.Error,
+	}
+	if len(chain.OnFailure.Payload) > 0 {
+		var stepPayload map[string]any
+		if err := json.Unmarshal(chain.OnFailure.Payload, &stepPayload); err == nil {
+			for k, v := range stepPayload {
+				failPayload[k] = v
+			}
+		}
+	}
+
+	payloadBytes, _ := json.Marshal(failPayload)
+	newJob := f.createChainJob(batch, job, chain.OnFailure.Queue, payloadBytes, -2, now)
+	return &newJob
+}
+
+// enqueueChainStep creates the next chain job with forwarded result payload.
+func (f *FSM) enqueueChainStep(batch *pebble.Batch, prevJob store.Job, step *store.ChainStep, stepIndex int, prevResult json.RawMessage, now time.Time) *store.Job {
+	payload := map[string]any{
+		"previous_job_id": prevJob.ID,
+	}
+	if len(prevResult) > 0 {
+		payload["previous_result"] = json.RawMessage(prevResult)
+	}
+	// Merge step-specific payload.
+	if len(step.Payload) > 0 {
+		var stepPayload map[string]any
+		if err := json.Unmarshal(step.Payload, &stepPayload); err == nil {
+			for k, v := range stepPayload {
+				payload[k] = v
+			}
+		}
+	}
+
+	payloadBytes, _ := json.Marshal(payload)
+	newJob := f.createChainJob(batch, prevJob, step.Queue, payloadBytes, stepIndex, now)
+	return &newJob
+}
+
+// createChainJob builds a new pending job for chain progression and writes it to the pebble batch.
+func (f *FSM) createChainJob(batch *pebble.Batch, prevJob store.Job, queue string, payload json.RawMessage, stepIndex int, now time.Time) store.Job {
+	jobID := store.NewJobID()
+	newJob := store.Job{
+		ID:           jobID,
+		Queue:        queue,
+		State:        store.StatePending,
+		Payload:      payload,
+		Priority:     store.PriorityNormal,
+		MaxRetries:   3,
+		RetryBackoff: store.BackoffExponential,
+		RetryBaseDelay: 5000,
+		RetryMaxDelay:  600000,
+		CreatedAt:    now.UTC(),
+		ChainConfig:  prevJob.ChainConfig,
+	}
+	if prevJob.ChainID != nil {
+		newJob.ChainID = prevJob.ChainID
+	}
+	newJob.ChainStep = &stepIndex
+
+	jobData, _ := encodeJobDoc(newJob)
+	batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+	batch.Set(kv.QueueNameKey(queue), nil, f.writeOpts)
+	createdNs := uint64(now.UnixNano())
+	batch.Set(kv.QueueAppendKey(queue, createdNs, jobID), nil, f.writeOpts)
+
+	return newJob
 }
 
 // --- Heartbeat ---
