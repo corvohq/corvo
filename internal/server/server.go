@@ -19,9 +19,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/user/jobbie/internal/enterprise"
-	"github.com/user/jobbie/internal/rpcconnect"
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/enterprise"
+	"github.com/user/corvo/internal/rpcconnect"
+	"github.com/user/corvo/internal/store"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -29,7 +29,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 )
 
-// Server is the HTTP server for Jobbie.
+// Server is the HTTP server for Corvo.
 type Server struct {
 	store       *store.Store
 	cluster     ClusterInfo
@@ -433,7 +433,7 @@ func structuredLogger(next http.Handler) http.Handler {
 }
 
 func otelHTTPMiddleware(next http.Handler) http.Handler {
-	tracer := otel.Tracer("jobbie/http")
+	tracer := otel.Tracer("corvo/http")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, span := tracer.Start(r.Context(), r.Method+" "+r.URL.Path)
 		span.SetAttributes(
@@ -454,7 +454,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, X-Jobbie-Namespace")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, X-Corvo-Namespace")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -534,7 +534,7 @@ func (s *Server) requireLeader(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.Header.Get("X-Jobbie-Forwarded") == "1" {
+		if r.Header.Get("X-Corvo-Forwarded") == "1" {
 			writeError(w, http.StatusServiceUnavailable, "leader forwarding loop detected", "FORWARD_LOOP")
 			return
 		}
@@ -830,10 +830,10 @@ func (s *Server) proxyToLeader(w http.ResponseWriter, r *http.Request, target *u
 	origDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		origDirector(req)
-		req.Header.Set("X-Jobbie-Forwarded", "1")
+		req.Header.Set("X-Corvo-Forwarded", "1")
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
-		resp.Header.Set("X-Jobbie-Forwarded", "1")
+		resp.Header.Set("X-Corvo-Forwarded", "1")
 		return nil
 	}
 	proxy.ServeHTTP(w, r)

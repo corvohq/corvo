@@ -8,11 +8,11 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/user/jobbie/internal/raft"
-	"github.com/user/jobbie/internal/scheduler"
-	"github.com/user/jobbie/internal/server"
-	"github.com/user/jobbie/internal/store"
-	"github.com/user/jobbie/pkg/client"
+	"github.com/user/corvo/internal/raft"
+	"github.com/user/corvo/internal/scheduler"
+	"github.com/user/corvo/internal/server"
+	"github.com/user/corvo/internal/store"
+	"github.com/user/corvo/pkg/client"
 )
 
 // testEnv holds a fully wired test stack.

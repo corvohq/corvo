@@ -3,16 +3,16 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "jobbie-worker"
+name = "corvo-worker"
 version = "0.1.0"
-description = "Python worker runtime for Jobbie"
+description = "Python worker runtime for Corvo"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = ["jobbie-client>=0.1.0"]
+dependencies = ["corvo-client>=0.1.0"]
 
 [tool.setuptools]
 package-dir = {"" = "."}
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["jobbie_worker*"]
+include = ["corvo_worker*"]

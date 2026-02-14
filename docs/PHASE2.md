@@ -4,7 +4,7 @@ This plan combines the current distributed core in `docs/DESIGN.md` with the AI 
 
 ## Outcome
 
-By the end of Phase 2, Jobbie should be:
+By the end of Phase 2, Corvo should be:
 - Fast by default (`--durable=false`) with stable tail latency under load
 - Operationally safe (clear durability behavior, deterministic recovery paths)
 - Ready for AI workloads (usage/cost tracking, budgets, held jobs, first agent-loop primitives)
@@ -34,7 +34,7 @@ Out of scope:
 
 ## Track A — Reliability + Durability
 
-Files: `internal/raft/*`, `internal/server/*`, `cmd/jobbie/main.go`, `docs/DESIGN.md`
+Files: `internal/raft/*`, `internal/server/*`, `cmd/corvo/main.go`, `docs/DESIGN.md`
 
 - [x] Deterministic pre-snapshot recovery:
   - On startup without snapshot, ensure FSM local state cannot replay on top of stale Pebble
@@ -86,18 +86,18 @@ Benchmark gates:
 
 ## Track C — AI Foundations (AI.md Phase 2a)
 
-Files: `docs/AI.md`, `internal/store/*`, `internal/server/*`, `pkg/client/*`, `cmd/jobbie/*`, UI files
+Files: `docs/AI.md`, `internal/store/*`, `internal/server/*`, `pkg/client/*`, `cmd/corvo/*`, UI files
 
 - [ ] Usage accounting:
   - [x] `job_usage` storage + usage reporting via ack/heartbeat
   - [x] Usage summary API (`GET /api/v1/usage/summary`)
-  - [x] Usage summary CLI (`jobbie usage`)
+  - [x] Usage summary CLI (`corvo usage`)
 - [x] Budget enforcement:
   - [x] Budget table + checks on fetch/ack paths
-  - [x] Queue/namespace/per-job budget APIs + CLI (`jobbie budget`)
+  - [x] Queue/namespace/per-job budget APIs + CLI (`corvo budget`)
 - [ ] Human-in-the-loop baseline:
   - [x] `held` state and approve/reject API
-  - [x] CLI (`jobbie held`, `jobbie approve`, `jobbie reject`)
+  - [x] CLI (`corvo held`, `corvo approve`, `corvo reject`)
   - [x] UI held-jobs view
 
 Exit criteria:
@@ -157,11 +157,11 @@ Exit criteria:
 - [x] Human-in-the-loop baseline:
   - Added `held` state transitions (`hold`, `approve`, `reject`) in Raft + SQLite mirror paths
   - Added HTTP APIs: `POST /api/v1/jobs/{id}/hold|approve|reject`
-  - Added CLI commands: `jobbie held`, `jobbie hold`, `jobbie approve`, `jobbie reject`
+  - Added CLI commands: `corvo held`, `corvo hold`, `corvo approve`, `corvo reject`
   - Wired held-job UI cards to approve/reject endpoints
 - [x] Budget enforcement baseline:
   - Added `budgets` migration + Raft-backed budget set/delete ops
   - Added API endpoints: `GET/POST/DELETE /api/v1/budgets...`
-  - Added CLI commands: `jobbie budget list|set|delete`
+  - Added CLI commands: `corvo budget list|set|delete`
   - Added fetch-path queue/global budget checks with `hold`/`reject` behavior
   - Added per-job budget checks on ack/heartbeat with soft `budget_exceeded` heartbeat signal

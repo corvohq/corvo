@@ -18,8 +18,8 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/hashicorp/raft"
-	"github.com/user/jobbie/internal/kv"
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/kv"
+	"github.com/user/corvo/internal/store"
 )
 
 // Cluster manages the Raft node, Pebble KV store, and SQLite materialized view.
@@ -127,7 +127,7 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 	// Open SQLite materialized view.
 	sqlitePath := strings.TrimSpace(cfg.SQLitePath)
 	if sqlitePath == "" {
-		sqlitePath = filepath.Join(cfg.DataDir, "jobbie.db")
+		sqlitePath = filepath.Join(cfg.DataDir, "corvo.db")
 	}
 	sqliteDB, err := openMaterializedView(sqlitePath)
 	if err != nil {

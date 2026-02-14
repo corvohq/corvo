@@ -28,7 +28,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 	tw := tar.NewWriter(gzw)
 
 	// 1. Pebble checkpoint
-	tmpDir, err := os.MkdirTemp("", "jobbie-snapshot-*")
+	tmpDir, err := os.MkdirTemp("", "corvo-snapshot-*")
 	if err != nil {
 		sink.Cancel()
 		return fmt.Errorf("create temp dir: %w", err)
@@ -84,7 +84,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		return fmt.Errorf("stat sqlite backup: %w", err)
 	}
 	header := &tar.Header{
-		Name: "sqlite/jobbie.db",
+		Name: "sqlite/corvo.db",
 		Size: info.Size(),
 		Mode: 0644,
 	}
@@ -115,7 +115,7 @@ func (s *fsmSnapshot) Release() {}
 
 // restoreFromSnapshot restores Pebble and SQLite from a snapshot tar.gz stream.
 func restoreFromSnapshot(pdb *pebble.DB, sqliteDB *sql.DB, rc io.Reader) error {
-	tmpDir, err := os.MkdirTemp("", "jobbie-restore-*")
+	tmpDir, err := os.MkdirTemp("", "corvo-restore-*")
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
@@ -202,7 +202,7 @@ func restoreFromSnapshot(pdb *pebble.DB, sqliteDB *sql.DB, rc io.Reader) error {
 	}
 
 	// Restore SQLite: exec from backup
-	sqlitePath := filepath.Join(tmpDir, "sqlite", "jobbie.db")
+	sqlitePath := filepath.Join(tmpDir, "sqlite", "corvo.db")
 	if _, err := os.Stat(sqlitePath); err == nil {
 		// Read the tables from the backup and apply to current DB
 		backupDB, err := sql.Open("sqlite", sqlitePath)

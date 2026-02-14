@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/store"
 )
 
 func TestListQueues(t *testing.T) {

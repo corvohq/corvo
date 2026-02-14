@@ -16,7 +16,7 @@ func TestOpen(t *testing.T) {
 	defer db.Close()
 
 	// Verify the database file was created
-	if _, err := os.Stat(filepath.Join(dir, "jobbie.db")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "corvo.db")); err != nil {
 		t.Fatalf("database file not created: %v", err)
 	}
 

@@ -1,13 +1,13 @@
 .PHONY: build run test perf lint clean ui ui-dev
 
-BINARY := jobbie
+BINARY := corvo
 BUILD_DIR := bin
 
 ui:
 	cd ui && npm install && npm run build
 
 build: ui
-	CGO_ENABLED=1 go build -o $(BUILD_DIR)/$(BINARY) ./cmd/jobbie
+	CGO_ENABLED=1 go build -o $(BUILD_DIR)/$(BINARY) ./cmd/corvo
 
 bench:
 	CGO_ENABLED=1 go build -o $(BUILD_DIR)/bench ./cmd/bench

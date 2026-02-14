@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/user/jobbie/internal/search"
+	"github.com/user/corvo/internal/search"
 )
 
 // BulkRequest describes a bulk operation.

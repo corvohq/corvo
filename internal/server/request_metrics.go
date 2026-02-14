@@ -167,30 +167,30 @@ func (m *requestMetrics) renderPrometheus() string {
 	})
 
 	var b strings.Builder
-	b.WriteString("# HELP jobbie_http_requests_total HTTP requests received.\n")
-	b.WriteString("# TYPE jobbie_http_requests_total counter\n")
-	b.WriteString("# HELP jobbie_http_request_errors_total HTTP requests resulting in 4xx/5xx.\n")
-	b.WriteString("# TYPE jobbie_http_request_errors_total counter\n")
-	b.WriteString("# HELP jobbie_http_request_duration_seconds HTTP request duration in seconds.\n")
-	b.WriteString("# TYPE jobbie_http_request_duration_seconds histogram\n")
-	b.WriteString("# HELP jobbie_http_requests_in_flight Current in-flight HTTP requests.\n")
-	b.WriteString("# TYPE jobbie_http_requests_in_flight gauge\n")
-	b.WriteString("# HELP jobbie_rate_limit_throttled_total Requests denied by server-side rate limiting.\n")
-	b.WriteString("# TYPE jobbie_rate_limit_throttled_total counter\n")
+	b.WriteString("# HELP corvo_http_requests_total HTTP requests received.\n")
+	b.WriteString("# TYPE corvo_http_requests_total counter\n")
+	b.WriteString("# HELP corvo_http_request_errors_total HTTP requests resulting in 4xx/5xx.\n")
+	b.WriteString("# TYPE corvo_http_request_errors_total counter\n")
+	b.WriteString("# HELP corvo_http_request_duration_seconds HTTP request duration in seconds.\n")
+	b.WriteString("# TYPE corvo_http_request_duration_seconds histogram\n")
+	b.WriteString("# HELP corvo_http_requests_in_flight Current in-flight HTTP requests.\n")
+	b.WriteString("# TYPE corvo_http_requests_in_flight gauge\n")
+	b.WriteString("# HELP corvo_rate_limit_throttled_total Requests denied by server-side rate limiting.\n")
+	b.WriteString("# TYPE corvo_rate_limit_throttled_total counter\n")
 	for _, k := range keys {
 		v := snap[k]
 		method := promLabelEscape(k.Method)
 		route := promLabelEscape(k.Route)
-		b.WriteString(fmt.Sprintf("jobbie_http_requests_total{method=\"%s\",route=\"%s\"} %d\n", method, route, v.Total))
-		b.WriteString(fmt.Sprintf("jobbie_http_request_errors_total{method=\"%s\",route=\"%s\"} %d\n", method, route, v.Errors))
+		b.WriteString(fmt.Sprintf("corvo_http_requests_total{method=\"%s\",route=\"%s\"} %d\n", method, route, v.Total))
+		b.WriteString(fmt.Sprintf("corvo_http_request_errors_total{method=\"%s\",route=\"%s\"} %d\n", method, route, v.Errors))
 		var cumulative uint64
 		for i, bucket := range requestDurationBuckets {
 			cumulative = v.Buckets[i]
-			b.WriteString(fmt.Sprintf("jobbie_http_request_duration_seconds_bucket{method=\"%s\",route=\"%s\",le=\"%g\"} %d\n", method, route, bucket, cumulative))
+			b.WriteString(fmt.Sprintf("corvo_http_request_duration_seconds_bucket{method=\"%s\",route=\"%s\",le=\"%g\"} %d\n", method, route, bucket, cumulative))
 		}
-		b.WriteString(fmt.Sprintf("jobbie_http_request_duration_seconds_bucket{method=\"%s\",route=\"%s\",le=\"+Inf\"} %d\n", method, route, v.Total))
-		b.WriteString(fmt.Sprintf("jobbie_http_request_duration_seconds_sum{method=\"%s\",route=\"%s\"} %.9f\n", method, route, v.SumSeconds))
-		b.WriteString(fmt.Sprintf("jobbie_http_request_duration_seconds_count{method=\"%s\",route=\"%s\"} %d\n", method, route, v.Total))
+		b.WriteString(fmt.Sprintf("corvo_http_request_duration_seconds_bucket{method=\"%s\",route=\"%s\",le=\"+Inf\"} %d\n", method, route, v.Total))
+		b.WriteString(fmt.Sprintf("corvo_http_request_duration_seconds_sum{method=\"%s\",route=\"%s\"} %.9f\n", method, route, v.SumSeconds))
+		b.WriteString(fmt.Sprintf("corvo_http_request_duration_seconds_count{method=\"%s\",route=\"%s\"} %d\n", method, route, v.Total))
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -198,7 +198,7 @@ func (m *requestMetrics) renderPrometheus() string {
 	for _, c := range m.byKey {
 		inflight += c.inFlight.Load()
 	}
-	b.WriteString(fmt.Sprintf("jobbie_http_requests_in_flight %d\n", inflight))
+	b.WriteString(fmt.Sprintf("corvo_http_requests_in_flight %d\n", inflight))
 	for _, k := range keys {
 		c := m.byKey[k]
 		if c == nil {
@@ -210,7 +210,7 @@ func (m *requestMetrics) renderPrometheus() string {
 		}
 		method := promLabelEscape(k.Method)
 		route := promLabelEscape(k.Route)
-		b.WriteString(fmt.Sprintf("jobbie_rate_limit_throttled_total{method=\"%s\",route=\"%s\"} %d\n", method, route, th))
+		b.WriteString(fmt.Sprintf("corvo_rate_limit_throttled_total{method=\"%s\",route=\"%s\"} %d\n", method, route, th))
 	}
 	return b.String()
 }

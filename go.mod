@@ -1,4 +1,4 @@
-module github.com/user/jobbie
+module github.com/user/corvo
 
 go 1.24.0
 

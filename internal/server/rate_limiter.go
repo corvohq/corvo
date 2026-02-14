@@ -150,10 +150,10 @@ func isRateLimitedPath(path string) bool {
 	// StreamLifecycle is a long-lived bidi stream; counting it with the
 	// same request limiter as short unary endpoints can throttle reconnect
 	// storms and amplify client retries. It has dedicated stream controls.
-	if path == "/jobbie.v1.WorkerService/StreamLifecycle" {
+	if path == "/corvo.v1.WorkerService/StreamLifecycle" {
 		return false
 	}
-	if strings.HasPrefix(path, "/api/v1/") || strings.HasPrefix(path, "/jobbie.v1.WorkerService/") {
+	if strings.HasPrefix(path, "/api/v1/") || strings.HasPrefix(path, "/corvo.v1.WorkerService/") {
 		return true
 	}
 	return false

@@ -327,6 +327,6 @@ Optional per-job lifecycle event log (`--lifecycle-events`): persists events (en
 2. `go test ./internal/raft/... -count=1` — FSM + cluster + apply pipeline
 3. `go test ./internal/store/... -count=1` — store API
 4. `go test ./... -count=1` — full suite
-5. `go build ./cmd/jobbie`
-6. `./jobbie server --bootstrap --data-dir /tmp/jobbie-test` — single node
+5. `go build ./cmd/corvo`
+6. `./corvo server --bootstrap --data-dir /tmp/corvo-test` — single node
 7. Bench: `./cmd/bench/main.go` — HTTP benchmark tool for throughput + latency

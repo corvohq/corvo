@@ -1,6 +1,6 @@
 # Enterprise & Cloud Strategy
 
-How Jobbie separates OSS from paid features, enforces licensing, and ships a single binary for both tiers.
+How Corvo separates OSS from paid features, enforces licensing, and ships a single binary for both tiers.
 
 ---
 
@@ -56,7 +56,7 @@ Everything that touches job processing:
 
 Everything in OSS, plus:
 
-- Zero-ops managed Jobbie — no Raft clusters to run
+- Zero-ops managed Corvo — no Raft clusters to run
 - Auto-scaling (node count adapts to throughput)
 - Global regions (deploy close to workers)
 - Automated backups with point-in-time recovery
@@ -100,9 +100,9 @@ Everything in Cloud, plus:
 One binary. All code compiles in. Enterprise features are behind Go interfaces with no-op defaults. A license key unlocks them at runtime.
 
 ```
-jobbie server                              -> OSS mode
-jobbie server --license-key=ent_abc123     -> enterprise features unlock
-JOBBIE_LICENSE_KEY=ent_abc123 jobbie server -> same, via env var
+corvo server                              -> OSS mode
+corvo server --license-key=ent_abc123     -> enterprise features unlock
+CORVO_LICENSE_KEY=ent_abc123 corvo server -> same, via env var
 ```
 
 ### Why not alternatives
@@ -197,7 +197,7 @@ func New(s *store.Store, cluster ClusterInfo, opts ...Option) *Server {
 ### Directory structure
 
 ```
-jobbie/
+corvo/
 ├── internal/
 │   ├── server/              # core (uses interfaces)
 │   ├── store/               # core
@@ -234,7 +234,7 @@ Signed JWT (Ed25519):
 }
 ```
 
-Signed with our private key (stays on the signing server). Verified with an Ed25519 public key supplied to the server (`--license-public-key` or `JOBBIE_LICENSE_PUBLIC_KEY`).
+Signed with our private key (stays on the signing server). Verified with an Ed25519 public key supplied to the server (`--license-public-key` or `CORVO_LICENSE_PUBLIC_KEY`).
 
 ### Properties
 
@@ -295,7 +295,7 @@ OSS code is public. Enterprise code in a separate private repo that imports OSS 
 Everything in one public repo. The `enterprise/` directory has a different license (BSL 1.1).
 
 ```
-jobbie/
+corvo/
 ├── LICENSE                 <- Apache 2.0 (covers everything except enterprise/)
 ├── internal/
 │   ├── server/             <- Apache 2.0
@@ -320,21 +320,21 @@ Nobody can take the enterprise code and compete commercially. Everyone can read 
 
 ## Cloud architecture
 
-The Cloud offering is a separate concern from the Jobbie binary. The binary running inside Cloud is the same enterprise binary. What's separate is the control plane:
+The Cloud offering is a separate concern from the Corvo binary. The binary running inside Cloud is the same enterprise binary. What's separate is the control plane:
 
 ```
 Cloud control plane (separate codebase, our infrastructure):
-├── Provisioning    — spin up/down Jobbie clusters per customer
+├── Provisioning    — spin up/down Corvo clusters per customer
 ├── Billing         — usage metering, Stripe integration
 ├── API gateway     — tenant routing, rate limiting
 ├── Backup service  — scheduled snapshots to S3/GCS
 └── Dashboard       — customer-facing management console
 
-Jobbie binary (same enterprise binary, per-tenant):
-└── jobbie server --license-key=cloud_internal_xxx
+Corvo binary (same enterprise binary, per-tenant):
+└── corvo server --license-key=cloud_internal_xxx
 ```
 
-The control plane is a separate codebase with separate services — it's the platform that runs Jobbie, not part of Jobbie itself. This is where microservices make sense, because provisioning and billing genuinely are different concerns from job processing.
+The control plane is a separate codebase with separate services — it's the platform that runs Corvo, not part of Corvo itself. This is where microservices make sense, because provisioning and billing genuinely are different concerns from job processing.
 
 ---
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Single-node Jobbie server: Go binary with embedded SQLite, HTTP/JSON API, CLI, and Go client library. No Raft/clustering yet — the store layer uses a `Writer` interface so Raft can be inserted later without changing callers.
+Single-node Corvo server: Go binary with embedded SQLite, HTTP/JSON API, CLI, and Go client library. No Raft/clustering yet — the store layer uses a `Writer` interface so Raft can be inserted later without changing callers.
 
 **Go dependencies:**
 - `github.com/mattn/go-sqlite3` — SQLite via CGo
@@ -15,11 +15,11 @@ Single-node Jobbie server: Go binary with embedded SQLite, HTTP/JSON API, CLI, a
 
 ### 1. Project Scaffold
 
-Files: `go.mod`, `cmd/jobbie/main.go`, `Makefile`, directory structure
+Files: `go.mod`, `cmd/corvo/main.go`, `Makefile`, directory structure
 
-- [x] `go mod init github.com/user/jobbie`
-- [x] Create directory structure (`cmd/jobbie/`, `internal/server/`, `internal/store/`, `internal/scheduler/`, `internal/search/`, `pkg/client/`, `migrations/`, `tests/integration/`)
-- [x] `cmd/jobbie/main.go` — cobra root command + `server` subcommand
+- [x] `go mod init github.com/user/corvo`
+- [x] Create directory structure (`cmd/corvo/`, `internal/server/`, `internal/store/`, `internal/scheduler/`, `internal/search/`, `pkg/client/`, `migrations/`, `tests/integration/`)
+- [x] `cmd/corvo/main.go` — cobra root command + `server` subcommand
 - [x] `Makefile` — `build`, `run`, `test`, `lint` targets
 - [x] Add Go dependencies (`go get`)
 
@@ -159,7 +159,7 @@ Files: `internal/server/server.go`, `internal/server/handlers_worker.go`, `inter
 
 ### 11. Graceful Shutdown
 
-Files: updates to `cmd/jobbie/main.go`, `internal/server/server.go`
+Files: updates to `cmd/corvo/main.go`, `internal/server/server.go`
 
 - [x] Trap SIGTERM + SIGINT
 - [x] Stop accepting new HTTP connections
@@ -170,7 +170,7 @@ Files: updates to `cmd/jobbie/main.go`, `internal/server/server.go`
 
 ### 12. CLI
 
-Files: `cmd/jobbie/` (one file per command group)
+Files: `cmd/corvo/` (one file per command group)
 
 - [x] `server` — start the server (bind addr, data dir, log level flags)
 - [x] `enqueue <queue> <payload>` — enqueue a job (flags for priority, unique_key, max_retries, scheduled_at, tags)
@@ -232,7 +232,7 @@ Files: `tests/integration/`
 After implementation, verify with:
 
 1. `make build` — compiles to single binary
-2. `./jobbie server` — starts, SQLite created, logs show ready
+2. `./corvo server` — starts, SQLite created, logs show ready
 3. `curl` the quick start sequence from DESIGN.md (enqueue -> fetch -> ack)
 4. `make test` — all integration tests pass
 5. `docker build` + `docker run` — works in container

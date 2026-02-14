@@ -12,7 +12,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 )
 
-// Store is the main data access layer for Jobbie.
+// Store is the main data access layer for Corvo.
 // Writes go through Raft consensus via the Applier; reads come from local SQLite.
 type Store struct {
 	applier Applier
@@ -49,9 +49,9 @@ func (s *Store) ReadDB() *sql.DB {
 // applyOp submits an operation through Raft and returns the result.
 func (s *Store) applyOp(opType OpType, data any) *OpResult {
 	ctx := context.Background()
-	tracer := otel.Tracer("jobbie/store")
+	tracer := otel.Tracer("corvo/store")
 	ctx, span := tracer.Start(ctx, "raft.apply")
-	span.SetAttributes(attribute.Int("jobbie.op_type", int(opType)))
+	span.SetAttributes(attribute.Int("corvo.op_type", int(opType)))
 	res := s.applier.Apply(opType, data)
 	if res != nil && res.Err != nil {
 		span.RecordError(res.Err)

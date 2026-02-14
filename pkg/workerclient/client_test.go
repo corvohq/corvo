@@ -8,9 +8,9 @@ import (
 
 	"golang.org/x/net/http2"
 
-	"github.com/user/jobbie/internal/raft"
-	"github.com/user/jobbie/internal/server"
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/raft"
+	"github.com/user/corvo/internal/server"
+	"github.com/user/corvo/internal/store"
 )
 
 func TestDefaultHTTPClientNoTimeout(t *testing.T) {

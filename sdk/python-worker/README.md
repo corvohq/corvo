@@ -1,8 +1,8 @@
-# jobbie-worker
+# corvo-worker
 
-Python worker runtime for Jobbie.
+Python worker runtime for Corvo.
 
-Depends on `jobbie-client` and provides:
+Depends on `corvo-client` and provides:
 - queue handler registration
 - fetch/ack/fail loop
 - heartbeat and cancellation signals
@@ -11,11 +11,11 @@ Depends on `jobbie-client` and provides:
 ## Quick start
 
 ```python
-from jobbie_client import JobbieClient
-from jobbie_worker import JobbieWorker, WorkerConfig
+from corvo_client import CorvoClient
+from corvo_worker import CorvoWorker, WorkerConfig
 
-client = JobbieClient("http://localhost:8080", api_key="your-api-key")
-worker = JobbieWorker(
+client = CorvoClient("http://localhost:8080", api_key="your-api-key")
+worker = CorvoWorker(
     client,
     WorkerConfig(
         queues=["emails.send"],

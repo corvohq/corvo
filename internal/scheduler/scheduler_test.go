@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/jobbie/internal/raft"
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/raft"
+	"github.com/user/corvo/internal/store"
 )
 
 func testSetup(t *testing.T) (*store.Store, *Scheduler, *sql.DB) {

@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
-	"github.com/user/jobbie/internal/kv"
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/kv"
+	"github.com/user/corvo/internal/store"
 )
 
 // --- Enqueue ---

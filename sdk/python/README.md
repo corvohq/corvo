@@ -1,13 +1,13 @@
-# jobbie-client
+# corvo-client
 
-Python client for Jobbie's HTTP API.
+Python client for Corvo's HTTP API.
 
 ## Quick start
 
 ```python
-from jobbie_client import JobbieClient
+from corvo_client import CorvoClient
 
-client = JobbieClient("http://localhost:8080")
+client = CorvoClient("http://localhost:8080")
 enq = client.enqueue("emails.send", {"to": "user@example.com"})
 client.ack(enq["job_id"], {"result": {"ok": True}})
 ```
@@ -15,7 +15,7 @@ client.ack(enq["job_id"], {"result": {"ok": True}})
 ## Auth
 
 ```python
-client = JobbieClient(
+client = CorvoClient(
     "http://localhost:8080",
     api_key="your-api-key",
     bearer_token="your-jwt",
@@ -23,4 +23,4 @@ client = JobbieClient(
 )
 ```
 
-For worker runtime support, use `jobbie-worker`.
+For worker runtime support, use `corvo-worker`.

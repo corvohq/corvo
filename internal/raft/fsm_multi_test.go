@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/store"
 )
 
 func makeEnqueueOp(jobID, queue string, now time.Time) store.EnqueueOp {

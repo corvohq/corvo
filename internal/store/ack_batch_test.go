@@ -3,7 +3,7 @@ package store_test
 import (
 	"testing"
 
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/store"
 )
 
 func TestAckBatchMissingJobDoesNotError(t *testing.T) {

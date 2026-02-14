@@ -16,8 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/user/jobbie/pkg/client"
-	"github.com/user/jobbie/pkg/workerclient"
+	"github.com/user/corvo/pkg/client"
+	"github.com/user/corvo/pkg/workerclient"
 )
 
 const streamsPerRPCClient = 200
@@ -54,7 +54,7 @@ func main() {
 	workDuration := flag.Duration("work-duration", 0, "simulated per-job work duration in lifecycle benchmark (e.g. 1ms)")
 	flag.Parse()
 
-	fmt.Printf("Jobbie Benchmark\n")
+	fmt.Printf("Corvo Benchmark\n")
 	fmt.Printf("  server:      %s\n", *server)
 	fmt.Printf("  protocol:    %s\n", *protocol)
 	fmt.Printf("  jobs:        %d\n", *jobs)

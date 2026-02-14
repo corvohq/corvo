@@ -1,6 +1,0 @@
-apiVersion: v2
-name: jobbie
-description: Jobbie job processing server
-type: application
-version: 0.1.0
-appVersion: "latest"

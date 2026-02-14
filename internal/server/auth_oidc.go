@@ -48,8 +48,8 @@ func (s *Server) resolveOIDCPrincipal(r *http.Request) (authPrincipal, bool) {
 	}
 	p := authPrincipal{
 		Name:      claimString(claims, "email", "preferred_username", "sub"),
-		Namespace: claimString(claims, "jobbie_namespace", "namespace"),
-		Role:      claimString(claims, "jobbie_role", "role"),
+		Namespace: claimString(claims, "corvo_namespace", "namespace"),
+		Role:      claimString(claims, "corvo_role", "role"),
 	}
 	if p.Name == "" {
 		p.Name = "oidc-user"
@@ -60,7 +60,7 @@ func (s *Server) resolveOIDCPrincipal(r *http.Request) (authPrincipal, bool) {
 	if p.Role == "" {
 		p.Role = "readonly"
 	}
-	if rawRoles, ok := claims["jobbie_roles"]; ok {
+	if rawRoles, ok := claims["corvo_roles"]; ok {
 		p.Roles = claimsStringSlice(rawRoles)
 	}
 	return p, true
@@ -88,19 +88,19 @@ func newSAMLHeaderAuthenticator(cfg SAMLHeaderConfig) *samlHeaderAuthenticator {
 	}
 	subject := strings.TrimSpace(cfg.SubjectHeader)
 	if subject == "" {
-		subject = "X-Jobbie-SAML-Subject"
+		subject = "X-Corvo-SAML-Subject"
 	}
 	role := strings.TrimSpace(cfg.RoleHeader)
 	if role == "" {
-		role = "X-Jobbie-SAML-Role"
+		role = "X-Corvo-SAML-Role"
 	}
 	ns := strings.TrimSpace(cfg.NamespaceHeader)
 	if ns == "" {
-		ns = "X-Jobbie-SAML-Namespace"
+		ns = "X-Corvo-SAML-Namespace"
 	}
 	roles := strings.TrimSpace(cfg.RolesHeader)
 	if roles == "" {
-		roles = "X-Jobbie-SAML-Roles"
+		roles = "X-Corvo-SAML-Roles"
 	}
 	return &samlHeaderAuthenticator{
 		enabled:         true,

@@ -17,17 +17,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/jobbie/pkg/client"
-	"github.com/user/jobbie/pkg/workerclient"
+	"github.com/user/corvo/pkg/client"
+	"github.com/user/corvo/pkg/workerclient"
 )
 
 func TestPerfE2EEnqueueHTTP(t *testing.T) {
 	baseURL := startRealServer(t, false)
 	c := client.New(baseURL)
 
-	total := envInt("JOBBIE_PERF_E2E_ENQ_TOTAL", 4000)
-	concurrency := envInt("JOBBIE_PERF_E2E_ENQ_CONCURRENCY", 10)
-	minOps := envFloat("JOBBIE_PERF_E2E_ENQ_MIN_OPS", 100.0)
+	total := envInt("CORVO_PERF_E2E_ENQ_TOTAL", 4000)
+	concurrency := envInt("CORVO_PERF_E2E_ENQ_CONCURRENCY", 10)
+	minOps := envFloat("CORVO_PERF_E2E_ENQ_MIN_OPS", 100.0)
 
 	start := time.Now()
 	var wg sync.WaitGroup
@@ -67,11 +67,11 @@ func TestPerfE2ELifecycleRPC(t *testing.T) {
 	c := client.New(baseURL)
 	wc := workerclient.New(baseURL)
 
-	total := envInt("JOBBIE_PERF_E2E_LC_TOTAL", 3000)
-	concurrency := envInt("JOBBIE_PERF_E2E_LC_CONCURRENCY", 10)
-	fetchBatch := envInt("JOBBIE_PERF_E2E_LC_FETCH_BATCH", 8)
-	ackBatch := envInt("JOBBIE_PERF_E2E_LC_ACK_BATCH", 64)
-	minOps := envFloat("JOBBIE_PERF_E2E_LC_MIN_OPS", 80.0)
+	total := envInt("CORVO_PERF_E2E_LC_TOTAL", 3000)
+	concurrency := envInt("CORVO_PERF_E2E_LC_CONCURRENCY", 10)
+	fetchBatch := envInt("CORVO_PERF_E2E_LC_FETCH_BATCH", 8)
+	ackBatch := envInt("CORVO_PERF_E2E_LC_ACK_BATCH", 64)
+	minOps := envFloat("CORVO_PERF_E2E_LC_MIN_OPS", 80.0)
 
 	for i := 0; i < total; i++ {
 		if _, err := c.Enqueue("perf.e2e.rpc", map[string]any{}); err != nil {
@@ -160,7 +160,7 @@ func TestPerfE2ELifecycleRPC(t *testing.T) {
 	}
 }
 
-// startRealServer starts the real `jobbie server` command path.
+// startRealServer starts the real `corvo server` command path.
 // durable=false means default fast profile; durable=true enables raft fsync mode.
 func startRealServer(t *testing.T, durable bool) string {
 	t.Helper()
@@ -170,7 +170,7 @@ func startRealServer(t *testing.T, durable bool) string {
 	dataDir := t.TempDir()
 
 	args := []string{
-		"run", "./cmd/jobbie", "server",
+		"run", "./cmd/corvo", "server",
 		"--bind", httpAddr,
 		"--data-dir", dataDir,
 		"--raft-bind", raftAddr,
@@ -191,7 +191,7 @@ func startRealServer(t *testing.T, durable bool) string {
 	cmd.Stderr = logFile
 
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("start jobbie server: %v", err)
+		t.Fatalf("start corvo server: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
@@ -282,8 +282,8 @@ func TestPerfHarnessUsesRealServerPath(t *testing.T) {
 		t.Skip("skip in -short")
 	}
 	root := repoRoot(t)
-	if _, err := os.Stat(filepath.Join(root, "cmd", "jobbie", "main.go")); err != nil {
-		t.Fatalf("expected cmd/jobbie/main.go in repo root: %v", err)
+	if _, err := os.Stat(filepath.Join(root, "cmd", "corvo", "main.go")); err != nil {
+		t.Fatalf("expected cmd/corvo/main.go in repo root: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "cmd", "bench", "main.go")); err != nil {
 		t.Fatalf("expected cmd/bench/main.go in repo root: %v", err)

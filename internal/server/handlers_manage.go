@@ -4,8 +4,8 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/user/jobbie/internal/search"
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/search"
+	"github.com/user/corvo/internal/store"
 )
 
 // Queue management

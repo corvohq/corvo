@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/user/jobbie/internal/search"
+	"github.com/user/corvo/internal/search"
 )
 
 // SearchResult is the search response returned to callers.

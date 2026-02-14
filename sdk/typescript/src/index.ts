@@ -68,7 +68,7 @@ export type AuthOptions = {
   tokenProvider?: () => Promise<string> | string;
 };
 
-export class JobbieClient {
+export class CorvoClient {
   readonly baseURL: string;
   readonly fetchImpl: typeof fetch;
   readonly auth: AuthOptions;

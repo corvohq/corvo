@@ -1,9 +1,9 @@
 # AI Extras
 
-Infrastructure-only AI workflow extensions for Jobbie.
+Infrastructure-only AI workflow extensions for Corvo.
 
 This document intentionally stays within the design boundary from `docs/DESIGN.md`:
-- Jobbie provides execution infrastructure.
+- Corvo provides execution infrastructure.
 - Workers own prompts, LLM calls, and tool choice.
 
 ## Scope

@@ -1,4 +1,4 @@
-# Jobbie AI
+# Corvo AI
 
 First-class support for AI/LLM workloads. Everything in this document is additive to the core design in [DESIGN.md](./DESIGN.md) — no breaking changes to existing APIs, schema, or behavior.
 
@@ -6,7 +6,7 @@ First-class support for AI/LLM workloads. Everything in this document is additiv
 
 LLM API calls are the perfect job queue use case: they're slow (seconds, not milliseconds), expensive ($0.01–$1+ per call), flaky (429s, 503s, rate limits), and non-deterministic (same input, different output). Every team building on LLMs ends up reinventing job queue primitives inside their agent framework — retries, rate limiting, cost tracking, timeouts, human approval gates.
 
-Jobbie already handles most of this. This document describes the features that make it *purpose-built* for AI workloads.
+Corvo already handles most of this. This document describes the features that make it *purpose-built* for AI workloads.
 
 ---
 
@@ -178,7 +178,7 @@ CREATE UNIQUE INDEX idx_budgets_scope ON budgets(scope, target);
 
 ## Agent loop primitive
 
-An agent is a loop: call LLM, get tool calls, execute tools, feed results back, repeat until done. Jobbie models this as an iterative job — each iteration is a discrete unit of work with its own audit trail, and the server enforces guardrails.
+An agent is a loop: call LLM, get tool calls, execute tools, feed results back, repeat until done. Corvo models this as an iterative job — each iteration is a discrete unit of work with its own audit trail, and the server enforces guardrails.
 
 This is not workflow orchestration. There are no DAGs, no step definitions, no state machines to author. It's a single job that keeps re-executing until it declares itself done.
 
@@ -365,7 +365,7 @@ The server creates a new job with:
 
 CLI shorthand:
 ```bash
-jobbie replay job_01HX7Y --from 3 --set agent.max_iterations=30
+corvo replay job_01HX7Y --from 3 --set agent.max_iterations=30
 ```
 
 ---
@@ -534,7 +534,7 @@ CREATE TABLE approval_policies (
 
 ## Provider-aware rate limiting
 
-LLM providers have rate limits (requests/min, tokens/min) that are shared across all your queues. Jobbie can manage provider-level rate limiting centrally.
+LLM providers have rate limits (requests/min, tokens/min) that are shared across all your queues. Corvo can manage provider-level rate limiting centrally.
 
 ### Provider configuration
 
@@ -1132,38 +1132,38 @@ A dedicated view (or filter) for jobs awaiting approval:
 
 ```bash
 # Usage and cost
-jobbie usage                                    # summary for last 24h
-jobbie usage --period 7d --group-by queue       # cost per queue
-jobbie usage --period 30d --group-by model      # cost per model
-jobbie usage --period 7d --group-by tag:tenant  # cost per tenant
+corvo usage                                    # summary for last 24h
+corvo usage --period 7d --group-by queue       # cost per queue
+corvo usage --period 30d --group-by model      # cost per model
+corvo usage --period 7d --group-by tag:tenant  # cost per tenant
 
 # Budgets
-jobbie budget list                              # show all budgets
-jobbie budget set agents.research --daily 50    # set daily budget
-jobbie budget set agents.research --per-job 2   # set per-job budget
+corvo budget list                              # show all budgets
+corvo budget set agents.research --daily 50    # set daily budget
+corvo budget set agents.research --per-job 2   # set per-job budget
 
 # Held jobs
-jobbie held                                     # list held jobs
-jobbie approve job_01HX...                      # approve a held job
-jobbie reject job_01HX...                       # reject a held job
-jobbie reject job_01HX... --revise "fix the email address"
+corvo held                                     # list held jobs
+corvo approve job_01HX...                      # approve a held job
+corvo reject job_01HX...                       # reject a held job
+corvo reject job_01HX... --revise "fix the email address"
 
 # Agent replay
-jobbie replay job_01HX... --from 3              # replay from iteration 3
-jobbie replay job_01HX... --from 3 --set agent.max_iterations=30
+corvo replay job_01HX... --from 3              # replay from iteration 3
+corvo replay job_01HX... --from 3 --set agent.max_iterations=30
 
 # Providers
-jobbie providers                                # list providers
-jobbie provider add anthropic --rpm 4000 --input-tpm 400000
-jobbie provider add openai --rpm 10000 --input-tpm 2000000
+corvo providers                                # list providers
+corvo provider add anthropic --rpm 4000 --input-tpm 400000
+corvo provider add openai --rpm 10000 --input-tpm 2000000
 
 # Scores
-jobbie scores job_01HX...                       # show scores for a job
-jobbie scores --queue extraction --period 7d    # aggregate scores
+corvo scores job_01HX...                       # show scores for a job
+corvo scores --queue extraction --period 7d    # aggregate scores
 
 # Cache
-jobbie cache stats                              # cache hit rate + savings
-jobbie cache clear --queue llm.chat             # clear cache for a queue
+corvo cache stats                              # cache hit rate + savings
+corvo cache clear --queue llm.chat             # clear cache for a queue
 ```
 
 ---
@@ -1177,12 +1177,12 @@ These features are additive and can be built incrementally after the core MVP fr
 - [x] `job_usage` table + usage reporting on ack and heartbeat
 - [x] Usage summary endpoints (`/api/v1/usage/summary`)
 - [ ] Cost dashboard in UI
-- [x] CLI: `jobbie usage`
+- [x] CLI: `corvo usage`
 - [x] `held` job state + approve/reject endpoints
 - [x] Held jobs view in UI
-- [x] CLI: `jobbie held`, `jobbie approve`, `jobbie reject`
+- [x] CLI: `corvo held`, `corvo approve`, `corvo reject`
 - [x] Budget table + enforcement on fetch and ack
-- [x] CLI: `jobbie budget`
+- [x] CLI: `corvo budget`
 
 ### Phase 2b — Agent loop
 
@@ -1203,7 +1203,7 @@ These features are additive and can be built incrementally after the core MVP fr
 - [ ] Queue-to-provider linking
 - [ ] Model fallback routing (`routing` config on enqueue)
 - [ ] `provider_error` flag on fail
-- [ ] CLI: `jobbie providers`
+- [ ] CLI: `corvo providers`
 
 ### Phase 2d — Quality and caching
 
@@ -1213,10 +1213,10 @@ These features are additive and can be built incrementally after the core MVP fr
 - [ ] `chain_id` + chain tracking in UI
 - [ ] Semantic caching (exact match via payload hash)
 - [ ] Cache metrics in usage dashboard
-- [ ] CLI: `jobbie cache`
+- [ ] CLI: `corvo cache`
 - [ ] `job_scores` table + scoring endpoints
 - [ ] Score aggregation + comparison endpoints
-- [ ] CLI: `jobbie scores`
+- [ ] CLI: `corvo scores`
 - [ ] `parent_id` for tool-as-child-job pattern
 - [ ] Approval policies (auto-hold rules)
 
@@ -1224,9 +1224,9 @@ These features are additive and can be built incrementally after the core MVP fr
 
 ## What this is NOT
 
-This document extends Jobbie with AI-aware features but does not make it:
+This document extends Corvo with AI-aware features but does not make it:
 
-- **An agent framework** — Jobbie doesn't write prompts, call LLMs, or choose tools. Your worker code does that. Jobbie provides the execution infrastructure: retries, rate limits, cost control, human approval, observability.
-- **An LLM gateway/proxy** — Jobbie doesn't proxy API calls to LLM providers. Workers call providers directly. Jobbie manages the *jobs* that wrap those calls.
-- **A prompt management system** — Prompts live in your code or your prompt store. Jobbie tracks which model and prompt version were used (via tags) for analysis, but doesn't manage prompt content.
-- **An eval platform** — The scoring feature provides basic quality tracking. For serious evals (automated test suites, regression detection, model comparison), use a dedicated eval tool and feed scores back to Jobbie via the scoring API.
+- **An agent framework** — Corvo doesn't write prompts, call LLMs, or choose tools. Your worker code does that. Corvo provides the execution infrastructure: retries, rate limits, cost control, human approval, observability.
+- **An LLM gateway/proxy** — Corvo doesn't proxy API calls to LLM providers. Workers call providers directly. Corvo manages the *jobs* that wrap those calls.
+- **A prompt management system** — Prompts live in your code or your prompt store. Corvo tracks which model and prompt version were used (via tags) for analysis, but doesn't manage prompt content.
+- **An eval platform** — The scoring feature provides basic quality tracking. For serious evals (automated test suites, regression detection, model comparison), use a dedicated eval tool and feed scores back to Corvo via the scoring API.

@@ -1,4 +1,4 @@
-import { JobbieClient } from "@jobbie/client";
+import { CorvoClient } from "@corvo/client";
 
 declare const process:
   | {
@@ -35,18 +35,18 @@ export type WorkerJobContext = {
   progress: (current: number, total: number, message: string) => Promise<void>;
 };
 
-export class JobbieWorker {
-  private readonly client: JobbieClient;
+export class CorvoWorker {
+  private readonly client: CorvoClient;
   private readonly cfg: Required<WorkerConfig>;
   private readonly handlers: Map<string, WorkerHandler> = new Map();
   private readonly active: Map<string, { cancelled: boolean }> = new Map();
   private stopping = false;
 
-  constructor(client: JobbieClient, cfg: WorkerConfig) {
+  constructor(client: CorvoClient, cfg: WorkerConfig) {
     this.client = client;
     this.cfg = {
       ...cfg,
-      hostname: cfg.hostname ?? "jobbie-worker",
+      hostname: cfg.hostname ?? "corvo-worker",
       concurrency: cfg.concurrency ?? 10,
       shutdownTimeoutMs: cfg.shutdownTimeoutMs ?? 30000,
     };

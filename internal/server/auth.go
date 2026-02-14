@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/store"
 )
 
 type authPrincipal struct {
@@ -91,7 +91,7 @@ func (s *Server) resolvePrincipal(r *http.Request) (authPrincipal, int, string, 
 		return defaults, 0, "", ""
 	}
 	if keyCount == 0 {
-		ns := strings.TrimSpace(r.Header.Get("X-Jobbie-Namespace"))
+		ns := strings.TrimSpace(r.Header.Get("X-Corvo-Namespace"))
 		if ns != "" {
 			defaults.Namespace = ns
 		}

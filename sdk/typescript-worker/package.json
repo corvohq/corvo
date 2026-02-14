@@ -1,7 +1,7 @@
 {
-  "name": "@jobbie/worker",
+  "name": "@corvo/worker",
   "version": "0.1.0",
-  "description": "TypeScript worker runtime for Jobbie",
+  "description": "TypeScript worker runtime for Corvo",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -9,7 +9,7 @@
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@jobbie/client": "0.1.0"
+    "@corvo/client": "0.1.0"
   },
   "devDependencies": {
     "typescript": "^5.6.3"

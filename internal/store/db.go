@@ -25,7 +25,7 @@ type DB struct {
 	EventsWrite *sql.DB
 }
 
-// Open creates or opens a SQLite database at dataDir/jobbie.db.
+// Open creates or opens a SQLite database at dataDir/corvo.db.
 // It configures WAL mode, synchronous=NORMAL, foreign_keys=ON,
 // and runs any pending migrations.
 // A separate events.db is created for events/stats to avoid write lock contention.
@@ -34,7 +34,7 @@ func Open(dataDir string) (*DB, error) {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
-	dbPath := filepath.Join(dataDir, "jobbie.db")
+	dbPath := filepath.Join(dataDir, "corvo.db")
 	eventsPath := filepath.Join(dataDir, "events.db")
 
 	writeDB, err := openConn(dbPath)

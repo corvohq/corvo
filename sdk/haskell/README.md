@@ -1,14 +1,14 @@
-# jobbie-client (Haskell)
+# corvo-client (Haskell)
 
-Minimal Haskell client module for Jobbie.
+Minimal Haskell client module for Corvo.
 
 ```haskell
-import Jobbie.Client
+import Corvo.Client
 import Data.Aeson (object, (.=))
 
 main :: IO ()
 main = do
-  let client = JobbieClient "http://localhost:8080" Nothing
+  let client = CorvoClient "http://localhost:8080" Nothing
   r <- enqueue client "emails.send" (object ["to" .= ("user@example.com" :: String)])
   print r
 ```

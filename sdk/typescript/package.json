@@ -1,7 +1,7 @@
 {
-  "name": "@jobbie/client",
+  "name": "@corvo/client",
   "version": "0.1.0",
-  "description": "TypeScript client for Jobbie",
+  "description": "TypeScript client for Corvo",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

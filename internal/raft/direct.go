@@ -6,7 +6,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	hashraft "github.com/hashicorp/raft"
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/store"
 )
 
 // DirectApplier applies operations directly through the FSM without Raft networking.
@@ -25,7 +25,7 @@ func NewDirectApplier(dataDir string) (*DirectApplier, error) {
 		return nil, err
 	}
 
-	sqlitePath := filepath.Join(dataDir, "jobbie.db")
+	sqlitePath := filepath.Join(dataDir, "corvo.db")
 	sqliteDB, err := openMaterializedView(sqlitePath)
 	if err != nil {
 		pdb.Close()

@@ -1,4 +1,4 @@
-# Jobbie UI — Feature Roadmap
+# Corvo UI — Feature Roadmap
 
 The admin UI is a React 19 SPA (Vite, Radix/shadcn, Tailwind CSS v4) embedded in the Go binary via `embed.FS`. Real-time updates via SSE. Served at `/ui/`.
 
@@ -46,13 +46,13 @@ Flag workers whose last heartbeat is older than a configurable threshold (e.g. 6
 ### Shareable URL state
 Persist search filters, pagination cursor, and active tab to the URL query string so links can be shared (e.g. "page 3 of dead letter jobs in queue X").
 
-## Differentiators — features that would set Jobbie apart
+## Differentiators — features that would set Corvo apart
 
 ### Live event stream
 Expose the existing SSE feed as a visible real-time event log in the UI (like `kubectl logs -f` or Temporal's event history). Show job state transitions, enqueues, failures, and retries as they happen with auto-scroll and pause. Very few job dashboards surface their event stream to users.
 
 ### AI agent observability
-Lean into the AI agent story — this is unique to Jobbie's domain. Per-job token usage, model calls, cost overlaid on the job timeline. Iteration traces showing each agent loop step with input/output/score. Budget burn-down charts per queue. No other job dashboard has this because they don't run AI workloads. (Partially implemented via cost dashboard, iteration table, budget bar, score summary, held card components.)
+Lean into the AI agent story — this is unique to Corvo's domain. Per-job token usage, model calls, cost overlaid on the job timeline. Iteration traces showing each agent loop step with input/output/score. Budget burn-down charts per queue. No other job dashboard has this because they don't run AI workloads. (Partially implemented via cost dashboard, iteration table, budget bar, score summary, held card components.)
 
 ### Diff view for retries
 When a job is retried (especially with payload edit), show a diff of what changed between attempts — payload edits, different errors, different duration. Makes debugging flaky jobs much faster.

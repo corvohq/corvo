@@ -1,6 +1,6 @@
 package worker
 
-import "github.com/user/jobbie/pkg/client"
+import "github.com/user/corvo/pkg/client"
 
 // Worker runtime aliases that make lifecycle-oriented imports explicit.
 // This package is intentionally thin and delegates behavior to pkg/client.

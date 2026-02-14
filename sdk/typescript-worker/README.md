@@ -1,8 +1,8 @@
-# @jobbie/worker
+# @corvo/worker
 
-TypeScript worker runtime for Jobbie.
+TypeScript worker runtime for Corvo.
 
-Depends on `@jobbie/client` and provides:
+Depends on `@corvo/client` and provides:
 - queue handler registration
 - fetch/ack/fail loop
 - heartbeat and cancellation signals
@@ -11,13 +11,13 @@ Depends on `@jobbie/client` and provides:
 ## Quick start
 
 ```ts
-import { JobbieClient } from "@jobbie/client";
-import { JobbieWorker } from "@jobbie/worker";
+import { CorvoClient } from "@corvo/client";
+import { CorvoWorker } from "@corvo/worker";
 
-const client = new JobbieClient("http://localhost:8080", fetch, {
-  apiKey: process.env.JOBBIE_API_KEY || "",
+const client = new CorvoClient("http://localhost:8080", fetch, {
+  apiKey: process.env.CORVO_API_KEY || "",
 });
-const worker = new JobbieWorker(client, {
+const worker = new CorvoWorker(client, {
   queues: ["emails.send"],
   workerID: "worker-ts-1",
   concurrency: 8,

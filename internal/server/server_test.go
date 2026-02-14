@@ -16,11 +16,11 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	"github.com/user/jobbie/internal/enterprise"
-	"github.com/user/jobbie/internal/raft"
-	jobbiev1 "github.com/user/jobbie/internal/rpcconnect/gen/jobbie/v1"
-	"github.com/user/jobbie/internal/rpcconnect/gen/jobbie/v1/jobbiev1connect"
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/enterprise"
+	"github.com/user/corvo/internal/raft"
+	corvov1 "github.com/user/corvo/internal/rpcconnect/gen/corvo/v1"
+	"github.com/user/corvo/internal/rpcconnect/gen/corvo/v1/corvov1connect"
+	"github.com/user/corvo/internal/store"
 	"golang.org/x/net/http2"
 )
 
@@ -186,9 +186,9 @@ func TestPrometheusMetricsIncludeHTTPSeries(t *testing.T) {
 	}
 	body := rr.Body.String()
 	for _, needle := range []string{
-		"jobbie_http_requests_total",
-		"jobbie_http_request_duration_seconds_bucket",
-		"jobbie_http_requests_in_flight",
+		"corvo_http_requests_total",
+		"corvo_http_request_duration_seconds_bucket",
+		"corvo_http_requests_in_flight",
 	} {
 		if !strings.Contains(body, needle) {
 			t.Fatalf("metrics missing %q", needle)
@@ -860,7 +860,7 @@ func TestJobIterationsEndpoint(t *testing.T) {
 		"trace": map[string]any{
 			"model": "claude-sonnet",
 			"tool_calls": []map[string]any{
-				{"name": "search", "args": map[string]any{"q": "jobbie"}},
+				{"name": "search", "args": map[string]any{"q": "corvo"}},
 			},
 		},
 		"usage": map[string]any{
@@ -1395,10 +1395,10 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 	}
 	body := rr.Body.String()
 	for _, needle := range []string{
-		"jobbie_throughput_enqueued_total",
-		"jobbie_queues_total",
-		"jobbie_queue_jobs",
-		"jobbie_jobs",
+		"corvo_throughput_enqueued_total",
+		"corvo_queues_total",
+		"corvo_queue_jobs",
+		"corvo_jobs",
 	} {
 		if !strings.Contains(body, needle) {
 			t.Fatalf("metrics body missing %q", needle)
@@ -1547,9 +1547,9 @@ func TestConnectWorkerLifecycle(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	client := jobbiev1connect.NewWorkerServiceClient(ts.Client(), ts.URL)
+	client := corvov1connect.NewWorkerServiceClient(ts.Client(), ts.URL)
 
-	enqResp, err := client.Enqueue(context.Background(), connect.NewRequest(&jobbiev1.EnqueueRequest{
+	enqResp, err := client.Enqueue(context.Background(), connect.NewRequest(&corvov1.EnqueueRequest{
 		Queue:       "connect.q",
 		PayloadJson: `{"hello":"connect"}`,
 	}))
@@ -1561,7 +1561,7 @@ func TestConnectWorkerLifecycle(t *testing.T) {
 		t.Fatal("empty job_id")
 	}
 
-	fetchResp, err := client.Fetch(context.Background(), connect.NewRequest(&jobbiev1.FetchRequest{
+	fetchResp, err := client.Fetch(context.Background(), connect.NewRequest(&corvov1.FetchRequest{
 		Queues:        []string{"connect.q"},
 		WorkerId:      "w1",
 		Hostname:      "h1",
@@ -1577,7 +1577,7 @@ func TestConnectWorkerLifecycle(t *testing.T) {
 		t.Fatalf("fetched job_id = %s want %s", fetchResp.Msg.GetJobId(), jobID)
 	}
 
-	if _, err := client.Ack(context.Background(), connect.NewRequest(&jobbiev1.AckRequest{
+	if _, err := client.Ack(context.Background(), connect.NewRequest(&corvov1.AckRequest{
 		JobId:      jobID,
 		ResultJson: `{"ok":true}`,
 	})); err != nil {
@@ -1606,14 +1606,14 @@ func TestConnectWorkerLifecycleStream(t *testing.T) {
 		},
 	}
 	httpClient := &http.Client{Transport: tr}
-	client := jobbiev1connect.NewWorkerServiceClient(httpClient, ts.URL)
-	if _, err := client.Enqueue(context.Background(), connect.NewRequest(&jobbiev1.EnqueueRequest{
+	client := corvov1connect.NewWorkerServiceClient(httpClient, ts.URL)
+	if _, err := client.Enqueue(context.Background(), connect.NewRequest(&corvov1.EnqueueRequest{
 		Queue:       "connect.stream.q",
 		PayloadJson: `{}`,
 	})); err != nil {
 		t.Fatalf("connect enqueue 1: %v", err)
 	}
-	if _, err := client.Enqueue(context.Background(), connect.NewRequest(&jobbiev1.EnqueueRequest{
+	if _, err := client.Enqueue(context.Background(), connect.NewRequest(&corvov1.EnqueueRequest{
 		Queue:       "connect.stream.q",
 		PayloadJson: `{}`,
 	})); err != nil {
@@ -1623,7 +1623,7 @@ func TestConnectWorkerLifecycleStream(t *testing.T) {
 	stream := client.StreamLifecycle(context.Background())
 	defer stream.CloseRequest()
 
-	if err := stream.Send(&jobbiev1.LifecycleStreamRequest{
+	if err := stream.Send(&corvov1.LifecycleStreamRequest{
 		RequestId:     1,
 		Queues:        []string{"connect.stream.q"},
 		WorkerId:      "w1",
@@ -1641,11 +1641,11 @@ func TestConnectWorkerLifecycleStream(t *testing.T) {
 		t.Fatalf("fetched jobs = %d, want 2", len(fetchResp.GetJobs()))
 	}
 
-	acks := make([]*jobbiev1.AckBatchItem, 0, 2)
+	acks := make([]*corvov1.AckBatchItem, 0, 2)
 	for _, job := range fetchResp.GetJobs() {
-		acks = append(acks, &jobbiev1.AckBatchItem{JobId: job.GetJobId(), ResultJson: `{"ok":true}`})
+		acks = append(acks, &corvov1.AckBatchItem{JobId: job.GetJobId(), ResultJson: `{"ok":true}`})
 	}
-	if err := stream.Send(&jobbiev1.LifecycleStreamRequest{
+	if err := stream.Send(&corvov1.LifecycleStreamRequest{
 		RequestId: 2,
 		Acks:      acks,
 	}); err != nil {

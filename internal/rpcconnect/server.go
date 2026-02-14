@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	jobbiev1 "github.com/user/jobbie/internal/rpcconnect/gen/jobbie/v1"
-	"github.com/user/jobbie/internal/rpcconnect/gen/jobbie/v1/jobbiev1connect"
-	"github.com/user/jobbie/internal/store"
+	corvov1 "github.com/user/corvo/internal/rpcconnect/gen/corvo/v1"
+	"github.com/user/corvo/internal/rpcconnect/gen/corvo/v1/corvov1connect"
+	"github.com/user/corvo/internal/store"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -102,7 +102,7 @@ func NewHandler(s *store.Store, opts ...func(*Server)) (string, http.Handler) {
 	}
 	srv.streamCfg = srv.streamCfg.withDefaults()
 	srv.frameSem = make(chan struct{}, srv.streamCfg.MaxInFlight)
-	return jobbiev1connect.NewWorkerServiceHandler(srv)
+	return corvov1connect.NewWorkerServiceHandler(srv)
 }
 
 // WithStreamConfig sets the per-stream rate limit / circuit-break config.
@@ -110,7 +110,7 @@ func WithStreamConfig(cfg StreamConfig) func(*Server) {
 	return func(s *Server) { s.streamCfg = cfg }
 }
 
-func (s *Server) Enqueue(ctx context.Context, req *connect.Request[jobbiev1.EnqueueRequest]) (*connect.Response[jobbiev1.EnqueueResponse], error) {
+func (s *Server) Enqueue(ctx context.Context, req *connect.Request[corvov1.EnqueueRequest]) (*connect.Response[corvov1.EnqueueResponse], error) {
 	payload := strings.TrimSpace(req.Msg.GetPayloadJson())
 	if payload == "" {
 		payload = `{}`
@@ -125,14 +125,14 @@ func (s *Server) Enqueue(ctx context.Context, req *connect.Request[jobbiev1.Enqu
 		return nil, mapStoreError(err)
 	}
 
-	return connect.NewResponse(&jobbiev1.EnqueueResponse{
+	return connect.NewResponse(&corvov1.EnqueueResponse{
 		JobId:          result.JobID,
 		Status:         result.Status,
 		UniqueExisting: result.UniqueExisting,
 	}), nil
 }
 
-func (s *Server) Fetch(ctx context.Context, req *connect.Request[jobbiev1.FetchRequest]) (*connect.Response[jobbiev1.FetchResponse], error) {
+func (s *Server) Fetch(ctx context.Context, req *connect.Request[corvov1.FetchRequest]) (*connect.Response[corvov1.FetchResponse], error) {
 	var result *store.FetchResult
 	fetchReq := store.FetchRequest{
 		Queues:        req.Msg.GetQueues(),
@@ -152,10 +152,10 @@ func (s *Server) Fetch(ctx context.Context, req *connect.Request[jobbiev1.FetchR
 		return nil, mapStoreError(err)
 	}
 	if result == nil {
-		return connect.NewResponse(&jobbiev1.FetchResponse{Found: false}), nil
+		return connect.NewResponse(&corvov1.FetchResponse{Found: false}), nil
 	}
 
-	resp := &jobbiev1.FetchResponse{
+	resp := &corvov1.FetchResponse{
 		Found:          true,
 		JobId:          result.JobID,
 		Queue:          result.Queue,
@@ -170,7 +170,7 @@ func (s *Server) Fetch(ctx context.Context, req *connect.Request[jobbiev1.FetchR
 	return connect.NewResponse(resp), nil
 }
 
-func (s *Server) FetchBatch(ctx context.Context, req *connect.Request[jobbiev1.FetchBatchRequest]) (*connect.Response[jobbiev1.FetchBatchResponse], error) {
+func (s *Server) FetchBatch(ctx context.Context, req *connect.Request[corvov1.FetchBatchRequest]) (*connect.Response[corvov1.FetchBatchResponse], error) {
 	count := int(req.Msg.GetCount())
 	if count <= 0 {
 		count = 1
@@ -194,9 +194,9 @@ func (s *Server) FetchBatch(ctx context.Context, req *connect.Request[jobbiev1.F
 		return nil, mapStoreError(err)
 	}
 
-	respJobs := make([]*jobbiev1.FetchBatchJob, 0, len(jobs))
+	respJobs := make([]*corvov1.FetchBatchJob, 0, len(jobs))
 	for _, j := range jobs {
-		respJobs = append(respJobs, &jobbiev1.FetchBatchJob{
+		respJobs = append(respJobs, &corvov1.FetchBatchJob{
 			JobId:          j.JobID,
 			Queue:          j.Queue,
 			PayloadJson:    string(j.Payload),
@@ -208,10 +208,10 @@ func (s *Server) FetchBatch(ctx context.Context, req *connect.Request[jobbiev1.F
 			Agent:          agentStateToPB(j.Agent),
 		})
 	}
-	return connect.NewResponse(&jobbiev1.FetchBatchResponse{Jobs: respJobs}), nil
+	return connect.NewResponse(&corvov1.FetchBatchResponse{Jobs: respJobs}), nil
 }
 
-func (s *Server) Ack(ctx context.Context, req *connect.Request[jobbiev1.AckRequest]) (*connect.Response[jobbiev1.AckResponse], error) {
+func (s *Server) Ack(ctx context.Context, req *connect.Request[corvov1.AckRequest]) (*connect.Response[corvov1.AckResponse], error) {
 	resultJSON := strings.TrimSpace(req.Msg.GetResultJson())
 	if resultJSON == "" {
 		resultJSON = `{}`
@@ -227,10 +227,10 @@ func (s *Server) Ack(ctx context.Context, req *connect.Request[jobbiev1.AckReque
 	}); err != nil {
 		return nil, mapStoreError(err)
 	}
-	return connect.NewResponse(&jobbiev1.AckResponse{}), nil
+	return connect.NewResponse(&corvov1.AckResponse{}), nil
 }
 
-func (s *Server) AckBatch(ctx context.Context, req *connect.Request[jobbiev1.AckBatchRequest]) (*connect.Response[jobbiev1.AckBatchResponse], error) {
+func (s *Server) AckBatch(ctx context.Context, req *connect.Request[corvov1.AckBatchRequest]) (*connect.Response[corvov1.AckBatchResponse], error) {
 	items := req.Msg.GetItems()
 	if len(items) == 0 {
 		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("items is required"))
@@ -256,10 +256,10 @@ func (s *Server) AckBatch(ctx context.Context, req *connect.Request[jobbiev1.Ack
 	if err != nil {
 		return nil, mapStoreError(err)
 	}
-	return connect.NewResponse(&jobbiev1.AckBatchResponse{Acked: int32(acked)}), nil
+	return connect.NewResponse(&corvov1.AckBatchResponse{Acked: int32(acked)}), nil
 }
 
-func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream[jobbiev1.LifecycleStreamRequest, jobbiev1.LifecycleStreamResponse]) error {
+func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream[corvov1.LifecycleStreamRequest, corvov1.LifecycleStreamResponse]) error {
 	cfg := s.streamCfg
 	if n := s.openCount.Add(1); cfg.MaxOpenStreams > 0 && n > int64(cfg.MaxOpenStreams) {
 		s.openCount.Add(-1)
@@ -296,7 +296,7 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 			}
 			return connect.NewError(connect.CodeUnknown, fmt.Errorf("stream lifecycle receive: %w", err))
 		}
-		resp := &jobbiev1.LifecycleStreamResponse{
+		resp := &corvov1.LifecycleStreamResponse{
 			RequestId: req.GetRequestId(),
 		}
 		frameHadError := false
@@ -389,9 +389,9 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 						resp.Error = "fetch: " + err.Error()
 					}
 				} else {
-					respJobs := make([]*jobbiev1.FetchBatchJob, 0, len(jobs))
+					respJobs := make([]*corvov1.FetchBatchJob, 0, len(jobs))
 					for _, j := range jobs {
-						respJobs = append(respJobs, &jobbiev1.FetchBatchJob{
+						respJobs = append(respJobs, &corvov1.FetchBatchJob{
 							JobId:          j.JobID,
 							Queue:          j.Queue,
 							PayloadJson:    string(j.Payload),
@@ -479,13 +479,13 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 	}
 }
 
-func (s *Server) Fail(ctx context.Context, req *connect.Request[jobbiev1.FailRequest]) (*connect.Response[jobbiev1.FailResponse], error) {
+func (s *Server) Fail(ctx context.Context, req *connect.Request[corvov1.FailRequest]) (*connect.Response[corvov1.FailResponse], error) {
 	result, err := s.store.Fail(req.Msg.GetJobId(), req.Msg.GetError(), req.Msg.GetBacktrace(), false)
 	if err != nil {
 		return nil, mapStoreError(err)
 	}
 
-	resp := &jobbiev1.FailResponse{
+	resp := &corvov1.FailResponse{
 		Status:            result.Status,
 		AttemptsRemaining: int32(result.AttemptsRemaining),
 	}
@@ -495,7 +495,7 @@ func (s *Server) Fail(ctx context.Context, req *connect.Request[jobbiev1.FailReq
 	return connect.NewResponse(resp), nil
 }
 
-func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[jobbiev1.HeartbeatRequest]) (*connect.Response[jobbiev1.HeartbeatResponse], error) {
+func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[corvov1.HeartbeatRequest]) (*connect.Response[corvov1.HeartbeatResponse], error) {
 	hbReq := store.HeartbeatRequest{Jobs: map[string]store.HeartbeatJobUpdate{}}
 
 	for jobID, update := range req.Msg.GetJobs() {
@@ -527,14 +527,14 @@ func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[jobbiev1.He
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 
-	resp := &jobbiev1.HeartbeatResponse{Jobs: map[string]*jobbiev1.HeartbeatJobResponse{}}
+	resp := &corvov1.HeartbeatResponse{Jobs: map[string]*corvov1.HeartbeatJobResponse{}}
 	for jobID, status := range result.Jobs {
-		resp.Jobs[jobID] = &jobbiev1.HeartbeatJobResponse{Status: status.Status}
+		resp.Jobs[jobID] = &corvov1.HeartbeatJobResponse{Status: status.Status}
 	}
 	return connect.NewResponse(resp), nil
 }
 
-func usageFromPB(in *jobbiev1.UsageReport) *store.UsageReport {
+func usageFromPB(in *corvov1.UsageReport) *store.UsageReport {
 	if in == nil {
 		return nil
 	}
@@ -549,7 +549,7 @@ func usageFromPB(in *jobbiev1.UsageReport) *store.UsageReport {
 	}
 }
 
-func agentConfigFromPB(in *jobbiev1.AgentConfig) *store.AgentConfig {
+func agentConfigFromPB(in *corvov1.AgentConfig) *store.AgentConfig {
 	if in == nil {
 		return nil
 	}
@@ -560,11 +560,11 @@ func agentConfigFromPB(in *jobbiev1.AgentConfig) *store.AgentConfig {
 	}
 }
 
-func agentStateToPB(in *store.AgentState) *jobbiev1.AgentState {
+func agentStateToPB(in *store.AgentState) *corvov1.AgentState {
 	if in == nil {
 		return nil
 	}
-	return &jobbiev1.AgentState{
+	return &corvov1.AgentState{
 		MaxIterations:    int32(in.MaxIterations),
 		MaxCostUsd:       in.MaxCostUSD,
 		IterationTimeout: in.IterationTimeout,

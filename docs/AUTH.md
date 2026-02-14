@@ -1,6 +1,6 @@
 # Authentication & Authorization
 
-Jobbie supports API-key auth in OSS and optional enterprise SSO + custom RBAC under license.
+Corvo supports API-key auth in OSS and optional enterprise SSO + custom RBAC under license.
 
 Auth behavior today:
 
@@ -47,7 +47,7 @@ jb_dev_x9y8z7w6v5u4...     # development
 jb_test_m3n4o5p6q7r8...    # testing
 ```
 
-Jobbie can auto-generate keys if `key` is omitted in create requests, but supplying your own is recommended. Example:
+Corvo can auto-generate keys if `key` is omitted in create requests, but supplying your own is recommended. Example:
 
 ```bash
 openssl rand -base64 32 | tr -d '=/+' | sed 's/^/jb_prod_/'
@@ -116,7 +116,7 @@ When no enabled API keys exist, all requests are treated as admin. As soon as a 
 When auth is enabled, the UI requires a token. Options:
 
 1. **Login page** — enter an API key, stored in localStorage. Simple, works for small teams.
-2. **Proxy auth** — put Jobbie behind an authenticating reverse proxy (nginx, Cloudflare Access, etc.) that sets a header. Jobbie reads the header as the identity.
+2. **Proxy auth** — put Corvo behind an authenticating reverse proxy (nginx, Cloudflare Access, etc.) that sets a header. Corvo reads the header as the identity.
 
 For OSS, option 1 is sufficient. The UI stores the token in localStorage and sends it as a Bearer header on all API requests. Logging out clears the token.
 
@@ -136,9 +136,9 @@ Current implementation:
 Server flags:
 
 ```bash
-jobbie server \
-  --license-key "$JOBBIE_LICENSE_KEY" \
-  --license-public-key "$JOBBIE_LICENSE_PUBLIC_KEY" \
+corvo server \
+  --license-key "$CORVO_LICENSE_KEY" \
+  --license-public-key "$CORVO_LICENSE_PUBLIC_KEY" \
   --oidc-issuer-url "https://accounts.google.com" \
   --oidc-client-id "xxx.apps.googleusercontent.com"
 ```

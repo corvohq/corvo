@@ -26,7 +26,7 @@ type ClusterConfig struct {
 	ApplyMaxFetchQueueInFly int           // Max concurrent in-flight fetch/fetch-batch applies per queue
 	ApplySubBatchMax        int           // Max requests per raft.Apply execution (splits large mixed batches)
 	LifecycleEvents         bool          // Persist per-job lifecycle event log in Pebble
-	SQLitePath              string        // Optional explicit SQLite mirror path (defaults to <DataDir>/jobbie.db)
+	SQLitePath              string        // Optional explicit SQLite mirror path (defaults to <DataDir>/corvo.db)
 }
 
 // DefaultClusterConfig returns a ClusterConfig with sensible defaults.

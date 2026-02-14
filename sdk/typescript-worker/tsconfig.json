@@ -9,7 +9,7 @@
     "skipLibCheck": true,
     "baseUrl": ".",
     "paths": {
-      "@jobbie/client": ["../typescript/src/index.ts"]
+      "@corvo/client": ["../typescript/src/index.ts"]
     }
   },
   "include": ["src/**/*"]

@@ -1,7 +1,7 @@
 # Append-Only + Lifecycle Streaming Plan
 
 ## Goal
-Shift Jobbie from per-operation state-machine mutation toward a log-first architecture with batched worker lifecycle interactions, while preserving existing rich queue features.
+Shift Corvo from per-operation state-machine mutation toward a log-first architecture with batched worker lifecycle interactions, while preserving existing rich queue features.
 
 ## Performance Targets
 - Enqueue: 20k+ ops/sec on local single-node durable defaults

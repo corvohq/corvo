@@ -37,7 +37,7 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
       <div className="flex h-14 items-center border-b px-4">
         <NavLink to="/ui" className="flex items-center gap-2" onClick={onNavigate}>
           <Layers className="h-5 w-5" />
-          <span className="text-lg font-bold tracking-tight">Jobbie</span>
+          <span className="text-lg font-bold tracking-tight">Corvo</span>
         </NavLink>
       </div>
       <nav className="flex-1 space-y-1 p-3">

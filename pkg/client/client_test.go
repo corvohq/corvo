@@ -5,9 +5,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/user/jobbie/internal/raft"
-	"github.com/user/jobbie/internal/server"
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/raft"
+	"github.com/user/corvo/internal/server"
+	"github.com/user/corvo/internal/store"
 )
 
 func testClient(t *testing.T) *Client {

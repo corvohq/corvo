@@ -1,4 +1,4 @@
-# Jobbie
+# Corvo
 
 An open-source, language-agnostic job processing system built in Go with a Pebble + SQLite hybrid storage engine and Raft consensus.
 
@@ -10,13 +10,13 @@ Every team ends up building their own job queue. They start with Postgres pollin
 
 Faktory gets the architecture right (language-agnostic server, polyglot clients) but gates its best features behind an Enterprise license ($149–$949/month) and has a lacking UI. pgboss nails the DX but is Node-only and Postgres-bound.
 
-Jobbie takes the best ideas from both, gives away every feature for free in OSS, and adds automatic clustering, a modern UI, and first-class Kubernetes support.
+Corvo takes the best ideas from both, gives away every feature for free in OSS, and adds automatic clustering, a modern UI, and first-class Kubernetes support.
 
 ## Design principles
 
 1. **Smart server, dumb clients** — all job lifecycle logic (retries, backoff, unique enforcement, priority routing, rate limiting, scheduling) lives in the server. Clients are thin HTTP wrappers. Fixing a bug in the server is one deploy; fixing a bug in a client is N upgrades across N teams.
-2. **Single binary, single process, zero dependencies** — `jobbie server` starts everything: the HTTP API, the web UI, the scheduler, and embedded Pebble + SQLite storage. No external database, message broker, or infrastructure to set up.
-3. **Clustering that manages itself** — run 3 replicas and Jobbie handles Raft leader election, data replication, and automatic failover. No external coordination service (no Consul, no etcd, no Zookeeper).
+2. **Single binary, single process, zero dependencies** — `corvo server` starts everything: the HTTP API, the web UI, the scheduler, and embedded Pebble + SQLite storage. No external database, message broker, or infrastructure to set up.
+3. **Clustering that manages itself** — run 3 replicas and Corvo handles Raft leader election, data replication, and automatic failover. No external coordination service (no Consul, no etcd, no Zookeeper).
 4. **Language-agnostic by default** — the wire protocol is HTTP/JSON. A client library is ~100–200 lines in any language. You can enqueue a job with `curl`.
 5. **Kubernetes-native** — graceful shutdown, horizontal scaling, health checks, and StatefulSet clustering are first-class, not afterthoughts.
 6. **Observable** — every job has a full lifecycle trail visible in the UI. No "fire and forget into a black hole."
@@ -27,7 +27,7 @@ Jobbie takes the best ideas from both, gives away every feature for free in OSS,
 
 Everything pgboss and Faktory Enterprise offer, in a single free OSS package:
 
-| Feature | Jobbie OSS | pgboss | Faktory OSS | Faktory Enterprise |
+| Feature | Corvo OSS | pgboss | Faktory OSS | Faktory Enterprise |
 |---|---|---|---|---|
 | Enqueue / process / ack | yes | yes | yes | yes |
 | Retries + configurable backoff | yes | yes | yes | yes |
@@ -57,7 +57,7 @@ Everything pgboss and Faktory Enterprise offer, in a single free OSS package:
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  Jobbie Server (single Go binary)                                    │
+│  Corvo Server (single Go binary)                                    │
 │                                                                      │
 │  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐     │
 │  │  HTTP API    │  │  Web UI      │  │  RPC (internal)        │     │
@@ -152,86 +152,86 @@ Read (search, get job, list queues, list workers):
 - Log compaction keeps disk usage bounded
 - Configurable Raft log/stable store backend via `--raft-store`: `bolt` (default, BoltDB), `badger` (BadgerDB), or `pebble`
 
-**Jobbie HTTP Server** (Go, net/http + chi router)
+**Corvo HTTP Server** (Go, net/http + chi router)
 - Serves the worker protocol (enqueue, fetch, ack, fail, heartbeat, progress)
 - Serves the management API (pause, resume, retry, cancel, inspect)
 - Serves the web UI (embedded SPA via `embed.FS`, SSE for real-time updates)
 - Runs the scheduler (cron evaluation, delayed job promotion — leader only)
 - Manages cluster state (Raft leader election, follower write proxying)
 
-**Workers** (your code + a thin Jobbie client library)
-- Connect to Jobbie via HTTP/JSON
+**Workers** (your code + a thin Corvo client library)
+- Connect to Corvo via HTTP/JSON
 - Long-poll for jobs, heartbeat while processing, ack/fail when done
 - Handle SIGTERM for graceful shutdown
 - Know nothing about SQLite, Raft, clustering, or job lifecycle logic
 
-**Jobbie CLI** (ships with the server binary)
+**Corvo CLI** (ships with the server binary)
 
 Job operations:
-- `jobbie enqueue <queue> <payload>` — enqueue a job
-- `jobbie inspect <job-id>` — show full job detail
-- `jobbie retry <job-id>` — retry a failed/dead job
-- `jobbie cancel <job-id>` — cancel a pending/active job
-- `jobbie move <job-id> <target-queue>` — move a job to another queue
-- `jobbie delete <job-id>` — delete a job
+- `corvo enqueue <queue> <payload>` — enqueue a job
+- `corvo inspect <job-id>` — show full job detail
+- `corvo retry <job-id>` — retry a failed/dead job
+- `corvo cancel <job-id>` — cancel a pending/active job
+- `corvo move <job-id> <target-queue>` — move a job to another queue
+- `corvo delete <job-id>` — delete a job
 
 Queue management:
-- `jobbie queues` — list all queues with stats
-- `jobbie pause <queue>` — pause a queue
-- `jobbie resume <queue>` — resume a paused queue
-- `jobbie clear <queue>` — clear all pending jobs in a queue
-- `jobbie drain <queue>` — pause + wait for active jobs to finish
-- `jobbie destroy <queue> --confirm` — delete a queue and all its jobs
+- `corvo queues` — list all queues with stats
+- `corvo pause <queue>` — pause a queue
+- `corvo resume <queue>` — resume a paused queue
+- `corvo clear <queue>` — clear all pending jobs in a queue
+- `corvo drain <queue>` — pause + wait for active jobs to finish
+- `corvo destroy <queue> --confirm` — delete a queue and all its jobs
 
 Search and bulk operations:
-- `jobbie search --queue emails.send --state dead` — search jobs
-- `jobbie search --queue emails.send --payload-contains "user@example.com"` — payload search
-- `jobbie search --queue emails.send --payload-jq '.amount > 100'` — jq filter
-- `jobbie search --tag tenant=acme-corp --state pending` — search by tag
-- `jobbie search --error-contains "SMTP" --created-after 2026-02-10` — error search
-- `jobbie search --queue emails.send --state dead | jobbie bulk retry` — pipe search to bulk
-- `jobbie search --queue old.queue --state pending | jobbie bulk move new.queue` — bulk move
-- `jobbie search --payload-jq '.legacy == true' | jobbie bulk delete` — bulk delete by payload
-- `jobbie bulk retry --filter '{"queue":"emails.send","state":["dead"]}'` — inline filter
+- `corvo search --queue emails.send --state dead` — search jobs
+- `corvo search --queue emails.send --payload-contains "user@example.com"` — payload search
+- `corvo search --queue emails.send --payload-jq '.amount > 100'` — jq filter
+- `corvo search --tag tenant=acme-corp --state pending` — search by tag
+- `corvo search --error-contains "SMTP" --created-after 2026-02-10` — error search
+- `corvo search --queue emails.send --state dead | corvo bulk retry` — pipe search to bulk
+- `corvo search --queue old.queue --state pending | corvo bulk move new.queue` — bulk move
+- `corvo search --payload-jq '.legacy == true' | corvo bulk delete` — bulk delete by payload
+- `corvo bulk retry --filter '{"queue":"emails.send","state":["dead"]}'` — inline filter
 
 Server and cluster:
-- `jobbie server` — start the server
-- `jobbie server --bootstrap` — bootstrap a new single-node cluster
-- `jobbie server --join <addr>` — join an existing cluster
-- `jobbie server --raft-bind :9000` — Raft transport address
-- `jobbie server --node-id node-1` — unique node ID
-- `jobbie status` — show queue stats + cluster health
-- `jobbie top` — live TUI dashboard (active workers, jobs, throughput)
-- `jobbie workers` — list connected workers
-- `jobbie schedules` — list cron schedules
-- `jobbie cluster status` — show cluster topology and replication lag
+- `corvo server` — start the server
+- `corvo server --bootstrap` — bootstrap a new single-node cluster
+- `corvo server --join <addr>` — join an existing cluster
+- `corvo server --raft-bind :9000` — Raft transport address
+- `corvo server --node-id node-1` — unique node ID
+- `corvo status` — show queue stats + cluster health
+- `corvo top` — live TUI dashboard (active workers, jobs, throughput)
+- `corvo workers` — list connected workers
+- `corvo schedules` — list cron schedules
+- `corvo cluster status` — show cluster topology and replication lag
 
 The CLI supports `--output json` for all commands, enabling scripting:
 ```bash
 # Find all dead jobs with SMTP errors, retry them
-jobbie search --queue emails.send --state dead --error-contains "SMTP" --output json \
-  | jobbie bulk retry
+corvo search --queue emails.send --state dead --error-contains "SMTP" --output json \
+  | corvo bulk retry
 
 # Move all pending jobs from one queue to another
-jobbie search --queue old.emails --state pending --output json \
-  | jobbie bulk move emails.v2
+corvo search --queue old.emails --state pending --output json \
+  | corvo bulk move emails.v2
 
 # Delete all completed jobs older than 7 days
-jobbie search --state completed --created-before "$(date -d '7 days ago' -Iseconds)" --output json \
-  | jobbie bulk delete
+corvo search --state completed --created-before "$(date -d '7 days ago' -Iseconds)" --output json \
+  | corvo bulk delete
 
 # Count dead jobs per queue
-jobbie search --state dead --output json | jq 'group_by(.queue) | map({queue: .[0].queue, count: length})'
+corvo search --state dead --output json | jq 'group_by(.queue) | map({queue: .[0].queue, count: length})'
 
 # Export all jobs matching a payload condition
-jobbie search --queue reports --payload-jq '.customer_id == "cust_42"' --output json > jobs.json
+corvo search --queue reports --payload-jq '.customer_id == "cust_42"' --output json > jobs.json
 ```
 
 ---
 
 ## HTTP Protocol
 
-All communication between clients and the Jobbie server is HTTP/JSON. No custom protocols, no binary encoding, no protobuf. You can test every endpoint with `curl`.
+All communication between clients and the Corvo server is HTTP/JSON. No custom protocols, no binary encoding, no protobuf. You can test every endpoint with `curl`.
 
 ### Producer endpoints
 
@@ -1208,7 +1208,7 @@ WHERE state = 'active'
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: jobbie-worker-emails
+  name: corvo-worker-emails
 spec:
   replicas: 3
   template:
@@ -1217,11 +1217,11 @@ spec:
       containers:
         - name: worker
           env:
-            - name: JOBBIE_URL
-              value: "http://jobbie:8080"
-            - name: JOBBIE_QUEUES
+            - name: CORVO_URL
+              value: "http://corvo:8080"
+            - name: CORVO_QUEUES
               value: "emails.send,emails.bulk"
-            - name: JOBBIE_CONCURRENCY
+            - name: CORVO_CONCURRENCY
               value: "10"
           readinessProbe:
             httpGet:
@@ -1271,8 +1271,8 @@ Under the hood, `ctx.checkpoint()` sends a heartbeat with checkpoint data. The s
 How many jobs a single worker process handles simultaneously:
 
 ```typescript
-const worker = new JobbieWorker({
-  url: "http://jobbie:8080",
+const worker = new CorvoWorker({
+  url: "http://corvo:8080",
   queues: ["emails.send"],
   concurrency: 10,
 });
@@ -1297,11 +1297,11 @@ Server enforces this in the fetch query — the fetch transaction checks `SELECT
 
 ### Overview
 
-Jobbie servers cluster automatically using hashicorp/raft for consensus and SQLite for storage. The user runs 3+ instances; Jobbie handles leader election, data replication, and automatic failover. No external coordination service required.
+Corvo servers cluster automatically using hashicorp/raft for consensus and SQLite for storage. The user runs 3+ instances; Corvo handles leader election, data replication, and automatic failover. No external coordination service required.
 
 ```
 ┌──────────────────────────┐ ┌──────────────────────────┐ ┌──────────────────────────┐
-│  Jobbie-0 (leader)        │ │  Jobbie-1 (follower)      │ │  Jobbie-2 (follower)      │
+│  Corvo-0 (leader)        │ │  Corvo-1 (follower)      │ │  Corvo-2 (follower)      │
 │                           │ │                           │ │                           │
 │  ┌──────────────────────┐ │ │  ┌──────────────────────┐ │ │  ┌──────────────────────┐ │
 │  │ Pebble (source)      │ │ │  │ Pebble (source)      │ │ │  │ Pebble (source)      │ │
@@ -1327,14 +1327,14 @@ Jobbie servers cluster automatically using hashicorp/raft for consensus and SQLi
 
 **Write path (through Raft):**
 ```
-Client → HTTP POST /api/v1/enqueue → any Jobbie node
+Client → HTTP POST /api/v1/enqueue → any Corvo node
   → If leader: serialize Op → raft.Apply() → committed to quorum → FSM applies to Pebble + SQLite → respond
   → If follower: proxy request to leader internally → leader applies via Raft → respond
 ```
 
 **Read path (local):**
 ```
-Client → HTTP GET /api/v1/jobs/search → any Jobbie node
+Client → HTTP GET /api/v1/jobs/search → any Corvo node
   → Query local SQLite directly (no Raft round-trip)
   → Reads may be slightly stale on followers (typically <1ms)
 ```
@@ -1438,7 +1438,7 @@ hashicorp/raft powers Consul, Nomad, and Vault in production. Pebble powers Cock
 **Peer discovery:**
 - Bootstrap: `--bootstrap` creates a single-node cluster, `--join <addr>` joins an existing one
 - Kubernetes: `--discover=dns` resolves peers via headless service DNS
-  (`jobbie-0.jobbie.ns.svc.cluster.local`, `jobbie-1.jobbie...`, etc.)
+  (`corvo-0.corvo.ns.svc.cluster.local`, `corvo-1.corvo...`, etc.)
 
 **Leader election:**
 - Handled entirely by hashicorp/raft (Raft protocol)
@@ -1456,34 +1456,34 @@ hashicorp/raft powers Consul, Nomad, and Vault in production. Pebble powers Cock
 ```
 
 **Write proxying:**
-- Workers connect to any Jobbie node (via load balancer)
+- Workers connect to any Corvo node (via load balancer)
 - Read operations (queue stats, job inspect, search) are served from local SQLite — no Raft round-trip
 - Write operations (enqueue, ack, fail, etc.) are proxied to the Raft leader internally
 - The client has no idea which node is the leader — the API is identical on every node
 
 **Automatic failover:**
 ```
-1. Leader (Jobbie-0) dies
+1. Leader (Corvo-0) dies
 2. Raft detects missing heartbeats (election timeout)
 3. Remaining nodes hold Raft election
-4. Jobbie-1 wins election, becomes new leader
-5. Jobbie-1 starts accepting writes via Raft
-6. Jobbie-1 starts the scheduler (only leader runs scheduler)
+4. Corvo-1 wins election, becomes new leader
+5. Corvo-1 starts accepting writes via Raft
+6. Corvo-1 starts the scheduler (only leader runs scheduler)
 7. Workers notice nothing — their HTTP requests still go through the LB
 ```
 
 **Rejoining:**
 ```
-1. Jobbie-0 comes back online
+1. Corvo-0 comes back online
 2. Rejoins the Raft cluster as a follower
 3. Raft replays missed log entries (or sends a snapshot if too far behind)
-4. Jobbie-0's SQLite catches up to current state
+4. Corvo-0's SQLite catches up to current state
 5. Cluster is back to 3 nodes
 ```
 
 **Snapshots and compaction:**
 - Raft log grows indefinitely without snapshots
-- Jobbie takes periodic snapshots (configurable, default every 10,000 log entries)
+- Corvo takes periodic snapshots (configurable, default every 10,000 log entries)
 - A snapshot includes a Pebble checkpoint (hard links, nearly free) + SQLite VACUUM INTO backup, tar/gzip'd for transport
 - After a snapshot, old log entries are discarded
 - New nodes joining the cluster receive the latest snapshot + recent log entries
@@ -1494,7 +1494,7 @@ hashicorp/raft powers Consul, Nomad, and Vault in production. Pebble powers Cock
 | Port | Purpose | Exposed to |
 |---|---|---|
 | 8080 | HTTP API + UI + worker protocol | Workers, users, load balancer |
-| 9400 | Raft consensus + peer communication | Other Jobbie instances only |
+| 9400 | Raft consensus + peer communication | Other Corvo instances only |
 
 Workers and users only ever see port 8080. Port 9400 is internal cluster traffic only.
 
@@ -1504,21 +1504,21 @@ Workers and users only ever see port 8080. Port 9400 is internal cluster traffic
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: jobbie
+  name: corvo
 spec:
-  serviceName: jobbie-internal
+  serviceName: corvo-internal
   replicas: 3
   selector:
     matchLabels:
-      app: jobbie
+      app: corvo
   template:
     metadata:
       labels:
-        app: jobbie
+        app: corvo
     spec:
       containers:
-        - name: jobbie
-          image: jobbie:latest
+        - name: corvo
+          image: corvo:latest
           args: ["server", "--discover=dns", "--raft-bind", ":9400"]
           ports:
             - containerPort: 8080
@@ -1549,12 +1549,12 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: jobbie-internal
+  name: corvo-internal
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
   selector:
-    app: jobbie
+    app: corvo
   ports:
     - name: raft
       port: 9400
@@ -1563,10 +1563,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: jobbie
+  name: corvo
 spec:
   selector:
-    app: jobbie
+    app: corvo
   ports:
     - name: api
       port: 8080
@@ -1576,14 +1576,14 @@ spec:
 
 ```
 Mode 1: Single node (default)
-  $ jobbie server --bootstrap --data-dir /var/lib/jobbie
+  $ corvo server --bootstrap --data-dir /var/lib/corvo
   → Pebble + SQLite, everything in one process, no clustering overhead
   → Raft runs in single-node mode (commits locally, no quorum needed)
   → Durable by default: pebbleNoSync=false, raftNoSync=false (every write fsync'd)
   → Good for: dev, staging, small production, single server
 
 Mode 2: Clustered (automatic HA)
-  $ jobbie server --join node1:9400 --raft-bind :9400 --node-id node-2
+  $ corvo server --join node1:9400 --raft-bind :9400 --node-id node-2
   or in k8s: --discover=dns
   → 3-node Raft group, automatic leader election + failover
   → Each node has its own Pebble + SQLite, kept in sync via Raft
@@ -1591,14 +1591,14 @@ Mode 2: Clustered (automatic HA)
   → Good for: production HA, medium-to-large scale
 
 Mode 3: Federated clusters (horizontal scaling)
-  → Multiple independent Jobbie clusters, each handling a subset of queues
+  → Multiple independent Corvo clusters, each handling a subset of queues
   → Queues are assigned to clusters; workers/producers point at the right cluster
   → No code changes — just deployment configuration
   → Good for: extreme throughput beyond single-cluster capacity
 
-Mode 4: Jobbie Cloud (managed)
+Mode 4: Corvo Cloud (managed)
   → Customers configure workers with an API key + URL
-  → Infrastructure is Jobbie's problem
+  → Infrastructure is Corvo's problem
 ```
 
 ### Federated clusters
@@ -1607,7 +1607,7 @@ When a single cluster isn't enough, scale by running multiple independent cluste
 
 ```
                     ┌──────────────────────────────┐
-                    │       Jobbie Federation       │
+                    │       Corvo Federation       │
                     │       (optional gateway)      │
                     └──────┬──────────────┬─────────┘
                            │              │
@@ -1632,7 +1632,7 @@ Future work could add a **federation gateway** — a thin proxy that routes requ
 
 ## Durability model
 
-Jobbie treats Pebble as rebuildable materialized state and uses the Raft log as the durability anchor.
+Corvo treats Pebble as rebuildable materialized state and uses the Raft log as the durability anchor.
 
 Current default behavior in all modes:
 
@@ -1760,13 +1760,13 @@ Both histograms expose p50/p90/p99/avg and per-bucket counts via the `/api/v1/cl
 
 ## The UI
 
-Served by the Jobbie server as an embedded SPA (via Go's `embed.FS`). Real-time updates via SSE.
+Served by the Corvo server as an embedded SPA (via Go's `embed.FS`). Real-time updates via SSE.
 
 ### Dashboard
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  Jobbie                                    cluster: prod (3 nodes)   │
+│  Corvo                                    cluster: prod (3 nodes)   │
 ├──────────────────────────────────────────────────────────────────────┤
 │                                                                      │
 │  Queues                                                              │
@@ -1792,9 +1792,9 @@ Served by the Jobbie server as an embedded SPA (via Go's `embed.FS`). Real-time 
 │  ┌───────────┬────────────┬──────────┬──────────────────────────┐    │
 │  │ Node      │ Role       │ Raft     │ Status                   │    │
 │  ├───────────┼────────────┼──────────┼──────────────────────────┤    │
-│  │ jobbie-0  │ leader     │ leader   │ healthy                  │    │
-│  │ jobbie-1  │ follower   │ follower │ healthy, log: current    │    │
-│  │ jobbie-2  │ follower   │ follower │ healthy, log: current    │    │
+│  │ corvo-0  │ leader     │ leader   │ healthy                  │    │
+│  │ corvo-1  │ follower   │ follower │ healthy, log: current    │    │
+│  │ corvo-2  │ follower   │ follower │ healthy, log: current    │    │
 │  └───────────┴────────────┴──────────┴──────────────────────────┘    │
 │                                                                      │
 │  Recent failures                                                     │
@@ -1952,14 +1952,14 @@ Served by the Jobbie server as an embedded SPA (via Go's `embed.FS`). Real-time 
 
 ## Client library contract
 
-A Jobbie client library is a thin HTTP wrapper. Worker lifecycle orchestration
+A Corvo client library is a thin HTTP wrapper. Worker lifecycle orchestration
 (handler registration, fetch/ack/fail loop, heartbeat, graceful drain) lives in a
 separate worker runtime package that depends on the client library.
 
 ### What a client does
 
 ```
-1. Make HTTP requests to Jobbie server
+1. Make HTTP requests to Corvo server
 2. Parse JSON responses
 3. Manage a pool of concurrent fetch loops (for concurrency)
 4. Handle SIGTERM → stop fetching, wait for in-flight, fail remaining
@@ -1981,7 +1981,7 @@ separate worker runtime package that depends on the client library.
 ### Example client: TypeScript (~150 lines of real logic)
 
 ```typescript
-class JobbieWorker {
+class CorvoWorker {
   private url: string;
   private queues: string[];
   private concurrency: number;
@@ -2080,14 +2080,14 @@ curl -X POST http://localhost:8080/api/v1/enqueue \
 ## Project structure
 
 ```
-jobbie/
+corvo/
 ├── cmd/
-│   ├── jobbie/
+│   ├── corvo/
 │   │   └── main.go              # Entry point — server, CLI subcommands
 │   └── bench/
 │       └── main.go              # HTTP/RPC benchmark tool for throughput + latency
 ├── proto/
-│   └── jobbie/v1/
+│   └── corvo/v1/
 │       └── worker.proto         # Connect RPC service definitions (protobuf)
 ├── internal/
 │   ├── kv/
@@ -2117,7 +2117,7 @@ jobbie/
 │   │   └── server_test.go       # RPC server tests
 │   ├── rpcconnect/
 │   │   ├── server.go            # Connect RPC WorkerService (HTTP/2, protobuf)
-│   │   └── gen/jobbie/v1/       # Generated protobuf + Connect code
+│   │   └── gen/corvo/v1/       # Generated protobuf + Connect code
 │   ├── server/
 │   │   ├── server.go            # HTTP/2 server setup, middleware, routing, leader proxy
 │   │   ├── handlers_worker.go   # enqueue, fetch, ack, fail, heartbeat
@@ -2176,10 +2176,10 @@ jobbie/
 
 ```bash
 # Download
-curl -fsSL https://get.jobbie.dev | sh
+curl -fsSL https://get.corvo.dev | sh
 
 # Start (embedded SQLite, serves UI on :8080)
-jobbie server
+corvo server
 
 # In another terminal — enqueue a job
 curl -X POST http://localhost:8080/api/v1/enqueue \
@@ -2202,44 +2202,44 @@ done
 ### Docker
 
 ```bash
-docker run -d -p 8080:8080 -v jobbie-data:/data jobbie/jobbie
+docker run -d -p 8080:8080 -v corvo-data:/data corvo/corvo
 ```
 
 ### Docker Compose (clustered)
 
 ```yaml
 services:
-  jobbie-0:
-    image: jobbie/jobbie
+  corvo-0:
+    image: corvo/corvo
     command: server --bootstrap --node-id node-0 --raft-bind :9400
     ports: ["8080:8080"]
-    volumes: ["jobbie-0-data:/data"]
+    volumes: ["corvo-0-data:/data"]
 
-  jobbie-1:
-    image: jobbie/jobbie
-    command: server --join jobbie-0:9400 --node-id node-1 --raft-bind :9400
-    volumes: ["jobbie-1-data:/data"]
+  corvo-1:
+    image: corvo/corvo
+    command: server --join corvo-0:9400 --node-id node-1 --raft-bind :9400
+    volumes: ["corvo-1-data:/data"]
 
-  jobbie-2:
-    image: jobbie/jobbie
-    command: server --join jobbie-0:9400 --node-id node-2 --raft-bind :9400
-    volumes: ["jobbie-2-data:/data"]
+  corvo-2:
+    image: corvo/corvo
+    command: server --join corvo-0:9400 --node-id node-2 --raft-bind :9400
+    volumes: ["corvo-2-data:/data"]
 
 volumes:
-  jobbie-0-data:
-  jobbie-1-data:
-  jobbie-2-data:
+  corvo-0-data:
+  corvo-1-data:
+  corvo-2-data:
 ```
 
 ### Kubernetes (clustered, automatic discovery)
 
 ```bash
-helm install jobbie jobbie/jobbie --set cluster.enabled=true --set replicas=3
+helm install corvo corvo/corvo --set cluster.enabled=true --set replicas=3
 ```
 
 ---
 
-## Paid service (Jobbie Cloud)
+## Paid service (Corvo Cloud)
 
 The OSS version is fully functional — every feature described above is free.
 
@@ -2260,9 +2260,9 @@ The boundary is clear: **OSS handles all job processing features. Cloud handles 
 
 ---
 
-## What Jobbie is NOT
+## What Corvo is NOT
 
-- **Not a workflow engine** — no DAGs, no step-by-step orchestration, no replay. If you need sagas or multi-step workflows, use Temporal. Jobbie does one job at a time, well.
+- **Not a workflow engine** — no DAGs, no step-by-step orchestration, no replay. If you need sagas or multi-step workflows, use Temporal. Corvo does one job at a time, well.
 - **Not a cron replacement** — it has cron support, but it's for recurring jobs that go through the job lifecycle (retries, monitoring, etc.), not arbitrary shell commands.
 - **Not a message broker** — it's a job queue. Jobs are processed exactly once. If you need pub/sub or event streaming, use NATS/Kafka/etc.
 
@@ -2371,7 +2371,7 @@ Replaced SQLite-only store with Pebble (source of truth) + Raft (consensus) + SQ
 See `docs/AI.md` for full spec and `docs/PHASE2.md` for delivery plan.
 
 - [x] Token and cost tracking (`job_usage` table, usage reporting on ack/heartbeat)
-- [x] Usage summary endpoints + CLI (`jobbie usage`)
+- [x] Usage summary endpoints + CLI (`corvo usage`)
 - [x] Budget enforcement (daily/per-job limits, hold/reject/alert actions)
 - [x] `held` job state + approve/reject endpoints + CLI
 - [x] Agent loop primitive (iterative jobs with server-enforced guardrails)

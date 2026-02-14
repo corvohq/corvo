@@ -1,4 +1,4 @@
-# Jobbie Benchmarks
+# Corvo Benchmarks
 
 This file tracks current Raft+Pebble performance numbers and benchmark commands.
 Older SQLite-era benchmark sections were removed to avoid stale comparisons.
@@ -53,11 +53,11 @@ Notes:
 ### Start server
 
 ```sh
-./bin/jobbie server \
+./bin/corvo server \
   --bind 127.0.0.1:18080 \
   --raft-bind 127.0.0.1:19000 \
   --raft-advertise 127.0.0.1:19000 \
-  --data-dir /tmp/jobbie-bench \
+  --data-dir /tmp/corvo-bench \
   --raft-store badger
 ```
 
@@ -79,7 +79,7 @@ Useful flags:
 
 ## E2E Perf Smoke Tests (CI/Local)
 
-These are real end-to-end tests that start the actual `cmd/jobbie server` path and run HTTP/RPC flows through client libraries.
+These are real end-to-end tests that start the actual `cmd/corvo server` path and run HTTP/RPC flows through client libraries.
 
 Run:
 
@@ -117,11 +117,11 @@ Notes:
 - c200 lifecycle p99 remains elevated under heavy overload/retry pressure and stays an active tuning item.
 
 Thresholds are intentionally loose and env-configurable for machine stability:
-- `JOBBIE_PERF_E2E_ENQ_TOTAL`
-- `JOBBIE_PERF_E2E_ENQ_CONCURRENCY`
-- `JOBBIE_PERF_E2E_ENQ_MIN_OPS`
-- `JOBBIE_PERF_E2E_LC_TOTAL`
-- `JOBBIE_PERF_E2E_LC_CONCURRENCY`
-- `JOBBIE_PERF_E2E_LC_FETCH_BATCH`
-- `JOBBIE_PERF_E2E_LC_ACK_BATCH`
-- `JOBBIE_PERF_E2E_LC_MIN_OPS`
+- `CORVO_PERF_E2E_ENQ_TOTAL`
+- `CORVO_PERF_E2E_ENQ_CONCURRENCY`
+- `CORVO_PERF_E2E_ENQ_MIN_OPS`
+- `CORVO_PERF_E2E_LC_TOTAL`
+- `CORVO_PERF_E2E_LC_CONCURRENCY`
+- `CORVO_PERF_E2E_LC_FETCH_BATCH`
+- `CORVO_PERF_E2E_LC_ACK_BATCH`
+- `CORVO_PERF_E2E_LC_MIN_OPS`

@@ -1,8 +1,8 @@
 [package]
-name = "jobbie-client"
+name = "corvo-client"
 version = "0.1.0"
 edition = "2021"
-description = "Rust client for Jobbie"
+description = "Rust client for Corvo"
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }

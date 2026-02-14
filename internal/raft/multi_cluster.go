@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/store"
 )
 
 // MultiCluster runs N independent raft groups in one process and routes ops
@@ -44,7 +44,7 @@ func NewMultiCluster(base ClusterConfig, shardCount int) (*MultiCluster, error) 
 	// Multi-shard always uses a shared SQLite so cross-shard reads work.
 	sharedSQLite := strings.TrimSpace(base.SQLitePath)
 	if sharedSQLite == "" {
-		sharedSQLite = filepath.Join(rootDir, "jobbie.db")
+		sharedSQLite = filepath.Join(rootDir, "corvo.db")
 	}
 	if err := ensureDir(filepath.Dir(sharedSQLite)); err != nil {
 		return nil, err

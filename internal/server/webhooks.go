@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/store"
 )
 
 type webhookConfig struct {
@@ -187,12 +187,12 @@ func (s *Server) deliverWebhook(h webhookConfig, ev map[string]any) {
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		req, _ := http.NewRequest(http.MethodPost, h.URL, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Jobbie-Webhook-ID", h.ID)
-		req.Header.Set("X-Jobbie-Webhook-Event", asString(ev["type"]))
+		req.Header.Set("X-Corvo-Webhook-ID", h.ID)
+		req.Header.Set("X-Corvo-Webhook-Event", asString(ev["type"]))
 		if h.Secret != "" {
 			sig := hmac.New(sha256.New, []byte(h.Secret))
 			_, _ = sig.Write(body)
-			req.Header.Set("X-Jobbie-Signature", "sha256="+hex.EncodeToString(sig.Sum(nil)))
+			req.Header.Set("X-Corvo-Signature", "sha256="+hex.EncodeToString(sig.Sum(nil)))
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {

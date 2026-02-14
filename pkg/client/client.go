@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// Client is a thin HTTP wrapper for the Jobbie API.
+// Client is a thin HTTP wrapper for the Corvo API.
 type Client struct {
 	URL        string
 	HTTPClient *http.Client
@@ -63,12 +63,12 @@ func WithAPIKeyHeader(header, key string) ClientOption {
 	}
 }
 
-// New creates a new Jobbie client.
+// New creates a new Corvo client.
 func New(url string) *Client {
 	return NewWithOptions(url)
 }
 
-// NewWithOptions creates a new Jobbie client with optional auth/header behavior.
+// NewWithOptions creates a new Corvo client with optional auth/header behavior.
 func NewWithOptions(url string, opts ...ClientOption) *Client {
 	c := &Client{
 		URL: strings.TrimRight(url, "/"),

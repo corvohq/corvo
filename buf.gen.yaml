@@ -4,9 +4,9 @@ plugins:
     out: .
     opt:
       - paths=import
-      - module=github.com/user/jobbie
+      - module=github.com/user/corvo
   - plugin: connect-go
     out: .
     opt:
       - paths=import
-      - module=github.com/user/jobbie
+      - module=github.com/user/corvo

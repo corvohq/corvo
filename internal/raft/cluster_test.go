@@ -14,7 +14,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/hashicorp/raft"
-	"github.com/user/jobbie/internal/store"
+	"github.com/user/corvo/internal/store"
 )
 
 func testRaftAddr(t *testing.T) string {

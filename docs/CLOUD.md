@@ -1,10 +1,10 @@
-# Jobbie Managed Infrastructure Slice
+# Corvo Managed Infrastructure Slice
 
-This repository includes a reference managed-infrastructure slice for clustered Jobbie deployment.
+This repository includes a reference managed-infrastructure slice for clustered Corvo deployment.
 
 ## Included
 
-- 3-node Jobbie cluster (`deploy/cloud/docker-compose.yml`)
+- 3-node Corvo cluster (`deploy/cloud/docker-compose.yml`)
 - ingress/load-balancer tier (`nginx`)
 - persistent node-local volumes
 - leader failover via built-in Raft
