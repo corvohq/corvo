@@ -12,10 +12,14 @@ import {
   Network,
   Clock,
   Radio,
-  Settings,
+  KeyRound,
+  FolderTree,
+  Shield,
+  Fingerprint,
+  ScrollText,
 } from "lucide-react";
 
-const navItems = [
+const coreItems = [
   { to: "/ui", icon: LayoutDashboard, label: "Dashboard", end: true },
   { to: "/ui/queues", icon: ListOrdered, label: "Queues" },
   { to: "/ui/scheduled", icon: Clock, label: "Scheduled" },
@@ -25,12 +29,46 @@ const navItems = [
   { to: "/ui/cost", icon: DollarSign, label: "Cost" },
   { to: "/ui/workers", icon: Users, label: "Workers" },
   { to: "/ui/cluster", icon: Network, label: "Cluster" },
-  { to: "/ui/settings", icon: Settings, label: "Settings" },
+];
+
+const adminItems = [
+  { to: "/ui/api-keys", icon: KeyRound, label: "API Keys" },
+  { to: "/ui/namespaces", icon: FolderTree, label: "Namespaces" },
+  { to: "/ui/roles", icon: Shield, label: "Roles" },
+  { to: "/ui/sso", icon: Fingerprint, label: "SSO" },
+  { to: "/ui/audit-logs", icon: ScrollText, label: "Audit Logs" },
 ];
 
 interface SidebarProps {
   mobileOpen: boolean;
   onMobileOpenChange: (open: boolean) => void;
+}
+
+function NavItem({
+  item,
+  onNavigate,
+}: {
+  item: (typeof coreItems)[number];
+  onNavigate?: () => void;
+}) {
+  return (
+    <NavLink
+      to={item.to}
+      end={item.end}
+      onClick={onNavigate}
+      className={({ isActive }) =>
+        cn(
+          "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors",
+          isActive
+            ? "bg-sidebar-accent text-sidebar-accent-foreground"
+            : "text-sidebar-foreground/70 hover:bg-sidebar-accent/50 hover:text-sidebar-foreground",
+        )
+      }
+    >
+      <item.icon className="h-4 w-4" />
+      {item.label}
+    </NavLink>
+  );
 }
 
 function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
@@ -43,24 +81,18 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
         </NavLink>
       </div>
       <nav className="flex-1 space-y-1 p-3">
-        {navItems.map((item) => (
-          <NavLink
-            key={item.to}
-            to={item.to}
-            end={item.end}
-            onClick={onNavigate}
-            className={({ isActive }) =>
-              cn(
-                "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors",
-                isActive
-                  ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                  : "text-sidebar-foreground/70 hover:bg-sidebar-accent/50 hover:text-sidebar-foreground",
-              )
-            }
-          >
-            <item.icon className="h-4 w-4" />
-            {item.label}
-          </NavLink>
+        {coreItems.map((item) => (
+          <NavItem key={item.to} item={item} onNavigate={onNavigate} />
+        ))}
+
+        <div className="pt-3 pb-1 px-3">
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-sidebar-foreground/40">
+            Admin
+          </span>
+        </div>
+
+        {adminItems.map((item) => (
+          <NavItem key={item.to} item={item} onNavigate={onNavigate} />
         ))}
       </nav>
     </>

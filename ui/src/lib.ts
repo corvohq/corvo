@@ -18,6 +18,7 @@ export { default as AuditLogsPage } from "@/pages/audit-logs";
 export { default as RolesPage } from "@/pages/roles-page";
 export { default as NamespacesPage } from "@/pages/namespaces-page";
 export { default as SSOPage } from "@/pages/sso-page";
+export { default as ApiKeysPage } from "@/pages/api-keys-page";
 
 // SSE provider — wraps children with real-time query invalidation
 export { useSSE } from "@/hooks/use-events";

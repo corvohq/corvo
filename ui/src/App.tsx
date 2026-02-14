@@ -14,7 +14,11 @@ import WorkersPage from "@/pages/workers-page";
 import ClusterPage from "@/pages/cluster-page";
 import ScheduledJobs from "@/pages/scheduled-jobs";
 import EventsPage from "@/pages/events-page";
-import SettingsPage from "@/pages/settings";
+import ApiKeysPage from "@/pages/api-keys-page";
+import NamespacesPage from "@/pages/namespaces-page";
+import RolesPage from "@/pages/roles-page";
+import SSOPage from "@/pages/sso-page";
+import AuditLogsPage from "@/pages/audit-logs";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -49,7 +53,11 @@ export default function App() {
               <Route path="/ui/cluster" element={<ClusterPage />} />
               <Route path="/ui/scheduled" element={<ScheduledJobs />} />
               <Route path="/ui/events" element={<EventsPage />} />
-              <Route path="/ui/settings" element={<SettingsPage />} />
+              <Route path="/ui/api-keys" element={<ApiKeysPage />} />
+              <Route path="/ui/namespaces" element={<NamespacesPage />} />
+              <Route path="/ui/roles" element={<RolesPage />} />
+              <Route path="/ui/sso" element={<SSOPage />} />
+              <Route path="/ui/audit-logs" element={<AuditLogsPage />} />
             </Route>
           </Routes>
         </BrowserRouter>

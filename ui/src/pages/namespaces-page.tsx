@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api, post, del } from "@/lib/api";
+import { api, post, del, ApiError } from "@/lib/api";
 
 interface Namespace {
   name: string;
@@ -9,7 +9,7 @@ interface Namespace {
 
 export default function NamespacesPage() {
   const qc = useQueryClient();
-  const { data: namespaces = [], isLoading } = useQuery({
+  const { data: namespaces = [], isLoading, error } = useQuery({
     queryKey: ["namespaces"],
     queryFn: () => api<Namespace[]>("/namespaces"),
   });
@@ -44,12 +44,12 @@ export default function NamespacesPage() {
           value={newName}
           onChange={(e) => setNewName(e.target.value)}
           placeholder="Namespace name (e.g. staging)"
-          className="rounded-lg border border-surface-700 bg-surface-800 px-3 py-1.5 text-sm text-surface-300 w-64"
+          className="rounded-lg border border-border bg-muted px-3 py-1.5 text-sm text-foreground w-64"
         />
         <button
           onClick={() => createMutation.mutate(newName)}
           disabled={!newName.trim() || createMutation.isPending}
-          className="rounded-lg bg-accent-500 px-4 py-2 text-sm font-medium text-white hover:bg-accent-600 transition-colors disabled:opacity-50"
+          className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
         >
           {createMutation.isPending ? "Creating..." : "Create"}
         </button>
@@ -61,29 +61,39 @@ export default function NamespacesPage() {
         </p>
       )}
 
-      {!isLoading && namespaces.length === 0 && (
+      {!isLoading && error && (
+        <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-6 text-center">
+          <p className="text-sm text-yellow-400">
+            {error instanceof ApiError && error.status === 403
+              ? "This feature requires an enterprise license."
+              : `Failed to load namespaces: ${error.message}`}
+          </p>
+        </div>
+      )}
+
+      {!isLoading && !error && namespaces.length === 0 && (
         <div className="rounded-lg border border-dashed p-12 text-center">
           <p className="text-sm text-muted-foreground">
-            No namespaces defined.
+            No namespaces defined. Create one above to get started.
           </p>
         </div>
       )}
 
       {namespaces.length > 0 && (
-        <div className="overflow-x-auto rounded-lg border border-surface-800">
+        <div className="overflow-x-auto rounded-lg border border-border">
           <table className="w-full text-sm">
             <thead>
-              <tr className="border-b border-surface-800 bg-surface-900/50">
-                <th className="px-4 py-2.5 text-left font-medium text-surface-400">Name</th>
-                <th className="px-4 py-2.5 text-left font-medium text-surface-400">Created</th>
-                <th className="px-4 py-2.5 text-right font-medium text-surface-400">Actions</th>
+              <tr className="border-b border-border bg-muted/50">
+                <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">Name</th>
+                <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">Created</th>
+                <th className="px-4 py-2.5 text-right font-medium text-muted-foreground">Actions</th>
               </tr>
             </thead>
             <tbody>
               {namespaces.map((ns) => (
-                <tr key={ns.name} className="border-b border-surface-800/50 hover:bg-surface-900/30">
-                  <td className="px-4 py-2 font-medium text-surface-200">{ns.name}</td>
-                  <td className="px-4 py-2 text-surface-400 text-xs whitespace-nowrap">
+                <tr key={ns.name} className="border-b border-border/50 hover:bg-muted/30">
+                  <td className="px-4 py-2 font-medium text-foreground">{ns.name}</td>
+                  <td className="px-4 py-2 text-muted-foreground text-xs whitespace-nowrap">
                     {new Date(ns.created_at).toLocaleDateString()}
                   </td>
                   <td className="px-4 py-2 text-right">

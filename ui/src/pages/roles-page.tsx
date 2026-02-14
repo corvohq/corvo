@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api, post, del } from "@/lib/api";
+import { api, post, del, ApiError } from "@/lib/api";
 
 interface AuthPermission {
   resource: string;
@@ -16,7 +16,7 @@ interface AuthRole {
 
 export default function RolesPage() {
   const qc = useQueryClient();
-  const { data: roles = [], isLoading } = useQuery({
+  const { data: roles = [], isLoading, error } = useQuery({
     queryKey: ["auth-roles"],
     queryFn: () => api<AuthRole[]>("/auth/roles"),
   });
@@ -90,6 +90,43 @@ export default function RolesPage() {
     saveMutation.mutate({ name, permissions: filtered });
   }
 
+  const builtInRoles = [
+    { name: "admin", description: "Full access to all resources and operations" },
+    { name: "operator", description: "Full access except cannot create or modify API keys" },
+    { name: "worker", description: "Can enqueue, fetch, ack, fail, and heartbeat jobs. Read-only access to job details" },
+    { name: "readonly", description: "Read-only access (GET requests only)" },
+  ];
+
+  if (error instanceof ApiError && error.status === 403) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold">Roles</h1>
+          <p className="text-sm text-muted-foreground">
+            Manage RBAC roles and their permissions.
+          </p>
+        </div>
+        <div className="rounded-lg border border-border bg-card p-4">
+          <h2 className="text-sm font-semibold text-foreground mb-1">Built-in Roles</h2>
+          <p className="text-xs text-muted-foreground mb-3">These are always available and cannot be modified.</p>
+          <div className="space-y-2">
+            {builtInRoles.map((r) => (
+              <div key={r.name} className="flex items-baseline gap-3">
+                <span className="rounded bg-muted px-1.5 py-0.5 text-xs font-medium text-foreground w-20 text-center">{r.name}</span>
+                <span className="text-xs text-muted-foreground">{r.description}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-6 text-center">
+          <p className="text-sm text-yellow-400">
+            Custom RBAC roles require an enterprise license.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -102,11 +139,25 @@ export default function RolesPage() {
         {!editing && (
           <button
             onClick={startCreate}
-            className="rounded-lg bg-accent-500 px-4 py-2 text-sm font-medium text-white hover:bg-accent-600 transition-colors"
+            className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
           >
             Create Role
           </button>
         )}
+      </div>
+
+      {/* Built-in roles */}
+      <div className="rounded-lg border border-border bg-card p-4">
+        <h2 className="text-sm font-semibold text-foreground mb-1">Built-in Roles</h2>
+        <p className="text-xs text-muted-foreground mb-3">These are always available and cannot be modified.</p>
+        <div className="space-y-2">
+          {builtInRoles.map((r) => (
+            <div key={r.name} className="flex items-baseline gap-3">
+              <span className="rounded bg-muted px-1.5 py-0.5 text-xs font-medium text-foreground w-20 text-center">{r.name}</span>
+              <span className="text-xs text-muted-foreground">{r.description}</span>
+            </div>
+          ))}
+        </div>
       </div>
 
       {isLoading && (
@@ -124,37 +175,37 @@ export default function RolesPage() {
       )}
 
       {roles.length > 0 && (
-        <div className="overflow-x-auto rounded-lg border border-surface-800">
+        <div className="overflow-x-auto rounded-lg border border-border">
           <table className="w-full text-sm">
             <thead>
-              <tr className="border-b border-surface-800 bg-surface-900/50">
-                <th className="px-4 py-2.5 text-left font-medium text-surface-400">Name</th>
-                <th className="px-4 py-2.5 text-left font-medium text-surface-400">Permissions</th>
-                <th className="px-4 py-2.5 text-left font-medium text-surface-400">Created</th>
-                <th className="px-4 py-2.5 text-right font-medium text-surface-400">Actions</th>
+              <tr className="border-b border-border bg-muted/50">
+                <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">Name</th>
+                <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">Permissions</th>
+                <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">Created</th>
+                <th className="px-4 py-2.5 text-right font-medium text-muted-foreground">Actions</th>
               </tr>
             </thead>
             <tbody>
               {roles.map((role) => (
-                <tr key={role.name} className="border-b border-surface-800/50 hover:bg-surface-900/30">
-                  <td className="px-4 py-2 font-medium text-surface-200">{role.name}</td>
-                  <td className="px-4 py-2 text-surface-300">
+                <tr key={role.name} className="border-b border-border/50 hover:bg-muted/30">
+                  <td className="px-4 py-2 font-medium text-foreground">{role.name}</td>
+                  <td className="px-4 py-2 text-foreground">
                     {role.permissions.map((p) => (
                       <span
                         key={p.resource}
-                        className="mr-2 inline-block rounded bg-surface-800 px-1.5 py-0.5 text-xs"
+                        className="mr-2 inline-block rounded bg-muted px-1.5 py-0.5 text-xs"
                       >
                         {p.resource}: {p.actions.join(", ")}
                       </span>
                     ))}
                   </td>
-                  <td className="px-4 py-2 text-surface-400 text-xs whitespace-nowrap">
+                  <td className="px-4 py-2 text-muted-foreground text-xs whitespace-nowrap">
                     {new Date(role.created_at).toLocaleDateString()}
                   </td>
                   <td className="px-4 py-2 text-right">
                     <button
                       onClick={() => startEdit(role)}
-                      className="mr-2 text-xs text-accent-400 hover:text-accent-300"
+                      className="mr-2 text-xs text-primary hover:text-primary/80"
                     >
                       Edit
                     </button>
@@ -173,13 +224,13 @@ export default function RolesPage() {
       )}
 
       {editing && (
-        <div className="rounded-lg border border-surface-700 bg-surface-900 p-4 space-y-4">
+        <div className="rounded-lg border border-border bg-card p-4 space-y-4">
           <h2 className="text-lg font-semibold">
             {editing === "__new__" ? "Create Role" : `Edit Role: ${editing}`}
           </h2>
 
           <div>
-            <label className="block text-sm font-medium text-surface-400 mb-1">
+            <label className="block text-sm font-medium text-muted-foreground mb-1">
               Role Name
             </label>
             <input
@@ -187,12 +238,12 @@ export default function RolesPage() {
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
               disabled={editing !== "__new__"}
-              className="w-full max-w-xs rounded-lg border border-surface-700 bg-surface-800 px-3 py-1.5 text-sm text-surface-300 disabled:opacity-50"
+              className="w-full max-w-xs rounded-lg border border-border bg-muted px-3 py-1.5 text-sm text-foreground disabled:opacity-50"
             />
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-surface-400 mb-2">
+            <label className="block text-sm font-medium text-muted-foreground mb-2">
               Permissions
             </label>
             {permissions.map((perm, idx) => (
@@ -202,13 +253,13 @@ export default function RolesPage() {
                   value={perm.resource}
                   onChange={(e) => updatePermission(idx, "resource", e.target.value)}
                   placeholder="Resource (e.g. queues, jobs, *)"
-                  className="rounded-lg border border-surface-700 bg-surface-800 px-3 py-1.5 text-sm text-surface-300 w-48"
+                  className="rounded-lg border border-border bg-muted px-3 py-1.5 text-sm text-foreground w-48"
                 />
                 <div className="flex flex-wrap gap-1">
                   {allActions.map((action) => (
                     <label
                       key={action}
-                      className="flex items-center gap-1 rounded bg-surface-800 px-2 py-1 text-xs text-surface-300 cursor-pointer"
+                      className="flex items-center gap-1 rounded bg-muted px-2 py-1 text-xs text-foreground cursor-pointer"
                     >
                       <input
                         type="checkbox"
@@ -237,7 +288,7 @@ export default function RolesPage() {
             ))}
             <button
               onClick={addPermissionRow}
-              className="text-xs text-accent-400 hover:text-accent-300"
+              className="text-xs text-primary hover:text-primary/80"
             >
               + Add permission row
             </button>
@@ -247,13 +298,13 @@ export default function RolesPage() {
             <button
               onClick={handleSave}
               disabled={saveMutation.isPending}
-              className="rounded-lg bg-accent-500 px-4 py-2 text-sm font-medium text-white hover:bg-accent-600 transition-colors disabled:opacity-50"
+              className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
             >
               {saveMutation.isPending ? "Saving..." : "Save"}
             </button>
             <button
               onClick={resetEditor}
-              className="rounded-lg border border-surface-700 px-4 py-2 text-sm font-medium text-surface-300 hover:bg-surface-800 transition-colors"
+              className="rounded-lg border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-muted transition-colors"
             >
               Cancel
             </button>

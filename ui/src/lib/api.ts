@@ -48,56 +48,59 @@ export function del<T>(path: string): Promise<T> {
   return api<T>(path, { method: "DELETE" });
 }
 
-// --- Settings / Org types and functions ---
+// --- Auth API key types and functions ---
 
-export interface Org {
-  id: string;
+export interface AuthKey {
+  key_hash: string;
   name: string;
-  created_at: string;
-}
-
-export interface OrgMember {
-  id: string;
-  name: string;
-  email: string;
+  namespace: string;
   role: string;
+  queue_scope?: string;
+  enabled: boolean;
   created_at: string;
+  last_used_at?: string;
+  expires_at?: string;
 }
 
-export interface ApiKey {
-  id: string;
+export function listAuthKeys(): Promise<AuthKey[]> {
+  return api<AuthKey[]>("/auth/keys");
+}
+
+export function createAuthKey(req: {
   name: string;
-  key?: string; // only present on creation
-  prefix: string;
-  created_at: string;
+  namespace: string;
+  role: string;
+  queue_scope?: string;
+  expires_at?: string;
+}): Promise<{ status: string; api_key: string }> {
+  return post<{ status: string; api_key: string }>("/auth/keys", req);
 }
 
-export function getOrg(): Promise<Org> {
-  return api<Org>("/org");
+export function deleteAuthKey(keyHash: string): Promise<{ status: string }> {
+  return api<{ status: string }>("/auth/keys", {
+    method: "DELETE",
+    body: JSON.stringify({ key_hash: keyHash }),
+  });
 }
 
-export function updateOrg(name: string): Promise<{ status: string }> {
-  return put<{ status: string }>("/org", { name });
+export function listAuthKeyRoles(
+  keyHash: string,
+): Promise<{ roles: string[] }> {
+  return api<{ roles: string[] }>(`/auth/keys/${keyHash}/roles`);
 }
 
-export function listMembers(): Promise<OrgMember[]> {
-  return api<OrgMember[]>("/org/members");
+export function assignAuthKeyRole(
+  keyHash: string,
+  role: string,
+): Promise<{ status: string }> {
+  return post<{ status: string }>(`/auth/keys/${keyHash}/roles`, { role });
 }
 
-export function removeMember(id: string): Promise<{ status: string }> {
-  return del<{ status: string }>(`/org/members/${id}`);
-}
-
-export function listApiKeys(): Promise<ApiKey[]> {
-  return api<ApiKey[]>("/org/api-keys");
-}
-
-export function createApiKey(name: string): Promise<ApiKey> {
-  return post<ApiKey>("/org/api-keys", { name });
-}
-
-export function deleteApiKey(id: string): Promise<{ status: string }> {
-  return del<{ status: string }>(`/org/api-keys/${id}`);
+export function unassignAuthKeyRole(
+  keyHash: string,
+  role: string,
+): Promise<{ status: string }> {
+  return del<{ status: string }>(`/auth/keys/${keyHash}/roles/${role}`);
 }
 
 // --- Audit log types and functions ---

@@ -45,14 +45,14 @@ export default function AuditLogs() {
           placeholder="Filter by principal..."
           value={principal}
           onChange={(e) => setPrincipal(e.target.value)}
-          className="rounded-lg border border-surface-700 bg-surface-900 px-3 py-1.5 text-sm text-surface-300 placeholder:text-surface-500"
+          className="rounded-lg border border-border bg-card px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground"
         />
         <input
           type="text"
           placeholder="Filter by method..."
           value={method}
           onChange={(e) => setMethod(e.target.value)}
-          className="rounded-lg border border-surface-700 bg-surface-900 px-3 py-1.5 text-sm text-surface-300 placeholder:text-surface-500"
+          className="rounded-lg border border-border bg-card px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground"
         />
       </div>
 
@@ -71,33 +71,33 @@ export default function AuditLogs() {
       )}
 
       {logs.length > 0 && (
-        <div className="overflow-x-auto rounded-lg border border-surface-800">
+        <div className="overflow-x-auto rounded-lg border border-border">
           <table className="w-full text-sm">
             <thead>
-              <tr className="border-b border-surface-800 bg-surface-900/50">
-                <th className="px-4 py-2.5 text-left font-medium text-surface-400">Time</th>
-                <th className="px-4 py-2.5 text-left font-medium text-surface-400">Principal</th>
-                <th className="px-4 py-2.5 text-left font-medium text-surface-400">Role</th>
-                <th className="px-4 py-2.5 text-left font-medium text-surface-400">Method</th>
-                <th className="px-4 py-2.5 text-left font-medium text-surface-400">Path</th>
-                <th className="px-4 py-2.5 text-left font-medium text-surface-400">Status</th>
-                <th className="px-4 py-2.5 text-left font-medium text-surface-400">Duration</th>
+              <tr className="border-b border-border bg-muted/50">
+                <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">Time</th>
+                <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">Principal</th>
+                <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">Role</th>
+                <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">Method</th>
+                <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">Path</th>
+                <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">Status</th>
+                <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">Duration</th>
               </tr>
             </thead>
             <tbody>
               {logs.map((log) => (
-                <tr key={log.id} className="border-b border-surface-800/50 hover:bg-surface-900/30">
-                  <td className="px-4 py-2 text-surface-300 whitespace-nowrap">
+                <tr key={log.id} className="border-b border-border/50 hover:bg-muted/30">
+                  <td className="px-4 py-2 text-foreground whitespace-nowrap">
                     {new Date(log.created_at).toLocaleString()}
                   </td>
-                  <td className="px-4 py-2 text-surface-300">{log.principal ?? "—"}</td>
-                  <td className="px-4 py-2 text-surface-300">{log.role ?? "—"}</td>
+                  <td className="px-4 py-2 text-foreground">{log.principal ?? "—"}</td>
+                  <td className="px-4 py-2 text-foreground">{log.role ?? "—"}</td>
                   <td className="px-4 py-2">
-                    <span className="rounded bg-surface-800 px-1.5 py-0.5 text-xs font-mono">
+                    <span className="rounded bg-muted px-1.5 py-0.5 text-xs font-mono">
                       {log.method}
                     </span>
                   </td>
-                  <td className="px-4 py-2 text-surface-300 font-mono text-xs">{log.path}</td>
+                  <td className="px-4 py-2 text-foreground font-mono text-xs">{log.path}</td>
                   <td className="px-4 py-2">
                     <span
                       className={
@@ -111,7 +111,7 @@ export default function AuditLogs() {
                       {log.status_code}
                     </span>
                   </td>
-                  <td className="px-4 py-2 text-surface-400 text-xs">
+                  <td className="px-4 py-2 text-muted-foreground text-xs">
                     {log.metadata?.duration_ms != null
                       ? `${log.metadata.duration_ms}ms`
                       : "—"}
