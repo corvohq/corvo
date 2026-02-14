@@ -1,5 +1,5 @@
 bin/
-corvo
+/corvo
 *.db
 *.db-wal
 *.db-shm

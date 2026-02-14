@@ -36,22 +36,6 @@ var seedDemoCmd = &cobra.Command{
 		}); err != nil {
 			return err
 		}
-		if err := postOK("/api/v1/providers", map[string]any{
-			"name":             "anthropic",
-			"rpm_limit":        4000,
-			"input_tpm_limit":  400000,
-			"output_tpm_limit": 80000,
-		}); err != nil {
-			return err
-		}
-		if err := postOK("/api/v1/providers", map[string]any{
-			"name":            "openai",
-			"rpm_limit":       10000,
-			"input_tpm_limit": 2000000,
-		}); err != nil {
-			return err
-		}
-		_ = postOK("/api/v1/queues/agents.research/provider", map[string]any{"provider": "anthropic"})
 		if err := postOK("/api/v1/budgets", map[string]any{
 			"scope":       "queue",
 			"target":      agentQueue,
@@ -362,28 +346,6 @@ var seedDemoCmd = &cobra.Command{
 				}
 			}
 		}
-		if agentEnq.JobID != "" {
-			if err := waitForJobVisible(agentEnq.JobID, 2*time.Second); err != nil {
-				return err
-			}
-			if err := postOKWithRetry("/api/v1/scores", map[string]any{
-				"job_id":    agentEnq.JobID,
-				"dimension": "relevance",
-				"value":     0.94,
-				"scorer":    "auto:seed",
-			}, 20, 100*time.Millisecond); err != nil {
-				return err
-			}
-			if err := postOKWithRetry("/api/v1/scores", map[string]any{
-				"job_id":    agentEnq.JobID,
-				"dimension": "grounding",
-				"value":     0.89,
-				"scorer":    "auto:seed",
-			}, 20, 100*time.Millisecond); err != nil {
-				return err
-			}
-		}
-
 		// Agent job forced to held by guardrail.
 		var guardrailEnq enqueueResult
 		if err := postDecode("/api/v1/enqueue", map[string]any{
@@ -469,37 +431,6 @@ func postDecode(path string, body any, out any) error {
 	return nil
 }
 
-func postOKWithRetry(path string, body any, attempts int, backoff time.Duration) error {
-	if attempts <= 1 {
-		return postOK(path, body)
-	}
-	var lastErr error
-	for i := 0; i < attempts; i++ {
-		if err := postOK(path, body); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
-		time.Sleep(backoff)
-	}
-	return lastErr
-}
-
-func waitForJobVisible(jobID string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	path := "/api/v1/jobs/" + jobID
-	for time.Now().Before(deadline) {
-		data, status, err := apiRequest("GET", path, nil)
-		if err == nil && status == 200 {
-			return nil
-		}
-		if err == nil && status >= 500 {
-			return fmt.Errorf("GET %s failed (%d): %s", path, status, string(data))
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return fmt.Errorf("job %s not visible in time", jobID)
-}
 
 func fetchOne(queue string) (string, error) {
 	var out struct {
