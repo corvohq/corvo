@@ -312,7 +312,7 @@ func (s *Server) upsertAPIKey(name, key, namespace, role, queueScope, expiresAt 
 		return "", fmt.Errorf("name is required")
 	}
 	if strings.TrimSpace(key) == "" {
-		key = "jk_" + strings.ReplaceAll(strings.ToLower(store.NewJobID()), "job_", "")
+		key = "sk_" + strings.ReplaceAll(strings.ToLower(store.NewJobID()), "job_", "")
 	}
 	if strings.TrimSpace(namespace) == "" {
 		namespace = "default"
