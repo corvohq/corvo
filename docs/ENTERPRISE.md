@@ -320,21 +320,31 @@ Nobody can take the enterprise code and compete commercially. Everyone can read 
 
 ## Cloud architecture
 
-The Cloud offering is a separate concern from the Corvo binary. The binary running inside Cloud is the same enterprise binary. What's separate is the control plane:
+The Cloud offering is a separate concern from the Corvo binary. The binary running inside Cloud is the same binary. What's separate is the control plane:
 
 ```
 Cloud control plane (separate codebase, our infrastructure):
-├── Provisioning    — spin up/down Corvo clusters per customer
-├── Billing         — usage metering, Stripe integration
-├── API gateway     — tenant routing, rate limiting
-├── Backup service  — scheduled snapshots to S3/GCS
-└── Dashboard       — customer-facing management console
++-- Provisioning    — spin up/down Corvo instances per customer
++-- Billing         — usage metering, Stripe integration
++-- Proxy           — tenant routing, API key injection
++-- Console         — customer-facing management dashboard
 
-Corvo binary (same enterprise binary, per-tenant):
-└── corvo server --license-key=cloud_internal_xxx
+Corvo instance (per-tenant, accessed via proxy + API key):
++-- corvo server --data-dir=/data --bind=:8080
 ```
 
-The control plane is a separate codebase with separate services — it's the platform that runs Corvo, not part of Corvo itself. This is where microservices make sense, because provisioning and billing genuinely are different concerns from job processing.
+The control plane is a separate codebase — it's the platform that runs Corvo, not part of Corvo itself.
+
+### How cloud accesses instances
+
+Cloud does NOT inject per-user identity into the instance. Instead:
+
+- **Human access**: Browser -> Cloud Console -> Proxy -> Instance (single admin API key per tenant)
+- **Worker access**: Worker -> Instance directly (sk_ API key created through the console)
+
+Cloud org roles (owner/admin/member) control what the console UI shows. The instance itself sees all proxied requests as the same admin API key. This avoids the complexity of an identity bridge (SAML header injection) while keeping the access model simple.
+
+Enterprise instances will additionally have a license key (set at provisioning time) to unlock enterprise features like namespaces, custom RBAC, and audit logging — all accessed through the same proxy.
 
 ---
 
