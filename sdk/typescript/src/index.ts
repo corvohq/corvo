@@ -60,6 +60,35 @@ export type BulkTask = {
   finished_at?: string;
 };
 
+export type BatchJob = {
+  queue: string;
+  payload: unknown;
+  [key: string]: unknown;
+};
+
+export type BatchConfig = {
+  callback_queue: string;
+  callback_payload?: unknown;
+};
+
+export type BatchResult = {
+  job_ids: string[];
+  batch_id: string;
+};
+
+export type FetchedJob = {
+  job_id: string;
+  queue: string;
+  payload: unknown;
+  attempt: number;
+};
+
+export type HeartbeatResult = {
+  acked: string[];
+  unknown: string[];
+  canceled: string[];
+};
+
 export type AuthOptions = {
   headers?: Record<string, string>;
   bearerToken?: string;
@@ -108,11 +137,60 @@ export class CorvoClient {
     return this.request(`/api/v1/bulk/${encodeURIComponent(id)}`, { method: "GET" });
   }
 
+  async enqueueBatch(jobs: BatchJob[], batch?: BatchConfig): Promise<BatchResult> {
+    return this.request("/api/v1/enqueue/batch", {
+      method: "POST",
+      body: JSON.stringify({ jobs, batch }),
+    });
+  }
+
+  async fetch(queues: string[], workerID: string, hostname = "corvo-worker", timeout = 30): Promise<FetchedJob | null> {
+    const result = await this.request<FetchedJob>("/api/v1/fetch", {
+      method: "POST",
+      body: JSON.stringify({ queues, worker_id: workerID, hostname, timeout }),
+    });
+    if (!result || !(result as FetchedJob).job_id) return null;
+    return result;
+  }
+
   async ack(jobID: string, body: Record<string, unknown> = {}): Promise<{ status: string }> {
     return this.request(`/api/v1/ack/${encodeURIComponent(jobID)}`, {
       method: "POST",
       body: JSON.stringify(body),
     });
+  }
+
+  async fail(jobID: string, error: string, backtrace?: string): Promise<{ status: string }> {
+    return this.request(`/api/v1/fail/${encodeURIComponent(jobID)}`, {
+      method: "POST",
+      body: JSON.stringify({ error, backtrace }),
+    });
+  }
+
+  async heartbeat(jobs: Record<string, Record<string, unknown>>): Promise<HeartbeatResult> {
+    return this.request("/api/v1/heartbeat", {
+      method: "POST",
+      body: JSON.stringify({ jobs }),
+    });
+  }
+
+  async retryJob(id: string): Promise<void> {
+    await this.request(`/api/v1/jobs/${encodeURIComponent(id)}/retry`, { method: "POST" });
+  }
+
+  async cancelJob(id: string): Promise<void> {
+    await this.request(`/api/v1/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+  }
+
+  async moveJob(id: string, targetQueue: string): Promise<void> {
+    await this.request(`/api/v1/jobs/${encodeURIComponent(id)}/move`, {
+      method: "POST",
+      body: JSON.stringify({ queue: targetQueue }),
+    });
+  }
+
+  async deleteJob(id: string): Promise<void> {
+    await this.request(`/api/v1/jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
   }
 
   private async request<T>(path: string, init: RequestInit): Promise<T> {

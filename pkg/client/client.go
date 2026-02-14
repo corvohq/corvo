@@ -140,6 +140,26 @@ func WithAgent(cfg AgentConfig) EnqueueOption {
 	return func(m map[string]interface{}) { m["agent"] = cfg }
 }
 
+// ChainConfig defines a job chain for sequential execution.
+type ChainConfig struct {
+	Steps     []ChainStep `json:"steps"`
+	OnFailure string      `json:"on_failure,omitempty"`
+	OnExit    *ChainStep  `json:"on_exit,omitempty"`
+}
+
+// ChainStep is a single step in a chain.
+type ChainStep struct {
+	Queue   string      `json:"queue"`
+	Payload interface{} `json:"payload"`
+}
+
+func WithChain(steps []ChainStep, onFailure string, onExit *ChainStep) EnqueueOption {
+	return func(m map[string]interface{}) {
+		chain := ChainConfig{Steps: steps, OnFailure: onFailure, OnExit: onExit}
+		m["chain"] = chain
+	}
+}
+
 // EnqueueResult is the response from enqueuing a job.
 type EnqueueResult struct {
 	JobID          string `json:"job_id"`
@@ -284,6 +304,139 @@ func (c *Client) CancelJob(id string) error {
 
 func (c *Client) DeleteJob(id string) error {
 	return c.doRequest("DELETE", "/api/v1/jobs/"+id, nil, nil)
+}
+
+// MoveJob moves a job to a different queue.
+func (c *Client) MoveJob(id, targetQueue string) error {
+	return c.post("/api/v1/jobs/"+id+"/move", map[string]string{"queue": targetQueue}, nil)
+}
+
+// FetchResult is a job returned by long-poll fetch.
+type FetchResult struct {
+	JobID   string          `json:"job_id"`
+	Queue   string          `json:"queue"`
+	Payload json.RawMessage `json:"payload"`
+	Attempt int             `json:"attempt"`
+}
+
+// Fetch long-polls for a job from the given queues.
+func (c *Client) Fetch(ctx context.Context, queues []string, workerID, hostname string, timeout int) (*FetchResult, error) {
+	body := map[string]interface{}{
+		"queues":    queues,
+		"worker_id": workerID,
+		"hostname":  hostname,
+		"timeout":   timeout,
+	}
+	var result FetchResult
+	if err := c.postWithContext(ctx, "/api/v1/fetch", body, &result); err != nil {
+		return nil, err
+	}
+	if result.JobID == "" {
+		return nil, nil
+	}
+	return &result, nil
+}
+
+// AckBody is the request body for acknowledging a job.
+type AckBody struct {
+	Result     interface{} `json:"result,omitempty"`
+	StepStatus string      `json:"step_status,omitempty"`
+}
+
+// Ack acknowledges a job as complete.
+func (c *Client) Ack(jobID string, body AckBody) error {
+	return c.post("/api/v1/ack/"+jobID, body, nil)
+}
+
+// FailResult is the response from failing a job.
+type FailResult struct {
+	Status  string `json:"status"`
+	Attempt int    `json:"attempt"`
+}
+
+// Fail marks a job as failed.
+func (c *Client) Fail(jobID, errMsg, backtrace string) (*FailResult, error) {
+	body := map[string]string{"error": errMsg, "backtrace": backtrace}
+	var result FailResult
+	if err := c.post("/api/v1/fail/"+jobID, body, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// HeartbeatJob is a single job entry in a heartbeat request.
+type HeartbeatJob struct {
+	Progress   *int        `json:"progress,omitempty"`
+	Checkpoint interface{} `json:"checkpoint,omitempty"`
+}
+
+// HeartbeatResult is the response from a heartbeat.
+type HeartbeatResult struct {
+	Acked    []string `json:"acked"`
+	Unknown  []string `json:"unknown"`
+	Canceled []string `json:"canceled"`
+}
+
+// Heartbeat sends a batched heartbeat for active jobs.
+func (c *Client) Heartbeat(jobs map[string]HeartbeatJob) (*HeartbeatResult, error) {
+	body := map[string]interface{}{"jobs": jobs}
+	var result HeartbeatResult
+	if err := c.post("/api/v1/heartbeat", body, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// BulkRequest is the request for a bulk operation.
+type BulkRequest struct {
+	JobIDs      []string      `json:"job_ids,omitempty"`
+	Filter      *SearchFilter `json:"filter,omitempty"`
+	Action      string        `json:"action"`
+	MoveToQueue string        `json:"move_to_queue,omitempty"`
+	Priority    string        `json:"priority,omitempty"`
+	Async       bool          `json:"async,omitempty"`
+}
+
+// BulkResult is the response from a synchronous bulk operation.
+type BulkResult struct {
+	Affected   int    `json:"affected"`
+	Errors     int    `json:"errors"`
+	DurationMs int64  `json:"duration_ms"`
+	BulkOpID   string `json:"bulk_operation_id,omitempty"`
+	Status     string `json:"status,omitempty"`
+}
+
+// Bulk performs a bulk operation on jobs.
+func (c *Client) Bulk(req BulkRequest) (*BulkResult, error) {
+	var result BulkResult
+	if err := c.post("/api/v1/jobs/bulk", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// BulkTask is the status of an async bulk operation.
+type BulkTask struct {
+	ID         string `json:"id"`
+	Status     string `json:"status"`
+	Action     string `json:"action"`
+	Total      int    `json:"total"`
+	Processed  int    `json:"processed"`
+	Affected   int    `json:"affected"`
+	Errors     int    `json:"errors"`
+	Error      string `json:"error,omitempty"`
+	CreatedAt  string `json:"created_at"`
+	UpdatedAt  string `json:"updated_at"`
+	FinishedAt string `json:"finished_at,omitempty"`
+}
+
+// BulkStatus checks the status of an async bulk operation.
+func (c *Client) BulkStatus(id string) (*BulkTask, error) {
+	var result BulkTask
+	if err := c.get("/api/v1/bulk/"+id, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // HTTP helpers

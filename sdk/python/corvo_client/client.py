@@ -65,6 +65,24 @@ class CorvoClient:
     def heartbeat(self, jobs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         return self._request("POST", "/api/v1/heartbeat", {"jobs": jobs})
 
+    def enqueue_batch(self, jobs: list[Dict[str, Any]], batch: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"jobs": jobs}
+        if batch is not None:
+            body["batch"] = batch
+        return self._request("POST", "/api/v1/enqueue/batch", body)
+
+    def retry_job(self, job_id: str) -> Dict[str, Any]:
+        return self._request("POST", f"/api/v1/jobs/{job_id}/retry")
+
+    def cancel_job(self, job_id: str) -> Dict[str, Any]:
+        return self._request("POST", f"/api/v1/jobs/{job_id}/cancel")
+
+    def move_job(self, job_id: str, target_queue: str) -> Dict[str, Any]:
+        return self._request("POST", f"/api/v1/jobs/{job_id}/move", {"queue": target_queue})
+
+    def delete_job(self, job_id: str) -> Dict[str, Any]:
+        return self._request("DELETE", f"/api/v1/jobs/{job_id}")
+
     def _request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = self.base_url + path
         headers = {"Content-Type": "application/json"}
