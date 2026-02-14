@@ -186,15 +186,17 @@ func (f *FSM) applyUnassignAPIKeyRoleOp(op store.UnassignAPIKeyRoleOp) *store.Op
 func (f *FSM) applySetSSOSettingsOp(op store.SetSSOSettingsOp) *store.OpResult {
 	f.syncSQLite(func(db sqlExecer) error {
 		_, err := db.Exec(`
-			INSERT INTO sso_settings (id, provider, oidc_issuer_url, oidc_client_id, saml_enabled, updated_at)
-			VALUES ('singleton', ?, ?, ?, ?, ?)
+			INSERT INTO sso_settings (id, provider, oidc_issuer_url, oidc_client_id, saml_enabled, oidc_group_claim, group_role_mappings, updated_at)
+			VALUES ('singleton', ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				provider = excluded.provider,
 				oidc_issuer_url = excluded.oidc_issuer_url,
 				oidc_client_id = excluded.oidc_client_id,
 				saml_enabled = excluded.saml_enabled,
+				oidc_group_claim = excluded.oidc_group_claim,
+				group_role_mappings = excluded.group_role_mappings,
 				updated_at = excluded.updated_at
-		`, op.Provider, op.OIDCIssuerURL, op.OIDCClientID, op.SAMLEnabled, op.Now)
+		`, op.Provider, op.OIDCIssuerURL, op.OIDCClientID, op.SAMLEnabled, op.OIDCGroupClaim, op.GroupRoleMappings, op.Now)
 		return err
 	})
 	return &store.OpResult{}

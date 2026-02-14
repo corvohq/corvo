@@ -304,11 +304,13 @@ type UnassignAPIKeyRoleOp struct {
 }
 
 type SetSSOSettingsOp struct {
-	Provider      string `json:"provider"`
-	OIDCIssuerURL string `json:"oidc_issuer_url"`
-	OIDCClientID  string `json:"oidc_client_id"`
-	SAMLEnabled   int    `json:"saml_enabled"`
-	Now           string `json:"now"`
+	Provider          string `json:"provider"`
+	OIDCIssuerURL     string `json:"oidc_issuer_url"`
+	OIDCClientID      string `json:"oidc_client_id"`
+	SAMLEnabled       int    `json:"saml_enabled"`
+	OIDCGroupClaim    string `json:"oidc_group_claim"`
+	GroupRoleMappings string `json:"group_role_mappings"`
+	Now               string `json:"now"`
 }
 
 type UpsertAPIKeyOp struct {

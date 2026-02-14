@@ -806,6 +806,8 @@ func ensureMaterializedViewSchema(db *sql.DB) error {
 		{table: "job_iterations", name: "trace", sql: "ALTER TABLE job_iterations ADD COLUMN trace TEXT"},
 		{table: "queues", name: "provider", sql: "ALTER TABLE queues ADD COLUMN provider TEXT REFERENCES providers(name)"},
 		{table: "api_keys", name: "expires_at", sql: "ALTER TABLE api_keys ADD COLUMN expires_at TEXT"},
+		{table: "sso_settings", name: "oidc_group_claim", sql: "ALTER TABLE sso_settings ADD COLUMN oidc_group_claim TEXT NOT NULL DEFAULT 'groups'"},
+		{table: "sso_settings", name: "group_role_mappings", sql: "ALTER TABLE sso_settings ADD COLUMN group_role_mappings TEXT NOT NULL DEFAULT '{}'"},
 	}
 	for _, c := range columns {
 		ok, err := sqliteHasColumn(db, c.table, c.name)
@@ -1212,12 +1214,14 @@ CREATE TABLE IF NOT EXISTS namespaces (
 INSERT OR IGNORE INTO namespaces (name) VALUES ('default');
 
 CREATE TABLE IF NOT EXISTS sso_settings (
-    id              TEXT PRIMARY KEY DEFAULT 'singleton',
-    provider        TEXT NOT NULL DEFAULT '',
-    oidc_issuer_url TEXT NOT NULL DEFAULT '',
-    oidc_client_id  TEXT NOT NULL DEFAULT '',
-    saml_enabled    INTEGER NOT NULL DEFAULT 0,
-    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+    id                  TEXT PRIMARY KEY DEFAULT 'singleton',
+    provider            TEXT NOT NULL DEFAULT '',
+    oidc_issuer_url     TEXT NOT NULL DEFAULT '',
+    oidc_client_id      TEXT NOT NULL DEFAULT '',
+    saml_enabled        INTEGER NOT NULL DEFAULT 0,
+    oidc_group_claim    TEXT NOT NULL DEFAULT 'groups',
+    group_role_mappings TEXT NOT NULL DEFAULT '{}',
+    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
 );
 INSERT OR IGNORE INTO sso_settings (id) VALUES ('singleton');
 

@@ -57,11 +57,32 @@ func (s *Server) resolveOIDCPrincipal(r *http.Request) (authPrincipal, bool) {
 	if p.Namespace == "" {
 		p.Namespace = "default"
 	}
-	if p.Role == "" {
-		p.Role = "readonly"
-	}
+	explicitRole := p.Role != ""
 	if rawRoles, ok := claims["corvo_roles"]; ok {
 		p.Roles = claimsStringSlice(rawRoles)
+	}
+	// Group-to-role mapping: only apply if no explicit corvo_role claim was set
+	if !explicitRole {
+		s.authMu.RLock()
+		groupClaim := s.oidcGroupClaim
+		groupMappings := s.oidcGroupMappings
+		s.authMu.RUnlock()
+		if len(groupMappings) > 0 && groupClaim != "" {
+			if rawGroups, ok := claims[groupClaim]; ok {
+				groups := claimsStringSlice(rawGroups)
+				for _, g := range groups {
+					if role, ok := groupMappings[g]; ok {
+						if p.Role == "" {
+							p.Role = role
+						}
+						p.Roles = append(p.Roles, role)
+					}
+				}
+			}
+		}
+	}
+	if p.Role == "" {
+		p.Role = "readonly"
 	}
 	return p, true
 }

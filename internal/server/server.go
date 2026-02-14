@@ -42,9 +42,11 @@ type Server struct {
 	webhookStop chan struct{}
 	webhookDone chan struct{}
 	license     *enterprise.License
-	authMu      sync.RWMutex
-	oidcAuth    *oidcAuthenticator
-	samlAuth    *samlHeaderAuthenticator
+	authMu            sync.RWMutex
+	oidcAuth          *oidcAuthenticator
+	samlAuth          *samlHeaderAuthenticator
+	oidcGroupClaim    string
+	oidcGroupMappings map[string]string
 	reqMetrics  *requestMetrics
 	rateLimiter   *rateLimiter
 	streamCfg     *rpcconnect.StreamConfig
