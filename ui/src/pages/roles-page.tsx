@@ -100,11 +100,14 @@ export default function RolesPage() {
 
   const allActions = ["*", "read", "write", "delete", "pause", "resume", "drain", "clear", "retry", "cancel", "approve", "reject", "hold"];
 
+  const validPermissions = permissions.filter((p) => p.resource.trim() && p.actions.length > 0);
+  const canSave = newName.trim().length > 0 && validPermissions.length > 0;
+  const missingName = newName.trim().length === 0;
+  const missingPerms = validPermissions.length === 0;
+
   function handleSave() {
-    const name = newName.trim();
-    const filtered = permissions.filter((p) => p.resource.trim() && p.actions.length > 0);
-    if (!name || filtered.length === 0) return;
-    saveMutation.mutate({ name, permissions: filtered });
+    if (!canSave) return;
+    saveMutation.mutate({ name: newName.trim(), permissions: validPermissions });
   }
 
   const builtInRoles = [
@@ -328,11 +331,17 @@ export default function RolesPage() {
             </button>
           </div>
 
-          <div className="flex gap-2">
+          {saveMutation.isError && (
+            <p className="text-sm text-red-400">
+              Failed to save role: {saveMutation.error?.message ?? "unknown error"}
+            </p>
+          )}
+
+          <div className="flex items-center gap-2">
             <button
               onClick={handleSave}
-              disabled={saveMutation.isPending}
-              className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+              disabled={!canSave || saveMutation.isPending}
+              className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {saveMutation.isPending ? "Saving..." : "Save"}
             </button>
@@ -342,6 +351,15 @@ export default function RolesPage() {
             >
               Cancel
             </button>
+            {!canSave && (
+              <span className="text-xs text-muted-foreground">
+                {missingName && missingPerms
+                  ? "Enter a role name and add at least one permission."
+                  : missingName
+                    ? "Enter a role name."
+                    : "Select a resource and at least one action."}
+              </span>
+            )}
           </div>
         </div>
       )}
