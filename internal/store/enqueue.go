@@ -12,7 +12,6 @@ type EnqueueRequest struct {
 	Queue          string          `json:"queue"`
 	Payload        json.RawMessage `json:"payload"`
 	Checkpoint     json.RawMessage `json:"checkpoint,omitempty"`
-	ResultSchema   json.RawMessage `json:"result_schema,omitempty"`
 	Priority       string          `json:"priority"`
 	UniqueKey      string          `json:"unique_key,omitempty"`
 	UniquePeriod   int             `json:"unique_period,omitempty"` // seconds
@@ -29,7 +28,6 @@ type EnqueueRequest struct {
 	ChainStep      *int            `json:"chain_step,omitempty"`
 	ChainConfig    json.RawMessage `json:"chain_config,omitempty"`
 	DependsOn      []string         `json:"depends_on,omitempty"`
-	Routing        *RoutingConfig   `json:"routing,omitempty"`
 	Chain          *ChainDefinition `json:"chain,omitempty"`
 }
 
@@ -42,10 +40,6 @@ type EnqueueResult struct {
 
 // Enqueue inserts a new job into the store via Raft consensus.
 func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
-	if err := validateResultSchemaDoc(req.ResultSchema); err != nil {
-		return nil, err
-	}
-
 	now := time.Now()
 	jobID := NewJobID()
 	priority := PriorityFromString(req.Priority)
@@ -144,12 +138,10 @@ func (s *Store) Enqueue(req EnqueueRequest) (*EnqueueResult, error) {
 		CreatedAt:    now.UTC(),
 		NowNs:        uint64(now.UnixNano()),
 		Agent:        normalizeAgentConfig(req.Agent),
-		ResultSchema: req.ResultSchema,
 		ParentID:     req.ParentID,
 		ChainID:      opChainID,
 		ChainStep:    opChainStep,
 		ChainConfig:  opChainConfig,
-		Routing:      normalizeRoutingConfig(req.Routing),
 	}
 
 	return applyOpResult[EnqueueResult](s, OpEnqueue, op)
@@ -183,9 +175,6 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 
 	jobs := make([]EnqueueOp, len(req.Jobs))
 	for i, jobReq := range req.Jobs {
-		if err := validateResultSchemaDoc(jobReq.ResultSchema); err != nil {
-			return nil, err
-		}
 		priority := PriorityFromString(jobReq.Priority)
 		maxRetries := 3
 		if jobReq.MaxRetries != nil {
@@ -223,12 +212,10 @@ func (s *Store) EnqueueBatch(req BatchEnqueueRequest) (*BatchEnqueueResult, erro
 			CreatedAt:    now.UTC(),
 			NowNs:        uint64(now.UnixNano()),
 			Agent:        normalizeAgentConfig(jobReq.Agent),
-			ResultSchema: jobReq.ResultSchema,
 			ParentID:     jobReq.ParentID,
 			ChainID:      jobReq.ChainID,
 			ChainStep:    jobReq.ChainStep,
 			ChainConfig:  mergeDependsOnChainConfig(jobReq.ChainConfig, jobReq.DependsOn),
-			Routing:      normalizeRoutingConfig(jobReq.Routing),
 		}
 	}
 
@@ -297,38 +284,3 @@ func normalizeAgentConfig(cfg *AgentConfig) *AgentState {
 	return out
 }
 
-func normalizeRoutingConfig(cfg *RoutingConfig) *RoutingConfig {
-	if cfg == nil {
-		return nil
-	}
-	out := &RoutingConfig{
-		Prefer:   strings.TrimSpace(cfg.Prefer),
-		Strategy: strings.TrimSpace(cfg.Strategy),
-	}
-	seen := map[string]struct{}{}
-	add := func(v string) {
-		v = strings.TrimSpace(v)
-		if v == "" {
-			return
-		}
-		if _, ok := seen[v]; ok {
-			return
-		}
-		seen[v] = struct{}{}
-		out.Fallback = append(out.Fallback, v)
-	}
-	for _, v := range cfg.Fallback {
-		add(v)
-	}
-	if out.Prefer == "" && len(out.Fallback) > 0 {
-		out.Prefer = out.Fallback[0]
-		out.Fallback = out.Fallback[1:]
-	}
-	if out.Prefer == "" && len(out.Fallback) == 0 {
-		return nil
-	}
-	if out.Strategy == "" {
-		out.Strategy = "fallback_on_error"
-	}
-	return out
-}

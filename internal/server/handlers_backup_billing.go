@@ -74,7 +74,7 @@ func (s *Server) handleTenantBackup(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		name := visibleQueue(ns, q.Name)
-		out.Queues = append(out.Queues, store.Queue{Name: name, Paused: q.Paused, MaxConcurrency: q.MaxConcurrency, RateLimit: q.RateLimit, RateWindowMs: q.RateWindowMs, Provider: q.Provider, CreatedAt: q.CreatedAt})
+		out.Queues = append(out.Queues, store.Queue{Name: name, Paused: q.Paused, MaxConcurrency: q.MaxConcurrency, RateLimit: q.RateLimit, RateWindowMs: q.RateWindowMs, CreatedAt: q.CreatedAt})
 	}
 
 	writeJSON(w, http.StatusOK, out)

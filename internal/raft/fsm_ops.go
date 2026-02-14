@@ -501,7 +501,6 @@ func (f *FSM) applyFetchOp(op store.FetchOp) *store.OpResult {
 			Tags:          job.Tags,
 			Checkpoint:    job.Checkpoint,
 			Agent:         job.Agent,
-			RoutingTarget: job.RoutingTarget,
 		}
 		return &store.OpResult{Data: result}
 	}
@@ -650,7 +649,6 @@ func (f *FSM) applyFetchBatchOp(op store.FetchBatchOp) *store.OpResult {
 				Tags:          job.Tags,
 				Checkpoint:    job.Checkpoint,
 				Agent:         job.Agent,
-				RoutingTarget: job.RoutingTarget,
 			})
 			if len(results) >= op.Count {
 				break
@@ -1394,26 +1392,12 @@ func (f *FSM) applyFailOp(op store.FailOp) *store.OpResult {
 	if remaining < 0 {
 		remaining = 0
 	}
-	routed := false
-	if op.ProviderError && remaining > 0 && job.Routing != nil {
-		strategy := strings.ToLower(strings.TrimSpace(job.Routing.Strategy))
-		if strategy == "" || strategy == "fallback_on_error" {
-			if target, idx, ok := routingTargetFor(job.Routing, job.RoutingIndex+1); ok {
-				job.RoutingTarget = &target
-				job.RoutingIndex = idx
-				routed = true
-			}
-		}
-	}
 
 	var result store.FailResult
 	var callbackJobID string
 
 	if remaining > 0 {
 		delay := store.CalculateBackoff(job.RetryBackoff, job.Attempt, job.RetryBaseDelay, job.RetryMaxDelay)
-		if routed {
-			delay = 0
-		}
 		nextAttempt := now.Add(delay)
 		retryNs := uint64(nextAttempt.UnixNano())
 
@@ -1678,11 +1662,6 @@ func (f *FSM) applyHeartbeatOp(op store.HeartbeatOp) *store.OpResult {
 		batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
 		// Update active key with new lease
 		batch.Set(kv.ActiveKey(job.Queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
-		if update.StreamDelta != "" {
-			if err := f.appendStreamEvent(batch, jobID, job.Queue, update.StreamDelta, op.NowNs); err != nil {
-				return &store.OpResult{Err: err}
-			}
-		}
 
 		resp.Jobs[jobID] = store.HeartbeatJobResponse{Status: "ok"}
 	}
@@ -1961,74 +1940,6 @@ func (f *FSM) applyDeleteBudgetOp(op store.DeleteBudgetOp) *store.OpResult {
 	}
 	f.syncSQLite(func(db sqlExecer) error {
 		return sqliteDeleteBudget(db, op.Scope, op.Target)
-	})
-	return &store.OpResult{Data: nil}
-}
-
-// --- Provider operations ---
-
-func (f *FSM) applySetProvider(data json.RawMessage) *store.OpResult {
-	var op store.SetProviderOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applySetProviderOp(op)
-}
-
-func (f *FSM) applySetProviderOp(op store.SetProviderOp) *store.OpResult {
-	doc := store.Provider{
-		Name:           op.Name,
-		RPMLimit:       op.RPMLimit,
-		InputTPMLimit:  op.InputTPMLimit,
-		OutputTPMLimit: op.OutputTPMLimit,
-		CreatedAt:      op.CreatedAt,
-	}
-	b, err := json.Marshal(doc)
-	if err != nil {
-		return &store.OpResult{Err: err}
-	}
-	if err := f.pebble.Set(kv.ProviderKey(op.Name), b, f.writeOpts); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	f.syncSQLite(func(db sqlExecer) error {
-		return sqliteUpsertProvider(db, doc)
-	})
-	return &store.OpResult{Data: nil}
-}
-
-func (f *FSM) applyDeleteProvider(data json.RawMessage) *store.OpResult {
-	var op store.DeleteProviderOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyDeleteProviderOp(op)
-}
-
-func (f *FSM) applyDeleteProviderOp(op store.DeleteProviderOp) *store.OpResult {
-	if err := f.pebble.Delete(kv.ProviderKey(op.Name), f.writeOpts); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	f.syncSQLite(func(db sqlExecer) error {
-		return sqliteDeleteProvider(db, op.Name)
-	})
-	return &store.OpResult{Data: nil}
-}
-
-func (f *FSM) applySetQueueProvider(data json.RawMessage) *store.OpResult {
-	var op store.SetQueueProviderOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applySetQueueProviderOp(op)
-}
-
-func (f *FSM) applySetQueueProviderOp(op store.SetQueueProviderOp) *store.OpResult {
-	val := []byte(op.Provider)
-	if err := f.pebble.Set(kv.QueueProviderKey(op.Queue), val, f.writeOpts); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	f.syncSQLite(func(db sqlExecer) error {
-		return sqliteSetQueueProvider(db, op.Queue, op.Provider)
 	})
 	return &store.OpResult{Data: nil}
 }
@@ -2970,21 +2881,12 @@ func (f *FSM) deleteJobsByPrefix(batch *pebble.Batch, prefix []byte) {
 
 // jobToDoc creates a store.Job from an EnqueueOp for Pebble storage.
 func jobToDoc(op store.EnqueueOp) store.Job {
-	var routingTarget *string
-	routingIndex := 0
-	if op.Routing != nil {
-		if t, idx, ok := routingTargetFor(op.Routing, 0); ok {
-			routingTarget = &t
-			routingIndex = idx
-		}
-	}
 	j := store.Job{
 		ID:             op.JobID,
 		Queue:          op.Queue,
 		State:          op.State,
 		Payload:        op.Payload,
 		Checkpoint:     op.Checkpoint,
-		ResultSchema:   op.ResultSchema,
 		Priority:       op.Priority,
 		MaxRetries:     op.MaxRetries,
 		RetryBackoff:   op.Backoff,
@@ -2993,9 +2895,6 @@ func jobToDoc(op store.EnqueueOp) store.Job {
 		CreatedAt:      op.CreatedAt,
 		Tags:           op.Tags,
 		Agent:          op.Agent,
-		Routing:        op.Routing,
-		RoutingTarget:  routingTarget,
-		RoutingIndex:   routingIndex,
 	}
 	if op.UniqueKey != "" {
 		j.UniqueKey = &op.UniqueKey
@@ -3022,27 +2921,6 @@ func jobToDoc(op store.EnqueueOp) store.Job {
 		j.ChainConfig = op.ChainConfig
 	}
 	return j
-}
-
-func routingTargetFor(cfg *store.RoutingConfig, index int) (string, int, bool) {
-	if cfg == nil {
-		return "", 0, false
-	}
-	candidates := make([]string, 0, 1+len(cfg.Fallback))
-	if cfg.Prefer != "" {
-		candidates = append(candidates, cfg.Prefer)
-	}
-	candidates = append(candidates, cfg.Fallback...)
-	if len(candidates) == 0 {
-		return "", 0, false
-	}
-	if index < 0 {
-		index = 0
-	}
-	if index >= len(candidates) {
-		return "", 0, false
-	}
-	return candidates[index], index, true
 }
 
 func marshalStringSlice(ss []string) json.RawMessage {

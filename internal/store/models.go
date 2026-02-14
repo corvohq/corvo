@@ -102,7 +102,6 @@ type Job struct {
 	Progress       json.RawMessage `json:"progress,omitempty"`
 	Checkpoint     json.RawMessage `json:"checkpoint,omitempty"`
 	Result         json.RawMessage `json:"result,omitempty"`
-	ResultSchema   json.RawMessage `json:"result_schema,omitempty"`
 	LeaseExpiresAt *time.Time      `json:"lease_expires_at,omitempty"`
 	ScheduledAt    *time.Time      `json:"scheduled_at,omitempty"`
 	ExpireAt       *time.Time      `json:"expire_at,omitempty"`
@@ -111,9 +110,6 @@ type Job struct {
 	ChainStep      *int            `json:"chain_step,omitempty"`
 	ChainConfig    json.RawMessage `json:"chain_config,omitempty"`
 	ProviderError  bool            `json:"provider_error,omitempty"`
-	Routing        *RoutingConfig  `json:"routing,omitempty"`
-	RoutingTarget  *string         `json:"routing_target,omitempty"`
-	RoutingIndex   int             `json:"routing_index,omitempty"`
 	CreatedAt      time.Time       `json:"created_at"`
 	StartedAt      *time.Time      `json:"started_at,omitempty"`
 	CompletedAt    *time.Time      `json:"completed_at,omitempty"`
@@ -140,7 +136,6 @@ type Queue struct {
 	MaxConcurrency *int      `json:"max_concurrency,omitempty"`
 	RateLimit      *int      `json:"rate_limit,omitempty"`
 	RateWindowMs   *int      `json:"rate_window_ms,omitempty"`
-	Provider       *string   `json:"provider,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 }
 
@@ -211,12 +206,6 @@ type AgentConfig struct {
 	IterationTimeout string  `json:"iteration_timeout,omitempty"`
 }
 
-type RoutingConfig struct {
-	Prefer   string   `json:"prefer,omitempty"`
-	Fallback []string `json:"fallback,omitempty"`
-	Strategy string   `json:"strategy,omitempty"`
-}
-
 type AgentState struct {
 	MaxIterations    int     `json:"max_iterations,omitempty"`
 	MaxCostUSD       float64 `json:"max_cost_usd,omitempty"`
@@ -231,7 +220,6 @@ type JobIteration struct {
 	Iteration           int             `json:"iteration"`
 	Status              string          `json:"status"`
 	Checkpoint          json.RawMessage `json:"checkpoint,omitempty"`
-	Trace               json.RawMessage `json:"trace,omitempty"`
 	HoldReason          *string         `json:"hold_reason,omitempty"`
 	Result              json.RawMessage `json:"result,omitempty"`
 	InputTokens         int64           `json:"input_tokens,omitempty"`

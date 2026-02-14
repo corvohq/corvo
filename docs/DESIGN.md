@@ -2414,12 +2414,8 @@ See `docs/AI.md` for full spec and `docs/PHASE2.md` for delivery plan.
 - [x] Agent loop primitive (iterative jobs with server-enforced guardrails)
 - [x] `job_iterations` table + iteration tracking
 - [x] Agent replay from specific iteration
-- [x] Provider-aware rate limiting (token-based sliding window)
-- [x] Model fallback routing
-- [x] Result schema validation (JSON Schema on ack)
 - [x] Job chains (sequential pipelines with `chain` on enqueue, `step_status` on ack, `on_failure`/`on_exit` handlers)
 - [x] Result caching via unique jobs (covered by existing `unique_key` + `unique_period`)
-- [x] Output scoring + aggregate queries
 - [x] Cost dashboard in UI
 - [x] Held jobs view in UI
 
@@ -2430,7 +2426,6 @@ See `docs/AI.md` for full spec and `docs/PHASE2.md` for delivery plan.
 - [x] OpenTelemetry integration (trace job from enqueue to complete)
 - [x] Rust client library
 - [x] Haskell client library
-- [x] Streaming progress deltas via SSE (for LLM agent output)
 
 ### Phase 6 — Enterprise + Cloud
 

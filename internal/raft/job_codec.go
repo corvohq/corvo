@@ -91,14 +91,8 @@ func encodeJobDoc(job store.Job) ([]byte, error) {
 		Progress:       append([]byte(nil), job.Progress...),
 		Checkpoint:     append([]byte(nil), job.Checkpoint...),
 		Result:         append([]byte(nil), job.Result...),
-		ResultSchema:   append([]byte(nil), job.ResultSchema...),
 		CreatedAtNs:    job.CreatedAt.UnixNano(),
 		ProviderError:  job.ProviderError,
-		RoutingIndex:   int32(job.RoutingIndex),
-	}
-	if job.Routing != nil {
-		b, _ := json.Marshal(job.Routing)
-		p.Routing = b
 	}
 	if job.UniqueKey != nil {
 		p.HasUniqueKey = true
@@ -167,10 +161,6 @@ func encodeJobDoc(job store.Job) ([]byte, error) {
 	if len(job.ChainConfig) > 0 {
 		p.ChainConfig = append([]byte(nil), job.ChainConfig...)
 	}
-	if job.RoutingTarget != nil {
-		p.HasRoutingTarget = true
-		p.RoutingTarget = *job.RoutingTarget
-	}
 	wire, err := oldproto.Marshal(p)
 	if err != nil {
 		return nil, err
@@ -199,16 +189,8 @@ func decodeJobDoc(data []byte, out *store.Job) error {
 			Progress:       append([]byte(nil), p.Progress...),
 			Checkpoint:     append([]byte(nil), p.Checkpoint...),
 			Result:         append([]byte(nil), p.Result...),
-			ResultSchema:   append([]byte(nil), p.ResultSchema...),
 			CreatedAt:      time.Unix(0, p.CreatedAtNs).UTC(),
 			ProviderError:  p.ProviderError,
-			RoutingIndex:   int(p.RoutingIndex),
-		}
-		if len(p.Routing) > 0 {
-			var r store.RoutingConfig
-			if err := json.Unmarshal(p.Routing, &r); err == nil {
-				out.Routing = &r
-			}
 		}
 		if p.HasUniqueKey {
 			v := p.UniqueKey
@@ -277,10 +259,6 @@ func decodeJobDoc(data []byte, out *store.Job) error {
 		}
 		if len(p.ChainConfig) > 0 {
 			out.ChainConfig = append([]byte(nil), p.ChainConfig...)
-		}
-		if p.HasRoutingTarget {
-			v := p.RoutingTarget
-			out.RoutingTarget = &v
 		}
 		return nil
 	}

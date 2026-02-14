@@ -90,7 +90,6 @@ message AckRequest {
   string checkpoint_json = 4;
   string agent_status = 5;
   string hold_reason = 6;
-  string trace_json = 7;
 }
 
 message AckResponse {}
@@ -164,7 +163,6 @@ message HeartbeatJobUpdate {
   string progress_json = 1;
   string checkpoint_json = 2;
   UsageReport usage = 3;
-  string stream_delta = 4;
 }
 
 message HeartbeatRequest {

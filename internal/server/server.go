@@ -181,7 +181,6 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/queues", s.handleListQueues)
 		r.Get("/jobs/{id}", s.handleGetJob)
 		r.Get("/jobs/{id}/iterations", s.handleListJobIterations)
-		r.Get("/jobs/{id}/stream", s.handleJobStreamSSE)
 		r.Post("/jobs/search", s.handleSearch)
 		r.Get("/search/fulltext", s.handleFullTextSearch)
 		r.Get("/workers", s.handleListWorkers)
@@ -192,7 +191,6 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/metrics/throughput", s.handleThroughput)
 		r.Get("/usage/summary", s.handleUsageSummary)
 		r.Get("/budgets", s.handleListBudgets)
-		r.Get("/providers", s.handleListProviders)
 		r.Get("/approval-policies", s.handleListApprovalPolicies)
 		r.Get("/webhooks", s.handleListWebhooks)
 		r.Get("/auth/status", s.handleAuthStatus)
@@ -206,9 +204,6 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/org/members", s.handleListMembers)
 		r.Get("/org/api-keys", s.handleListOrgAPIKeys)
 		r.Get("/billing/summary", s.handleBillingSummary)
-		r.Get("/scores/summary", s.handleScoreSummary)
-		r.Get("/scores/compare", s.handleScoreCompare)
-		r.Get("/jobs/{id}/scores", s.handleListJobScores)
 
 		// Write endpoints (leader only when clustered)
 		r.Group(func(r chi.Router) {
@@ -225,10 +220,6 @@ func (s *Server) buildRouter() chi.Router {
 			r.Post("/heartbeat", s.handleHeartbeat)
 			r.Post("/budgets", s.handleSetBudget)
 			r.Delete("/budgets/{scope}/{target}", s.handleDeleteBudget)
-			r.Post("/providers", s.handleSetProvider)
-			r.Delete("/providers/{name}", s.handleDeleteProvider)
-			r.Post("/queues/{name}/provider", s.handleSetQueueProvider)
-			r.Post("/scores", s.handleAddScore)
 			r.Post("/approval-policies", s.handleSetApprovalPolicy)
 			r.Delete("/approval-policies/{id}", s.handleDeleteApprovalPolicy)
 			r.Post("/webhooks", s.handleSetWebhook)
@@ -422,14 +413,6 @@ func writeStoreError(w http.ResponseWriter, err error, fallbackStatus int, fallb
 	}
 	if store.IsBudgetExceededError(err) {
 		writeError(w, http.StatusTooManyRequests, err.Error(), "BUDGET_EXCEEDED")
-		return
-	}
-	if vErr, ok := store.AsResultSchemaValidationError(err); ok {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
-			"error":             vErr.Message,
-			"code":              "RESULT_SCHEMA_VALIDATION_ERROR",
-			"validation_errors": vErr.Errors,
-		})
 		return
 	}
 	writeError(w, fallbackStatus, err.Error(), fallbackCode)

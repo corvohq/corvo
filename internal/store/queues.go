@@ -63,10 +63,7 @@ func (s *Store) ListQueues() ([]QueueInfo, error) {
 			v := int(rateWindow.Int64)
 			qi.RateWindowMs = &v
 		}
-		if provider.Valid && provider.String != "" {
-			v := provider.String
-			qi.Provider = &v
-		}
+		_ = provider // removed feature, column kept for compat
 		if oldestPending.Valid {
 			if t, err := time.Parse(time.RFC3339Nano, oldestPending.String); err == nil {
 				qi.OldestPendingAt = &t

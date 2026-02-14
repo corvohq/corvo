@@ -475,46 +475,6 @@ func TestFailDead(t *testing.T) {
 	}
 }
 
-func TestFailProviderErrorAdvancesRoutingTarget(t *testing.T) {
-	s := testStore(t)
-
-	maxRetries := 3
-	enqResult, _ := s.Enqueue(store.EnqueueRequest{
-		Queue:      "route.queue",
-		Payload:    json.RawMessage(`{}`),
-		MaxRetries: &maxRetries,
-		Routing: &store.RoutingConfig{
-			Prefer:   "model-a",
-			Fallback: []string{"model-b", "model-c"},
-			Strategy: "fallback_on_error",
-		},
-	})
-	if _, err := s.Fetch(store.FetchRequest{Queues: []string{"route.queue"}, WorkerID: "w", Hostname: "h"}); err != nil {
-		t.Fatalf("Fetch() error: %v", err)
-	}
-
-	result, err := s.Fail(enqResult.JobID, "provider timeout", "", true)
-	if err != nil {
-		t.Fatalf("Fail() error: %v", err)
-	}
-	if result.Status != store.StateRetrying {
-		t.Fatalf("Fail() status = %q, want %q", result.Status, store.StateRetrying)
-	}
-
-	job, err := s.GetJob(enqResult.JobID)
-	if err != nil {
-		t.Fatalf("GetJob: %v", err)
-	}
-	if !job.ProviderError {
-		t.Fatalf("provider_error = false, want true")
-	}
-	if job.RoutingTarget == nil || *job.RoutingTarget != "model-b" {
-		t.Fatalf("routing_target = %v, want model-b", job.RoutingTarget)
-	}
-	if job.RoutingIndex != 1 {
-		t.Fatalf("routing_index = %d, want 1", job.RoutingIndex)
-	}
-}
 
 func TestHeartbeatExtendsLease(t *testing.T) {
 	s := testStore(t)

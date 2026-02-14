@@ -120,12 +120,6 @@ func (f *FSM) applyByType(opType store.OpType, data json.RawMessage) *store.OpRe
 		return f.applySetBudget(data)
 	case store.OpDeleteBudget:
 		return f.applyDeleteBudget(data)
-	case store.OpSetProvider:
-		return f.applySetProvider(data)
-	case store.OpDeleteProvider:
-		return f.applyDeleteProvider(data)
-	case store.OpSetQueueProvider:
-		return f.applySetQueueProvider(data)
 	case store.OpCreateNamespace:
 		return f.applyCreateNamespace(data)
 	case store.OpDeleteNamespace:
@@ -296,21 +290,6 @@ func (f *FSM) applyDecoded(op *store.DecodedRaftOp) *store.OpResult {
 			return f.applyDeleteBudgetOp(*op.DeleteBudget)
 		}
 		return &store.OpResult{Err: fmt.Errorf("delete budget op missing payload")}
-	case store.OpSetProvider:
-		if op.SetProvider != nil {
-			return f.applySetProviderOp(*op.SetProvider)
-		}
-		return &store.OpResult{Err: fmt.Errorf("set provider op missing payload")}
-	case store.OpDeleteProvider:
-		if op.DeleteProvider != nil {
-			return f.applyDeleteProviderOp(*op.DeleteProvider)
-		}
-		return &store.OpResult{Err: fmt.Errorf("delete provider op missing payload")}
-	case store.OpSetQueueProvider:
-		if op.SetQueueProvider != nil {
-			return f.applySetQueueProviderOp(*op.SetQueueProvider)
-		}
-		return &store.OpResult{Err: fmt.Errorf("set queue provider op missing payload")}
 	case store.OpCreateNamespace:
 		if op.CreateNamespace != nil {
 			return f.applyCreateNamespaceOp(*op.CreateNamespace)

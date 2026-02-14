@@ -220,7 +220,6 @@ func (s *Server) Ack(ctx context.Context, req *connect.Request[corvov1.AckReques
 		JobID:       req.Msg.GetJobId(),
 		Result:      json.RawMessage(resultJSON),
 		Checkpoint:  json.RawMessage(strings.TrimSpace(req.Msg.GetCheckpointJson())),
-		Trace:       json.RawMessage(strings.TrimSpace(req.Msg.GetTraceJson())),
 		Usage:       usageFromPB(req.Msg.GetUsage()),
 		AgentStatus: req.Msg.GetAgentStatus(),
 		HoldReason:  req.Msg.GetHoldReason(),
@@ -514,7 +513,6 @@ func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[corvov1.Hea
 			}
 			jobUpdate.Checkpoint = m
 		}
-		jobUpdate.StreamDelta = update.GetStreamDelta()
 		jobUpdate.Usage = usageFromPB(update.GetUsage())
 		hbReq.Jobs[jobID] = jobUpdate
 	}

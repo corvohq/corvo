@@ -40,9 +40,6 @@ type DecodedRaftOp struct {
 	CleanRate    *CleanRateLimitOp
 	SetBudget    *SetBudgetOp
 	DeleteBudget *DeleteBudgetOp
-	SetProvider      *SetProviderOp
-	DeleteProvider   *DeleteProviderOp
-	SetQueueProvider *SetQueueProviderOp
 	CreateNamespace     *CreateNamespaceOp
 	DeleteNamespace     *DeleteNamespaceOp
 	SetAuthRole         *SetAuthRoleOp
@@ -626,24 +623,6 @@ func buildPBOp(opType OpType, data any) (*pbOp, error) {
 			return nil, fmt.Errorf("delete budget op type mismatch: %T", data)
 		}
 		op.DeleteBudget = toPBDeleteBudget(v)
-	case OpSetProvider:
-		v, ok := data.(SetProviderOp)
-		if !ok {
-			return nil, fmt.Errorf("set provider op type mismatch: %T", data)
-		}
-		op.SetProvider = toPBSetProvider(v)
-	case OpDeleteProvider:
-		v, ok := data.(DeleteProviderOp)
-		if !ok {
-			return nil, fmt.Errorf("delete provider op type mismatch: %T", data)
-		}
-		op.DeleteProvider = toPBDeleteProvider(v)
-	case OpSetQueueProvider:
-		v, ok := data.(SetQueueProviderOp)
-		if !ok {
-			return nil, fmt.Errorf("set queue provider op type mismatch: %T", data)
-		}
-		op.SetQueueProvider = toPBSetQueueProvider(v)
 	case OpCreateNamespace:
 		v, ok := data.(CreateNamespaceOp)
 		if !ok {
@@ -907,24 +886,6 @@ func buildPBSubOp(sub Op) (*pbOp, error) {
 			return nil, err
 		}
 		op.DeleteBudget = toPBDeleteBudget(v)
-	case OpSetProvider:
-		var v SetProviderOp
-		if err := json.Unmarshal(sub.Data, &v); err != nil {
-			return nil, err
-		}
-		op.SetProvider = toPBSetProvider(v)
-	case OpDeleteProvider:
-		var v DeleteProviderOp
-		if err := json.Unmarshal(sub.Data, &v); err != nil {
-			return nil, err
-		}
-		op.DeleteProvider = toPBDeleteProvider(v)
-	case OpSetQueueProvider:
-		var v SetQueueProviderOp
-		if err := json.Unmarshal(sub.Data, &v); err != nil {
-			return nil, err
-		}
-		op.SetQueueProvider = toPBSetQueueProvider(v)
 	case OpCreateNamespace:
 		var v CreateNamespaceOp
 		if err := json.Unmarshal(sub.Data, &v); err != nil {
@@ -1158,21 +1119,6 @@ func fromPBOp(op *pbOp) (*DecodedRaftOp, error) {
 		out.DeleteBudget = &v
 		return out, nil
 	}
-	if op.SetProvider != nil {
-		v := fromPBSetProvider(op.SetProvider)
-		out.SetProvider = &v
-		return out, nil
-	}
-	if op.DeleteProvider != nil {
-		v := fromPBDeleteProvider(op.DeleteProvider)
-		out.DeleteProvider = &v
-		return out, nil
-	}
-	if op.SetQueueProvider != nil {
-		v := fromPBSetQueueProvider(op.SetQueueProvider)
-		out.SetQueueProvider = &v
-		return out, nil
-	}
 	if op.CreateNamespace != nil {
 		v := fromPBCreateNamespace(op.CreateNamespace)
 		out.CreateNamespace = &v
@@ -1264,14 +1210,9 @@ func toPBEnqueue(op EnqueueOp) *pbEnqueueOp {
 		NowNs:        op.NowNs,
 		BatchID:      op.BatchID,
 		Checkpoint:   append([]byte(nil), op.Checkpoint...),
-		ResultSchema: append([]byte(nil), op.ResultSchema...),
 		ParentID:     op.ParentID,
 		ChainID:      op.ChainID,
 		ChainConfig:  append([]byte(nil), op.ChainConfig...),
-	}
-	if op.Routing != nil {
-		b, _ := json.Marshal(op.Routing)
-		p.Routing = b
 	}
 	if op.ChainStep != nil {
 		p.HasChainStep = true
@@ -1314,16 +1255,9 @@ func fromPBEnqueue(op *pbEnqueueOp) EnqueueOp {
 		NowNs:        op.NowNs,
 		BatchID:      op.BatchID,
 		Checkpoint:   append([]byte(nil), op.Checkpoint...),
-		ResultSchema: append([]byte(nil), op.ResultSchema...),
 		ParentID:     op.ParentID,
 		ChainID:      op.ChainID,
 		ChainConfig:  append([]byte(nil), op.ChainConfig...),
-	}
-	if len(op.Routing) > 0 {
-		var r RoutingConfig
-		if err := json.Unmarshal(op.Routing, &r); err == nil {
-			out.Routing = &r
-		}
 	}
 	if op.HasChainStep {
 		v := int(op.ChainStep)
@@ -1438,7 +1372,6 @@ func toPBAck(op AckOp) *pbAckOp {
 		Checkpoint:  append([]byte(nil), op.Checkpoint...),
 		AgentStatus: op.AgentStatus,
 		HoldReason:  op.HoldReason,
-		Trace:       append([]byte(nil), op.Trace...),
 		StepStatus:  op.StepStatus,
 		ExitReason:  op.ExitReason,
 	}
@@ -1453,7 +1386,6 @@ func fromPBAck(op *pbAckOp) AckOp {
 		Checkpoint:  append([]byte(nil), op.Checkpoint...),
 		AgentStatus: op.AgentStatus,
 		HoldReason:  op.HoldReason,
-		Trace:       append([]byte(nil), op.Trace...),
 		StepStatus:  op.StepStatus,
 		ExitReason:  op.ExitReason,
 	}
@@ -1508,7 +1440,6 @@ func toPBHeartbeat(op HeartbeatOp) *pbHeartbeatOp {
 			item.HasCP = true
 		}
 		item.Usage = toPBUsage(j.Usage)
-		item.StreamDelta = j.StreamDelta
 		out.Jobs = append(out.Jobs, item)
 	}
 	return out
@@ -1525,7 +1456,6 @@ func fromPBHeartbeat(op *pbHeartbeatOp) HeartbeatOp {
 			j.Checkpoint = append([]byte(nil), item.Checkpoint...)
 		}
 		j.Usage = fromPBUsage(item.Usage)
-		j.StreamDelta = item.StreamDelta
 		out.Jobs[item.JobID] = j
 	}
 	return out
@@ -1751,62 +1681,6 @@ func fromPBDeleteBudget(op *pbDeleteBudgetOp) DeleteBudgetOp {
 		Scope:  op.Scope,
 		Target: op.Target,
 	}
-}
-
-func toPBSetProvider(op SetProviderOp) *pbSetProviderOp {
-	out := &pbSetProviderOp{
-		Name:      op.Name,
-		CreatedAt: op.CreatedAt,
-	}
-	if op.RPMLimit != nil {
-		out.HasRPMLimit = true
-		out.RPMLimit = int32(*op.RPMLimit)
-	}
-	if op.InputTPMLimit != nil {
-		out.HasInputTPM = true
-		out.InputTPMLimit = int32(*op.InputTPMLimit)
-	}
-	if op.OutputTPMLimit != nil {
-		out.HasOutputTPM = true
-		out.OutputTPMLimit = int32(*op.OutputTPMLimit)
-	}
-	return out
-}
-
-func fromPBSetProvider(op *pbSetProviderOp) SetProviderOp {
-	out := SetProviderOp{
-		Name:      op.Name,
-		CreatedAt: op.CreatedAt,
-	}
-	if op.HasRPMLimit {
-		v := int(op.RPMLimit)
-		out.RPMLimit = &v
-	}
-	if op.HasInputTPM {
-		v := int(op.InputTPMLimit)
-		out.InputTPMLimit = &v
-	}
-	if op.HasOutputTPM {
-		v := int(op.OutputTPMLimit)
-		out.OutputTPMLimit = &v
-	}
-	return out
-}
-
-func toPBDeleteProvider(op DeleteProviderOp) *pbDeleteProviderOp {
-	return &pbDeleteProviderOp{Name: op.Name}
-}
-
-func fromPBDeleteProvider(op *pbDeleteProviderOp) DeleteProviderOp {
-	return DeleteProviderOp{Name: op.Name}
-}
-
-func toPBSetQueueProvider(op SetQueueProviderOp) *pbSetQueueProviderOp {
-	return &pbSetQueueProviderOp{Queue: op.Queue, Provider: op.Provider}
-}
-
-func fromPBSetQueueProvider(op *pbSetQueueProviderOp) SetQueueProviderOp {
-	return SetQueueProviderOp{Queue: op.Queue, Provider: op.Provider}
 }
 
 // Enterprise pb struct types.

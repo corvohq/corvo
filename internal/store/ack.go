@@ -11,7 +11,6 @@ type AckRequest struct {
 	JobID       string
 	Result      json.RawMessage
 	Checkpoint  json.RawMessage
-	Trace       json.RawMessage
 	Usage       *UsageReport
 	AgentStatus string
 	HoldReason  string
@@ -30,10 +29,6 @@ func (s *Store) AckWithUsage(jobID string, result json.RawMessage, usage *UsageR
 }
 
 func (s *Store) AckJob(req AckRequest) error {
-	if err := s.validateAckResultSchema(req.JobID, req.Result); err != nil {
-		return err
-	}
-
 	normUsage := normalizeUsage(req.Usage)
 	if normUsage != nil {
 		exceeded, action, err := s.evaluatePerJobBudget(req.JobID, normUsage.CostUSD)
@@ -57,7 +52,7 @@ func (s *Store) AckJob(req AckRequest) error {
 			// Only evaluate approval policies if the job is visible in the
 			// read replica. Under raft read-lag, skip policy evaluation and
 			// let the ack proceed — the FSM will apply it correctly.
-			reason, matched, pErr := s.evaluateApprovalPolicyHold(job, req.Trace)
+			reason, matched, pErr := s.evaluateApprovalPolicyHold(job)
 			if pErr == nil && matched {
 				status = AgentStatusHold
 				if strings.TrimSpace(req.HoldReason) == "" {
@@ -79,7 +74,6 @@ func (s *Store) AckJob(req AckRequest) error {
 		JobID:       req.JobID,
 		Result:      req.Result,
 		Checkpoint:  req.Checkpoint,
-		Trace:       req.Trace,
 		Usage:       normUsage,
 		AgentStatus: status,
 		HoldReason:  strings.TrimSpace(req.HoldReason),

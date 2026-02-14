@@ -112,7 +112,6 @@ type EnqueueOp struct {
 	State        string          `json:"state"`
 	Payload      json.RawMessage `json:"payload"`
 	Checkpoint   json.RawMessage `json:"checkpoint,omitempty"`
-	ResultSchema json.RawMessage `json:"result_schema,omitempty"`
 	Priority     int             `json:"priority"`
 	MaxRetries   int             `json:"max_retries"`
 	Backoff      string          `json:"backoff"`
@@ -131,7 +130,6 @@ type EnqueueOp struct {
 	ChainID      string          `json:"chain_id,omitempty"`
 	ChainStep    *int            `json:"chain_step,omitempty"`
 	ChainConfig  json.RawMessage `json:"chain_config,omitempty"`
-	Routing      *RoutingConfig  `json:"routing,omitempty"`
 }
 
 type EnqueueBatchOp struct {
@@ -168,7 +166,6 @@ type AckOp struct {
 	JobID       string          `json:"job_id"`
 	Result      json.RawMessage `json:"result,omitempty"`
 	Checkpoint  json.RawMessage `json:"checkpoint,omitempty"`
-	Trace       json.RawMessage `json:"trace,omitempty"`
 	Usage       *UsageReport    `json:"usage,omitempty"`
 	AgentStatus string          `json:"agent_status,omitempty"`
 	HoldReason  string          `json:"hold_reason,omitempty"`
@@ -198,7 +195,6 @@ type HeartbeatOp struct {
 type HeartbeatJobOp struct {
 	Progress    json.RawMessage `json:"progress,omitempty"`
 	Checkpoint  json.RawMessage `json:"checkpoint,omitempty"`
-	StreamDelta string          `json:"stream_delta,omitempty"`
 	Usage       *UsageReport    `json:"usage,omitempty"`
 }
 
@@ -274,23 +270,6 @@ type SetBudgetOp struct {
 type DeleteBudgetOp struct {
 	Scope  string `json:"scope"`
 	Target string `json:"target"`
-}
-
-type SetProviderOp struct {
-	Name           string `json:"name"`
-	RPMLimit       *int   `json:"rpm_limit,omitempty"`
-	InputTPMLimit  *int   `json:"input_tpm_limit,omitempty"`
-	OutputTPMLimit *int   `json:"output_tpm_limit,omitempty"`
-	CreatedAt      string `json:"created_at"`
-}
-
-type DeleteProviderOp struct {
-	Name string `json:"name"`
-}
-
-type SetQueueProviderOp struct {
-	Queue    string `json:"queue"`
-	Provider string `json:"provider"`
 }
 
 // Enterprise Op structs (SQLite-only config/metadata).

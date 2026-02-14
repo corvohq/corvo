@@ -28,7 +28,6 @@ type FetchResult struct {
 	Checkpoint    json.RawMessage `json:"checkpoint,omitempty"`
 	Tags          json.RawMessage `json:"tags,omitempty"`
 	Agent         *AgentState     `json:"agent,omitempty"`
-	RoutingTarget *string         `json:"routing_target,omitempty"`
 }
 
 // Fetch claims the highest-priority pending job from the given queues via Raft.
@@ -38,10 +37,6 @@ func (s *Store) Fetch(req FetchRequest) (*FetchResult, error) {
 		return nil, fmt.Errorf("at least one queue is required")
 	}
 	allowedQueues, err := s.enforceFetchBudgets(req.Queues)
-	if err != nil {
-		return nil, err
-	}
-	allowedQueues, err = s.enforceFetchProviders(allowedQueues)
 	if err != nil {
 		return nil, err
 	}
@@ -77,10 +72,6 @@ func (s *Store) FetchBatch(req FetchRequest, count int) ([]FetchResult, error) {
 	}
 
 	allowedQueues, err := s.enforceFetchBudgets(req.Queues)
-	if err != nil {
-		return nil, err
-	}
-	allowedQueues, err = s.enforceFetchProviders(allowedQueues)
 	if err != nil {
 		return nil, err
 	}

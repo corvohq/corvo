@@ -64,7 +64,7 @@ func TestMigrationCreatesAllTables(t *testing.T) {
 		"jobs", "job_errors", "unique_locks", "batches",
 		"queues", "rate_limit_window", "schedules",
 		"workers", "events", "queue_stats", "schema_migrations", "job_usage", "budgets", "job_iterations",
-		"job_scores", "providers", "provider_usage_window", "approval_policies",
+		"approval_policies",
 	}
 
 	for _, table := range expectedTables {
@@ -150,11 +150,6 @@ func TestMigrationCreatesIndexes(t *testing.T) {
 		"idx_job_iterations_job",
 		"idx_jobs_parent",
 		"idx_jobs_chain",
-		"idx_jobs_provider_error",
-		"idx_job_scores_job",
-		"idx_job_scores_dimension",
-		"idx_provider_usage",
-		"idx_jobs_routing_target",
 		"idx_approval_policies_enabled",
 	}
 

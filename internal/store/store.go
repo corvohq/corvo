@@ -17,9 +17,8 @@ import (
 type Store struct {
 	applier Applier
 	sqliteR *sql.DB // read-only SQLite connection (materialized view)
-	// Tri-state flags: -1 unknown, 0 none configured, 1 configured.
+	// Tri-state flag: -1 unknown, 0 none configured, 1 configured.
 	budgetConfigState   atomic.Int32
-	providerConfigState atomic.Int32
 }
 
 // NewStore creates a new Store backed by a Raft cluster.
@@ -29,7 +28,6 @@ func NewStore(applier Applier, sqliteR *sql.DB) *Store {
 		sqliteR: sqliteR,
 	}
 	s.budgetConfigState.Store(-1)
-	s.providerConfigState.Store(-1)
 	return s
 }
 

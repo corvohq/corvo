@@ -579,101 +579,6 @@ func TestFailEndpointProviderError(t *testing.T) {
 	}
 }
 
-func TestAckResultSchemaValidation(t *testing.T) {
-	srv, _ := testServer(t)
-	rr := doRequest(srv, "POST", "/api/v1/enqueue", map[string]interface{}{
-		"queue": "schema.q",
-		"payload": map[string]interface{}{
-			"task": "extract",
-		},
-		"result_schema": map[string]interface{}{
-			"type":     "object",
-			"required": []string{"vendor"},
-			"properties": map[string]interface{}{
-				"vendor": map[string]interface{}{"type": "string"},
-			},
-		},
-	})
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("enqueue status = %d, body: %s", rr.Code, rr.Body.String())
-	}
-	var enq store.EnqueueResult
-	decodeResponse(t, rr, &enq)
-
-	rr = doRequest(srv, "POST", "/api/v1/fetch", map[string]interface{}{
-		"queues":    []string{"schema.q"},
-		"worker_id": "w1",
-		"hostname":  "h1",
-		"timeout":   1,
-	})
-	if rr.Code != http.StatusOK {
-		t.Fatalf("fetch status = %d, body: %s", rr.Code, rr.Body.String())
-	}
-
-	rr = doRequest(srv, "POST", "/api/v1/ack/"+enq.JobID, map[string]interface{}{
-		"result": map[string]interface{}{},
-	})
-	if rr.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("ack status = %d, want %d, body: %s", rr.Code, http.StatusUnprocessableEntity, rr.Body.String())
-	}
-}
-
-func TestProvidersAndScoresEndpoints(t *testing.T) {
-	srv, _ := testServer(t)
-
-	rr := doRequest(srv, "POST", "/api/v1/providers", map[string]interface{}{
-		"name":             "anthropic",
-		"rpm_limit":        4000,
-		"input_tpm_limit":  400000,
-		"output_tpm_limit": 80000,
-	})
-	if rr.Code != http.StatusOK {
-		t.Fatalf("set provider status = %d, body: %s", rr.Code, rr.Body.String())
-	}
-	rr = doRequest(srv, "GET", "/api/v1/providers", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("list providers status = %d, body: %s", rr.Code, rr.Body.String())
-	}
-
-	rr = doRequest(srv, "POST", "/api/v1/queues/score.q/provider", map[string]interface{}{
-		"provider": "anthropic",
-	})
-	if rr.Code != http.StatusOK {
-		t.Fatalf("set queue provider status = %d, body: %s", rr.Code, rr.Body.String())
-	}
-
-	rr = doRequest(srv, "POST", "/api/v1/enqueue", map[string]interface{}{
-		"queue":   "score.q",
-		"payload": map[string]string{"k": "v"},
-	})
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("enqueue status = %d, body: %s", rr.Code, rr.Body.String())
-	}
-	var enq store.EnqueueResult
-	decodeResponse(t, rr, &enq)
-
-	rr = doRequest(srv, "POST", "/api/v1/scores", map[string]interface{}{
-		"job_id":    enq.JobID,
-		"dimension": "accuracy",
-		"value":     0.91,
-		"scorer":    "auto:test",
-	})
-	if rr.Code != http.StatusOK {
-		t.Fatalf("add score status = %d, body: %s", rr.Code, rr.Body.String())
-	}
-	rr = doRequest(srv, "GET", "/api/v1/jobs/"+enq.JobID+"/scores", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("job scores status = %d, body: %s", rr.Code, rr.Body.String())
-	}
-	rr = doRequest(srv, "GET", "/api/v1/scores/summary?queue=score.q&period=24h", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("score summary status = %d, body: %s", rr.Code, rr.Body.String())
-	}
-	rr = doRequest(srv, "GET", "/api/v1/scores/compare?queue=score.q&period=24h&group_by=queue", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("score compare status = %d, body: %s", rr.Code, rr.Body.String())
-	}
-}
 
 func TestQueueEndpoints(t *testing.T) {
 	srv, _ := testServer(t)
@@ -910,9 +815,6 @@ func TestJobIterationsEndpoint(t *testing.T) {
 	}
 	if out.Iterations[0].Status != "continue" {
 		t.Fatalf("iteration 1 status = %s, want continue", out.Iterations[0].Status)
-	}
-	if string(out.Iterations[0].Trace) == "" {
-		t.Fatalf("iteration 1 trace should be present")
 	}
 	if out.Iterations[1].Status != "done" {
 		t.Fatalf("iteration 2 status = %s, want done", out.Iterations[1].Status)
@@ -1231,10 +1133,9 @@ func TestApprovalPolicyEndpointsAndAutoHold(t *testing.T) {
 	srv, _ := testServer(t)
 
 	rr := doRequest(srv, "POST", "/api/v1/approval-policies", map[string]any{
-		"name":            "hold-risky-action",
-		"mode":            "all",
-		"queue":           "apol.q",
-		"trace_action_in": []string{"send_email"},
+		"name":  "hold-risky-action",
+		"mode":  "all",
+		"queue": "apol.q",
 	})
 	if rr.Code != http.StatusOK {
 		t.Fatalf("set policy status = %d, body: %s", rr.Code, rr.Body.String())
@@ -1268,9 +1169,6 @@ func TestApprovalPolicyEndpointsAndAutoHold(t *testing.T) {
 	decodeResponse(t, rr, &f)
 	rr = doRequest(srv, "POST", "/api/v1/ack/"+f.JobID, map[string]any{
 		"agent_status": "continue",
-		"trace": map[string]any{
-			"action": "send_email",
-		},
 	})
 	if rr.Code != http.StatusOK {
 		t.Fatalf("ack status = %d, body: %s", rr.Code, rr.Body.String())

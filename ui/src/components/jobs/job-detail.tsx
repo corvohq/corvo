@@ -29,10 +29,7 @@ import { MoveDialog } from "@/components/dialogs/move-dialog";
 import { EnqueueDialog } from "@/components/dialogs/enqueue-dialog";
 import { useJobIterations } from "@/hooks/use-job-iterations";
 import { useSearch } from "@/hooks/use-search";
-import { useJobStream } from "@/hooks/use-job-stream";
 import { IterationTable } from "@/components/ai/iteration-table";
-import { ScoreSummary } from "@/components/ai/score-summary";
-import { StreamOutput } from "@/components/ai/stream-output";
 
 export function JobDetail({ job }: { job: Job }) {
   const retryJob = useRetryJob();
@@ -63,23 +60,6 @@ export function JobDetail({ job }: { job: Job }) {
   );
 
   const retryLabel = job.state === "scheduled" ? "Run Now" : "Retry";
-  const resultObj =
-    job.result && typeof job.result === "object" && !Array.isArray(job.result)
-      ? (job.result as Record<string, unknown>)
-      : {};
-  const scores =
-    resultObj.scores && typeof resultObj.scores === "object" && !Array.isArray(resultObj.scores)
-      ? (resultObj.scores as Record<string, number>)
-      : {};
-  const outputText =
-    typeof resultObj.output === "string"
-      ? resultObj.output
-      : typeof resultObj.text === "string"
-        ? resultObj.text
-        : typeof resultObj.summary === "string"
-          ? resultObj.summary
-          : "";
-  const stream = useJobStream(job.id, outputText);
   const isAgentJob = !!job.agent;
 
   return (
@@ -284,28 +264,6 @@ export function JobDetail({ job }: { job: Job }) {
           )}
         </CardContent>
       </Card>
-
-      {Object.keys(scores).length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">Scores</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <ScoreSummary scores={scores} />
-          </CardContent>
-        </Card>
-      )}
-
-      {(stream.content || outputText) && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">Output</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <StreamOutput content={stream.content} isStreaming={stream.isStreaming} />
-          </CardContent>
-        </Card>
-      )}
 
       {isAgentJob && (
         <Card>

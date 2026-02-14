@@ -26,26 +26,21 @@ Out of scope:
 - Status: implemented baseline.
 - Next: expand predicates (cost range, payload field matches, tag patterns, queue patterns), add dry-run mode, add policy hit diagnostics endpoint.
 
-2. Trace UI improvements
-- Status: trace storage implemented (migration 007). Agent job detail UI with iteration history not yet built.
-- Next: agent job detail view with iteration history, expandable traces, iteration-to-iteration diff, and tool/action timeline.
+2. Agent job detail UI
+- Status: agent iteration tracking implemented. Agent job detail UI with iteration history not yet built.
+- Next: agent job detail view with iteration history, iteration-to-iteration diff, and tool/action timeline.
 
-3. Exact-match caching at enqueue
-- Status: usage has cache token metrics; enqueue cache-hit behavior not implemented.
-- Next: add payload-hash cache key lookup on enqueue, short-circuit completed response on hit, TTL-aware invalidation.
-
-4. Budget warning signal in heartbeat
+3. Budget warning signal in heartbeat
 - Status: implemented (`budget_exceeded` in heartbeat response).
 - Next: document in API/CLI help and surface clearly in worker examples.
 
-5. Better usage tag querying
+4. Better usage tag querying
 - Status: queue/model grouping exists.
 - Next: add `group_by=tag:<key>` support to usage summary with tests and docs.
 
 ## Implementation Order
 
-1. Trace UI improvements
-2. Exact-match caching at enqueue
-3. Usage `group_by=tag:<key>`
-4. Approval policy predicate expansion and diagnostics
-5. Budget warning docs/examples polish
+1. Agent job detail UI
+2. Usage `group_by=tag:<key>`
+3. Approval policy predicate expansion and diagnostics
+4. Budget warning docs/examples polish

@@ -117,6 +117,10 @@ Files: `internal/store/*`, `internal/server/*`, `pkg/client/*`, UI files
 - [x] Replay baseline:
   - replay from iteration endpoint + CLI
 
+Removed (out of scope):
+- ~~Agent trace storage (optional `trace` field on ack)~~
+- ~~Streaming progress deltas via SSE~~
+
 Exit criteria:
 - One iterative agent workload can run safely with enforced server guardrails
 

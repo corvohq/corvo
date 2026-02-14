@@ -10,10 +10,10 @@ import (
 // GetJob returns a job with its error history from local SQLite.
 func (s *Store) GetJob(id string) (*Job, error) {
 	var j Job
-	var payload, tags, progress, checkpoint, result, resultSchema, chainConfig, routing, routingTarget sql.NullString
+	var payload, tags, progress, checkpoint, result, resultSchema, chainConfig, routing, routingTarget sql.NullString // resultSchema/routing/routingTarget kept for SQL compat
 	var agentIterTimeout, holdReason sql.NullString
 	var uniqueKey, batchID, workerID, hostname, parentID, chainID sql.NullString
-	var chainStep, routingIndex sql.NullInt64
+	var chainStep, routingIndex sql.NullInt64 // routingIndex kept for SQL compat
 	var providerError int
 	var agentMaxIterations sql.NullInt64
 	var agentIteration sql.NullInt64
@@ -70,9 +70,7 @@ func (s *Store) GetJob(id string) (*Job, error) {
 	if result.Valid {
 		j.Result = json.RawMessage(result.String)
 	}
-	if resultSchema.Valid {
-		j.ResultSchema = json.RawMessage(resultSchema.String)
-	}
+	_ = resultSchema // removed feature, column kept for compat
 	if parentID.Valid {
 		j.ParentID = &parentID.String
 	}
@@ -87,18 +85,9 @@ func (s *Store) GetJob(id string) (*Job, error) {
 		j.ChainConfig = json.RawMessage(chainConfig.String)
 	}
 	j.ProviderError = providerError == 1
-	if routing.Valid {
-		var cfg RoutingConfig
-		if err := json.Unmarshal([]byte(routing.String), &cfg); err == nil {
-			j.Routing = &cfg
-		}
-	}
-	if routingTarget.Valid {
-		j.RoutingTarget = &routingTarget.String
-	}
-	if routingIndex.Valid {
-		j.RoutingIndex = int(routingIndex.Int64)
-	}
+	_ = routing       // removed feature, column kept for compat
+	_ = routingTarget // removed feature, column kept for compat
+	_ = routingIndex  // removed feature, column kept for compat
 	if agentIteration.Valid {
 		j.Agent = &AgentState{
 			Iteration: int(agentIteration.Int64),
@@ -242,9 +231,7 @@ func (s *Store) ListJobIterations(id string) ([]JobIteration, error) {
 		if checkpoint.Valid {
 			it.Checkpoint = json.RawMessage(checkpoint.String)
 		}
-		if trace.Valid {
-			it.Trace = json.RawMessage(trace.String)
-		}
+		_ = trace // removed feature, column kept for compat
 		if holdReason.Valid {
 			it.HoldReason = &holdReason.String
 		}

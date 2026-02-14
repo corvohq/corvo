@@ -832,7 +832,7 @@ CREATE TABLE IF NOT EXISTS approval_policies (
     queue            TEXT,
     tag_key          TEXT,
     tag_value        TEXT,
-    trace_action_in  TEXT,
+
     created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
 );
 CREATE INDEX IF NOT EXISTS idx_approval_policies_enabled ON approval_policies(enabled);
@@ -1144,7 +1144,7 @@ CREATE TABLE IF NOT EXISTS approval_policies (
     queue            TEXT,
     tag_key          TEXT,
     tag_value        TEXT,
-    trace_action_in  TEXT,
+
     created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
 );
 CREATE INDEX IF NOT EXISTS idx_approval_policies_enabled ON approval_policies(enabled);

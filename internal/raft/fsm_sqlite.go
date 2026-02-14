@@ -19,9 +19,8 @@ type sqlExecer interface {
 }
 
 func sqliteInsertJob(db sqlExecer, op store.EnqueueOp) error {
-	var scheduledAt, expireAt, tags, uniqueKey, checkpoint, resultSchema, parentID, chainID, chainConfig, routing, routingTarget *string
+	var scheduledAt, expireAt, tags, uniqueKey, checkpoint, parentID, chainID, chainConfig *string
 	var chainStep *int
-	routingIndex := 0
 	var agentMaxIterations *int
 	var agentMaxCostUSD *float64
 	var agentIterationTimeout *string
@@ -46,10 +45,6 @@ func sqliteInsertJob(db sqlExecer, op store.EnqueueOp) error {
 		s := string(op.Checkpoint)
 		checkpoint = &s
 	}
-	if len(op.ResultSchema) > 0 {
-		s := string(op.ResultSchema)
-		resultSchema = &s
-	}
 	if op.ParentID != "" {
 		parentID = &op.ParentID
 	}
@@ -62,15 +57,6 @@ func sqliteInsertJob(db sqlExecer, op store.EnqueueOp) error {
 	if len(op.ChainConfig) > 0 {
 		s := string(op.ChainConfig)
 		chainConfig = &s
-	}
-	if op.Routing != nil {
-		b, _ := json.Marshal(op.Routing)
-		s := string(b)
-		routing = &s
-		if t, idx, ok := routingTargetFor(op.Routing, 0); ok {
-			routingTarget = &t
-			routingIndex = idx
-		}
 	}
 	if op.Agent != nil {
 		agentMaxIterations = &op.Agent.MaxIterations
@@ -85,16 +71,14 @@ func sqliteInsertJob(db sqlExecer, op store.EnqueueOp) error {
 	_, err := db.Exec(`INSERT OR REPLACE INTO jobs (id, queue, state, payload, priority, max_retries,
 		retry_backoff, retry_base_delay_ms, retry_max_delay_ms, unique_key, tags, checkpoint,
 		agent_max_iterations, agent_max_cost_usd, agent_iteration_timeout, agent_iteration, agent_total_cost_usd,
-		result_schema, parent_id, chain_id, chain_step, chain_config, provider_error,
-		routing, routing_target, routing_index,
+		parent_id, chain_id, chain_step, chain_config, provider_error,
 		scheduled_at, expire_at, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		op.JobID, op.Queue, op.State, string(op.Payload), op.Priority,
 		op.MaxRetries, op.Backoff, op.BaseDelayMs, op.MaxDelayMs,
 		uniqueKey, tags, checkpoint,
 		agentMaxIterations, agentMaxCostUSD, agentIterationTimeout, agentIteration, agentTotalCostUSD,
-		resultSchema, parentID, chainID, chainStep, chainConfig, 0,
-		routing, routingTarget, routingIndex,
+		parentID, chainID, chainStep, chainConfig, 0,
 		scheduledAt, expireAt, createdAt,
 	)
 	if err != nil {
@@ -131,9 +115,8 @@ func sqliteInsertBatch(db sqlExecer, op store.EnqueueBatchOp) error {
 	}
 
 	for _, j := range op.Jobs {
-		var tags, checkpoint, resultSchema, parentID, chainID, chainConfig, routing, routingTarget *string
+		var tags, checkpoint, parentID, chainID, chainConfig *string
 		var chainStep *int
-		routingIndex := 0
 		var agentMaxIterations *int
 		var agentMaxCostUSD *float64
 		var agentIterationTimeout *string
@@ -147,10 +130,6 @@ func sqliteInsertBatch(db sqlExecer, op store.EnqueueBatchOp) error {
 			s := string(j.Checkpoint)
 			checkpoint = &s
 		}
-		if len(j.ResultSchema) > 0 {
-			s := string(j.ResultSchema)
-			resultSchema = &s
-		}
 		if j.ParentID != "" {
 			parentID = &j.ParentID
 		}
@@ -163,15 +142,6 @@ func sqliteInsertBatch(db sqlExecer, op store.EnqueueBatchOp) error {
 		if len(j.ChainConfig) > 0 {
 			s := string(j.ChainConfig)
 			chainConfig = &s
-		}
-		if j.Routing != nil {
-			b, _ := json.Marshal(j.Routing)
-			s := string(b)
-			routing = &s
-			if t, idx, ok := routingTargetFor(j.Routing, 0); ok {
-				routingTarget = &t
-				routingIndex = idx
-			}
 		}
 		if j.Agent != nil {
 			agentMaxIterations = &j.Agent.MaxIterations
@@ -188,16 +158,14 @@ func sqliteInsertBatch(db sqlExecer, op store.EnqueueBatchOp) error {
 		db.Exec(`INSERT OR REPLACE INTO jobs (id, queue, state, payload, priority, max_retries,
 			retry_backoff, retry_base_delay_ms, retry_max_delay_ms, tags, checkpoint,
 			agent_max_iterations, agent_max_cost_usd, agent_iteration_timeout, agent_iteration, agent_total_cost_usd,
-			result_schema, parent_id, chain_id, chain_step, chain_config, provider_error,
-			routing, routing_target, routing_index,
+			parent_id, chain_id, chain_step, chain_config, provider_error,
 			batch_id, created_at)
-			VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			j.JobID, j.Queue, string(j.Payload), j.Priority,
 			j.MaxRetries, j.Backoff, j.BaseDelayMs, j.MaxDelayMs,
 			tags, checkpoint,
 			agentMaxIterations, agentMaxCostUSD, agentIterationTimeout, agentIteration, agentTotalCostUSD,
-			resultSchema, parentID, chainID, chainStep, chainConfig, 0,
-			routing, routingTarget, routingIndex,
+			parentID, chainID, chainStep, chainConfig, 0,
 			batchIDPtr, createdAt,
 		)
 		db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", j.Queue)
@@ -223,11 +191,6 @@ func sqliteFetchJob(db sqlExecer, job store.Job, op store.FetchOp) error {
 
 	// Record rate limit entry
 	db.Exec("INSERT INTO rate_limit_window (queue, fetched_at) VALUES (?, ?)", job.Queue, startedAt)
-	// Record provider request usage for provider-aware fetch gating (RPM).
-	var provider sql.NullString
-	if err := db.QueryRow("SELECT provider FROM queues WHERE name = ?", job.Queue).Scan(&provider); err == nil && provider.Valid && provider.String != "" {
-		db.Exec("INSERT INTO provider_usage_window (provider, input_tokens, output_tokens, recorded_at) VALUES (?, 0, 0, ?)", provider.String, startedAt)
-	}
 
 	// Upsert worker
 	queuesJSON, _ := json.Marshal(op.Queues)
@@ -305,17 +268,16 @@ func sqliteFailJob(db sqlExecer, job store.Job, op store.FailOp, errDoc store.Jo
 			scheduledAt = &s
 		}
 		_, err := db.Exec(`UPDATE jobs SET state = 'retrying', failed_at = ?, scheduled_at = ?, hold_reason = NULL,
-			provider_error = ?, routing_target = ?, routing_index = ?,
+			provider_error = ?,
 			worker_id = NULL, hostname = NULL, lease_expires_at = NULL WHERE id = ?`,
-			now, scheduledAt, boolToInt(op.ProviderError), job.RoutingTarget, job.RoutingIndex, op.JobID)
+			now, scheduledAt, boolToInt(op.ProviderError), op.JobID)
 		return err
 	}
 
 	// Dead
 	_, err := db.Exec(`UPDATE jobs SET state = 'dead', failed_at = ?, hold_reason = NULL, provider_error = ?,
-		routing_target = ?, routing_index = ?,
 		worker_id = NULL, hostname = NULL, lease_expires_at = NULL WHERE id = ?`,
-		now, boolToInt(op.ProviderError), job.RoutingTarget, job.RoutingIndex, op.JobID)
+		now, boolToInt(op.ProviderError), op.JobID)
 	if err != nil {
 		return err
 	}
@@ -388,12 +350,6 @@ func sqliteInsertUsage(db sqlExecer, jobID, queue string, attempt int, phase str
 	if err != nil {
 		return fmt.Errorf("sqlite insert job usage: %w", err)
 	}
-	if p := nullableString(usage.Provider); p != nil {
-		_, _ = db.Exec(
-			"INSERT INTO provider_usage_window (provider, input_tokens, output_tokens, recorded_at) VALUES (?, ?, ?, ?)",
-			*p, usage.InputTokens, usage.OutputTokens, createdAt,
-		)
-	}
 	return nil
 }
 
@@ -401,17 +357,13 @@ func sqliteInsertJobIteration(db sqlExecer, job store.Job, op store.AckOp, statu
 	if job.Agent == nil {
 		return nil
 	}
-	var checkpoint, trace, holdReason, result *string
+	var checkpoint, holdReason, result *string
 	if len(op.Checkpoint) > 0 {
 		s := string(op.Checkpoint)
 		checkpoint = &s
 	} else if len(job.Checkpoint) > 0 {
 		s := string(job.Checkpoint)
 		checkpoint = &s
-	}
-	if len(op.Trace) > 0 {
-		s := string(op.Trace)
-		trace = &s
 	}
 	if op.HoldReason != "" {
 		holdReason = &op.HoldReason
@@ -435,11 +387,11 @@ func sqliteInsertJobIteration(db sqlExecer, job store.Job, op store.AckOp, statu
 		costUSD = op.Usage.CostUSD
 	}
 	_, err := db.Exec(`INSERT INTO job_iterations (
-		job_id, iteration, status, checkpoint, trace, hold_reason, result,
+		job_id, iteration, status, checkpoint, hold_reason, result,
 		input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
 		model, provider, cost_usd, created_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		job.ID, job.Agent.Iteration, status, checkpoint, trace, holdReason, result,
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		job.ID, job.Agent.Iteration, status, checkpoint, holdReason, result,
 		inputTokens, outputTokens, cacheCreate, cacheRead, model, provider, costUSD, createdAt,
 	)
 	if err != nil {
@@ -492,33 +444,7 @@ func sqliteDeleteBudget(db sqlExecer, scope, target string) error {
 	return err
 }
 
-func sqliteUpsertProvider(db sqlExecer, p store.Provider) error {
-	_, err := db.Exec(`INSERT INTO providers (name, rpm_limit, input_tpm_limit, output_tpm_limit, created_at)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(name) DO UPDATE SET
-			rpm_limit = excluded.rpm_limit,
-			input_tpm_limit = excluded.input_tpm_limit,
-			output_tpm_limit = excluded.output_tpm_limit`,
-		p.Name, p.RPMLimit, p.InputTPMLimit, p.OutputTPMLimit, p.CreatedAt,
-	)
-	return err
-}
 
-func sqliteDeleteProvider(db sqlExecer, name string) error {
-	db.Exec("UPDATE queues SET provider = NULL WHERE provider = ?", name)
-	_, err := db.Exec("DELETE FROM providers WHERE name = ?", name)
-	return err
-}
-
-func sqliteSetQueueProvider(db sqlExecer, queue, provider string) error {
-	db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", queue)
-	var providerVal any
-	if provider != "" {
-		providerVal = provider
-	}
-	_, err := db.Exec("UPDATE queues SET provider = ? WHERE name = ?", providerVal, queue)
-	return err
-}
 
 func sqliteDeleteJob(db sqlExecer, jobID string) error {
 	db.Exec("DELETE FROM job_errors WHERE job_id = ?", jobID)
@@ -784,25 +710,6 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 				retErr = fmt.Errorf("upsert budget: %w", err)
 				return retErr
 			}
-		case bytes.HasPrefix(key, []byte(kv.PrefixProvider)):
-			var p store.Provider
-			if err := json.Unmarshal(val, &p); err != nil {
-				continue
-			}
-			if p.Name == "" {
-				p.Name = string(key[len(kv.PrefixProvider):])
-			}
-			if err := sqliteUpsertProvider(tx, p); err != nil {
-				retErr = fmt.Errorf("upsert provider: %w", err)
-				return retErr
-			}
-		case bytes.HasPrefix(key, []byte(kv.PrefixQueueProv)):
-			queue := string(key[len(kv.PrefixQueueProv):])
-			provider := string(val)
-			if err := sqliteSetQueueProvider(tx, queue, provider); err != nil {
-				retErr = fmt.Errorf("set queue provider: %w", err)
-				return retErr
-			}
 		}
 	}
 	if err := iter.Error(); err != nil {
@@ -834,9 +741,8 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 }
 
 func sqliteUpsertJobDoc(db sqlExecer, j store.Job) error {
-	var uniqueKey, batchID, workerID, hostname, leaseExpiresAt, scheduledAt, expireAt, startedAt, completedAt, failedAt, holdReason, resultSchema, parentID, chainID, chainConfig, routing, routingTarget *string
+	var uniqueKey, batchID, workerID, hostname, leaseExpiresAt, scheduledAt, expireAt, startedAt, completedAt, failedAt, holdReason, parentID, chainID, chainConfig *string
 	var chainStep *int
-	routingIndex := j.RoutingIndex
 	var agentMaxIterations *int
 	var agentMaxCostUSD *float64
 	var agentIterationTimeout *string
@@ -888,10 +794,6 @@ func sqliteUpsertJobDoc(db sqlExecer, j store.Job) error {
 	if j.HoldReason != nil {
 		holdReason = j.HoldReason
 	}
-	if len(j.ResultSchema) > 0 {
-		s := string(j.ResultSchema)
-		resultSchema = &s
-	}
 	if j.ParentID != nil {
 		parentID = j.ParentID
 	}
@@ -905,14 +807,6 @@ func sqliteUpsertJobDoc(db sqlExecer, j store.Job) error {
 		s := string(j.ChainConfig)
 		chainConfig = &s
 	}
-	if j.Routing != nil {
-		b, _ := json.Marshal(j.Routing)
-		s := string(b)
-		routing = &s
-	}
-	if j.RoutingTarget != nil {
-		routingTarget = j.RoutingTarget
-	}
 	createdAt := j.CreatedAt.UTC().Format(time.RFC3339Nano)
 
 	_, err := db.Exec(`INSERT INTO jobs (
@@ -920,10 +814,9 @@ func sqliteUpsertJobDoc(db sqlExecer, j store.Job) error {
 		retry_backoff, retry_base_delay_ms, retry_max_delay_ms,
 		unique_key, batch_id, worker_id, hostname, tags, progress, checkpoint, result,
 		agent_max_iterations, agent_max_cost_usd, agent_iteration_timeout, agent_iteration, agent_total_cost_usd,
-		hold_reason, result_schema, parent_id, chain_id, chain_step, chain_config, provider_error,
-		routing, routing_target, routing_index,
+		hold_reason, parent_id, chain_id, chain_step, chain_config, provider_error,
 		lease_expires_at, scheduled_at, expire_at, created_at, started_at, completed_at, failed_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 		queue = excluded.queue,
 		state = excluded.state,
@@ -948,15 +841,11 @@ func sqliteUpsertJobDoc(db sqlExecer, j store.Job) error {
 		agent_iteration = excluded.agent_iteration,
 		agent_total_cost_usd = excluded.agent_total_cost_usd,
 		hold_reason = excluded.hold_reason,
-		result_schema = excluded.result_schema,
 		parent_id = excluded.parent_id,
 		chain_id = excluded.chain_id,
 		chain_step = excluded.chain_step,
 		chain_config = excluded.chain_config,
 		provider_error = excluded.provider_error,
-		routing = excluded.routing,
-		routing_target = excluded.routing_target,
-		routing_index = excluded.routing_index,
 		lease_expires_at = excluded.lease_expires_at,
 		scheduled_at = excluded.scheduled_at,
 		expire_at = excluded.expire_at,
@@ -968,8 +857,7 @@ func sqliteUpsertJobDoc(db sqlExecer, j store.Job) error {
 		j.RetryBackoff, j.RetryBaseDelay, j.RetryMaxDelay,
 		uniqueKey, batchID, workerID, hostname, string(j.Tags), string(j.Progress), string(j.Checkpoint), string(j.Result),
 		agentMaxIterations, agentMaxCostUSD, agentIterationTimeout, agentIteration, agentTotalCostUSD,
-		holdReason, resultSchema, parentID, chainID, chainStep, chainConfig, boolToInt(j.ProviderError),
-		routing, routingTarget, routingIndex,
+		holdReason, parentID, chainID, chainStep, chainConfig, boolToInt(j.ProviderError),
 		leaseExpiresAt, scheduledAt, expireAt, createdAt, startedAt, completedAt, failedAt,
 	)
 	if err != nil {

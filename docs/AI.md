@@ -294,9 +294,9 @@ Workers don't need to implement any of these — the server handles it:
 | Crash recovery | If a worker dies mid-iteration, the server reclaims the lease. The next fetch picks up the job with its checkpoint intact. |
 | Cancellation | Cancel an agent job via API/UI. Worker gets cancel signal on next heartbeat. |
 
-### Agent trace
+### Iteration tracking
 
-Each iteration is recorded as an entry in a new `job_iterations` table:
+Each iteration is recorded as an entry in the `job_iterations` table:
 
 ```sql
 CREATE TABLE job_iterations (
@@ -305,7 +305,6 @@ CREATE TABLE job_iterations (
     iteration   INTEGER NOT NULL,
     status      TEXT NOT NULL,                -- 'continue', 'done', 'hold', 'failed'
     checkpoint  TEXT,                          -- JSON: accumulated state
-    trace       TEXT,                          -- JSON: LLM request/response for this iteration
     input_tokens  INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     model       TEXT,
@@ -317,29 +316,6 @@ CREATE TABLE job_iterations (
 );
 CREATE INDEX idx_job_iterations_job ON job_iterations(job_id, iteration);
 ```
-
-Workers can optionally include a `trace` field in the ack to store the full LLM request/response:
-
-```json
-{
-  "agent_status": "continue",
-  "trace": {
-    "request": {
-      "model": "claude-sonnet-4-5-20250929",
-      "messages": [{"role": "user", "content": "..."}],
-      "tools": [{"name": "web_search", "description": "..."}]
-    },
-    "response": {
-      "content": "I'll search for competitors...",
-      "tool_calls": [{"name": "web_search", "input": {"query": "Acme Corp competitors"}}]
-    }
-  },
-  "checkpoint": { "messages": [...] },
-  "usage": { "input_tokens": 2100, "output_tokens": 340, "cost_usd": 0.015 }
-}
-```
-
-This is optional — workers that don't send traces still get iteration tracking via the `job_iterations` table.
 
 ### Replay
 
@@ -532,195 +508,6 @@ CREATE TABLE approval_policies (
 
 ---
 
-## Provider-aware rate limiting
-
-LLM providers have rate limits (requests/min, tokens/min) that are shared across all your queues. Corvo can manage provider-level rate limiting centrally.
-
-### Provider configuration
-
-```
-POST /api/v1/providers
-Content-Type: application/json
-
-{
-  "name": "anthropic",
-  "rate_limits": {
-    "requests_per_minute": 4000,
-    "input_tokens_per_minute": 400000,
-    "output_tokens_per_minute": 80000
-  }
-}
-```
-
-```
-POST /api/v1/providers
-Content-Type: application/json
-
-{
-  "name": "openai",
-  "rate_limits": {
-    "requests_per_minute": 10000,
-    "input_tokens_per_minute": 2000000
-  }
-}
-```
-
-### Linking queues to providers
-
-```
-POST /api/v1/queues/llm.chat/provider
-Content-Type: application/json
-
-{
-  "provider": "anthropic"
-}
-```
-
-Multiple queues can share a provider. The server enforces provider rate limits across all linked queues. When a queue has both its own rate limit and a provider rate limit, the more restrictive one applies.
-
-### How it works
-
-On each `POST /api/v1/fetch` for a provider-linked queue, the server checks the provider's rate limit pool in addition to the queue's own rate limit. Usage data reported via ack/heartbeat updates the token counters.
-
-This is the same sliding-window mechanism from [DESIGN.md](./DESIGN.md#rate-limiting--throttling), extended with token-aware counters:
-
-```sql
-CREATE TABLE providers (
-    name        TEXT PRIMARY KEY,
-    rpm_limit   INTEGER,
-    input_tpm_limit  INTEGER,
-    output_tpm_limit INTEGER,
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
-);
-
--- Links queues to providers
-ALTER TABLE queues ADD COLUMN provider TEXT REFERENCES providers(name);
-
--- Provider usage window (extends rate_limit_window concept)
-CREATE TABLE provider_usage_window (
-    provider    TEXT NOT NULL,
-    input_tokens  INTEGER NOT NULL DEFAULT 0,
-    output_tokens INTEGER NOT NULL DEFAULT 0,
-    recorded_at TEXT NOT NULL
-);
-CREATE INDEX idx_provider_usage ON provider_usage_window(provider, recorded_at);
-```
-
----
-
-## Model fallback and routing
-
-When an LLM call fails due to a provider issue, automatically retry with a different model or provider.
-
-### Enqueue with routing
-
-```
-POST /api/v1/enqueue
-Content-Type: application/json
-
-{
-  "queue": "llm.chat",
-  "payload": {
-    "messages": [{"role": "user", "content": "Summarize this document..."}]
-  },
-  "routing": {
-    "prefer": "claude-sonnet-4-5-20250929",
-    "fallback": ["gpt-4o", "gemini-2.0-flash"],
-    "strategy": "fallback_on_error"
-  }
-}
-```
-
-### How it works
-
-The `routing` config is stored on the job. When the job is fetched, the response includes the current target model:
-
-```json
-{
-  "job_id": "job_01HX...",
-  "payload": { "messages": [...] },
-  "routing": {
-    "target": "claude-sonnet-4-5-20250929",
-    "attempt_index": 0
-  }
-}
-```
-
-The worker reads `routing.target` to decide which model to call. If the worker fails with a provider error, the server checks the routing config before applying normal retry logic:
-
-1. If the failure looks like a provider issue (worker includes `"provider_error": true` in the fail request), advance to the next model in the fallback list.
-2. If all models have been tried, fall through to normal retry behavior.
-
-```
-POST /api/v1/fail/{job_id}
-Content-Type: application/json
-
-{
-  "error": "Anthropic API 503: Service temporarily unavailable",
-  "provider_error": true
-}
-```
-
-**Routing strategies:**
-- `fallback_on_error` — try preferred model first, fall back on provider errors only (default)
-- `round_robin` — distribute across all models evenly
-- `lowest_cost` — server picks the cheapest model based on usage data (requires provider config with pricing)
-
-### Schema
-
-```sql
--- Routing config stored on the job (in existing payload or new column)
-ALTER TABLE jobs ADD COLUMN routing TEXT;           -- JSON: {prefer, fallback, strategy}
-ALTER TABLE jobs ADD COLUMN routing_target TEXT;     -- current target model
-ALTER TABLE jobs ADD COLUMN routing_index INTEGER DEFAULT 0;  -- position in fallback list
-```
-
----
-
-## Result schema validation
-
-Declare expected output structure at enqueue time. If the LLM returns invalid output, the server automatically retries.
-
-```
-POST /api/v1/enqueue
-Content-Type: application/json
-
-{
-  "queue": "extraction.invoices",
-  "payload": { "document_url": "s3://...", "prompt": "Extract invoice fields" },
-  "result_schema": {
-    "type": "object",
-    "required": ["vendor", "amount", "date"],
-    "properties": {
-      "vendor": { "type": "string" },
-      "amount": { "type": "number" },
-      "date": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" }
-    }
-  }
-}
-```
-
-On `POST /api/v1/ack/{job_id}`, the server validates `result` against `result_schema` (JSON Schema draft 2020-12). If validation fails:
-
-1. The ack is rejected with a 422 response including the validation errors
-2. The job remains `active` — the worker can retry the LLM call and ack again
-3. If the worker acks with invalid results and then disconnects, the lease expires and the job retries normally
-
-The worker receives the validation errors so it can include them in a retry prompt:
-
-```json
-{
-  "error": "result_schema_validation_failed",
-  "validation_errors": [
-    {"path": "$.date", "message": "does not match pattern ^\\d{4}-\\d{2}-\\d{2}$", "value": "February 11"}
-  ]
-}
-```
-
-This is a server-side safety net. Workers should still use structured output features from LLM providers (tool use, JSON mode), but the server catches what slips through.
-
----
-
 ## Job dependencies
 
 Jobs can declare dependencies on other jobs via `depends_on`. A dependent job stays in `pending` until all its dependencies complete. This covers sequential processing pipelines without the server owning result forwarding or pipeline definitions — workers read the upstream job's result and enqueue the next step themselves.
@@ -747,106 +534,6 @@ ALTER TABLE jobs ADD COLUMN chain_config TEXT;   -- JSON: dependency config
 ALTER TABLE jobs ADD COLUMN chain_id TEXT;        -- links all jobs in a chain
 ALTER TABLE jobs ADD COLUMN chain_step INTEGER;   -- 0, 1, 2, ...
 CREATE INDEX idx_jobs_chain ON jobs(chain_id) WHERE chain_id IS NOT NULL;
-```
-
----
-
-## Streaming progress
-
-Extend the existing progress and SSE mechanisms to support streaming text output from LLM jobs. Workers send incremental text deltas; the UI renders them in real time.
-
-### Reporting stream deltas
-
-```
-POST /api/v1/heartbeat
-Content-Type: application/json
-
-{
-  "jobs": {
-    "job_01HX...": {
-      "stream_delta": "The top three competitors are:\n1. "
-    }
-  }
-}
-```
-
-The server appends deltas to a buffer and broadcasts them via the existing SSE event stream:
-
-```
-event: job.stream
-data: {"job_id":"job_01HX...","delta":"The top three competitors are:\n1. ","offset":0}
-
-event: job.stream
-data: {"job_id":"job_01HX...","delta":"CompanyA - a leading provider of...","offset":42}
-```
-
-UI clients subscribe to the SSE stream and render streaming output in the job detail view. The full assembled text is stored on the job when it completes (as part of `result` or `checkpoint`).
-
-Stream deltas are ephemeral — they're broadcast via SSE and held in a short-lived buffer for late-joining UI clients, but not permanently stored per-delta. Only the final assembled output is persisted.
-
----
-
-## Output scoring
-
-Downstream consumers or humans can score job results. Scores are aggregated for quality monitoring.
-
-```
-POST /api/v1/jobs/{id}/score
-Content-Type: application/json
-
-{
-  "scores": {
-    "relevance": 0.85,
-    "accuracy": 0.92,
-    "conciseness": 0.78
-  },
-  "scorer": "human:jeremy"
-}
-```
-
-Multiple scores can be recorded per job (human review, automated eval, downstream consumer feedback). Score names are freeform — teams define their own dimensions.
-
-### Aggregate queries
-
-```
-GET /api/v1/scores/summary?queue=extraction.invoices&period=7d
-
-{
-  "queue": "extraction.invoices",
-  "period": "7d",
-  "dimensions": {
-    "accuracy": { "mean": 0.91, "p50": 0.94, "p5": 0.72, "count": 482 },
-    "relevance": { "mean": 0.87, "p50": 0.89, "p5": 0.68, "count": 482 }
-  }
-}
-```
-
-Compare scores across tags (for A/B testing prompts):
-
-```
-GET /api/v1/scores/compare?queue=llm.summarize&group_by=tag:prompt_version&period=7d
-
-{
-  "groups": [
-    { "tag": "prompt_version:v2", "accuracy": {"mean": 0.87}, "count": 241 },
-    { "tag": "prompt_version:v3-concise", "accuracy": {"mean": 0.93}, "count": 241 }
-  ]
-}
-```
-
-### Schema
-
-```sql
-CREATE TABLE job_scores (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id     TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    dimension  TEXT NOT NULL,
-    value      REAL NOT NULL,
-    scorer     TEXT,                          -- 'human:jeremy', 'auto:eval-v2', 'downstream:api'
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now'))
-);
-CREATE INDEX idx_job_scores_job ON job_scores(job_id);
-CREATE INDEX idx_job_scores_dimension ON job_scores(dimension, created_at);
 ```
 
 ---
@@ -970,29 +657,6 @@ Extended job detail for agent jobs showing the iteration history:
 │  │ 4   │ sonnet   │ ● Running...                      │  ... │ ... ││
 │  └─────┴──────────┴───────────────────────────────────┴──────┴─────┘│
 │                                                                      │
-│  ▸ Iteration 1 detail (click to expand)                             │
-│  ▾ Iteration 2 detail                                               │
-│  ┌──────────────────────────────────────────────────────────────────┐│
-│  │  Request:                                                        ││
-│  │  model: claude-sonnet-4-5     tokens: 2,100 in / 340 out        ││
-│  │                                                                  ││
-│  │  Response:                                                       ││
-│  │  "Based on the search results, I can see two main competitors.  ││
-│  │   Let me search for more details on each..."                    ││
-│  │                                                                  ││
-│  │  Tool calls:                                                     ││
-│  │  ┌─ web_search("CompA products 2026")                           ││
-│  │  │  → 3 results, 1.2s                                           ││
-│  │  └─ web_search("CompB products overview")                       ││
-│  │     → 5 results, 0.9s                                           ││
-│  └──────────────────────────────────────────────────────────────────┘│
-│                                                                      │
-│  Streaming output                                                    │
-│  ┌──────────────────────────────────────────────────────────────────┐│
-│  │  The top three competitors to Acme Corp are:                     ││
-│  │  1. CompanyA - a leading provider of█                            ││
-│  └──────────────────────────────────────────────────────────────────┘│
-│                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1054,15 +718,6 @@ corvo reject job_01HX... --revise "fix the email address"
 corvo replay job_01HX... --from 3              # replay from iteration 3
 corvo replay job_01HX... --from 3 --set agent.max_iterations=30
 
-# Providers
-corvo providers                                # list providers
-corvo provider add anthropic --rpm 4000 --input-tpm 400000
-corvo provider add openai --rpm 10000 --input-tpm 2000000
-
-# Scores
-corvo scores job_01HX...                       # show scores for a job
-corvo scores --queue extraction --period 7d    # aggregate scores
-
 # Cache
 corvo cache stats                              # cache hit rate + savings
 corvo cache clear --queue llm.chat             # clear cache for a queue
@@ -1092,31 +747,14 @@ These features are additive and can be built incrementally after the core MVP fr
 - [x] `agent_status` handling on ack (continue, done, hold)
 - [x] `job_iterations` table + iteration tracking
 - [x] Server-side guardrail enforcement (max iterations, max cost)
-- [x] Agent trace storage (optional `trace` field)
-- [ ] Agent job detail view in UI (iteration history, expandable traces)
+- [ ] Agent job detail view in UI (iteration history)
 - [x] Replay endpoint + CLI
-- [x] Streaming progress deltas via SSE
-- [ ] Streaming output in job detail UI
 
-### Phase 2c — Provider intelligence
+### Phase 2c — Dependencies and caching
 
-- [x] Provider table + configuration endpoints
-- [x] Provider-aware rate limiting (token-based sliding window)
-- [x] Queue-to-provider linking
-- [x] Model fallback routing (`routing` config on enqueue — infrastructure in place, strategy dispatch incomplete)
-- [x] `provider_error` flag on fail
-- [x] CLI: `corvo providers`
-
-### Phase 2d — Quality and caching
-
-- [x] Result schema validation (JSON Schema on ack)
-- [x] `result_schema` field on enqueue
 - [x] Job dependencies (`depends_on` + `chain_id`/`chain_step`)
 - [ ] Chain tracking in UI (dependency visualization)
 - [x] Result caching via unique jobs (covered by existing `unique_key` + `unique_period`)
-- [x] `job_scores` table + scoring endpoints
-- [x] Score aggregation + comparison endpoints
-- [x] CLI: `corvo scores`
 - [x] `parent_id` for tool-as-child-job pattern
 - [x] Approval policies (auto-hold rules)
 
@@ -1129,4 +767,4 @@ This document extends Corvo with AI-aware features but does not make it:
 - **An agent framework** — Corvo doesn't write prompts, call LLMs, or choose tools. Your worker code does that. Corvo provides the execution infrastructure: retries, rate limits, cost control, human approval, observability.
 - **An LLM gateway/proxy** — Corvo doesn't proxy API calls to LLM providers. Workers call providers directly. Corvo manages the *jobs* that wrap those calls.
 - **A prompt management system** — Prompts live in your code or your prompt store. Corvo tracks which model and prompt version were used (via tags) for analysis, but doesn't manage prompt content.
-- **An eval platform** — The scoring feature provides basic quality tracking. For serious evals (automated test suites, regression detection, model comparison), use a dedicated eval tool and feed scores back to Corvo via the scoring API.
+- **An eval platform** — Corvo does not score or evaluate LLM outputs. Use a dedicated eval tool for that.

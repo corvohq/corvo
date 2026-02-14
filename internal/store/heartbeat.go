@@ -9,7 +9,6 @@ import (
 type HeartbeatJobUpdate struct {
 	Progress    map[string]interface{} `json:"progress,omitempty"`
 	Checkpoint  map[string]interface{} `json:"checkpoint,omitempty"`
-	StreamDelta string                 `json:"stream_delta,omitempty"`
 	Usage       *UsageReport           `json:"usage,omitempty"`
 }
 
@@ -45,7 +44,6 @@ func (s *Store) Heartbeat(req HeartbeatRequest) (*HeartbeatResponse, error) {
 		jobs[jobID] = HeartbeatJobOp{
 			Progress:    progress,
 			Checkpoint:  checkpoint,
-			StreamDelta: update.StreamDelta,
 			Usage:       normalizeUsage(update.Usage),
 		}
 	}

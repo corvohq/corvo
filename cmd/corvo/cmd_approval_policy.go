@@ -62,7 +62,6 @@ var (
 	approvalPolicyMode     string
 	approvalPolicyQueue    string
 	approvalPolicyTag      string
-	approvalPolicyActions  string
 	approvalPolicyDisabled bool
 )
 
@@ -89,16 +88,6 @@ var approvalPolicySetCmd = &cobra.Command{
 			}
 			body["tag_key"] = strings.TrimSpace(parts[0])
 			body["tag_value"] = strings.TrimSpace(parts[1])
-		}
-		if strings.TrimSpace(approvalPolicyActions) != "" {
-			raw := strings.Split(approvalPolicyActions, ",")
-			actions := make([]string, 0, len(raw))
-			for _, a := range raw {
-				if v := strings.TrimSpace(a); v != "" {
-					actions = append(actions, v)
-				}
-			}
-			body["trace_action_in"] = actions
 		}
 		data, status, err := apiRequest("POST", "/api/v1/approval-policies", body)
 		if err != nil {
@@ -137,7 +126,6 @@ func init() {
 	approvalPolicySetCmd.Flags().StringVar(&approvalPolicyMode, "mode", "any", "Policy match mode (any|all)")
 	approvalPolicySetCmd.Flags().StringVar(&approvalPolicyQueue, "queue", "", "Queue to match")
 	approvalPolicySetCmd.Flags().StringVar(&approvalPolicyTag, "tag", "", "Required tag as key=value")
-	approvalPolicySetCmd.Flags().StringVar(&approvalPolicyActions, "actions", "", "Trace actions to match (comma-separated)")
 	approvalPolicySetCmd.Flags().BoolVar(&approvalPolicyDisabled, "disabled", false, "Create policy disabled")
 
 	approvalPolicyCmd.AddCommand(approvalPolicyListCmd, approvalPolicySetCmd, approvalPolicyDeleteCmd)
