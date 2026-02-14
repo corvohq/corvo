@@ -49,6 +49,7 @@ Everything pgboss and Faktory Enterprise offer, in a single free OSS package:
 | Clustering / HA | yes (automatic) | no (Postgres) | no | no |
 | Checkpointing (long-running jobs) | yes | no | no | no |
 | Cancellation (pending + active) | yes | no | no | no |
+| Job chains (sequential pipelines) | yes | no | no | no |
 | Prometheus metrics | yes | no | no | yes (Statsd) |
 
 ---
@@ -263,6 +264,39 @@ Content-Type: application/json
 }
 ```
 
+**Enqueue a job chain (sequential pipeline):**
+```
+POST /api/v1/enqueue
+Content-Type: application/json
+
+{
+  "queue": "ai.extract",
+  "payload": { "document_url": "https://example.com/report.pdf" },
+  "chain": {
+    "steps": [
+      { "queue": "ai.extract" },
+      { "queue": "ai.summarize" },
+      { "queue": "ai.review" }
+    ],
+    "on_failure": { "queue": "alerts.chain-failed", "payload": { "notify": "ops" } },
+    "on_exit": { "queue": "cleanup.finalize" }
+  }
+}
+
+→ 201 Created
+{
+  "job_id": "job_01HX7Y2K3M...",
+  "status": "pending",
+  "unique_existing": false
+}
+```
+
+The first step runs immediately. On completion, the server automatically enqueues the next step with the previous job's result forwarded in the payload. Workers control flow via `step_status` on ack:
+- `"continue"` (default) — advance to the next step
+- `"exit"` — skip remaining steps, run `on_exit` handler if configured
+
+If a step exhausts retries and goes dead, the `on_failure` handler runs with error context. Chain state (`chain_id`, `chain_step`, `chain_config`) is carried on each job — no new Op types or migrations needed.
+
 **Enqueue a batch:**
 ```
 POST /api/v1/enqueue/batch
@@ -322,11 +356,14 @@ POST /api/v1/ack/{job_id}
 Content-Type: application/json
 
 {
-  "result": { "sent": true, "message_id": "msg_123" }
+  "result": { "sent": true, "message_id": "msg_123" },
+  "step_status": "continue"
 }
 
 → 200 OK
 ```
+
+The `step_status` field is optional and only meaningful for chain jobs. Values: `"continue"` (default, advance to next step) or `"exit"` (skip remaining steps, run `on_exit` if configured).
 
 **Fail a job:**
 ```
@@ -2380,7 +2417,7 @@ See `docs/AI.md` for full spec and `docs/PHASE2.md` for delivery plan.
 - [x] Provider-aware rate limiting (token-based sliding window)
 - [x] Model fallback routing
 - [x] Result schema validation (JSON Schema on ack)
-- [x] Job dependencies (`depends_on` + `chain_id`)
+- [x] Job chains (sequential pipelines with `chain` on enqueue, `step_status` on ack, `on_failure`/`on_exit` handlers)
 - [x] Result caching via unique jobs (covered by existing `unique_key` + `unique_period`)
 - [x] Output scoring + aggregate queries
 - [x] Cost dashboard in UI
