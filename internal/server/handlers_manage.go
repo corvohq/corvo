@@ -168,7 +168,7 @@ func (s *Server) handleListJobIterations(w http.ResponseWriter, r *http.Request)
 func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
-	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+	if !s.enforceJobNamespace(principal, id) {
 		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
 		return
 	}
@@ -182,7 +182,7 @@ func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
-	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+	if !s.enforceJobNamespace(principal, id) {
 		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
 		return
 	}
@@ -197,7 +197,7 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMoveJob(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
-	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+	if !s.enforceJobNamespace(principal, id) {
 		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
 		return
 	}
@@ -223,7 +223,7 @@ func (s *Server) handleMoveJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
-	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+	if !s.enforceJobNamespace(principal, id) {
 		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
 		return
 	}
@@ -237,7 +237,7 @@ func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHoldJob(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
-	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+	if !s.enforceJobNamespace(principal, id) {
 		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
 		return
 	}
@@ -251,7 +251,7 @@ func (s *Server) handleHoldJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleApproveJob(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
-	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+	if !s.enforceJobNamespace(principal, id) {
 		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
 		return
 	}
@@ -265,7 +265,7 @@ func (s *Server) handleApproveJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRejectJob(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
-	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+	if !s.enforceJobNamespace(principal, id) {
 		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
 		return
 	}
@@ -279,7 +279,7 @@ func (s *Server) handleRejectJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleReplayJob(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	id := chi.URLParam(r, "id")
-	if job, err := s.store.GetJob(id); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+	if !s.enforceJobNamespace(principal, id) {
 		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
 		return
 	}

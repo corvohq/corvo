@@ -13,14 +13,23 @@ import (
 
 var (
 	serverURL  string
+	apiKey     string
 	outputJSON bool
 )
 
 func addClientFlags(cmds ...*cobra.Command) {
 	for _, cmd := range cmds {
 		cmd.Flags().StringVar(&serverURL, "server", "http://localhost:8080", "Corvo server URL")
+		cmd.Flags().StringVar(&apiKey, "api-key", "", "API key or admin password for authentication (env: CORVO_API_KEY)")
 		cmd.Flags().BoolVar(&outputJSON, "output-json", false, "Output as JSON")
 	}
+}
+
+func resolveAPIKey() string {
+	if apiKey != "" {
+		return apiKey
+	}
+	return os.Getenv("CORVO_API_KEY")
 }
 
 func apiRequest(method, path string, body interface{}) ([]byte, int, error) {
@@ -38,6 +47,9 @@ func apiRequest(method, path string, body interface{}) ([]byte, int, error) {
 		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if key := resolveAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

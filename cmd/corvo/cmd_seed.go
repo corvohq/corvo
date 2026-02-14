@@ -69,12 +69,14 @@ var seedDemoCmd = &cobra.Command{
 		queues := []string{"emails.send", "reports.generate", "agents.research"}
 		models := []string{"claude-sonnet-4-5", "gpt-4.1", "gpt-4o-mini"}
 		providers := []string{"anthropic", "openai", "openai"}
+		priorities := []string{"normal", "normal", "high", "low", "critical"}
 
-		// General jobs with usage/cost data.
+		// General jobs with usage/cost data, priorities, and retry configs.
 		for i := 0; i < seedCount; i++ {
 			queue := queues[i%len(queues)]
 			body := map[string]any{
-				"queue": queue,
+				"queue":    queue,
+				"priority": priorities[i%len(priorities)],
 				"payload": map[string]any{
 					"type":      "seed",
 					"index":     i,
@@ -83,6 +85,16 @@ var seedDemoCmd = &cobra.Command{
 				"tags": map[string]any{
 					"tenant": fmt.Sprintf("tenant-%d", (i%3)+1),
 				},
+			}
+			// Add retry config to some jobs.
+			if i%8 == 0 {
+				body["retry_backoff"] = "exponential"
+				body["retry_base_delay"] = "2s"
+				body["retry_max_delay"] = "5m"
+			}
+			// Add expiry to some jobs.
+			if i%10 == 0 {
+				body["expire_after"] = "24h"
 			}
 			var enq enqueueResult
 			if err := postDecode("/api/v1/enqueue", body, &enq); err != nil {
@@ -160,6 +172,112 @@ var seedDemoCmd = &cobra.Command{
 				return err
 			}
 		}
+
+		// Unique key / idempotent jobs.
+		for i := 0; i < 3; i++ {
+			if err := postOK("/api/v1/enqueue", map[string]any{
+				"queue":         "emails.send",
+				"payload":       map[string]any{"type": "seed-unique", "recipient": "dedup@example.com"},
+				"unique_key":    "email:dedup@example.com",
+				"unique_period": 3600,
+			}); err != nil {
+				return err
+			}
+		}
+		fmt.Println("- unique key dedup: 3 enqueued, should result in 1 job")
+
+		// Chained job pipeline: ingest -> transform -> notify, with failure handler.
+		var chainEnq enqueueResult
+		if err := postDecode("/api/v1/enqueue", map[string]any{
+			"queue":   "pipeline.ingest",
+			"payload": map[string]any{"type": "seed-chain", "source": "s3://data/batch-001.csv"},
+			"chain": map[string]any{
+				"steps": []map[string]any{
+					{"queue": "pipeline.ingest", "payload": map[string]any{"source": "s3://data/batch-001.csv"}},
+					{"queue": "pipeline.transform", "payload": map[string]any{"format": "parquet"}},
+					{"queue": "pipeline.notify", "payload": map[string]any{"channel": "#data-team"}},
+				},
+				"on_failure": map[string]any{"queue": "pipeline.failure", "payload": map[string]any{"alert": true}},
+				"on_exit":    map[string]any{"queue": "pipeline.cleanup"},
+			},
+			"tags": map[string]any{"pipeline": "etl-daily"},
+		}, &chainEnq); err != nil {
+			return err
+		}
+		// Complete the first step so the chain progresses.
+		if chainEnq.JobID != "" {
+			jobID, err := fetchOne("pipeline.ingest")
+			if err != nil {
+				return err
+			}
+			if jobID != "" {
+				_ = postOK("/api/v1/ack/"+jobID, map[string]any{
+					"result":      map[string]any{"rows_ingested": 15420},
+					"step_status": "done",
+				})
+			}
+		}
+
+		// Job with dependencies: create parent jobs, then a child that depends on them.
+		var dep1, dep2 enqueueResult
+		if err := postDecode("/api/v1/enqueue", map[string]any{
+			"queue":   "reports.generate",
+			"payload": map[string]any{"type": "seed-dep-parent", "report": "sales-q4"},
+			"tags":    map[string]any{"dependency": "parent"},
+		}, &dep1); err != nil {
+			return err
+		}
+		if err := postDecode("/api/v1/enqueue", map[string]any{
+			"queue":   "reports.generate",
+			"payload": map[string]any{"type": "seed-dep-parent", "report": "inventory-q4"},
+			"tags":    map[string]any{"dependency": "parent"},
+		}, &dep2); err != nil {
+			return err
+		}
+		var depChild enqueueResult
+		depIDs := []string{}
+		if dep1.JobID != "" {
+			depIDs = append(depIDs, dep1.JobID)
+		}
+		if dep2.JobID != "" {
+			depIDs = append(depIDs, dep2.JobID)
+		}
+		if len(depIDs) > 0 {
+			if err := postDecode("/api/v1/enqueue", map[string]any{
+				"queue":      "reports.generate",
+				"payload":    map[string]any{"type": "seed-dep-child", "report": "combined-q4-summary"},
+				"depends_on": depIDs,
+				"tags":       map[string]any{"dependency": "child"},
+			}, &depChild); err != nil {
+				return err
+			}
+		}
+
+		// Approval policy + job that triggers it.
+		_ = postOK("/api/v1/approval-policies", map[string]any{
+			"name":     "high-value-review",
+			"mode":     "any",
+			"queue":    "emails.send",
+			"tag_key":  "requires_approval",
+			"tag_value": "true",
+		})
+		var approvalEnq enqueueResult
+		if err := postDecode("/api/v1/enqueue", map[string]any{
+			"queue":   "emails.send",
+			"payload": map[string]any{"type": "seed-approval", "campaign": "black-friday-blast"},
+			"tags":    map[string]any{"requires_approval": "true", "tenant": "tenant-1"},
+		}, &approvalEnq); err != nil {
+			return err
+		}
+
+		// Webhook (pointing to a non-existent URL, just for demo display).
+		_ = postOK("/api/v1/webhooks", map[string]any{
+			"url":         "https://hooks.example.com/corvo",
+			"events":      []string{"job.completed", "job.failed", "job.dead"},
+			"secret":      "whsec_demo_seed_secret",
+			"enabled":     true,
+			"retry_limit": 3,
+		})
 
 		// Held job from explicit hold action.
 		var holdEnq enqueueResult
@@ -301,6 +419,15 @@ var seedDemoCmd = &cobra.Command{
 		fmt.Printf("Seeded demo data successfully.\n")
 		fmt.Printf("- base jobs requested: %d\n", seedCount)
 		fmt.Printf("- seeded job IDs tracked: %d\n", len(seededIDs))
+		if chainEnq.JobID != "" {
+			fmt.Printf("- chain pipeline job: %s\n", chainEnq.JobID)
+		}
+		if depChild.JobID != "" {
+			fmt.Printf("- dependency child job: %s (depends on %d parents)\n", depChild.JobID, len(depIDs))
+		}
+		if approvalEnq.JobID != "" {
+			fmt.Printf("- approval-held job: %s\n", approvalEnq.JobID)
+		}
 		if agentEnq.JobID != "" {
 			fmt.Printf("- agent detail job: %s\n", agentEnq.JobID)
 		}

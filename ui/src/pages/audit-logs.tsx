@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { api } from "@/lib/api";
+import { api, ApiError } from "@/lib/api";
 
 interface AuditLog {
   id: number;
@@ -22,7 +22,7 @@ export default function AuditLogs() {
   if (principal) params.set("principal", principal);
   if (method) params.set("method", method);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error } = useQuery({
     queryKey: ["audit-logs", principal, method],
     queryFn: () =>
       api<{ audit_logs: AuditLog[] }>(`/audit-logs?${params.toString()}`),
@@ -55,6 +55,22 @@ export default function AuditLogs() {
           className="rounded-lg border border-border bg-card px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground"
         />
       </div>
+
+      {error instanceof ApiError && error.status === 403 && (
+        <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-6 text-center">
+          <p className="text-sm text-yellow-400">
+            Audit logs require an enterprise license.
+          </p>
+        </div>
+      )}
+
+      {error && !(error instanceof ApiError && error.status === 403) && (
+        <div className="rounded-lg border border-red-500/30 bg-red-500/5 p-6 text-center">
+          <p className="text-sm text-red-400">
+            Failed to load audit logs: {error.message}
+          </p>
+        </div>
+      )}
 
       {isLoading && (
         <p className="py-8 text-center text-sm text-muted-foreground">

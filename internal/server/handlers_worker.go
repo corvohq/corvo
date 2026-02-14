@@ -206,7 +206,7 @@ func (s *Server) handleFetchBatch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	jobID := chi.URLParam(r, "job_id")
-	if job, err := s.store.GetJob(jobID); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+	if !s.enforceJobNamespace(principal, jobID) {
 		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
 		return
 	}
@@ -282,7 +282,7 @@ func (s *Server) handleAckBatch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleFail(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	jobID := chi.URLParam(r, "job_id")
-	if job, err := s.store.GetJob(jobID); err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
+	if !s.enforceJobNamespace(principal, jobID) {
 		writeError(w, http.StatusNotFound, "job not found", "NOT_FOUND")
 		return
 	}
@@ -317,10 +317,11 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
 		return
 	}
-	for jobID := range req.Jobs {
-		job, err := s.store.GetJob(jobID)
-		if err != nil || !enforceNamespaceJob(principal.Namespace, job.Queue) {
-			delete(req.Jobs, jobID)
+	if !isDefaultNamespace(principal.Namespace) {
+		for jobID := range req.Jobs {
+			if !s.enforceJobNamespace(principal, jobID) {
+				delete(req.Jobs, jobID)
+			}
 		}
 	}
 

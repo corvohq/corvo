@@ -2,6 +2,12 @@ package server
 
 import "net/http"
 
+func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"admin_password_set": s.adminPassword != "",
+	})
+}
+
 func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
 	keys, err := s.listAPIKeys()
 	if err != nil {

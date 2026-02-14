@@ -154,7 +154,7 @@ export default function Dashboard() {
                   >
                     <div className="flex items-center gap-2">
                       <StateBadge state={job.state} />
-                      <span className="font-mono text-xs">
+                      <span className="font-mono text-xs" title={job.id}>
                         {truncateId(job.id)}
                       </span>
                       <span className="text-xs text-muted-foreground">

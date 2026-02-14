@@ -59,7 +59,12 @@ export default function EventsPage() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">Live Events</h1>
+        <div>
+          <h1 className="text-2xl font-bold">Live Events Tail</h1>
+          <p className="text-sm text-muted-foreground">
+            Real-time event stream. Events are not persisted and will be lost on page refresh.
+          </p>
+        </div>
         <div className="flex gap-2">
           <Button
             variant="outline"
@@ -130,6 +135,7 @@ export default function EventsPage() {
                     <Link
                       to={`/ui/jobs/${event.job_id}`}
                       className="font-mono text-xs text-primary hover:underline"
+                      title={event.job_id}
                     >
                       {event.job_id.slice(0, 12)}
                     </Link>

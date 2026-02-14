@@ -49,7 +49,7 @@ export function JobRow({ job, selected, onSelect, focused, showScheduledAt }: Jo
           onCheckedChange={(checked) => onSelect(job.id, !!checked)}
         />
       </TableCell>
-      <TableCell className="font-mono text-xs">{truncateId(job.id)}</TableCell>
+      <TableCell className="font-mono text-xs" title={job.id}>{truncateId(job.id)}</TableCell>
       <TableCell>
         <StateBadge state={job.state} />
       </TableCell>

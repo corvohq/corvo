@@ -25,7 +25,7 @@ const coreItems = [
   { to: "/ui/scheduled", icon: Clock, label: "Scheduled" },
   { to: "/ui/dead-letter", icon: Skull, label: "Dead Letter" },
   { to: "/ui/held", icon: HandMetal, label: "Held Jobs" },
-  { to: "/ui/events", icon: Radio, label: "Events" },
+  { to: "/ui/events", icon: Radio, label: "Live Tail" },
   { to: "/ui/cost", icon: DollarSign, label: "Cost" },
   { to: "/ui/workers", icon: Users, label: "Workers" },
   { to: "/ui/cluster", icon: Network, label: "Cluster" },

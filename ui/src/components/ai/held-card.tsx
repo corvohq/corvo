@@ -28,7 +28,7 @@ export function HeldCard({ job }: HeldCardProps) {
       <CardHeader className="pb-3">
         <div className="flex items-start justify-between">
           <div>
-            <CardTitle className="font-mono text-sm">
+            <CardTitle className="font-mono text-sm" title={job.id}>
               {truncateId(job.id)}
             </CardTitle>
             <div className="mt-1 flex items-center gap-2">

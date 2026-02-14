@@ -148,8 +148,10 @@ export interface ClusterStatus {
 export interface ClusterNode {
   id?: string;
   address?: string;
-  role: string;
-  status: string;
+  role?: string;
+  status?: string;
+  voter?: boolean;
+  self?: boolean;
 }
 
 export interface UsageSummaryTotals {

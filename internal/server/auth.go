@@ -64,6 +64,26 @@ func principalFromContext(ctx context.Context) authPrincipal {
 	return authPrincipal{Namespace: "default", Role: "admin"}
 }
 
+// resolveCredential extracts an API key or admin password from the request.
+// Checks X-API-Key header, Authorization: Bearer, and corvo_api_key cookie
+// (for EventSource/SSE which cannot set custom headers).
+func resolveCredential(r *http.Request) string {
+	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
+		return key
+	}
+	if authz := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(strings.ToLower(authz), "bearer ") {
+		if key := strings.TrimSpace(authz[len("Bearer "):]); key != "" {
+			return key
+		}
+	}
+	if c, err := r.Cookie("corvo_api_key"); err == nil {
+		if key := strings.TrimSpace(c.Value); key != "" {
+			return key
+		}
+	}
+	return ""
+}
+
 func (s *Server) resolvePrincipal(r *http.Request) (authPrincipal, int, string, string) {
 	defaults := authPrincipal{Namespace: "default", Role: "admin", Name: "anonymous"}
 	if s.store == nil || s.store.ReadDB() == nil {
@@ -89,29 +109,24 @@ func (s *Server) resolvePrincipal(r *http.Request) (authPrincipal, int, string, 
 			return p, 0, "", ""
 		}
 	}
+	// Extract credential from X-API-Key header, Authorization: Bearer, or ?api_key query param.
+	cred := resolveCredential(r)
+
 	// Admin password bypass — always grants full admin access.
-	if s.adminPassword != "" {
-		pw := strings.TrimSpace(r.Header.Get("X-API-Key"))
-		if pw == "" {
-			if authz := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(strings.ToLower(authz), "bearer ") {
-				pw = strings.TrimSpace(authz[len("Bearer "):])
-			}
+	if s.adminPassword != "" && cred == s.adminPassword {
+		p := authPrincipal{Name: "admin", Namespace: "default", Role: "admin"}
+		ns := strings.TrimSpace(r.Header.Get("X-Corvo-Namespace"))
+		if ns != "" {
+			p.Namespace = ns
 		}
-		if pw == s.adminPassword {
-			p := authPrincipal{Name: "admin", Namespace: "default", Role: "admin"}
-			ns := strings.TrimSpace(r.Header.Get("X-Corvo-Namespace"))
-			if ns != "" {
-				p.Namespace = ns
-			}
-			return p, 0, "", ""
-		}
+		return p, 0, "", ""
 	}
 	db := s.store.ReadDB()
 	var keyCount int
 	if err := db.QueryRow("SELECT COUNT(*) FROM api_keys WHERE enabled = 1").Scan(&keyCount); err != nil {
 		return defaults, 0, "", ""
 	}
-	if keyCount == 0 {
+	if keyCount == 0 && s.adminPassword == "" {
 		ns := strings.TrimSpace(r.Header.Get("X-Corvo-Namespace"))
 		if ns != "" {
 			defaults.Namespace = ns
@@ -119,16 +134,10 @@ func (s *Server) resolvePrincipal(r *http.Request) (authPrincipal, int, string, 
 		return defaults, 0, "", ""
 	}
 
-	apiKey := strings.TrimSpace(r.Header.Get("X-API-Key"))
-	if apiKey == "" {
-		authz := strings.TrimSpace(r.Header.Get("Authorization"))
-		if strings.HasPrefix(strings.ToLower(authz), "bearer ") {
-			apiKey = strings.TrimSpace(authz[len("Bearer "):])
-		}
-	}
-	if apiKey == "" {
+	if cred == "" {
 		return authPrincipal{}, http.StatusUnauthorized, "UNAUTHORIZED", "missing API key"
 	}
+	apiKey := cred
 	h := hashAPIKey(apiKey)
 	var p authPrincipal
 	var enabled int
@@ -237,12 +246,30 @@ func visibleQueue(ns, queue string) string {
 	return queue
 }
 
-func enforceNamespaceJob(ns string, jobQueue string) bool {
+func isDefaultNamespace(ns string) bool {
 	ns = strings.TrimSpace(ns)
-	if ns == "" || ns == "default" {
+	return ns == "" || ns == "default"
+}
+
+func enforceNamespaceJob(ns string, jobQueue string) bool {
+	if isDefaultNamespace(ns) {
 		return true
 	}
 	return strings.HasPrefix(jobQueue, ns+"::")
+}
+
+// enforceJobNamespace checks that the caller's namespace has access to the
+// given job. For default-namespace callers it skips the read-path GetJob
+// lookup entirely, avoiding raft read-lag issues.
+func (s *Server) enforceJobNamespace(principal authPrincipal, jobID string) bool {
+	if isDefaultNamespace(principal.Namespace) {
+		return true
+	}
+	job, err := s.store.GetJob(jobID)
+	if err != nil {
+		return false
+	}
+	return enforceNamespaceJob(principal.Namespace, job.Queue)
 }
 
 func (s *Server) auditLogMiddleware(next http.Handler) http.Handler {

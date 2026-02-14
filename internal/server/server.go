@@ -195,6 +195,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/providers", s.handleListProviders)
 		r.Get("/approval-policies", s.handleListApprovalPolicies)
 		r.Get("/webhooks", s.handleListWebhooks)
+		r.Get("/auth/status", s.handleAuthStatus)
 		r.Get("/auth/keys", s.handleListAPIKeys)
 		r.Get("/audit-logs", s.requireEnterpriseFeature("audit", s.handleListAuditLogs))
 		r.Get("/auth/roles", s.requireEnterpriseFeature("rbac", s.handleListAuthRoles))

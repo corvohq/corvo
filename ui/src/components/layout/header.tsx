@@ -24,21 +24,26 @@ export function Header({ onMenuClick }: HeaderProps) {
       </Button>
       <div className="hidden md:block" />
       <div className="flex items-center gap-2">
-        {cluster && (
-          <>
-            <Badge
-              variant="outline"
-              className={
-                cluster.status === "healthy"
-                  ? "border-green-500 text-green-600"
-                  : "border-red-500 text-red-600"
-              }
-            >
-              {cluster.status}
-            </Badge>
-            <Badge variant="outline">{cluster.mode}</Badge>
-          </>
-        )}
+        {cluster && (() => {
+          const healthy = cluster.status === "healthy" ||
+            (!cluster.status && cluster.state && ["leader", "follower"].includes(cluster.state.toLowerCase()));
+          const label = cluster.status || (healthy ? "healthy" : cluster.state || "unknown");
+          return (
+            <>
+              <Badge
+                variant="outline"
+                className={
+                  healthy
+                    ? "border-green-500 text-green-600"
+                    : "border-red-500 text-red-600"
+                }
+              >
+                {label}
+              </Badge>
+              <Badge variant="outline">{cluster.mode}</Badge>
+            </>
+          );
+        })()}
         <Button variant="ghost" size="sm" onClick={toggle}>
           {theme === "dark" ? (
             <Sun className="h-4 w-4" />

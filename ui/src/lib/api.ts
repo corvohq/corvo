@@ -4,12 +4,25 @@ export function getStoredApiKey(): string | null {
   return localStorage.getItem(API_KEY_STORAGE_KEY);
 }
 
+// Sync cookie from localStorage on module load so EventSource (SSE)
+// can authenticate even if the key was stored before cookie support.
+(function syncCookie() {
+  const key = localStorage.getItem(API_KEY_STORAGE_KEY);
+  if (key) {
+    document.cookie = `corvo_api_key=${encodeURIComponent(key)}; path=/; SameSite=Strict`;
+  }
+})();
+
 export function setStoredApiKey(key: string): void {
   localStorage.setItem(API_KEY_STORAGE_KEY, key);
+  // Also set as a cookie so EventSource (SSE) can authenticate
+  // (EventSource cannot send custom headers).
+  document.cookie = `corvo_api_key=${encodeURIComponent(key)}; path=/; SameSite=Strict`;
 }
 
 export function clearStoredApiKey(): void {
   localStorage.removeItem(API_KEY_STORAGE_KEY);
+  document.cookie = "corvo_api_key=; path=/; SameSite=Strict; max-age=0";
 }
 
 // Fires when the server requires auth and we have no valid key.

@@ -10,9 +10,11 @@ import {
   listAuthKeyRoles,
   assignAuthKeyRole,
   unassignAuthKeyRole,
+  setStoredApiKey,
+  getStoredApiKey,
 } from "@/lib/api";
 import type { AuthKey, Namespace } from "@/lib/api";
-import { Copy, ChevronDown, ChevronRight, X } from "lucide-react";
+import { Copy, ChevronDown, ChevronRight, X, AlertTriangle } from "lucide-react";
 
 const BUILT_IN_ROLES = ["admin", "operator", "worker", "readonly"];
 
@@ -30,6 +32,11 @@ export default function ApiKeysPage() {
   const { data: namespaces = [] } = useQuery({
     queryKey: ["namespaces"],
     queryFn: () => api<Namespace[]>("/namespaces"),
+  });
+
+  const { data: authStatus } = useQuery({
+    queryKey: ["auth-status"],
+    queryFn: () => api<{ admin_password_set: boolean }>("/auth/status"),
   });
 
   const [name, setName] = useState("");
@@ -51,6 +58,11 @@ export default function ApiKeysPage() {
         expires_at: expiresAt ? new Date(expiresAt).toISOString() : undefined,
       }),
     onSuccess: (data) => {
+      // Store key in localStorage BEFORE invalidating queries so subsequent
+      // requests include it and don't trigger the auth gate.
+      if (!getStoredApiKey()) {
+        setStoredApiKey(data.api_key);
+      }
       qc.invalidateQueries({ queryKey: ["auth-keys"] });
       setCreatedKey(data.api_key);
       setName("");
@@ -79,6 +91,23 @@ export default function ApiKeysPage() {
           Manage authentication keys for API access.
         </p>
       </div>
+
+      {authStatus && !authStatus.admin_password_set && (
+        <div className="flex items-start gap-3 rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-4">
+          <AlertTriangle className="h-5 w-5 text-yellow-400 shrink-0 mt-0.5" />
+          <div>
+            <p className="text-sm font-medium text-yellow-400">
+              No admin password set
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              If you lose your API keys, you will be locked out. Set an admin password
+              with <code className="rounded bg-muted px-1 py-0.5">--admin-password</code> or
+              the <code className="rounded bg-muted px-1 py-0.5">CORVO_ADMIN_PASSWORD</code> environment
+              variable to ensure you can always access the server.
+            </p>
+          </div>
+        </div>
+      )}
 
       {createdKey && (
         <div className="rounded-lg border border-green-500/30 bg-green-500/5 p-4">

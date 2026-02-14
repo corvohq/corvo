@@ -53,17 +53,16 @@ func (s *Store) AckJob(req AckRequest) error {
 	}
 	if status == AgentStatusContinue {
 		job, err := s.GetJob(req.JobID)
-		if err != nil {
-			return err
-		}
-		reason, matched, err := s.evaluateApprovalPolicyHold(job, req.Trace)
-		if err != nil {
-			return err
-		}
-		if matched {
-			status = AgentStatusHold
-			if strings.TrimSpace(req.HoldReason) == "" {
-				req.HoldReason = reason
+		if err == nil {
+			// Only evaluate approval policies if the job is visible in the
+			// read replica. Under raft read-lag, skip policy evaluation and
+			// let the ack proceed — the FSM will apply it correctly.
+			reason, matched, pErr := s.evaluateApprovalPolicyHold(job, req.Trace)
+			if pErr == nil && matched {
+				status = AgentStatusHold
+				if strings.TrimSpace(req.HoldReason) == "" {
+					req.HoldReason = reason
+				}
 			}
 		}
 	}
