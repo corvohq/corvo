@@ -115,6 +115,32 @@ pub struct FetchedJob {
     pub attempt: u32,
 }
 
+#[derive(Debug, Serialize)]
+struct FetchBatchRequest {
+    queues: Vec<String>,
+    worker_id: String,
+    hostname: String,
+    timeout: u64,
+    count: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FetchBatchResult {
+    pub jobs: Vec<FetchedJob>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AckBatchItem {
+    pub job_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AckBatchResult {
+    pub acked: u64,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct AckBody {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -256,6 +282,40 @@ impl CorvoClient {
         batch: Option<BatchConfig>,
     ) -> Result<BatchResult, CorvoError> {
         self.post("/api/v1/enqueue/batch", &BatchRequest { jobs, batch }).await
+    }
+
+    // -- Batch fetch / ack --
+
+    pub async fn fetch_batch(
+        &self,
+        queues: Vec<String>,
+        worker_id: &str,
+        hostname: &str,
+        timeout: u64,
+        count: u32,
+    ) -> Result<FetchBatchResult, CorvoError> {
+        self.post(
+            "/api/v1/fetch/batch",
+            &FetchBatchRequest {
+                queues,
+                worker_id: worker_id.to_string(),
+                hostname: hostname.to_string(),
+                timeout,
+                count,
+            },
+        )
+        .await
+    }
+
+    pub async fn ack_batch(
+        &self,
+        acks: Vec<AckBatchItem>,
+    ) -> Result<AckBatchResult, CorvoError> {
+        #[derive(Serialize)]
+        struct Req {
+            acks: Vec<AckBatchItem>,
+        }
+        self.post("/api/v1/ack/batch", &Req { acks }).await
     }
 
     // -- Worker lifecycle --

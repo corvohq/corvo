@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/corvo/pkg/client"
-	"github.com/user/corvo/pkg/workerclient"
+	"github.com/user/corvo/sdk/go/client"
+	"github.com/user/corvo/sdk/go/worker"
 )
 
 func TestPerfE2EEnqueueHTTP(t *testing.T) {
@@ -65,7 +65,7 @@ func TestPerfE2EEnqueueHTTP(t *testing.T) {
 func TestPerfE2ELifecycleRPC(t *testing.T) {
 	baseURL := startRealServer(t, false)
 	c := client.New(baseURL)
-	wc := workerclient.New(baseURL)
+	wc := worker.New(baseURL)
 
 	total := envInt("CORVO_PERF_E2E_LC_TOTAL", 3000)
 	concurrency := envInt("CORVO_PERF_E2E_LC_CONCURRENCY", 10)
@@ -89,7 +89,7 @@ func TestPerfE2ELifecycleRPC(t *testing.T) {
 		go func(workerID string) {
 			defer wg.Done()
 			ctx := context.Background()
-			pending := make([]workerclient.AckBatchItem, 0, ackBatch*2)
+			pending := make([]worker.AckBatchItem, 0, ackBatch*2)
 			for {
 				if int(done.Load()) >= total {
 					return
@@ -120,7 +120,7 @@ func TestPerfE2ELifecycleRPC(t *testing.T) {
 				if n > remaining {
 					n = remaining
 				}
-				jobs, err := wc.FetchBatch(ctx, workerclient.FetchRequest{
+				jobs, err := wc.FetchBatch(ctx, worker.FetchRequest{
 					Queues:        []string{"perf.e2e.rpc"},
 					WorkerID:      workerID,
 					Hostname:      "perf-host",
@@ -136,7 +136,7 @@ func TestPerfE2ELifecycleRPC(t *testing.T) {
 					continue
 				}
 				for _, j := range jobs {
-					pending = append(pending, workerclient.AckBatchItem{
+					pending = append(pending, worker.AckBatchItem{
 						JobID:  j.JobID,
 						Result: json.RawMessage(`{}`),
 					})
@@ -160,6 +160,133 @@ func TestPerfE2ELifecycleRPC(t *testing.T) {
 	}
 }
 
+func TestPerfE2ELifecycleStream(t *testing.T) {
+	baseURL := startRealServer(t, false)
+	c := client.New(baseURL)
+	wc := worker.New(baseURL)
+
+	total := envInt("CORVO_PERF_E2E_STREAM_TOTAL", 3000)
+	concurrency := envInt("CORVO_PERF_E2E_STREAM_CONCURRENCY", 10)
+	fetchBatch := envInt("CORVO_PERF_E2E_STREAM_FETCH_BATCH", 16)
+	ackBatch := envInt("CORVO_PERF_E2E_STREAM_ACK_BATCH", 64)
+	minOps := envFloat("CORVO_PERF_E2E_STREAM_MIN_OPS", 200.0)
+
+	// Seed jobs using batch enqueue for speed.
+	const seedBatch = 100
+	for i := 0; i < total; i += seedBatch {
+		n := seedBatch
+		if n > total-i {
+			n = total - i
+		}
+		jobs := make([]client.BatchJob, n)
+		for j := range jobs {
+			jobs[j] = client.BatchJob{Queue: "perf.e2e.stream", Payload: map[string]any{}}
+		}
+		if _, err := c.EnqueueBatch(client.BatchRequest{Jobs: jobs}); err != nil {
+			t.Fatalf("seed batch enqueue failed at %d: %v", i, err)
+		}
+	}
+
+	start := time.Now()
+	var done atomic.Int64
+	var failures atomic.Int64
+	var wg sync.WaitGroup
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(workerID string) {
+			defer wg.Done()
+			ctx := context.Background()
+			stream := wc.OpenLifecycleStream(ctx)
+			defer stream.Close()
+			var reqID uint64 = 1
+
+			pending := make([]worker.AckBatchItem, 0, ackBatch*2)
+			for {
+				if int(done.Load()) >= total && len(pending) == 0 {
+					return
+				}
+
+				// Build acks from pending.
+				ackN := ackBatch
+				if ackN > len(pending) {
+					ackN = len(pending)
+				}
+				acks := pending[:ackN]
+
+				// Determine fetch count.
+				fetchN := 0
+				remaining := total - int(done.Load()) - len(pending)
+				if remaining > 0 {
+					fetchN = fetchBatch
+					if fetchN > remaining {
+						fetchN = remaining
+					}
+				}
+
+				resp, err := stream.Exchange(worker.LifecycleRequest{
+					RequestID:    reqID,
+					Queues:       []string{"perf.e2e.stream"},
+					WorkerID:     workerID,
+					Hostname:     "perf-host",
+					LeaseSeconds: 10,
+					FetchCount:   fetchN,
+					Acks:         acks,
+				})
+				reqID++
+
+				if err != nil {
+					failures.Add(1)
+					// Reopen stream on error.
+					stream.Close()
+					stream = wc.OpenLifecycleStream(ctx)
+					time.Sleep(2 * time.Millisecond)
+					continue
+				}
+				if resp.Error != "" {
+					failures.Add(1)
+					time.Sleep(1 * time.Millisecond)
+					continue
+				}
+
+				// Account for acked jobs.
+				acked := resp.Acked
+				if acked > len(pending) {
+					acked = len(pending)
+				}
+				done.Add(int64(acked))
+				pending = pending[acked:]
+
+				// Append newly fetched jobs.
+				for _, j := range resp.Jobs {
+					pending = append(pending, worker.AckBatchItem{
+						JobID:  j.JobID,
+						Result: json.RawMessage(`{}`),
+					})
+				}
+
+				if len(resp.Jobs) == 0 && fetchN > 0 && len(pending) == 0 {
+					time.Sleep(1 * time.Millisecond)
+				}
+			}
+		}("perf-stream-worker-" + strconv.Itoa(i))
+	}
+	wg.Wait()
+
+	if got := int(done.Load()); got < total {
+		t.Fatalf("stream lifecycle incomplete: got=%d want=%d failures=%d", got, total, failures.Load())
+	}
+	if n := failures.Load(); n > 0 {
+		t.Logf("e2e lifecycle stream had recoverable failures=%d", n)
+	}
+	elapsed := time.Since(start)
+	ops := float64(total) / elapsed.Seconds()
+	t.Logf("e2e lifecycle stream: total=%d concurrency=%d elapsed=%s ops/sec=%.1f", total, concurrency, elapsed.Round(time.Millisecond), ops)
+	if ops < minOps {
+		t.Fatalf("e2e lifecycle stream perf regression: ops/sec %.1f below threshold %.1f", ops, minOps)
+	}
+}
+
 // startRealServer starts the real `corvo server` command path.
 // durable=false means default fast profile; durable=true enables raft fsync mode.
 func startRealServer(t *testing.T, durable bool) string {
@@ -175,6 +302,7 @@ func startRealServer(t *testing.T, durable bool) string {
 		"--data-dir", dataDir,
 		"--raft-bind", raftAddr,
 		"--raft-advertise", raftAddr,
+		"--rate-limit-enabled=false",
 	}
 	if durable {
 		args = append(args, "--durable")

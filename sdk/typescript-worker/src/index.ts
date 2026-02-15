@@ -27,6 +27,8 @@ export type WorkerConfig = {
   hostname?: string;
   concurrency?: number;
   shutdownTimeoutMs?: number;
+  fetchBatchSize?: number;
+  ackBatchSize?: number;
 };
 
 export type WorkerJobContext = {
@@ -41,6 +43,8 @@ export class CorvoWorker {
   private readonly handlers: Map<string, WorkerHandler> = new Map();
   private readonly active: Map<string, { cancelled: boolean }> = new Map();
   private stopping = false;
+  private readonly fetchBatchSize: number;
+  private readonly ackBatchSize: number;
 
   constructor(client: CorvoClient, cfg: WorkerConfig) {
     this.client = client;
@@ -50,6 +54,8 @@ export class CorvoWorker {
       concurrency: cfg.concurrency ?? 10,
       shutdownTimeoutMs: cfg.shutdownTimeoutMs ?? 30000,
     };
+    this.fetchBatchSize = cfg.fetchBatchSize ?? 1;
+    this.ackBatchSize = cfg.ackBatchSize ?? 1;
   }
 
   register(queue: string, handler: WorkerHandler): void {
@@ -90,42 +96,77 @@ export class CorvoWorker {
   }
 
   private async fetchLoop(): Promise<void> {
+    const ackBuffer: { job_id: string; result?: Record<string, unknown> }[] = [];
+
     while (!this.stopping) {
       try {
-        const job = await this.fetch();
-        if (!job) continue;
+        await this.flushAcks(ackBuffer);
 
-        const handler = this.handlers.get(job.queue);
-        if (!handler) {
-          await this.client.ack(job.job_id, {});
-          continue;
+        let jobs: FetchedJob[];
+        if (this.fetchBatchSize > 1) {
+          const result = await this.fetchBatch();
+          jobs = result ?? [];
+        } else {
+          const job = await this.fetch();
+          jobs = job ? [job] : [];
         }
 
-        this.active.set(job.job_id, { cancelled: false });
-        const ctx: WorkerJobContext = {
-          isCancelled: () => this.active.get(job.job_id)?.cancelled === true,
-          checkpoint: async (checkpoint) => {
-            await this.heartbeat({ [job.job_id]: { checkpoint } });
-          },
-          progress: async (current, total, message) => {
-            await this.heartbeat({
-              [job.job_id]: { progress: { current, total, message } },
-            });
-          },
-        };
+        for (const job of jobs) {
+          const handler = this.handlers.get(job.queue);
+          if (!handler) {
+            ackBuffer.push({ job_id: job.job_id });
+            continue;
+          }
 
-        try {
-          await handler(job, ctx);
-          await this.client.ack(job.job_id, {});
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          await this.fail(job.job_id, message);
-        } finally {
-          this.active.delete(job.job_id);
+          this.active.set(job.job_id, { cancelled: false });
+          const ctx: WorkerJobContext = {
+            isCancelled: () => this.active.get(job.job_id)?.cancelled === true,
+            checkpoint: async (checkpoint) => {
+              await this.heartbeat({ [job.job_id]: { checkpoint } });
+            },
+            progress: async (current, total, message) => {
+              await this.heartbeat({
+                [job.job_id]: { progress: { current, total, message } },
+              });
+            },
+          };
+
+          try {
+            await handler(job, ctx);
+            ackBuffer.push({ job_id: job.job_id });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            await this.fail(job.job_id, message);
+          } finally {
+            this.active.delete(job.job_id);
+          }
         }
+
+        await this.flushAcks(ackBuffer);
       } catch {
         await sleep(1000);
       }
+    }
+    // Flush remaining acks on shutdown.
+    await this.flushAcks(ackBuffer, true);
+  }
+
+  private async flushAcks(
+    buffer: { job_id: string; result?: Record<string, unknown> }[],
+    force = false,
+  ): Promise<void> {
+    while (this.ackBatchSize > 1 && buffer.length >= this.ackBatchSize) {
+      const batch = buffer.splice(0, this.ackBatchSize);
+      await this.ackBatch(batch);
+    }
+    if (force && buffer.length > 0 && this.ackBatchSize > 1) {
+      await this.ackBatch(buffer.splice(0));
+    }
+    if (this.ackBatchSize <= 1 && buffer.length > 0) {
+      for (const item of buffer) {
+        await this.client.ack(item.job_id, item.result ?? {});
+      }
+      buffer.length = 0;
     }
   }
 
@@ -149,6 +190,29 @@ export class CorvoWorker {
         // Best-effort heartbeat.
       }
     }
+  }
+
+  private async fetchBatch(): Promise<FetchedJob[]> {
+    const result = await this.request<{ jobs: FetchedJob[] }>("/api/v1/fetch/batch", {
+      method: "POST",
+      body: JSON.stringify({
+        queues: this.cfg.queues,
+        worker_id: this.cfg.workerID,
+        hostname: this.cfg.hostname,
+        timeout: 30,
+        count: this.fetchBatchSize,
+      }),
+    });
+    return result.jobs ?? [];
+  }
+
+  private async ackBatch(
+    acks: { job_id: string; result?: Record<string, unknown> }[],
+  ): Promise<void> {
+    await this.request("/api/v1/ack/batch", {
+      method: "POST",
+      body: JSON.stringify({ acks }),
+    });
   }
 
   private async fetch(): Promise<FetchedJob | null> {

@@ -19,6 +19,8 @@ class WorkerConfig:
     hostname: str = socket.gethostname()
     concurrency: int = 10
     shutdown_timeout_s: float = 30.0
+    fetch_batch_size: int = 1
+    ack_batch_size: int = 1
 
 
 class JobContext:
@@ -87,33 +89,57 @@ class CorvoWorker:
         self.stop()
 
     def _fetch_loop(self) -> None:
+        ack_buffer: list[Dict[str, Any]] = []
         while not self._stop.is_set():
             try:
-                job = self.client.fetch(self.cfg.queues, self.cfg.worker_id, self.cfg.hostname, timeout=30)
-                if not job:
-                    continue
-                job_id = str(job["job_id"])
-                queue = str(job["queue"])
+                self._flush_acks(ack_buffer)
+                if self.cfg.fetch_batch_size > 1:
+                    result = self.client.fetch_batch(
+                        self.cfg.queues, self.cfg.worker_id, self.cfg.hostname,
+                        timeout=30, count=self.cfg.fetch_batch_size,
+                    )
+                    jobs = result.get("jobs", []) if result else []
+                else:
+                    job = self.client.fetch(self.cfg.queues, self.cfg.worker_id, self.cfg.hostname, timeout=30)
+                    jobs = [job] if job else []
 
-                handler = self._handlers.get(queue)
-                if handler is None:
-                    self.client.ack(job_id, {})
-                    continue
+                for job in jobs:
+                    if not job:
+                        continue
+                    job_id = str(job["job_id"])
+                    queue = str(job["queue"])
 
-                with self._mu:
-                    self._active[job_id] = {"cancelled": False}
+                    handler = self._handlers.get(queue)
+                    if handler is None:
+                        ack_buffer.append({"job_id": job_id})
+                        continue
 
-                ctx = JobContext(self, job_id)
-                try:
-                    handler(job, ctx)
-                    self.client.ack(job_id, {})
-                except Exception as exc:
-                    self.client.fail(job_id, str(exc))
-                finally:
                     with self._mu:
-                        self._active.pop(job_id, None)
+                        self._active[job_id] = {"cancelled": False}
+
+                    ctx = JobContext(self, job_id)
+                    try:
+                        handler(job, ctx)
+                        ack_buffer.append({"job_id": job_id})
+                    except Exception as exc:
+                        self.client.fail(job_id, str(exc))
+                    finally:
+                        with self._mu:
+                            self._active.pop(job_id, None)
+
+                self._flush_acks(ack_buffer)
             except Exception:
                 time.sleep(1.0)
+
+    def _flush_acks(self, buffer: list[Dict[str, Any]]) -> None:
+        while len(buffer) >= self.cfg.ack_batch_size and self.cfg.ack_batch_size > 1:
+            batch = buffer[:self.cfg.ack_batch_size]
+            del buffer[:self.cfg.ack_batch_size]
+            self.client.ack_batch(batch)
+        if buffer and self.cfg.ack_batch_size <= 1:
+            for item in buffer:
+                self.client.ack(item["job_id"], {})
+            buffer.clear()
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.is_set():

@@ -12,7 +12,7 @@ import (
 	"github.com/user/corvo/internal/scheduler"
 	"github.com/user/corvo/internal/server"
 	"github.com/user/corvo/internal/store"
-	"github.com/user/corvo/pkg/client"
+	"github.com/user/corvo/sdk/go/client"
 )
 
 // testEnv holds a fully wired test stack.

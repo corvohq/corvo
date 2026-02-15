@@ -1,4 +1,4 @@
-package workerclient
+package worker
 
 import (
 	"context"

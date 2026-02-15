@@ -14,11 +14,16 @@ module Corvo.Client
   , BulkRequest(..)
   , BulkResult(..)
   , BulkTask(..)
+  , FetchBatchResult(..)
+  , AckBatchItem(..)
+  , AckBatchResult(..)
   , defaultEnqueueOptions
   , defaultSearchFilter
   , enqueue
   , enqueueWith
   , enqueueBatch
+  , fetchBatch
+  , ackBatch
   , fetch
   , ack
   , fail
@@ -111,6 +116,31 @@ data FetchedJob = FetchedJob
 instance FromJSON FetchedJob where
   parseJSON = withObject "FetchedJob" $ \o ->
     FetchedJob <$> o .: "job_id" <*> o .: "queue" <*> o .: "payload" <*> o .: "attempt"
+
+data FetchBatchResult = FetchBatchResult
+  { fbrJobs :: [FetchedJob]
+  } deriving (Show)
+
+instance FromJSON FetchBatchResult where
+  parseJSON = withObject "FetchBatchResult" $ \o ->
+    FetchBatchResult <$> o .: "jobs"
+
+data AckBatchItem = AckBatchItem
+  { abiJobId  :: T.Text
+  , abiResult :: Maybe Value
+  } deriving (Show)
+
+instance ToJSON AckBatchItem where
+  toJSON AckBatchItem{..} = object $
+    ["job_id" .= abiJobId] <> maybe [] (\r -> ["result" .= r]) abiResult
+
+data AckBatchResult = AckBatchResult
+  { abrAcked :: Int
+  } deriving (Show)
+
+instance FromJSON AckBatchResult where
+  parseJSON = withObject "AckBatchResult" $ \o ->
+    AckBatchResult <$> o .: "acked"
 
 data HeartbeatResult = HeartbeatResult
   { hrAcked    :: [T.Text]
@@ -246,6 +276,27 @@ enqueueBatch :: CorvoClient -> [BatchJob] -> Maybe BatchConfig -> IO (Either Str
 enqueueBatch client jobs mbatch = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/enqueue/batch")
   let body = object $ ["jobs" .= jobs] <> maybe [] (\b -> ["batch" .= b]) mbatch
+      req1 = setRequestMethod "POST" $ setRequestBodyJSON body req0
+      req2 = applyAuth client req1
+  resp <- httpJSONEither req2
+  pure (getResponseBody resp)
+
+-- | Batch fetch for multiple jobs.
+fetchBatch :: CorvoClient -> [T.Text] -> T.Text -> T.Text -> Int -> Int -> IO (Either String FetchBatchResult)
+fetchBatch client queues workerId hostname timeout count = do
+  req0 <- parseRequest (baseUrl client ++ "/api/v1/fetch/batch")
+  let body = object [ "queues" .= queues, "worker_id" .= workerId
+                     , "hostname" .= hostname, "timeout" .= timeout, "count" .= count ]
+      req1 = setRequestMethod "POST" $ setRequestBodyJSON body req0
+      req2 = applyAuth client req1
+  resp <- httpJSONEither req2
+  pure (getResponseBody resp)
+
+-- | Batch acknowledge multiple jobs.
+ackBatch :: CorvoClient -> [AckBatchItem] -> IO (Either String AckBatchResult)
+ackBatch client items = do
+  req0 <- parseRequest (baseUrl client ++ "/api/v1/ack/batch")
+  let body = object ["acks" .= items]
       req1 = setRequestMethod "POST" $ setRequestBodyJSON body req0
       req2 = applyAuth client req1
   resp <- httpJSONEither req2

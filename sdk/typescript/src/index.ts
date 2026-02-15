@@ -171,6 +171,26 @@ export class CorvoClient {
     return this.request(`/api/v1/bulk/${encodeURIComponent(id)}`, { method: "GET" });
   }
 
+  async fetchBatch(
+    queues: string[],
+    workerID: string,
+    hostname = "corvo-worker",
+    timeout = 30,
+    count = 10,
+  ): Promise<{ jobs: FetchedJob[] }> {
+    return this.request("/api/v1/fetch/batch", {
+      method: "POST",
+      body: JSON.stringify({ queues, worker_id: workerID, hostname, timeout, count }),
+    });
+  }
+
+  async ackBatch(acks: { job_id: string; result?: Record<string, unknown> }[]): Promise<{ acked: number }> {
+    return this.request("/api/v1/ack/batch", {
+      method: "POST",
+      body: JSON.stringify({ acks }),
+    });
+  }
+
   async enqueueBatch(jobs: BatchJob[], batch?: BatchConfig): Promise<BatchResult> {
     return this.request("/api/v1/enqueue/batch", {
       method: "POST",

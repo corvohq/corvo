@@ -100,6 +100,16 @@ class CorvoClient:
     def heartbeat(self, jobs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         return self._request("POST", "/api/v1/heartbeat", {"jobs": jobs})
 
+    def fetch_batch(self, queues: list[str], worker_id: str, hostname: str = "corvo-worker", timeout: int = 30, count: int = 10) -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/v1/fetch/batch",
+            {"queues": queues, "worker_id": worker_id, "hostname": hostname, "timeout": timeout, "count": count},
+        )
+
+    def ack_batch(self, acks: list[Dict[str, Any]]) -> Dict[str, Any]:
+        return self._request("POST", "/api/v1/ack/batch", {"acks": acks})
+
     def enqueue_batch(self, jobs: list[Dict[str, Any]], batch: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         body: Dict[str, Any] = {"jobs": jobs}
         if batch is not None:
