@@ -512,7 +512,8 @@ func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 		}
 		key := rateLimitClientKey(r)
 		isWrite := isWriteMethod(r.Method)
-		if !s.rateLimiter.allow(key, isWrite, time.Now()) {
+		cost := batchRateLimitCost(r)
+		if !s.rateLimiter.allowN(key, isWrite, cost, time.Now()) {
 			if s.reqMetrics != nil {
 				s.reqMetrics.incThrottled(r.Method, r.URL.Path)
 			}
@@ -522,6 +523,65 @@ func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// batchRateLimitCost peeks at the request body for batch endpoints and
+// returns the number of items as the token cost. Non-batch endpoints cost 1.
+func batchRateLimitCost(r *http.Request) int {
+	path := r.URL.Path
+	switch path {
+	case "/api/v1/fetch/batch":
+		body, err := peekJSONBody(r)
+		if err != nil || body == nil {
+			return 1
+		}
+		if count, ok := body["count"].(float64); ok && count > 1 {
+			return int(count)
+		}
+		return 1
+	case "/api/v1/ack/batch":
+		body, err := peekJSONBody(r)
+		if err != nil || body == nil {
+			return 1
+		}
+		if acks, ok := body["acks"].([]any); ok && len(acks) > 1 {
+			return len(acks)
+		}
+		return 1
+	case "/api/v1/enqueue/batch":
+		body, err := peekJSONBody(r)
+		if err != nil || body == nil {
+			return 1
+		}
+		if jobs, ok := body["jobs"].([]any); ok && len(jobs) > 1 {
+			return len(jobs)
+		}
+		return 1
+	default:
+		return 1
+	}
+}
+
+// peekJSONBody reads the request body, parses it as JSON, and replaces the
+// body so downstream handlers can read it again. Limits read to 4MB.
+func peekJSONBody(r *http.Request) (map[string]any, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+	buf, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	_ = r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(buf))
+	if len(bytes.TrimSpace(buf)) == 0 {
+		return nil, nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal(buf, &out); err != nil {
+		return nil, nil
+	}
+	return out, nil
 }
 
 func (s *Server) requireLeader(next http.Handler) http.Handler {

@@ -89,8 +89,15 @@ func (r *rateLimiter) close() {
 }
 
 func (r *rateLimiter) allow(key string, isWrite bool, now time.Time) bool {
+	return r.allowN(key, isWrite, 1, now)
+}
+
+func (r *rateLimiter) allowN(key string, isWrite bool, n int, now time.Time) bool {
 	if !r.cfg.Enabled {
 		return true
+	}
+	if n <= 0 {
+		n = 1
 	}
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -110,12 +117,19 @@ func (r *rateLimiter) allow(key string, isWrite bool, now time.Time) bool {
 	}
 	c.last = now
 	if isWrite {
-		return takeToken(&c.wr, r.cfg.WriteRPS, r.cfg.WriteBurst, now)
+		return takeTokenN(&c.wr, r.cfg.WriteRPS, r.cfg.WriteBurst, now, n)
 	}
-	return takeToken(&c.read, r.cfg.ReadRPS, r.cfg.ReadBurst, now)
+	return takeTokenN(&c.read, r.cfg.ReadRPS, r.cfg.ReadBurst, now, n)
 }
 
 func takeToken(b *tokenBucket, rps, burst float64, now time.Time) bool {
+	return takeTokenN(b, rps, burst, now, 1)
+}
+
+func takeTokenN(b *tokenBucket, rps, burst float64, now time.Time, n int) bool {
+	if n <= 0 {
+		n = 1
+	}
 	if b.last.IsZero() {
 		b.last = now
 	}
@@ -127,10 +141,11 @@ func takeToken(b *tokenBucket, rps, burst float64, now time.Time) bool {
 		}
 	}
 	b.last = now
-	if b.tokens < 1 {
+	cost := float64(n)
+	if b.tokens < cost {
 		return false
 	}
-	b.tokens -= 1
+	b.tokens -= cost
 	return true
 }
 

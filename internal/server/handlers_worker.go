@@ -255,6 +255,10 @@ func (s *Server) handleAckBatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "acks array is required", "VALIDATION_ERROR")
 		return
 	}
+	if len(req.Acks) > 512 {
+		writeError(w, http.StatusBadRequest, "ack batch exceeds maximum of 512 items", "VALIDATION_ERROR")
+		return
+	}
 
 	acks := make([]store.AckOp, 0, len(req.Acks))
 	for _, ack := range req.Acks {
