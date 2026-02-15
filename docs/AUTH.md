@@ -216,6 +216,20 @@ See [ENTERPRISE.md](./ENTERPRISE.md) for the full multi-tenancy design.
 - Auth should be deployed behind TLS termination.
 - `GET /healthz` stays unauthenticated for probes.
 
+## Cloud Console SSO
+
+Corvo Cloud supports OIDC-based single sign-on for cloud console login. This is separate from instance-level SSO (above) — it controls who can log into the cloud management console, not how workers authenticate to instances.
+
+- Org owners configure OIDC (issuer URL, client ID/secret, email domain) in Settings > SSO
+- Users click "Sign in with SSO" on the login page and enter their work email
+- The backend looks up the IdP config by email domain and redirects to the identity provider
+- After authentication, users are JIT-provisioned into the org as `member` if they don't already exist
+- The proxy injects `X-Corvo-User-Email` and `X-Corvo-User-Role` headers on all proxied requests to instances
+
+See [`corvo-cloud/docs/ENTERPRISE.md`](../../corvo-cloud/docs/ENTERPRISE.md) for the full cloud auth model.
+
+---
+
 ## Summary
 
 | Feature | OSS | Enterprise (licensed) |
