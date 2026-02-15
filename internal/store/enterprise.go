@@ -66,6 +66,12 @@ func (s *Store) UpdateAPIKeyLastUsed(op UpdateAPIKeyUsedOp) {
 	s.applyBackground(OpUpdateAPIKeyUsed, op)
 }
 
+// SetNamespaceRateLimit sets per-namespace rate limit overrides via Raft.
+func (s *Store) SetNamespaceRateLimit(op SetNamespaceRateLimitOp) error {
+	res := s.applyOp(OpSetNamespaceRateLimit, op)
+	return res.Err
+}
+
 // UpsertWebhook creates or updates a webhook via Raft.
 func (s *Store) UpsertWebhook(op UpsertWebhookOp) error {
 	res := s.applyOp(OpUpsertWebhook, op)

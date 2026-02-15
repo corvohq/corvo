@@ -54,7 +54,8 @@ const (
 	OpUpdateAPIKeyUsed    OpType = 41
 	OpUpsertWebhook       OpType = 42
 	OpDeleteWebhook       OpType = 43
-	OpUpdateWebhookStatus OpType = 44
+	OpUpdateWebhookStatus      OpType = 44
+	OpSetNamespaceRateLimit    OpType = 45
 )
 
 // Op is the Raft log entry payload.
@@ -362,4 +363,12 @@ type UpdateWebhookStatusOp struct {
 	LastStatusCode int    `json:"last_status_code"`
 	LastError      string `json:"last_error"`
 	LastDeliveryAt string `json:"last_delivery_at"`
+}
+
+type SetNamespaceRateLimitOp struct {
+	Name       string   `json:"name"`
+	ReadRPS    *float64 `json:"read_rps"`
+	ReadBurst  *float64 `json:"read_burst"`
+	WriteRPS   *float64 `json:"write_rps"`
+	WriteBurst *float64 `json:"write_burst"`
 }

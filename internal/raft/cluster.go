@@ -808,6 +808,10 @@ func ensureMaterializedViewSchema(db *sql.DB) error {
 		{table: "api_keys", name: "expires_at", sql: "ALTER TABLE api_keys ADD COLUMN expires_at TEXT"},
 		{table: "sso_settings", name: "oidc_group_claim", sql: "ALTER TABLE sso_settings ADD COLUMN oidc_group_claim TEXT NOT NULL DEFAULT 'groups'"},
 		{table: "sso_settings", name: "group_role_mappings", sql: "ALTER TABLE sso_settings ADD COLUMN group_role_mappings TEXT NOT NULL DEFAULT '{}'"},
+		{table: "namespaces", name: "rate_limit_read_rps", sql: "ALTER TABLE namespaces ADD COLUMN rate_limit_read_rps REAL"},
+		{table: "namespaces", name: "rate_limit_read_burst", sql: "ALTER TABLE namespaces ADD COLUMN rate_limit_read_burst REAL"},
+		{table: "namespaces", name: "rate_limit_write_rps", sql: "ALTER TABLE namespaces ADD COLUMN rate_limit_write_rps REAL"},
+		{table: "namespaces", name: "rate_limit_write_burst", sql: "ALTER TABLE namespaces ADD COLUMN rate_limit_write_burst REAL"},
 	}
 	for _, c := range columns {
 		ok, err := sqliteHasColumn(db, c.table, c.name)

@@ -53,7 +53,8 @@ type DecodedRaftOp struct {
 	UpdateAPIKeyUsed    *UpdateAPIKeyUsedOp
 	UpsertWebhook       *UpsertWebhookOp
 	DeleteWebhook       *DeleteWebhookOp
-	UpdateWebhookStatus *UpdateWebhookStatusOp
+	UpdateWebhookStatus    *UpdateWebhookStatusOp
+	SetNamespaceRateLimit  *SetNamespaceRateLimitOp
 	Multi        []*DecodedRaftOp
 }
 
@@ -108,7 +109,8 @@ type pbOp struct {
 	UpdateAPIKeyUsed    *pbUpdateAPIKeyUsedOp    `protobuf:"bytes,42,opt,name=update_api_key_used,json=updateApiKeyUsed,proto3" json:"update_api_key_used,omitempty"`
 	UpsertWebhook       *pbUpsertWebhookOp       `protobuf:"bytes,43,opt,name=upsert_webhook,json=upsertWebhook,proto3" json:"upsert_webhook,omitempty"`
 	DeleteWebhook       *pbDeleteWebhookOp       `protobuf:"bytes,44,opt,name=delete_webhook,json=deleteWebhook,proto3" json:"delete_webhook,omitempty"`
-	UpdateWebhookStatus *pbUpdateWebhookStatusOp `protobuf:"bytes,45,opt,name=update_webhook_status,json=updateWebhookStatus,proto3" json:"update_webhook_status,omitempty"`
+	UpdateWebhookStatus    *pbUpdateWebhookStatusOp    `protobuf:"bytes,45,opt,name=update_webhook_status,json=updateWebhookStatus,proto3" json:"update_webhook_status,omitempty"`
+	SetNamespaceRateLimit  *pbSetNamespaceRateLimitOp  `protobuf:"bytes,46,opt,name=set_namespace_rate_limit,json=setNamespaceRateLimit,proto3" json:"set_namespace_rate_limit,omitempty"`
 }
 
 func (m *pbOp) Reset()         { *m = pbOp{} }
@@ -707,6 +709,12 @@ func buildPBOp(opType OpType, data any) (*pbOp, error) {
 			return nil, fmt.Errorf("update webhook status op type mismatch: %T", data)
 		}
 		op.UpdateWebhookStatus = toPBUpdateWebhookStatus(v)
+	case OpSetNamespaceRateLimit:
+		v, ok := data.(SetNamespaceRateLimitOp)
+		if !ok {
+			return nil, fmt.Errorf("set namespace rate limit op type mismatch: %T", data)
+		}
+		op.SetNamespaceRateLimit = toPBSetNamespaceRateLimit(v)
 	case OpMulti:
 		v, ok := data.(MultiOp)
 		if !ok {
@@ -970,6 +978,12 @@ func buildPBSubOp(sub Op) (*pbOp, error) {
 			return nil, err
 		}
 		op.UpdateWebhookStatus = toPBUpdateWebhookStatus(v)
+	case OpSetNamespaceRateLimit:
+		var v SetNamespaceRateLimitOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.SetNamespaceRateLimit = toPBSetNamespaceRateLimit(v)
 	default:
 		return nil, fmt.Errorf("unsupported multi sub-op type: %d", sub.Type)
 	}
@@ -1187,6 +1201,11 @@ func fromPBOp(op *pbOp) (*DecodedRaftOp, error) {
 	if op.UpdateWebhookStatus != nil {
 		v := fromPBUpdateWebhookStatus(op.UpdateWebhookStatus)
 		out.UpdateWebhookStatus = &v
+		return out, nil
+	}
+	if op.SetNamespaceRateLimit != nil {
+		v := fromPBSetNamespaceRateLimit(op.SetNamespaceRateLimit)
+		out.SetNamespaceRateLimit = &v
 		return out, nil
 	}
 	return nil, fmt.Errorf("protobuf op %d missing payload", op.Type)
@@ -1829,6 +1848,22 @@ func (m *pbUpdateWebhookStatusOp) Reset()         { *m = pbUpdateWebhookStatusOp
 func (m *pbUpdateWebhookStatusOp) String() string { return oldproto.CompactTextString(m) }
 func (*pbUpdateWebhookStatusOp) ProtoMessage()    {}
 
+type pbSetNamespaceRateLimitOp struct {
+	Name       string  `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	ReadRPS    float64 `protobuf:"fixed64,2,opt,name=read_rps,json=readRps,proto3" json:"read_rps,omitempty"`
+	HasReadRPS bool    `protobuf:"varint,3,opt,name=has_read_rps,json=hasReadRps,proto3" json:"has_read_rps,omitempty"`
+	ReadBurst  float64 `protobuf:"fixed64,4,opt,name=read_burst,json=readBurst,proto3" json:"read_burst,omitempty"`
+	HasReadBurst bool  `protobuf:"varint,5,opt,name=has_read_burst,json=hasReadBurst,proto3" json:"has_read_burst,omitempty"`
+	WriteRPS   float64 `protobuf:"fixed64,6,opt,name=write_rps,json=writeRps,proto3" json:"write_rps,omitempty"`
+	HasWriteRPS bool   `protobuf:"varint,7,opt,name=has_write_rps,json=hasWriteRps,proto3" json:"has_write_rps,omitempty"`
+	WriteBurst float64 `protobuf:"fixed64,8,opt,name=write_burst,json=writeBurst,proto3" json:"write_burst,omitempty"`
+	HasWriteBurst bool `protobuf:"varint,9,opt,name=has_write_burst,json=hasWriteBurst,proto3" json:"has_write_burst,omitempty"`
+}
+
+func (m *pbSetNamespaceRateLimitOp) Reset()         { *m = pbSetNamespaceRateLimitOp{} }
+func (m *pbSetNamespaceRateLimitOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbSetNamespaceRateLimitOp) ProtoMessage()    {}
+
 // Enterprise toPB/fromPB conversion functions.
 
 func toPBCreateNamespace(op CreateNamespaceOp) *pbCreateNamespaceOp {
@@ -1999,4 +2034,45 @@ func fromPBUpdateWebhookStatus(op *pbUpdateWebhookStatusOp) UpdateWebhookStatusO
 		LastError:      op.LastError,
 		LastDeliveryAt: op.LastDeliveryAt,
 	}
+}
+
+func toPBSetNamespaceRateLimit(op SetNamespaceRateLimitOp) *pbSetNamespaceRateLimitOp {
+	pb := &pbSetNamespaceRateLimitOp{Name: op.Name}
+	if op.ReadRPS != nil {
+		pb.ReadRPS = *op.ReadRPS
+		pb.HasReadRPS = true
+	}
+	if op.ReadBurst != nil {
+		pb.ReadBurst = *op.ReadBurst
+		pb.HasReadBurst = true
+	}
+	if op.WriteRPS != nil {
+		pb.WriteRPS = *op.WriteRPS
+		pb.HasWriteRPS = true
+	}
+	if op.WriteBurst != nil {
+		pb.WriteBurst = *op.WriteBurst
+		pb.HasWriteBurst = true
+	}
+	return pb
+}
+func fromPBSetNamespaceRateLimit(op *pbSetNamespaceRateLimitOp) SetNamespaceRateLimitOp {
+	out := SetNamespaceRateLimitOp{Name: op.Name}
+	if op.HasReadRPS {
+		v := op.ReadRPS
+		out.ReadRPS = &v
+	}
+	if op.HasReadBurst {
+		v := op.ReadBurst
+		out.ReadBurst = &v
+	}
+	if op.HasWriteRPS {
+		v := op.WriteRPS
+		out.WriteRPS = &v
+	}
+	if op.HasWriteBurst {
+		v := op.WriteBurst
+		out.WriteBurst = &v
+	}
+	return out
 }

@@ -122,6 +122,14 @@ func (f *FSM) applyUpdateWebhookStatus(data json.RawMessage) *store.OpResult {
 	return f.applyUpdateWebhookStatusOp(op)
 }
 
+func (f *FSM) applySetNamespaceRateLimit(data json.RawMessage) *store.OpResult {
+	var op store.SetNamespaceRateLimitOp
+	if err := json.Unmarshal(data, &op); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	return f.applySetNamespaceRateLimitOp(op)
+}
+
 // Typed apply handlers — each runs SQL against the SQLite materialized view.
 
 func (f *FSM) applyCreateNamespaceOp(op store.CreateNamespaceOp) *store.OpResult {
@@ -286,6 +294,18 @@ func (f *FSM) applyUpdateWebhookStatusOp(op store.UpdateWebhookStatusOp) *store.
 			"UPDATE webhooks SET last_status_code = ?, last_error = ?, last_delivery_at = ? WHERE id = ?",
 			op.LastStatusCode, errVal, op.LastDeliveryAt, op.ID,
 		)
+		return err
+	})
+	return &store.OpResult{}
+}
+
+func (f *FSM) applySetNamespaceRateLimitOp(op store.SetNamespaceRateLimitOp) *store.OpResult {
+	f.syncSQLite(func(db sqlExecer) error {
+		_, err := db.Exec(`UPDATE namespaces SET
+			rate_limit_read_rps = ?, rate_limit_read_burst = ?,
+			rate_limit_write_rps = ?, rate_limit_write_burst = ?
+			WHERE name = ?`,
+			op.ReadRPS, op.ReadBurst, op.WriteRPS, op.WriteBurst, op.Name)
 		return err
 	})
 	return &store.OpResult{}

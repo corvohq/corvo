@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -154,6 +155,12 @@ func New(s *store.Store, cluster ClusterInfo, bindAddr string, uiAssets fs.FS, o
 			slog.Warn("server option ignored", "error", err)
 		}
 	}
+	if srv.rateLimiter != nil && srv.store != nil {
+		srv.rateLimiter.setDBLoader(func() (*sql.DB, bool) {
+			db := srv.store.ReadDB()
+			return db, db != nil
+		})
+	}
 	srv.router = srv.buildRouter()
 	srv.httpServer = &http.Server{
 		Addr: bindAddr,
@@ -238,6 +245,8 @@ func (s *Server) buildRouter() chi.Router {
 			r.Delete("/auth/keys/{key_hash}/roles/{role}", s.requireEnterpriseFeature("rbac", s.handleUnassignAPIKeyRole))
 			r.Post("/namespaces", s.requireEnterpriseFeature("namespaces", s.handleCreateNamespace))
 			r.Delete("/namespaces/{name}", s.requireEnterpriseFeature("namespaces", s.handleDeleteNamespace))
+			r.Put("/namespaces/{name}/rate-limit", s.requireEnterpriseFeature("namespaces", s.handleSetNamespaceRateLimit))
+			r.Get("/namespaces/{name}/rate-limit", s.requireEnterpriseFeature("namespaces", s.handleGetNamespaceRateLimit))
 			r.Post("/settings/sso", s.requireEnterpriseFeature("sso", s.handleSetSSOSettings))
 			r.Get("/admin/backup", s.handleTenantBackup)
 			r.Post("/admin/restore", s.handleTenantRestore)
