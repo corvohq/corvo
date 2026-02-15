@@ -3,8 +3,10 @@
   "private": true,
   "version": "0.0.1",
   "type": "module",
+  "types": "./dist/lib/lib.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/lib/lib.d.ts",
       "import": "./dist/lib/corvo-ui.js"
     },
     "./style.css": "./dist/lib/corvo-ui.css"
