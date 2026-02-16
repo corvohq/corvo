@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -39,6 +40,10 @@ type Cluster struct {
 	stopCh    chan struct{}
 	doneCh    chan struct{}
 	workerCh  chan struct{}
+
+	overloadTotal      atomic.Uint64
+	fetchOverloadTotal atomic.Uint64
+	appliedTotal       atomic.Uint64
 }
 
 type applyRequest struct {
@@ -316,6 +321,7 @@ func (c *Cluster) Apply(opType store.OpType, data any) *store.OpResult {
 	select {
 	case c.applyCh <- req:
 	default:
+		c.overloadTotal.Add(1)
 		return c.overloadedResult("raft apply overloaded: pending queue is full")
 	case <-c.stopCh:
 		return &store.OpResult{Err: fmt.Errorf("raft cluster stopping")}
@@ -355,6 +361,7 @@ func (c *Cluster) acquireFetchQueuePermit(opType store.OpType, data any) (func()
 			<-sem
 		}, nil
 	default:
+		c.fetchOverloadTotal.Add(1)
 		return nil, store.NewOverloadedErrorRetry(
 			fmt.Sprintf("raft apply overloaded for fetch queue %q", queue),
 			2+retryJitterMs(6),
@@ -592,6 +599,7 @@ func (c *Cluster) flushApplyBatch(batch []*applyRequest) {
 		start := time.Now()
 		req.respCh <- c.applyImmediate(req.opType, req.data)
 		c.applyHist.observe(time.Since(start))
+		c.appliedTotal.Add(1)
 		return
 	}
 
@@ -619,6 +627,7 @@ func (c *Cluster) flushApplyBatch(batch []*applyRequest) {
 	start := time.Now()
 	res := c.applyBytes(multiBytes)
 	c.applyHist.observe(time.Since(start))
+	c.appliedTotal.Add(uint64(len(validReqs)))
 	if res.Err != nil {
 		for _, req := range validReqs {
 			req.respCh <- &store.OpResult{Err: res.Err}
@@ -1399,6 +1408,40 @@ func (h *durationHistogram) snapshot() map[string]any {
 	}
 }
 
+// PromBucket holds one histogram bucket for Prometheus exposition.
+type PromBucket struct {
+	Le    float64 // upper bound in seconds; math.Inf(1) for +Inf
+	Count uint64  // cumulative count
+}
+
+// PromSnapshot holds histogram data for Prometheus text format rendering.
+type PromSnapshot struct {
+	Buckets []PromBucket
+	Sum     float64 // sum in seconds
+	Count   uint64
+}
+
+func (h *durationHistogram) promSnapshot() PromSnapshot {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	snap := PromSnapshot{
+		Count:   h.total,
+		Sum:     float64(h.sumNs) / 1e9,
+		Buckets: make([]PromBucket, 0, len(h.counts)),
+	}
+	var cumulative uint64
+	for i, c := range h.counts {
+		cumulative += c
+		le := math.Inf(1)
+		if i < len(h.buckets) {
+			le = h.buckets[i].Seconds()
+		}
+		snap.Buckets = append(snap.Buckets, PromBucket{Le: le, Count: cumulative})
+	}
+	return snap
+}
+
 func (h *durationHistogram) quantileLocked(q float64) time.Duration {
 	if h.total == 0 {
 		return 0
@@ -1430,6 +1473,16 @@ func (h *durationHistogram) quantileLocked(q float64) time.Duration {
 		return 0
 	}
 	return h.buckets[len(h.buckets)-1]
+}
+
+// QueueTimeHistogram returns Prometheus-formatted histogram data for queue wait time.
+func (c *Cluster) QueueTimeHistogram() PromSnapshot {
+	return c.queueHist.promSnapshot()
+}
+
+// ApplyTimeHistogram returns Prometheus-formatted histogram data for apply execution time.
+func (c *Cluster) ApplyTimeHistogram() PromSnapshot {
+	return c.applyHist.promSnapshot()
 }
 
 // ClusterStatus returns a JSON-friendly status of the cluster.
@@ -1475,6 +1528,9 @@ func (c *Cluster) ClusterStatus() map[string]any {
 		"apply_max_fetch_queue_inflight": c.config.ApplyMaxFetchQueueInFly,
 		"apply_pending_now":              len(c.applyCh),
 		"apply_sub_batch_max":            c.config.ApplySubBatchMax,
+		"overload_total":                 c.overloadTotal.Load(),
+		"fetch_overload_total":           c.fetchOverloadTotal.Load(),
+		"applied_total":                  c.appliedTotal.Load(),
 		"queue_time_hist":                c.queueHist.snapshot(),
 		"apply_time_hist":                c.applyHist.snapshot(),
 		"snapshot":                       c.snapshotStatus(),

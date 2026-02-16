@@ -3,10 +3,28 @@ package scheduler
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/user/corvo/internal/store"
 )
+
+// Metrics holds atomic counters for scheduler operations, safe for concurrent
+// reads from the Prometheus handler.
+type Metrics struct {
+	PromoteRuns   atomic.Uint64
+	PromoteErrors atomic.Uint64
+	ReclaimRuns   atomic.Uint64
+	ReclaimErrors atomic.Uint64
+	ExpireRuns    atomic.Uint64
+	ExpireErrors  atomic.Uint64
+	PurgeRuns     atomic.Uint64
+	PurgeErrors   atomic.Uint64
+	LastPromote   atomic.Int64 // unix seconds
+	LastReclaim   atomic.Int64
+	LastExpire    atomic.Int64
+	LastPurge     atomic.Int64
+}
 
 // Config holds scheduler configuration.
 type Config struct {
@@ -45,6 +63,7 @@ type Scheduler struct {
 	store       *store.Store
 	leaderCheck LeaderCheck
 	config      Config
+	metrics     *Metrics
 	lastPromote time.Time
 	lastReclaim time.Time
 	lastUnique  time.Time
@@ -54,7 +73,8 @@ type Scheduler struct {
 }
 
 // New creates a new Scheduler. If leaderCheck is nil, the scheduler always runs.
-func New(s *store.Store, leaderCheck LeaderCheck, config Config) *Scheduler {
+// If metrics is non-nil, scheduler operations will be counted.
+func New(s *store.Store, leaderCheck LeaderCheck, config Config, metrics *Metrics) *Scheduler {
 	def := DefaultConfig()
 	if config.Interval == 0 {
 		config.Interval = def.Interval
@@ -80,7 +100,7 @@ func New(s *store.Store, leaderCheck LeaderCheck, config Config) *Scheduler {
 	if config.RetentionPeriod == 0 {
 		config.RetentionPeriod = def.RetentionPeriod
 	}
-	return &Scheduler{store: s, leaderCheck: leaderCheck, config: config}
+	return &Scheduler{store: s, leaderCheck: leaderCheck, config: config, metrics: metrics}
 }
 
 // Run starts the scheduler loop. It blocks until the context is cancelled.
@@ -111,12 +131,26 @@ func (s *Scheduler) tick(force bool) {
 	if force || now.Sub(s.lastPromote) >= s.config.PromoteInterval {
 		if err := s.store.Promote(); err != nil {
 			slog.Error("promote scheduled jobs", "error", err)
+			if s.metrics != nil {
+				s.metrics.PromoteErrors.Add(1)
+			}
+		}
+		if s.metrics != nil {
+			s.metrics.PromoteRuns.Add(1)
+			s.metrics.LastPromote.Store(now.Unix())
 		}
 		s.lastPromote = now
 	}
 	if force || now.Sub(s.lastReclaim) >= s.config.ReclaimInterval {
 		if err := s.store.Reclaim(); err != nil {
 			slog.Error("reclaim expired leases", "error", err)
+			if s.metrics != nil {
+				s.metrics.ReclaimErrors.Add(1)
+			}
+		}
+		if s.metrics != nil {
+			s.metrics.ReclaimRuns.Add(1)
+			s.metrics.LastReclaim.Store(now.Unix())
 		}
 		s.lastReclaim = now
 	}
@@ -135,12 +169,26 @@ func (s *Scheduler) tick(force bool) {
 	if force || now.Sub(s.lastExpire) >= s.config.ExpireInterval {
 		if err := s.store.ExpireJobs(); err != nil {
 			slog.Error("expire jobs past deadline", "error", err)
+			if s.metrics != nil {
+				s.metrics.ExpireErrors.Add(1)
+			}
+		}
+		if s.metrics != nil {
+			s.metrics.ExpireRuns.Add(1)
+			s.metrics.LastExpire.Store(now.Unix())
 		}
 		s.lastExpire = now
 	}
 	if force || now.Sub(s.lastPurge) >= s.config.PurgeInterval {
 		if err := s.store.PurgeJobs(s.config.RetentionPeriod); err != nil {
 			slog.Error("purge old terminal jobs", "error", err)
+			if s.metrics != nil {
+				s.metrics.PurgeErrors.Add(1)
+			}
+		}
+		if s.metrics != nil {
+			s.metrics.PurgeRuns.Add(1)
+			s.metrics.LastPurge.Store(now.Unix())
 		}
 		s.lastPurge = now
 	}

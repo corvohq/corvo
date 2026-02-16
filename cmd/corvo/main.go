@@ -294,13 +294,14 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	s := store.NewStore(cluster, cluster.SQLiteReadDB())
 
+	schedMetrics := &scheduler.Metrics{}
 	var schedCancel context.CancelFunc = func() {}
 	if schedulerEnabled {
 		schedCfg := scheduler.DefaultConfig()
 		schedCfg.Interval = schedulerInterval
 		schedCfg.RetentionPeriod = retentionPeriod
 		schedCfg.PurgeInterval = retentionInterval
-		sched := scheduler.New(s, cluster, schedCfg)
+		sched := scheduler.New(s, cluster, schedCfg, schedMetrics)
 		var schedCtx context.Context
 		schedCtx, schedCancel = context.WithCancel(context.Background())
 		go sched.Run(schedCtx)
@@ -385,6 +386,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		streamCfg.MaxOpenStreams *= raftShards
 	}
 	opts = append(opts, server.WithRPCStreamConfig(streamCfg))
+	opts = append(opts, server.WithSchedulerMetrics(schedMetrics))
 	srv := server.New(s, cluster, bindAddr, uiFS, opts...)
 	go func() {
 		if err := srv.Start(); err != nil && err != http.ErrServerClosed {

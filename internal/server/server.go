@@ -25,6 +25,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/user/corvo/internal/enterprise"
 	"github.com/user/corvo/internal/rpcconnect"
+	"github.com/user/corvo/internal/scheduler"
 	"github.com/user/corvo/internal/store"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -50,12 +51,14 @@ type Server struct {
 	samlAuth          *samlHeaderAuthenticator
 	oidcGroupClaim    string
 	oidcGroupMappings map[string]string
-	reqMetrics  *requestMetrics
-	rateLimiter   *rateLimiter
-	streamCfg     *rpcconnect.StreamConfig
-	adminPassword string
-	bindAddr      string
-	h2cTransport  http.RoundTripper
+	reqMetrics       *requestMetrics
+	rateLimiter      *rateLimiter
+	streamCfg        *rpcconnect.StreamConfig
+	rpcServer        *rpcconnect.Server
+	schedulerMetrics *scheduler.Metrics
+	adminPassword    string
+	bindAddr         string
+	h2cTransport     http.RoundTripper
 }
 
 // Option mutates server behavior.
@@ -104,6 +107,14 @@ func WithSAMLHeaderAuth(cfg SAMLHeaderConfig) Option {
 func WithRateLimit(cfg RateLimitConfig) Option {
 	return func(s *Server) error {
 		s.rateLimiter = newRateLimiter(cfg)
+		return nil
+	}
+}
+
+// WithSchedulerMetrics sets the scheduler metrics for Prometheus export.
+func WithSchedulerMetrics(m *scheduler.Metrics) Option {
+	return func(s *Server) error {
+		s.schedulerMetrics = m
 		return nil
 	}
 }
@@ -306,7 +317,8 @@ func (s *Server) buildRouter() chi.Router {
 	if s.cluster != nil {
 		rpcOpts = append(rpcOpts, rpcconnect.WithLeaderCheck(&leaderCheckAdapter{server: s}))
 	}
-	rpcPath, rpcHandler := rpcconnect.NewHandler(s.store, rpcOpts...)
+	rpcPath, rpcHandler, rpcSrv := rpcconnect.NewHandler(s.store, rpcOpts...)
+	s.rpcServer = rpcSrv
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireLeader)
 		r.Mount(strings.TrimSuffix(rpcPath, "/"), rpcHandler)

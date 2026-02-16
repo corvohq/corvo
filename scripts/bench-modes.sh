@@ -18,13 +18,15 @@ RESULTS_DIR="bench-results"
 BIND="${BIND:-:8080}"
 SERVER_URL="${SERVER_URL:-http://localhost:8080}"
 DATA_BASE="${DATA_BASE:-/tmp/corvo-bench}"
-STORES="${*:-bolt badger pebble}"
+STORES="${STORES:-bolt badger pebble}"
 SHARDS="${SHARDS:-1}"
 PRESET="${PRESET:-single-node}"
 JOBS="${JOBS:-}"
 PROTOCOL="${PROTOCOL:-rpc}"
 DURABLE="${DURABLE:-false}"
 CONCURRENCY="${CONCURRENCY:-}"
+WORKERS="${WORKERS:-}"
+WORKER_QUEUES="${WORKER_QUEUES:-}"
 
 SERVER_PID=""
 
@@ -117,6 +119,12 @@ run_one() {
     fi
     if [ -n "$CONCURRENCY" ]; then
         bench_args+=(--concurrency "$CONCURRENCY")
+    fi
+    if [ -n "$WORKERS" ]; then
+        bench_args+=(--workers "$WORKERS")
+    fi
+    if [ -n "$WORKER_QUEUES" ]; then
+        bench_args+=(--worker-queues "$WORKER_QUEUES")
     fi
 
     "$BINARY" "${bench_args[@]}" || true

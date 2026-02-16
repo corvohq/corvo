@@ -7,15 +7,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // Client is a thin HTTP wrapper for the Corvo API.
 type Client struct {
-	URL        string
-	HTTPClient *http.Client
-	auth       authConfig
+	URL            string
+	HTTPClient     *http.Client
+	ServerDuration time.Duration // last server-side processing duration from Server-Timing header
+	auth           authConfig
 }
 
 type TokenProvider func(ctx context.Context) (string, error)
@@ -481,6 +483,7 @@ func (c *Client) doRequestWithContext(ctx context.Context, method, path string, 
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+	c.parseServerTiming(resp)
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -525,4 +528,25 @@ func (c *Client) applyAuthHeaders(ctx context.Context, req *http.Request) error 
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	return nil
+}
+
+// parseServerTiming extracts the processing duration from the Server-Timing header.
+// Expected format: proc;dur=1.234 (milliseconds).
+func (c *Client) parseServerTiming(resp *http.Response) {
+	c.ServerDuration = 0
+	v := resp.Header.Get("Server-Timing")
+	if v == "" {
+		return
+	}
+	// Find dur= value.
+	for _, part := range strings.Split(v, ";") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "dur=") {
+			ms, err := strconv.ParseFloat(part[4:], 64)
+			if err == nil {
+				c.ServerDuration = time.Duration(ms * float64(time.Millisecond))
+			}
+			return
+		}
+	}
 }

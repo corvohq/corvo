@@ -21,7 +21,7 @@ func testSetup(t *testing.T) (*store.Store, *Scheduler, *sql.DB) {
 
 	s := store.NewStore(da, da.SQLiteDB())
 	t.Cleanup(func() { s.Close() })
-	sched := New(s, nil, DefaultConfig())
+	sched := New(s, nil, DefaultConfig(), nil)
 	return s, sched, da.SQLiteDB()
 }
 
@@ -131,7 +131,7 @@ func TestCleanExpiredUniqueLocks(t *testing.T) {
 
 func TestSchedulerGracefulStop(t *testing.T) {
 	s, _, _ := testSetup(t)
-	sched := New(s, nil, Config{Interval: 50 * time.Millisecond})
+	sched := New(s, nil, Config{Interval: 50 * time.Millisecond}, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

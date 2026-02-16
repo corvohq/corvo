@@ -61,13 +61,40 @@ type LeaderCheck interface {
 	LeaderHTTPURL() string // e.g. "http://10.0.0.2:8080", or "" if unknown
 }
 
+// StreamStats exposes lifecycle stream metrics for Prometheus scraping.
+type StreamStats struct {
+	OpenStreams    int64
+	MaxOpenStreams int
+	InFlight      int
+	MaxInFlight   int
+	FramesTotal   uint64
+	StreamsTotal  uint64
+	OverloadTotal uint64
+}
+
 // Server implements the Connect WorkerService API.
 type Server struct {
-	store       *store.Store
-	streamCfg   StreamConfig
-	frameSem    chan struct{}
-	openCount   atomic.Int64
-	leaderCheck LeaderCheck
+	store         *store.Store
+	streamCfg     StreamConfig
+	frameSem      chan struct{}
+	openCount     atomic.Int64
+	leaderCheck   LeaderCheck
+	framesTotal   atomic.Uint64
+	streamsTotal  atomic.Uint64
+	overloadTotal atomic.Uint64
+}
+
+// Stats returns a snapshot of lifecycle stream metrics.
+func (s *Server) Stats() StreamStats {
+	return StreamStats{
+		OpenStreams:    s.openCount.Load(),
+		MaxOpenStreams: s.streamCfg.MaxOpenStreams,
+		InFlight:      len(s.frameSem),
+		MaxInFlight:   s.streamCfg.MaxInFlight,
+		FramesTotal:   s.framesTotal.Load(),
+		StreamsTotal:  s.streamsTotal.Load(),
+		OverloadTotal: s.overloadTotal.Load(),
+	}
 }
 
 func longPollTimeout(lease int) time.Duration {
@@ -102,14 +129,15 @@ func waitForFetch(ctx context.Context, timeout time.Duration, poll func() (bool,
 }
 
 // NewHandler creates a Connect HTTP handler for worker lifecycle RPCs.
-func NewHandler(s *store.Store, opts ...func(*Server)) (string, http.Handler) {
+func NewHandler(s *store.Store, opts ...func(*Server)) (string, http.Handler, *Server) {
 	srv := &Server{store: s}
 	for _, o := range opts {
 		o(srv)
 	}
 	srv.streamCfg = srv.streamCfg.withDefaults()
 	srv.frameSem = make(chan struct{}, srv.streamCfg.MaxInFlight)
-	return corvov1connect.NewWorkerServiceHandler(srv)
+	path, handler := corvov1connect.NewWorkerServiceHandler(srv)
+	return path, handler, srv
 }
 
 // WithStreamConfig sets the per-stream rate limit / circuit-break config.
@@ -290,6 +318,7 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 		return nil
 	}
 
+	s.streamsTotal.Add(1)
 	cfg := s.streamCfg
 	if n := s.openCount.Add(1); cfg.MaxOpenStreams > 0 && n > int64(cfg.MaxOpenStreams) {
 		s.openCount.Add(-1)
@@ -359,6 +388,7 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 				case <-acquireTimer.C:
 					frameHadError = true
 					resp.Error = "OVERLOADED: lifecycle stream saturated"
+					s.overloadTotal.Add(1)
 				}
 				if !acquireTimer.Stop() {
 					select {
@@ -487,6 +517,7 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 		}
 		if acquired {
 			<-s.frameSem
+			s.framesTotal.Add(1)
 		}
 		// If fetch was empty, sleep outside semaphore so idle long-polling
 		// streams do not consume global in-flight slots.
