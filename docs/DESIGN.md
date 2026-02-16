@@ -1177,7 +1177,26 @@ POST /api/v1/enqueue
 }
 ```
 
-The server checks expiry on each state transition and during periodic sweeps. Expired jobs skip the retry cycle and go directly to `dead` with reason "expired."
+The scheduler checks expiry every 10 seconds. Non-terminal, non-active jobs (pending, scheduled, retrying, held) past their `expire_at` are moved directly to `dead` with error "job expired". Active jobs are left alone to finish or be reclaimed.
+
+### Job retention and purge
+
+Terminal-state jobs (completed, dead, cancelled) are automatically purged after a configurable retention period. This prevents unbounded disk growth, especially at high throughput.
+
+```
+corvo server --retention 7d --retention-interval 1h
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--retention` | `168h` (7 days) | How long to keep terminal jobs before purging |
+| `--retention-interval` | `1h` | How often the purge sweep runs |
+
+The purge sweep checks each terminal job's timestamp:
+- **completed** → uses `completed_at`
+- **dead/cancelled** → uses `failed_at` (falls back to `created_at`)
+
+Both expiration and purge are Raft operations (`ExpireJobs`, `PurgeJobs`) so they're consistent across cluster nodes.
 
 ---
 
@@ -1431,7 +1450,7 @@ type Op struct {
 }
 ```
 
-OpTypes: `Enqueue`, `EnqueueBatch`, `Fetch`, `Ack`, `Fail`, `Heartbeat`, `RetryJob`, `CancelJob`, `MoveJob`, `DeleteJob`, `PauseQueue`, `ResumeQueue`, `ClearQueue`, `DeleteQueue`, `SetConcurrency`, `SetThrottle`, `RemoveThrottle`, `Promote`, `Reclaim`, `BulkAction`, `CleanUnique`, `CleanRateLimit`
+OpTypes: `Enqueue`, `EnqueueBatch`, `Fetch`, `Ack`, `Fail`, `Heartbeat`, `RetryJob`, `CancelJob`, `MoveJob`, `DeleteJob`, `PauseQueue`, `ResumeQueue`, `ClearQueue`, `DeleteQueue`, `SetConcurrency`, `SetThrottle`, `RemoveThrottle`, `Promote`, `Reclaim`, `BulkAction`, `CleanUnique`, `CleanRateLimit`, `ExpireJobs`, `PurgeJobs`
 
 **Cluster setup:**
 
@@ -2319,7 +2338,7 @@ Single-node server with embedded SQLite, HTTP/JSON API, CLI, Go client. See `doc
 - [x] SQLite database layer (WAL mode, migrations)
 - [x] Domain models, ULID ID generation
 - [x] Store layer: enqueue, fetch, ack, fail, heartbeat, backoff
-- [x] Scheduler: promote scheduled/retrying, reclaim leases, clean unique locks
+- [x] Scheduler: promote scheduled/retrying, reclaim leases, clean unique locks, expire jobs, purge old terminal jobs
 - [x] Queue management: pause, resume, clear, drain, delete, concurrency, throttle
 - [x] Job management: get, retry, cancel, move, delete
 - [x] Search: full SQL query builder with all filter types, cursor pagination

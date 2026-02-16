@@ -79,7 +79,7 @@ type Op struct {
 }
 ```
 
-OpTypes: `Enqueue`, `EnqueueBatch`, `Fetch`, `FetchBatch`, `Ack`, `Fail`, `Heartbeat`, `RetryJob`, `CancelJob`, `MoveJob`, `DeleteJob`, `PauseQueue`, `ResumeQueue`, `ClearQueue`, `DeleteQueue`, `SetConcurrency`, `SetThrottle`, `RemoveThrottle`, `Promote`, `Reclaim`, `BulkAction`, `CleanUnique`, `CleanRateLimit`, `Multi`
+OpTypes: `Enqueue`, `EnqueueBatch`, `Fetch`, `FetchBatch`, `Ack`, `Fail`, `Heartbeat`, `RetryJob`, `CancelJob`, `MoveJob`, `DeleteJob`, `PauseQueue`, `ResumeQueue`, `ClearQueue`, `DeleteQueue`, `SetConcurrency`, `SetThrottle`, `RemoveThrottle`, `Promote`, `Reclaim`, `BulkAction`, `CleanUnique`, `CleanRateLimit`, `ExpireJobs`, `PurgeJobs`, `Multi`
 
 The `Multi` op type wraps multiple ops into a single Raft log entry for group-commit batching.
 
