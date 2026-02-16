@@ -61,7 +61,7 @@ var (
 	bootstrap           bool
 	joinAddr            string
 	durableMode         bool
-	raftStore           = "bolt"
+	raftStore           = "badger"
 	schedulerEnabled    = true
 	schedulerInterval   = time.Second
 	sqliteMirrorEnabled = true
@@ -99,7 +99,7 @@ func init() {
 	serverCmd.Flags().StringVar(&discoverMode, "discover", "", "Peer discovery mode (supported: dns)")
 	serverCmd.Flags().StringVar(&discoverDNSName, "discover-dns-name", "", "DNS name to resolve for cluster peer discovery when --discover=dns")
 	serverCmd.Flags().BoolVar(&durableMode, "durable", false, "Enable power-loss durability mode (Raft fsync per write). Significantly reduces throughput/latency performance; enable only if absolutely required.")
-	serverCmd.Flags().StringVar(&raftStore, "raft-store", "bolt", "Raft log/stable backend: bolt, badger, or pebble")
+	serverCmd.Flags().StringVar(&raftStore, "raft-store", "badger", "Raft log/stable backend: bolt, badger, or pebble")
 	serverCmd.Flags().DurationVar(&shutdownTimeout, "shutdown-timeout", 500*time.Millisecond, "Graceful HTTP shutdown timeout before force-close (e.g. 500ms, 2s)")
 	serverCmd.Flags().BoolVar(&otelEnabled, "otel-enabled", false, "Enable OpenTelemetry tracing")
 	serverCmd.Flags().StringVar(&otelEndpoint, "otel-endpoint", "", "OTLP HTTP endpoint (host:port) for traces; if empty uses stdout exporter")

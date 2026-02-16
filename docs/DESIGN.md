@@ -151,7 +151,7 @@ Read (search, get job, list queues, list workers):
 - Reads served directly from local SQLite (no Raft round-trip)
 - Snapshots: Pebble checkpoint (hard links, nearly free) + SQLite VACUUM INTO backup
 - Log compaction keeps disk usage bounded
-- Configurable Raft log/stable store backend via `--raft-store`: `bolt` (default, BoltDB), `badger` (BadgerDB), or `pebble`
+- Configurable Raft log/stable store backend via `--raft-store`: `badger` (default, BadgerDB), `bolt` (BoltDB), or `pebble`
 
 **Corvo HTTP Server** (Go, net/http + chi router)
 - Serves the worker protocol (enqueue, fetch, ack, fail, heartbeat, progress)
@@ -2371,7 +2371,7 @@ Replaced SQLite-only store with Pebble (source of truth) + Raft (consensus) + SQ
 - [x] Protobuf codec for Raft ops (`store/raft_proto_codec.go`)
 - [x] OpMulti for group-commit batching
 - [x] FetchBatch + AckBatch ops
-- [x] HTTP benchmark tool (`cmd/bench/`)
+- [x] HTTP benchmark tool (`corvo bench` subcommand)
 - [x] HTTP/2 stream-cap tuning (`MaxConcurrentStreams`) and bench RPC client pooling for high worker counts
 
 **Durability:**

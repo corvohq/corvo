@@ -413,8 +413,8 @@ func TestPerfHarnessUsesRealServerPath(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "cmd", "corvo", "main.go")); err != nil {
 		t.Fatalf("expected cmd/corvo/main.go in repo root: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "cmd", "bench", "main.go")); err != nil {
-		t.Fatalf("expected cmd/bench/main.go in repo root: %v", err)
+	if _, err := os.Stat(filepath.Join(root, "cmd", "corvo", "cmd_bench.go")); err != nil {
+		t.Fatalf("expected cmd/corvo/cmd_bench.go in repo root: %v", err)
 	}
 	t.Logf("perf harness repo root: %s", root)
 }

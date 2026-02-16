@@ -56,7 +56,7 @@ Exit criteria:
 
 ## Track B — Performance + Tail Latency
 
-Files: `internal/raft/cluster.go`, `internal/store/*`, `internal/rpcconnect/*`, `cmd/bench/main.go`, `docs/BENCHMARKS.md`
+Files: `internal/raft/cluster.go`, `internal/store/*`, `internal/rpcconnect/*`, `cmd/corvo/cmd_bench.go`, `docs/BENCHMARKS.md`
 
 - [x] Finish protobuf-first hot path:
   - [x] Remove remaining JSON marshalling in enqueue/lifecycle apply path where possible

@@ -44,7 +44,7 @@ github.com/hashicorp/raft-boltdb/v2   # Raft log/stable store (bolt backend)
 github.com/dgraph-io/badger/v4        # Raft log/stable store (badger backend)
 ```
 
-Raft log/stable store backend is selectable via `--raft-store`: `bolt` (default), `badger`, or `pebble`.
+Raft log/stable store backend is selectable via `--raft-store`: `badger` (default), `bolt`, or `pebble`.
 
 ## Pebble Key Layout
 
@@ -232,8 +232,8 @@ Selectable via `--raft-store` flag:
 
 | Backend | File | Notes |
 |---|---|---|
-| `bolt` (default) | `raft_store.go` | BoltDB via `raft-boltdb/v2`. Stable, well-tested. |
-| `badger` | `raft_store_badger.go` | BadgerDB v4. Key-value separation, good for large log entries. Custom binary encoding for raft logs. |
+| `bolt` | `raft_store.go` | BoltDB via `raft-boltdb/v2`. Stable, well-tested. |
+| `badger` (default) | `raft_store_badger.go` | BadgerDB v4. Key-value separation, good for large log entries. Custom binary encoding for raft logs. |
 | `pebble` | `raft_store_pebble.go` | Pebble. Same engine as FSM store. |
 
 All backends implement the `raftStore` interface (raft.LogStore + raft.StableStore + io.Closer). NoSync is configurable per backend.
@@ -283,7 +283,7 @@ func (s *Store) ListQueues() ([]QueueInfo, error)
 --node-id node-1          Unique node ID
 --bootstrap               Bootstrap new single-node cluster (default true)
 --join <addr>             Join existing cluster
---raft-store bolt         Raft log backend: bolt, badger, or pebble
+--raft-store badger       Raft log backend: badger, bolt, or pebble
 --log-level info          Log level (debug, info, warn, error)
 ```
 
@@ -329,4 +329,4 @@ Optional per-job lifecycle event log (`--lifecycle-events`): persists events (en
 4. `go test ./... -count=1` — full suite
 5. `go build ./cmd/corvo`
 6. `./corvo server --bootstrap --data-dir /tmp/corvo-test` — single node
-7. Bench: `./cmd/bench/main.go` — HTTP benchmark tool for throughput + latency
+7. Bench: `corvo bench` — HTTP benchmark tool for throughput + latency

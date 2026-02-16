@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -515,8 +516,10 @@ func (f *FSM) syncSQLite(fn func(db sqlExecer) error) {
 			f.sqliteQueued.Add(1)
 			return
 		default:
-			f.sqliteDrops.Add(1)
-			slog.Warn("sqlite mirror queue full; dropping mirror update")
+			n := f.sqliteDrops.Add(1)
+			if n == 1 || n%10000 == 0 {
+				slog.Warn("sqlite mirror queue full; dropping mirror updates", "total_drops", n)
+			}
 			return
 		}
 	}
@@ -544,7 +547,7 @@ func (f *FSM) SetSQLiteMirrorAsync(async bool) {
 		return
 	}
 	if async {
-		f.sqliteQueue = make(chan func(db sqlExecer) error, 16384)
+		f.sqliteQueue = make(chan func(db sqlExecer) error, 131072)
 		f.sqliteStop = make(chan struct{})
 		f.sqliteDone = make(chan struct{})
 		f.sqliteAsync = true
@@ -636,10 +639,68 @@ func (f *FSM) SQLiteRebuildStatus() map[string]any {
 	return out
 }
 
+func isSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "SQLITE_BUSY") || strings.Contains(s, "database is locked")
+}
+
+func tryFlush(f *FSM, batch []func(db sqlExecer) error) bool {
+	tx, err := f.sqlite.Begin()
+	if err != nil {
+		if isSQLiteBusy(err) {
+			return false
+		}
+		slog.Error("sqlite mirror begin failed", "error", err)
+		return true // don't retry non-busy errors
+	}
+	f.sqliteMu.Lock()
+	defer f.sqliteMu.Unlock()
+
+	for i, fn := range batch {
+		sp := fmt.Sprintf("sp%d", i)
+		if _, err := tx.Exec("SAVEPOINT " + sp); err != nil {
+			if isSQLiteBusy(err) {
+				tx.Rollback()
+				return false
+			}
+			slog.Error("sqlite mirror savepoint failed", "error", err)
+			f.sqliteDoneN.Add(1)
+			continue
+		}
+		if err := fn(tx); err != nil {
+			if isSQLiteBusy(err) {
+				tx.Rollback()
+				return false
+			}
+			_, _ = tx.Exec("ROLLBACK TO " + sp)
+			_, _ = tx.Exec("RELEASE " + sp)
+			slog.Error("sqlite mirror apply failed", "error", err)
+			f.sqliteDoneN.Add(1)
+			continue
+		}
+		if _, err := tx.Exec("RELEASE " + sp); err != nil {
+			slog.Error("sqlite mirror release failed", "error", err)
+		}
+		f.sqliteDoneN.Add(1)
+	}
+
+	if err := tx.Commit(); err != nil {
+		if isSQLiteBusy(err) {
+			tx.Rollback()
+			return false
+		}
+		slog.Error("sqlite mirror commit failed", "error", err)
+	}
+	return true
+}
+
 func (f *FSM) sqliteMirrorLoop() {
 	defer close(f.sqliteDone)
 
-	const maxBatch = 256
+	const maxBatch = 1024
 	flushInterval := 2 * time.Millisecond
 	timer := time.NewTimer(flushInterval)
 	defer timer.Stop()
@@ -650,37 +711,14 @@ func (f *FSM) sqliteMirrorLoop() {
 		if len(batch) == 0 {
 			return
 		}
-		tx, err := f.sqlite.Begin()
-		if err != nil {
-			slog.Error("sqlite mirror begin failed", "error", err)
-			batch = batch[:0]
-			return
-		}
-		f.sqliteMu.Lock()
-		defer f.sqliteMu.Unlock()
-
-		for i, fn := range batch {
-			sp := fmt.Sprintf("sp%d", i)
-			if _, err := tx.Exec("SAVEPOINT " + sp); err != nil {
-				slog.Error("sqlite mirror savepoint failed", "error", err)
-				f.sqliteDoneN.Add(1)
-				continue
+		const maxRetries = 3
+		for attempt := range maxRetries {
+			if attempt > 0 {
+				time.Sleep(time.Duration(attempt) * 5 * time.Millisecond)
 			}
-			if err := fn(tx); err != nil {
-				_, _ = tx.Exec("ROLLBACK TO " + sp)
-				_, _ = tx.Exec("RELEASE " + sp)
-				slog.Error("sqlite mirror apply failed", "error", err)
-				f.sqliteDoneN.Add(1)
-				continue
+			if tryFlush(f, batch) {
+				break
 			}
-			if _, err := tx.Exec("RELEASE " + sp); err != nil {
-				slog.Error("sqlite mirror release failed", "error", err)
-			}
-			f.sqliteDoneN.Add(1)
-		}
-
-		if err := tx.Commit(); err != nil {
-			slog.Error("sqlite mirror commit failed", "error", err)
 		}
 		batch = batch[:0]
 	}

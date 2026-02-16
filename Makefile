@@ -1,4 +1,4 @@
-.PHONY: build run test perf lint clean ui ui-dev
+.PHONY: build run test perf lint clean ui ui-dev bench bench-modes
 
 BINARY := corvo
 BUILD_DIR := bin
@@ -9,8 +9,11 @@ ui:
 build: ui
 	CGO_ENABLED=1 go build -o $(BUILD_DIR)/$(BINARY) ./cmd/corvo
 
-bench:
-	CGO_ENABLED=1 go build -o $(BUILD_DIR)/bench ./cmd/bench
+bench: build
+	./$(BUILD_DIR)/$(BINARY) bench
+
+bench-modes:
+	./scripts/bench-modes.sh
 
 run: build
 	./$(BUILD_DIR)/$(BINARY) server
