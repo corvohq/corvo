@@ -84,8 +84,15 @@ var (
 	rateLimitWriteRPS   float64 = 1000
 	rateLimitWriteBurst float64 = 2000
 	raftShards          int     = 1
-	retentionPeriod     = 7 * 24 * time.Hour
-	retentionInterval   = 1 * time.Hour
+	retentionPeriod             = 7 * 24 * time.Hour
+	retentionInterval           = 1 * time.Hour
+
+	// Guardrail tuning flags
+	streamMaxInFlight      = 2048
+	streamMaxOpen          = 4096
+	streamMaxFPS           = 500
+	raftMaxPending         = 16384
+	raftMaxFetchInflight   = 64
 )
 
 func init() {
@@ -119,6 +126,11 @@ func init() {
 	serverCmd.Flags().IntVar(&raftShards, "raft-shards", 1, "Number of in-process Raft shard groups for static queue sharding")
 	serverCmd.Flags().DurationVar(&retentionPeriod, "retention", 7*24*time.Hour, "How long to keep completed/dead/cancelled jobs before purging")
 	serverCmd.Flags().DurationVar(&retentionInterval, "retention-interval", 1*time.Hour, "How often to run the purge sweep for old terminal jobs")
+	serverCmd.Flags().IntVar(&streamMaxInFlight, "stream-max-inflight", 2048, "Max concurrently processing lifecycle stream frames")
+	serverCmd.Flags().IntVar(&streamMaxOpen, "stream-max-open", 4096, "Max concurrently open lifecycle streams")
+	serverCmd.Flags().IntVar(&streamMaxFPS, "stream-max-fps", 500, "Max frames/sec per lifecycle stream")
+	serverCmd.Flags().IntVar(&raftMaxPending, "raft-max-pending", 16384, "Max pending Raft apply requests before backpressure")
+	serverCmd.Flags().IntVar(&raftMaxFetchInflight, "raft-max-fetch-inflight", 64, "Max concurrent fetch/fetch-batch applies per queue")
 
 	rootCmd.AddCommand(serverCmd)
 }
@@ -201,6 +213,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 	clusterCfg.SQLiteMirror = sqliteMirrorEnabled
 	clusterCfg.SQLiteMirrorAsync = sqliteMirrorAsync
 	clusterCfg.ApplyTimeout = applyTimeout
+	clusterCfg.ApplyMaxPending = raftMaxPending
+	clusterCfg.ApplyMaxFetchQueueInFly = raftMaxFetchInflight
 	clusterCfg.Bootstrap = bootstrap
 	clusterCfg.JoinAddr = joinAddr
 
@@ -362,12 +376,15 @@ func runServer(cmd *cobra.Command, args []string) error {
 		WriteRPS:   rateLimitWriteRPS,
 		WriteBurst: rateLimitWriteBurst,
 	}))
-	if raftShards > 1 {
-		opts = append(opts, server.WithRPCStreamConfig(rpcsvc.StreamConfig{
-			MaxInFlight:    2048 * raftShards,
-			MaxOpenStreams: 4096 * raftShards,
-		}))
+	streamCfg := rpcsvc.StreamConfig{
+		MaxInFlight:    streamMaxInFlight,
+		MaxOpenStreams:  streamMaxOpen,
+		MaxFramesPerSec: streamMaxFPS,
 	}
+	if raftShards > 1 {
+		streamCfg.MaxOpenStreams *= raftShards
+	}
+	opts = append(opts, server.WithRPCStreamConfig(streamCfg))
 	srv := server.New(s, cluster, bindAddr, uiFS, opts...)
 	go func() {
 		if err := srv.Start(); err != nil && err != http.ErrServerClosed {

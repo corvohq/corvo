@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -228,6 +229,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/org/members", s.handleListMembers)
 		r.Get("/org/api-keys", s.handleListOrgAPIKeys)
 		r.Get("/billing/summary", s.handleBillingSummary)
+		r.Get("/debug/runtime", s.handleDebugRuntime)
 
 		// Write endpoints (leader only when clustered)
 		r.Group(func(r chi.Router) {
@@ -509,6 +511,43 @@ func (s *Server) requireEnterpriseFeature(feature string, next http.HandlerFunc)
 	}
 }
 
+// serverTimingWriter injects a Server-Timing header with the server-side
+// processing duration when the response status is written.
+type serverTimingWriter struct {
+	http.ResponseWriter
+	start       time.Time
+	wroteHeader bool
+}
+
+func (w *serverTimingWriter) WriteHeader(code int) {
+	if !w.wroteHeader {
+		w.wroteHeader = true
+		dur := time.Since(w.start)
+		w.ResponseWriter.Header().Set("Server-Timing", fmt.Sprintf("proc;dur=%.3f", float64(dur.Microseconds())/1000.0))
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *serverTimingWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *serverTimingWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *serverTimingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
+}
+
 func (s *Server) requestMetricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -519,7 +558,8 @@ func (s *Server) requestMetricsMiddleware(next http.Handler) http.Handler {
 			}
 		}
 		counter := s.reqMetrics.begin(r.Method, route)
-		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		stw := &serverTimingWriter{ResponseWriter: w, start: start}
+		ww := middleware.NewWrapResponseWriter(stw, r.ProtoMajor)
 		next.ServeHTTP(ww, r)
 		route = r.URL.Path
 		if rctx := chi.RouteContext(r.Context()); rctx != nil {

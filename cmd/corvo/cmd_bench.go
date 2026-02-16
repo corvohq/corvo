@@ -56,21 +56,23 @@ var (
 // ── types ───────────────────────────────────────────────────────────────────
 
 type benchResult struct {
-	lats    []time.Duration
-	elapsed time.Duration
+	lats       []time.Duration
+	serverLats []time.Duration
+	elapsed    time.Duration
 }
 
 type benchRunSummary struct {
-	opsPerSec float64
-	avg       time.Duration
-	p50       time.Duration
-	p90       time.Duration
-	p99       time.Duration
-	min       time.Duration
-	max       time.Duration
-	stddev    time.Duration
-	cvPct     float64
-	completed int
+	opsPerSec   float64
+	avg         time.Duration
+	p50         time.Duration
+	p90         time.Duration
+	p99         time.Duration
+	min         time.Duration
+	max         time.Duration
+	stddev      time.Duration
+	cvPct       float64
+	serverCvPct float64
+	completed   int
 }
 
 type benchMachineInfo struct {
@@ -90,22 +92,26 @@ type benchServerConfig struct {
 }
 
 type benchPhaseResult struct {
-	OpsPerSec float64 `json:"ops_per_sec"`
-	P50Us     int64   `json:"p50_us"`
-	P90Us     int64   `json:"p90_us"`
-	P99Us     int64   `json:"p99_us"`
-	MinUs     int64   `json:"min_us"`
-	MaxUs     int64   `json:"max_us"`
-	StddevUs  int64   `json:"stddev_us"`
-	CvPct     float64 `json:"cv_pct"`
-	Completed int     `json:"completed"`
+	OpsPerSec   float64 `json:"ops_per_sec"`
+	P50Us       int64   `json:"p50_us"`
+	P90Us       int64   `json:"p90_us"`
+	P99Us       int64   `json:"p99_us"`
+	MinUs       int64   `json:"min_us"`
+	MaxUs       int64   `json:"max_us"`
+	StddevUs    int64   `json:"stddev_us"`
+	CvPct       float64 `json:"cv_pct"`
+	ServerCvPct float64 `json:"server_cv_pct,omitempty"`
+	Completed   int     `json:"completed"`
+	ServerCPUPct  float64 `json:"server_cpu_pct,omitempty"`
+	ServerRSSMB   float64 `json:"server_rss_mb,omitempty"`
+	ServerGcP99Us int64   `json:"server_gc_p99_us,omitempty"`
 }
 
 type benchFaultResult struct {
-	InjectedAt       string `json:"injected_at,omitempty"`
-	RecoveredAt      string `json:"recovered_at,omitempty"`
-	RecoveryMs       int64  `json:"recovery_ms,omitempty"`
-	ErrorsDuringFault int   `json:"errors_during_fault,omitempty"`
+	InjectedAt        string `json:"injected_at,omitempty"`
+	RecoveredAt       string `json:"recovered_at,omitempty"`
+	RecoveryMs        int64  `json:"recovery_ms,omitempty"`
+	ErrorsDuringFault int    `json:"errors_during_fault,omitempty"`
 }
 
 type benchSaveData struct {
@@ -119,6 +125,16 @@ type benchSaveData struct {
 	Enqueue   *benchPhaseResult  `json:"enqueue,omitempty"`
 	Lifecycle *benchPhaseResult  `json:"lifecycle,omitempty"`
 	Fault     *benchFaultResult  `json:"fault,omitempty"`
+}
+
+type benchServerStats struct {
+	Goroutines   int   `json:"goroutines"`
+	GoMaxProcs   int   `json:"gomaxprocs"`
+	HeapInuse    int64 `json:"heap_inuse_bytes"`
+	StackInuse   int64 `json:"stack_inuse_bytes"`
+	GCPauseP99Ns int64 `json:"gc_pause_p99_ns"`
+	CPUUserNs    int64 `json:"cpu_user_ns"`
+	CPUSysNs     int64 `json:"cpu_sys_ns"`
 }
 
 type benchFetchedItem struct {
@@ -168,7 +184,7 @@ func init() {
 	f.DurationVar(&benchRepeatPause, "repeat-pause", 0, "Pause between repeats")
 	f.StringVar(&benchQueue, "queue", "bench.q", "Queue name")
 	f.IntVar(&benchEnqBatchSize, "enqueue-batch-size", 64, "Jobs per enqueue stream frame")
-	f.IntVar(&benchFetchBatchSize, "fetch-batch-size", 8, "Jobs per fetch request")
+	f.IntVar(&benchFetchBatchSize, "fetch-batch-size", 64, "Jobs per fetch request")
 	f.IntVar(&benchAckBatchSize, "ack-batch-size", 64, "ACKs per batch")
 	f.DurationVar(&benchWorkDuration, "work-duration", 0, "Simulated per-job work duration")
 
@@ -309,6 +325,7 @@ func runBench(cmd *cobra.Command, args []string) error {
 	}
 
 	var enqSummary, lcSummary benchRunSummary
+	var enqServerMetrics, lcServerMetrics *benchServerMetrics
 
 	run := func(mode string) {
 		if benchProtocol == "matrix" {
@@ -327,16 +344,32 @@ func runBench(cmd *cobra.Command, args []string) error {
 			}
 
 			fmt.Println("=== Enqueue Benchmark ===")
+			enqStatsBefore := benchFetchServerStats(httpC, benchServer)
+			enqStart := time.Now()
 			enqResult := benchDoEnqueue(mode, benchServer, benchJobs, benchConcurrency, benchWorkers, benchQueue, benchEnqBatchSize, benchWorkerQueues)
+			enqWall := time.Since(enqStart)
+			enqStatsAfter := benchFetchServerStats(httpC, benchServer)
 			s := benchPrintStats(enqResult)
+			if sm := benchComputeServerMetrics(enqStatsBefore, enqStatsAfter, enqWall); sm != nil {
+				enqServerMetrics = sm
+				benchPrintServerMetrics(sm)
+			}
 			enqRuns = append(enqRuns, s)
 			if i == benchRepeats {
 				enqSummary = s
 			}
 
 			fmt.Println("\n=== Processing Benchmark (fetch -> ack) ===")
+			lcStatsBefore := benchFetchServerStats(httpC, benchServer)
+			lcStart := time.Now()
 			lcResult := benchDoLifecycle(mode, httpC, benchServer, benchJobs, benchWorkers, benchConcurrency, benchQueue, benchFetchBatchSize, benchAckBatchSize, benchWorkDuration, benchWorkerQueues)
+			lcWall := time.Since(lcStart)
+			lcStatsAfter := benchFetchServerStats(httpC, benchServer)
 			s = benchPrintStats(lcResult)
+			if sm := benchComputeServerMetrics(lcStatsBefore, lcStatsAfter, lcWall); sm != nil {
+				lcServerMetrics = sm
+				benchPrintServerMetrics(sm)
+			}
 			lcRuns = append(lcRuns, s)
 			if i == benchRepeats {
 				lcSummary = s
@@ -382,7 +415,7 @@ func runBench(cmd *cobra.Command, args []string) error {
 	}
 
 	// Save results.
-	saveData := benchBuildSaveData(enqSummary, lcSummary, faultTracker, serverCfg)
+	saveData := benchBuildSaveData(enqSummary, lcSummary, faultTracker, serverCfg, enqServerMetrics, lcServerMetrics)
 	savePath := benchSave
 	if savePath == "" {
 		savePath = fmt.Sprintf("bench-%s.json", time.Now().Format("20060102-150405"))
@@ -408,6 +441,7 @@ func benchDoEnqueue(protocol, serverURL string, total, concurrency, workers int,
 		enqueueBatchSize = 1
 	}
 	lats := make([]time.Duration, total)
+	serverLats := make([]time.Duration, total)
 	var idx atomic.Int64
 	var queueRR atomic.Int64
 	var overloads atomic.Int64
@@ -453,6 +487,9 @@ func benchDoEnqueue(protocol, serverURL string, total, concurrency, workers int,
 						break
 					}
 					lats[pos] = time.Since(opStart)
+					if c.ServerDuration > 0 {
+						serverLats[pos] = c.ServerDuration
+					}
 				}
 				return
 			}
@@ -484,12 +521,16 @@ func benchDoEnqueue(protocol, serverURL string, total, concurrency, workers int,
 						continue
 					}
 					lat := time.Since(opStart)
+					srvDur := c.ServerDuration
 					for range resp.JobIDs {
 						pos := idx.Add(1) - 1
 						if pos >= int64(total) {
 							break
 						}
 						lats[pos] = lat
+						if srvDur > 0 {
+							serverLats[pos] = srvDur
+						}
 						remaining--
 					}
 				}
@@ -571,7 +612,24 @@ func benchDoEnqueue(protocol, serverURL string, total, concurrency, workers int,
 	if n := overloads.Load(); n > 0 {
 		fmt.Printf("  overloaded: %d\n", n)
 	}
-	return benchResult{lats: lats[:actual], elapsed: elapsed}
+	// Trim serverLats to only include entries that have data.
+	srvActual := serverLats[:actual]
+	var srvCount int
+	for _, d := range srvActual {
+		if d > 0 {
+			srvCount++
+		}
+	}
+	var srvResult []time.Duration
+	if srvCount > 0 {
+		srvResult = make([]time.Duration, 0, srvCount)
+		for _, d := range srvActual {
+			if d > 0 {
+				srvResult = append(srvResult, d)
+			}
+		}
+	}
+	return benchResult{lats: lats[:actual], serverLats: srvResult, elapsed: elapsed}
 }
 
 // ── lifecycle benchmark ─────────────────────────────────────────────────────
@@ -1009,17 +1067,37 @@ func benchSummarize(r benchResult) benchRunSummary {
 		cvPct = float64(stddev) / float64(avg) * 100
 	}
 
+	// Compute server-side CV if available.
+	var serverCv float64
+	if len(r.serverLats) > 0 {
+		var sSum time.Duration
+		for _, l := range r.serverLats {
+			sSum += l
+		}
+		sAvg := float64(sSum) / float64(len(r.serverLats))
+		var sVar float64
+		for _, l := range r.serverLats {
+			diff := float64(l) - sAvg
+			sVar += diff * diff
+		}
+		sVar /= float64(len(r.serverLats))
+		if sAvg > 0 {
+			serverCv = math.Sqrt(sVar) / sAvg * 100
+		}
+	}
+
 	return benchRunSummary{
-		opsPerSec: opsPerSec,
-		avg:       avg,
-		p50:       r.lats[n*50/100],
-		p90:       r.lats[n*90/100],
-		p99:       r.lats[n*99/100],
-		min:       r.lats[0],
-		max:       r.lats[n-1],
-		stddev:    stddev,
-		cvPct:     cvPct,
-		completed: n,
+		opsPerSec:   opsPerSec,
+		avg:         avg,
+		p50:         r.lats[n*50/100],
+		p90:         r.lats[n*90/100],
+		p99:         r.lats[n*99/100],
+		min:         r.lats[0],
+		max:         r.lats[n-1],
+		stddev:      stddev,
+		cvPct:       cvPct,
+		serverCvPct: serverCv,
+		completed:   n,
 	}
 }
 
@@ -1039,7 +1117,16 @@ func benchPrintStats(r benchResult) benchRunSummary {
 	fmt.Printf("  max:     %s\n", s.max.Round(time.Microsecond))
 	fmt.Printf("  stddev:  %s\n", s.stddev.Round(time.Microsecond))
 	fmt.Printf("  cv:      %.1f%%\n", s.cvPct)
+	if s.serverCvPct > 0 {
+		fmt.Printf("  srv cv:  %.1f%%\n", s.serverCvPct)
+	}
 	return s
+}
+
+func benchPrintServerMetrics(sm *benchServerMetrics) {
+	fmt.Printf("  srv cpu:  %.1f%%\n", sm.cpuPct)
+	fmt.Printf("  srv rss:  %.0fMB\n", sm.rssMB)
+	fmt.Printf("  srv gc99: %.1fms\n", float64(sm.gcP99Us)/1000.0)
 }
 
 func benchPrintRunAggregate(runs []benchRunSummary) {
@@ -1227,7 +1314,7 @@ func benchDetectDockerNetwork(container string) string {
 
 // ── save / compare ──────────────────────────────────────────────────────────
 
-func benchBuildSaveData(enq, lc benchRunSummary, ft *benchFaultTracker, sc *benchServerConfig) *benchSaveData {
+func benchBuildSaveData(enq, lc benchRunSummary, ft *benchFaultTracker, sc *benchServerConfig, enqSM, lcSM *benchServerMetrics) *benchSaveData {
 	data := &benchSaveData{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Commit:    benchGitCommit(),
@@ -1236,41 +1323,53 @@ func benchBuildSaveData(enq, lc benchRunSummary, ft *benchFaultTracker, sc *benc
 		Preset:    benchPreset,
 		Scenario:  benchScenario,
 		Config: map[string]any{
-			"jobs":             benchJobs,
-			"concurrency":     benchConcurrency,
-			"workers":         benchWorkers,
-			"worker_queues":   benchWorkerQueues,
-			"protocol":        benchProtocol,
-			"enqueue_batch":   benchEnqBatchSize,
-			"fetch_batch":     benchFetchBatchSize,
-			"ack_batch":       benchAckBatchSize,
-			"work_duration":   benchWorkDuration.String(),
+			"jobs":          benchJobs,
+			"concurrency":   benchConcurrency,
+			"workers":       benchWorkers,
+			"worker_queues": benchWorkerQueues,
+			"protocol":      benchProtocol,
+			"enqueue_batch": benchEnqBatchSize,
+			"fetch_batch":   benchFetchBatchSize,
+			"ack_batch":     benchAckBatchSize,
+			"work_duration": benchWorkDuration.String(),
 		},
 	}
 	if enq.completed > 0 {
 		data.Enqueue = &benchPhaseResult{
-			OpsPerSec: enq.opsPerSec,
-			P50Us:     enq.p50.Microseconds(),
-			P90Us:     enq.p90.Microseconds(),
-			P99Us:     enq.p99.Microseconds(),
-			MinUs:     enq.min.Microseconds(),
-			MaxUs:     enq.max.Microseconds(),
-			StddevUs:  enq.stddev.Microseconds(),
-			CvPct:     enq.cvPct,
-			Completed: enq.completed,
+			OpsPerSec:   enq.opsPerSec,
+			P50Us:       enq.p50.Microseconds(),
+			P90Us:       enq.p90.Microseconds(),
+			P99Us:       enq.p99.Microseconds(),
+			MinUs:       enq.min.Microseconds(),
+			MaxUs:       enq.max.Microseconds(),
+			StddevUs:    enq.stddev.Microseconds(),
+			CvPct:       enq.cvPct,
+			ServerCvPct: enq.serverCvPct,
+			Completed:   enq.completed,
+		}
+		if enqSM != nil {
+			data.Enqueue.ServerCPUPct = enqSM.cpuPct
+			data.Enqueue.ServerRSSMB = enqSM.rssMB
+			data.Enqueue.ServerGcP99Us = enqSM.gcP99Us
 		}
 	}
 	if lc.completed > 0 {
 		data.Lifecycle = &benchPhaseResult{
-			OpsPerSec: lc.opsPerSec,
-			P50Us:     lc.p50.Microseconds(),
-			P90Us:     lc.p90.Microseconds(),
-			P99Us:     lc.p99.Microseconds(),
-			MinUs:     lc.min.Microseconds(),
-			MaxUs:     lc.max.Microseconds(),
-			StddevUs:  lc.stddev.Microseconds(),
-			CvPct:     lc.cvPct,
-			Completed: lc.completed,
+			OpsPerSec:   lc.opsPerSec,
+			P50Us:       lc.p50.Microseconds(),
+			P90Us:       lc.p90.Microseconds(),
+			P99Us:       lc.p99.Microseconds(),
+			MinUs:       lc.min.Microseconds(),
+			MaxUs:       lc.max.Microseconds(),
+			StddevUs:    lc.stddev.Microseconds(),
+			CvPct:       lc.cvPct,
+			ServerCvPct: lc.serverCvPct,
+			Completed:   lc.completed,
+		}
+		if lcSM != nil {
+			data.Lifecycle.ServerCPUPct = lcSM.cpuPct
+			data.Lifecycle.ServerRSSMB = lcSM.rssMB
+			data.Lifecycle.ServerGcP99Us = lcSM.gcP99Us
 		}
 	}
 	if ft != nil {
@@ -1362,6 +1461,57 @@ func benchFormatMetric(val float64, unit string) string {
 		return fmt.Sprintf("%.0f", val)
 	}
 	return fmt.Sprintf("%.1f", val)
+}
+
+// ── server runtime stats ────────────────────────────────────────────────────
+
+func benchFetchServerStats(httpC *http.Client, serverURL string) *benchServerStats {
+	resp, err := httpC.Get(serverURL + "/api/v1/debug/runtime")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var stats benchServerStats
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		return nil
+	}
+	return &stats
+}
+
+type benchServerMetrics struct {
+	cpuPct  float64
+	rssMB   float64
+	gcP99Us int64
+}
+
+func benchComputeServerMetrics(before, after *benchServerStats, wallTime time.Duration) *benchServerMetrics {
+	if before == nil || after == nil || wallTime <= 0 {
+		return nil
+	}
+	deltaCPU := float64((after.CPUUserNs + after.CPUSysNs) - (before.CPUUserNs + before.CPUSysNs))
+	procs := after.GoMaxProcs
+	if procs <= 0 {
+		procs = 1
+	}
+	cpuPct := deltaCPU / float64(wallTime.Nanoseconds()) / float64(procs) * 100
+
+	// Peak RSS = max of before/after (heap + stack)
+	beforeRSS := before.HeapInuse + before.StackInuse
+	afterRSS := after.HeapInuse + after.StackInuse
+	peakRSS := afterRSS
+	if beforeRSS > peakRSS {
+		peakRSS = beforeRSS
+	}
+	rssMB := float64(peakRSS) / (1024 * 1024)
+
+	return &benchServerMetrics{
+		cpuPct:  cpuPct,
+		rssMB:   rssMB,
+		gcP99Us: after.GCPauseP99Ns / 1000,
+	}
 }
 
 // ── server config ───────────────────────────────────────────────────────────
