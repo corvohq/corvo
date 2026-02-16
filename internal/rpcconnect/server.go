@@ -55,12 +55,19 @@ func (c StreamConfig) withDefaults() StreamConfig {
 	return c
 }
 
+// LeaderCheck reports whether this node is the Raft leader.
+type LeaderCheck interface {
+	IsLeader() bool
+	LeaderHTTPURL() string // e.g. "http://10.0.0.2:8080", or "" if unknown
+}
+
 // Server implements the Connect WorkerService API.
 type Server struct {
-	store     *store.Store
-	streamCfg StreamConfig
-	frameSem  chan struct{}
-	openCount atomic.Int64
+	store       *store.Store
+	streamCfg   StreamConfig
+	frameSem    chan struct{}
+	openCount   atomic.Int64
+	leaderCheck LeaderCheck
 }
 
 func longPollTimeout(lease int) time.Duration {
@@ -108,6 +115,24 @@ func NewHandler(s *store.Store, opts ...func(*Server)) (string, http.Handler) {
 // WithStreamConfig sets the per-stream rate limit / circuit-break config.
 func WithStreamConfig(cfg StreamConfig) func(*Server) {
 	return func(s *Server) { s.streamCfg = cfg }
+}
+
+// WithLeaderCheck enables per-stream leadership verification.
+func WithLeaderCheck(lc LeaderCheck) func(*Server) {
+	return func(s *Server) { s.leaderCheck = lc }
+}
+
+// checkLeader returns a NOT_LEADER response if this node is not the leader,
+// or nil if the node is the leader (or no LeaderCheck is configured).
+func (s *Server) checkLeader(requestID uint64) *corvov1.LifecycleStreamResponse {
+	if s.leaderCheck == nil || s.leaderCheck.IsLeader() {
+		return nil
+	}
+	return &corvov1.LifecycleStreamResponse{
+		RequestId:  requestID,
+		Error:      "NOT_LEADER",
+		LeaderAddr: s.leaderCheck.LeaderHTTPURL(),
+	}
 }
 
 func (s *Server) Enqueue(ctx context.Context, req *connect.Request[corvov1.EnqueueRequest]) (*connect.Response[corvov1.EnqueueResponse], error) {
@@ -259,6 +284,12 @@ func (s *Server) AckBatch(ctx context.Context, req *connect.Request[corvov1.AckB
 }
 
 func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream[corvov1.LifecycleStreamRequest, corvov1.LifecycleStreamResponse]) error {
+	// Check leadership before accepting the stream.
+	if resp := s.checkLeader(0); resp != nil {
+		_ = stream.Send(resp)
+		return nil
+	}
+
 	cfg := s.streamCfg
 	if n := s.openCount.Add(1); cfg.MaxOpenStreams > 0 && n > int64(cfg.MaxOpenStreams) {
 		s.openCount.Add(-1)
@@ -295,6 +326,13 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 			}
 			return connect.NewError(connect.CodeUnknown, fmt.Errorf("stream lifecycle receive: %w", err))
 		}
+
+		// Check leadership on every frame; if lost, notify client.
+		if resp := s.checkLeader(req.GetRequestId()); resp != nil {
+			_ = stream.Send(resp)
+			return nil
+		}
+
 		resp := &corvov1.LifecycleStreamResponse{
 			RequestId: req.GetRequestId(),
 		}

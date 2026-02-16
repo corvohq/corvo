@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -386,6 +387,20 @@ type LifecycleResponse struct {
 	Acked          int
 	EnqueuedJobIDs []string
 	Error          string
+	LeaderAddr     string
+}
+
+// ErrNotLeader is returned when a lifecycle stream hits a non-leader node.
+// LeaderAddr contains the HTTP URL of the current leader, or "" if unknown.
+type ErrNotLeader struct {
+	LeaderAddr string
+}
+
+func (e *ErrNotLeader) Error() string {
+	if e.LeaderAddr != "" {
+		return "NOT_LEADER: leader is at " + e.LeaderAddr
+	}
+	return "NOT_LEADER: leader unknown"
 }
 
 type LifecycleStream struct {
@@ -461,10 +476,15 @@ func (s *LifecycleStream) Exchange(req LifecycleRequest) (*LifecycleResponse, er
 		}
 		return nil, err
 	}
+	if msg.GetError() == "NOT_LEADER" {
+		return nil, &ErrNotLeader{LeaderAddr: msg.GetLeaderAddr()}
+	}
+
 	resp := &LifecycleResponse{
-		RequestID: msg.GetRequestId(),
-		Acked:     int(msg.GetAcked()),
-		Error:     msg.GetError(),
+		RequestID:  msg.GetRequestId(),
+		Acked:      int(msg.GetAcked()),
+		Error:      msg.GetError(),
+		LeaderAddr: msg.GetLeaderAddr(),
 	}
 	resp.EnqueuedJobIDs = append(resp.EnqueuedJobIDs, msg.GetEnqueuedJobIds()...)
 	resp.Jobs = make([]FetchedJob, 0, len(msg.GetJobs()))
@@ -495,6 +515,63 @@ func (s *LifecycleStream) Close() error {
 	}
 	s.closed = true
 	return s.stream.CloseRequest()
+}
+
+// ResilientLifecycleStream wraps a LifecycleStream with automatic
+// reconnection on NOT_LEADER errors. When the server indicates a different
+// leader, the stream reconnects directly to that node.
+type ResilientLifecycleStream struct {
+	ctx     context.Context
+	baseURL string
+	opts    []Option
+	stream  *LifecycleStream
+}
+
+// OpenResilientLifecycleStream creates a lifecycle stream that automatically
+// reconnects to the leader on NOT_LEADER errors.
+func OpenResilientLifecycleStream(ctx context.Context, baseURL string, opts ...Option) *ResilientLifecycleStream {
+	client := New(baseURL, opts...)
+	return &ResilientLifecycleStream{
+		ctx:     ctx,
+		baseURL: baseURL,
+		opts:    opts,
+		stream:  client.OpenLifecycleStream(ctx),
+	}
+}
+
+// Exchange sends a request and receives a response, reconnecting to the
+// leader if a NOT_LEADER error is received with a known leader address.
+// Returns ErrNotLeader (with empty LeaderAddr) if the leader is unknown.
+// Returns other errors (io.EOF, transport) directly for caller backoff.
+func (r *ResilientLifecycleStream) Exchange(req LifecycleRequest) (*LifecycleResponse, error) {
+	resp, err := r.stream.Exchange(req)
+	if err == nil {
+		return resp, nil
+	}
+
+	var notLeader *ErrNotLeader
+	if !errors.As(err, &notLeader) {
+		return nil, err
+	}
+	if notLeader.LeaderAddr == "" {
+		return nil, err
+	}
+
+	// Reconnect to the leader.
+	_ = r.stream.Close()
+	client := New(notLeader.LeaderAddr, r.opts...)
+	r.stream = client.OpenLifecycleStream(r.ctx)
+	r.baseURL = notLeader.LeaderAddr
+
+	return r.stream.Exchange(req)
+}
+
+// Close closes the underlying stream.
+func (r *ResilientLifecycleStream) Close() error {
+	if r.stream == nil {
+		return nil
+	}
+	return r.stream.Close()
 }
 
 type FailResponse struct {

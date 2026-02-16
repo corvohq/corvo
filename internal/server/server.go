@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -52,6 +53,8 @@ type Server struct {
 	rateLimiter   *rateLimiter
 	streamCfg     *rpcconnect.StreamConfig
 	adminPassword string
+	bindAddr      string
+	h2cTransport  http.RoundTripper
 }
 
 // Option mutates server behavior.
@@ -146,6 +149,18 @@ func New(s *store.Store, cluster ClusterInfo, bindAddr string, uiAssets fs.FS, o
 		webhookDone: make(chan struct{}),
 		reqMetrics:  newRequestMetrics(),
 		rateLimiter: newRateLimiter(RateLimitConfig{Enabled: true}),
+		bindAddr:    bindAddr,
+		h2cTransport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				return (&net.Dialer{
+					Timeout:   5 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext(ctx, network, addr)
+			},
+			ReadIdleTimeout: 30 * time.Second,
+			PingTimeout:     10 * time.Second,
+		},
 	}
 	for _, opt := range opts {
 		if opt == nil {
@@ -285,6 +300,9 @@ func (s *Server) buildRouter() chi.Router {
 	var rpcOpts []func(*rpcconnect.Server)
 	if s.streamCfg != nil {
 		rpcOpts = append(rpcOpts, rpcconnect.WithStreamConfig(*s.streamCfg))
+	}
+	if s.cluster != nil {
+		rpcOpts = append(rpcOpts, rpcconnect.WithLeaderCheck(&leaderCheckAdapter{server: s}))
 	}
 	rpcPath, rpcHandler := rpcconnect.NewHandler(s.store, rpcOpts...)
 	r.Group(func(r chi.Router) {
@@ -599,6 +617,14 @@ func (s *Server) requireLeader(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// StreamLifecycle from direct SDK clients: let the handler return
+		// NOT_LEADER so the client can reconnect to the leader directly.
+		// Cloud-proxied streams (X-Corvo-Proxy-Stream: 1) still get proxied.
+		if strings.HasSuffix(r.URL.Path, "/StreamLifecycle") &&
+			r.Header.Get("X-Corvo-Proxy-Stream") != "1" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		leaders, isLeader, err := s.resolveRequestLeaders(r)
 		if err != nil {
 			if errors.Is(err, errMixedShardLeaders) {
@@ -894,12 +920,48 @@ func (s *Server) leaderTargetURL(r *http.Request, leaderAddr string) (*url.URL, 
 	}, nil
 }
 
+// leaderCheckAdapter bridges ClusterInfo to rpcconnect.LeaderCheck.
+type leaderCheckAdapter struct {
+	server *Server
+}
+
+func (a *leaderCheckAdapter) IsLeader() bool {
+	return a.server.cluster.IsLeader()
+}
+
+func (a *leaderCheckAdapter) LeaderHTTPURL() string {
+	leaderAddr := strings.TrimSpace(a.server.cluster.LeaderAddr())
+	if leaderAddr == "" {
+		return ""
+	}
+	if strings.HasPrefix(leaderAddr, "http://") || strings.HasPrefix(leaderAddr, "https://") {
+		return strings.TrimRight(leaderAddr, "/")
+	}
+	leaderHost, _, err := net.SplitHostPort(leaderAddr)
+	if err != nil {
+		return ""
+	}
+	if leaderHost == "" || leaderHost == "0.0.0.0" || leaderHost == "::" {
+		return ""
+	}
+	httpPort := ""
+	if _, p, err := net.SplitHostPort(a.server.bindAddr); err == nil {
+		httpPort = p
+	}
+	if httpPort == "" {
+		return ""
+	}
+	return "http://" + net.JoinHostPort(leaderHost, httpPort)
+}
+
 func (s *Server) proxyToLeader(w http.ResponseWriter, r *http.Request, target *url.URL) error {
 	if target == nil {
 		return errors.New("missing leader target")
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = s.h2cTransport
+	proxy.FlushInterval = -1
 	var proxyErr error
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 		proxyErr = err
