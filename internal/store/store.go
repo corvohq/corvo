@@ -101,3 +101,15 @@ func (s *Store) CleanRateLimits() error {
 	cutoff := time.Now().Add(-5 * time.Minute)
 	return s.applyOp(OpCleanRateLimit, CleanRateLimitOp{CutoffNs: uint64(cutoff.UnixNano())}).Err
 }
+
+// ExpireJobs moves non-terminal jobs past their expire_at to dead state.
+func (s *Store) ExpireJobs() error {
+	now := time.Now()
+	return s.applyOp(OpExpireJobs, ExpireJobsOp{NowNs: uint64(now.UnixNano())}).Err
+}
+
+// PurgeJobs deletes terminal-state jobs older than the given retention period.
+func (s *Store) PurgeJobs(retention time.Duration) error {
+	cutoff := time.Now().Add(-retention)
+	return s.applyOp(OpPurgeJobs, PurgeJobsOp{CutoffNs: uint64(cutoff.UnixNano())}).Err
+}

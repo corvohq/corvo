@@ -15,6 +15,9 @@ type Config struct {
 	ReclaimInterval        time.Duration // reclaim expired leases
 	CleanUniqueInterval    time.Duration // clean expired unique locks
 	CleanRateLimitInterval time.Duration // clean old rate limit windows
+	ExpireInterval         time.Duration // expire jobs past their expire_at
+	PurgeInterval          time.Duration // purge old terminal-state jobs
+	RetentionPeriod        time.Duration // how long to keep terminal jobs
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -25,6 +28,9 @@ func DefaultConfig() Config {
 		ReclaimInterval:        1 * time.Second,
 		CleanUniqueInterval:    30 * time.Second,
 		CleanRateLimitInterval: 30 * time.Second,
+		ExpireInterval:         10 * time.Second,
+		PurgeInterval:          1 * time.Hour,
+		RetentionPeriod:        7 * 24 * time.Hour,
 	}
 }
 
@@ -43,6 +49,8 @@ type Scheduler struct {
 	lastReclaim time.Time
 	lastUnique  time.Time
 	lastRate    time.Time
+	lastExpire  time.Time
+	lastPurge   time.Time
 }
 
 // New creates a new Scheduler. If leaderCheck is nil, the scheduler always runs.
@@ -62,6 +70,15 @@ func New(s *store.Store, leaderCheck LeaderCheck, config Config) *Scheduler {
 	}
 	if config.CleanRateLimitInterval == 0 {
 		config.CleanRateLimitInterval = def.CleanRateLimitInterval
+	}
+	if config.ExpireInterval == 0 {
+		config.ExpireInterval = def.ExpireInterval
+	}
+	if config.PurgeInterval == 0 {
+		config.PurgeInterval = def.PurgeInterval
+	}
+	if config.RetentionPeriod == 0 {
+		config.RetentionPeriod = def.RetentionPeriod
 	}
 	return &Scheduler{store: s, leaderCheck: leaderCheck, config: config}
 }
@@ -114,6 +131,18 @@ func (s *Scheduler) tick(force bool) {
 			slog.Error("clean old rate limit entries", "error", err)
 		}
 		s.lastRate = now
+	}
+	if force || now.Sub(s.lastExpire) >= s.config.ExpireInterval {
+		if err := s.store.ExpireJobs(); err != nil {
+			slog.Error("expire jobs past deadline", "error", err)
+		}
+		s.lastExpire = now
+	}
+	if force || now.Sub(s.lastPurge) >= s.config.PurgeInterval {
+		if err := s.store.PurgeJobs(s.config.RetentionPeriod); err != nil {
+			slog.Error("purge old terminal jobs", "error", err)
+		}
+		s.lastPurge = now
 	}
 }
 

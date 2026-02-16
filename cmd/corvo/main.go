@@ -84,6 +84,8 @@ var (
 	rateLimitWriteRPS   float64 = 1000
 	rateLimitWriteBurst float64 = 2000
 	raftShards          int     = 1
+	retentionPeriod     = 7 * 24 * time.Hour
+	retentionInterval   = 1 * time.Hour
 )
 
 func init() {
@@ -115,6 +117,8 @@ func init() {
 	serverCmd.Flags().Float64Var(&rateLimitWriteRPS, "rate-limit-write-rps", 1000, "Per-client sustained write requests/sec")
 	serverCmd.Flags().Float64Var(&rateLimitWriteBurst, "rate-limit-write-burst", 2000, "Per-client write burst tokens")
 	serverCmd.Flags().IntVar(&raftShards, "raft-shards", 1, "Number of in-process Raft shard groups for static queue sharding")
+	serverCmd.Flags().DurationVar(&retentionPeriod, "retention", 7*24*time.Hour, "How long to keep completed/dead/cancelled jobs before purging")
+	serverCmd.Flags().DurationVar(&retentionInterval, "retention-interval", 1*time.Hour, "How often to run the purge sweep for old terminal jobs")
 
 	rootCmd.AddCommand(serverCmd)
 }
@@ -280,6 +284,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if schedulerEnabled {
 		schedCfg := scheduler.DefaultConfig()
 		schedCfg.Interval = schedulerInterval
+		schedCfg.RetentionPeriod = retentionPeriod
+		schedCfg.PurgeInterval = retentionInterval
 		sched := scheduler.New(s, cluster, schedCfg)
 		var schedCtx context.Context
 		schedCtx, schedCancel = context.WithCancel(context.Background())

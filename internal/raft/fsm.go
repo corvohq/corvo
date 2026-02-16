@@ -151,6 +151,10 @@ func (f *FSM) applyByType(opType store.OpType, data json.RawMessage) *store.OpRe
 		return f.applyUpdateWebhookStatus(data)
 	case store.OpSetNamespaceRateLimit:
 		return f.applySetNamespaceRateLimit(data)
+	case store.OpExpireJobs:
+		return f.applyExpireJobs(data)
+	case store.OpPurgeJobs:
+		return f.applyPurgeJobs(data)
 	default:
 		return &store.OpResult{Err: fmt.Errorf("unknown op type: %d", opType)}
 	}
@@ -368,6 +372,16 @@ func (f *FSM) applyDecoded(op *store.DecodedRaftOp) *store.OpResult {
 			return f.applySetNamespaceRateLimitOp(*op.SetNamespaceRateLimit)
 		}
 		return &store.OpResult{Err: fmt.Errorf("set namespace rate limit op missing payload")}
+	case store.OpExpireJobs:
+		if op.ExpireJobs != nil {
+			return f.applyExpireJobsOp(*op.ExpireJobs)
+		}
+		return &store.OpResult{Err: fmt.Errorf("expire jobs op missing payload")}
+	case store.OpPurgeJobs:
+		if op.PurgeJobs != nil {
+			return f.applyPurgeJobsOp(*op.PurgeJobs)
+		}
+		return &store.OpResult{Err: fmt.Errorf("purge jobs op missing payload")}
 	default:
 		return &store.OpResult{Err: fmt.Errorf("unknown op type: %d", op.Type)}
 	}

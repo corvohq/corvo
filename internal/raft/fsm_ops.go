@@ -3098,3 +3098,187 @@ func removeFromSortedSet(batch *pebble.Batch, db *pebble.DB, job store.Job, writ
 		deleteRetryingKey(batch, db, job.Queue, job.ID, writeOpts)
 	}
 }
+
+// --- ExpireJobs ---
+
+func (f *FSM) applyExpireJobs(data json.RawMessage) *store.OpResult {
+	var op store.ExpireJobsOp
+	if err := json.Unmarshal(data, &op); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	return f.applyExpireJobsOp(op)
+}
+
+func (f *FSM) applyExpireJobsOp(op store.ExpireJobsOp) *store.OpResult {
+	batch := f.pebble.NewBatch()
+	defer batch.Close()
+
+	now := time.Unix(0, int64(op.NowNs))
+	var expired int
+	var sqliteUpdates []string
+
+	prefix := []byte(kv.PrefixJob)
+	iter, err := f.pebble.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return &store.OpResult{Err: err}
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var job store.Job
+		if err := decodeJobDoc(iter.Value(), &job); err != nil {
+			continue
+		}
+		if job.ExpireAt == nil || !job.ExpireAt.Before(now) {
+			continue
+		}
+		// Only expire non-terminal, non-active jobs
+		switch job.State {
+		case store.StatePending, store.StateScheduled, store.StateRetrying, store.StateHeld:
+		default:
+			continue
+		}
+
+		// Remove from queue index
+		switch job.State {
+		case store.StatePending:
+			deletePendingOrAppendKey(batch, f.pebble, job.Queue, job.ID, f.writeOpts)
+		case store.StateScheduled:
+			deleteScheduledKey(batch, f.pebble, job.Queue, job.ID, f.writeOpts)
+		case store.StateRetrying:
+			deleteRetryingKey(batch, f.pebble, job.Queue, job.ID, f.writeOpts)
+		}
+
+		// Write error record
+		errDoc := store.JobError{
+			JobID:     job.ID,
+			Attempt:   job.Attempt,
+			Error:     "job expired",
+			CreatedAt: now,
+		}
+		errData, _ := json.Marshal(errDoc)
+		batch.Set(kv.JobErrorKey(job.ID, uint32(job.Attempt)), errData, f.writeOpts)
+
+		// Update job state
+		job.State = store.StateDead
+		job.FailedAt = &now
+		jobData, _ := encodeJobDoc(job)
+		batch.Set(kv.JobKey(job.ID), jobData, f.writeOpts)
+
+		sqliteUpdates = append(sqliteUpdates, job.ID)
+		expired++
+	}
+
+	if expired > 0 {
+		if err := batch.Commit(f.writeOpts); err != nil {
+			return &store.OpResult{Err: err}
+		}
+	}
+
+	if len(sqliteUpdates) > 0 {
+		nowStr := now.UTC().Format(time.RFC3339Nano)
+		f.syncSQLite(func(db sqlExecer) error {
+			for _, jobID := range sqliteUpdates {
+				db.Exec("UPDATE jobs SET state = 'dead', failed_at = ? WHERE id = ?", nowStr, jobID)
+				db.Exec("INSERT INTO job_errors (job_id, attempt, error, created_at) VALUES (?, 0, 'job expired', ?)", jobID, nowStr)
+			}
+			return nil
+		})
+	}
+
+	return &store.OpResult{Data: expired}
+}
+
+// --- PurgeJobs ---
+
+func (f *FSM) applyPurgeJobs(data json.RawMessage) *store.OpResult {
+	var op store.PurgeJobsOp
+	if err := json.Unmarshal(data, &op); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	return f.applyPurgeJobsOp(op)
+}
+
+func (f *FSM) applyPurgeJobsOp(op store.PurgeJobsOp) *store.OpResult {
+	batch := f.pebble.NewBatch()
+	defer batch.Close()
+
+	cutoff := time.Unix(0, int64(op.CutoffNs))
+	var purged int
+	var sqliteDeletes []string
+
+	prefix := []byte(kv.PrefixJob)
+	iter, err := f.pebble.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return &store.OpResult{Err: err}
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var job store.Job
+		if err := decodeJobDoc(iter.Value(), &job); err != nil {
+			continue
+		}
+
+		var ts time.Time
+		switch job.State {
+		case store.StateCompleted:
+			if job.CompletedAt == nil {
+				continue
+			}
+			ts = *job.CompletedAt
+		case store.StateDead:
+			if job.FailedAt != nil {
+				ts = *job.FailedAt
+			} else {
+				ts = job.CreatedAt
+			}
+		case store.StateCancelled:
+			if job.FailedAt != nil {
+				ts = *job.FailedAt
+			} else {
+				ts = job.CreatedAt
+			}
+		default:
+			continue
+		}
+
+		if !ts.Before(cutoff) {
+			continue
+		}
+
+		// Delete job key
+		k := make([]byte, len(iter.Key()))
+		copy(k, iter.Key())
+		batch.Delete(k, f.writeOpts)
+
+		// Delete error records
+		deletePrefix(batch, f.pebble, kv.JobErrorPrefix(job.ID), f.writeOpts)
+
+		sqliteDeletes = append(sqliteDeletes, job.ID)
+		purged++
+	}
+
+	if purged > 0 {
+		if err := batch.Commit(f.writeOpts); err != nil {
+			return &store.OpResult{Err: err}
+		}
+	}
+
+	if len(sqliteDeletes) > 0 {
+		f.syncSQLite(func(db sqlExecer) error {
+			for _, jobID := range sqliteDeletes {
+				sqliteDeleteJob(db, jobID)
+			}
+			return nil
+		})
+	}
+
+	return &store.OpResult{Data: purged}
+}

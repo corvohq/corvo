@@ -55,6 +55,8 @@ type DecodedRaftOp struct {
 	DeleteWebhook       *DeleteWebhookOp
 	UpdateWebhookStatus    *UpdateWebhookStatusOp
 	SetNamespaceRateLimit  *SetNamespaceRateLimitOp
+	ExpireJobs             *ExpireJobsOp
+	PurgeJobs              *PurgeJobsOp
 	Multi        []*DecodedRaftOp
 }
 
@@ -111,6 +113,8 @@ type pbOp struct {
 	DeleteWebhook       *pbDeleteWebhookOp       `protobuf:"bytes,44,opt,name=delete_webhook,json=deleteWebhook,proto3" json:"delete_webhook,omitempty"`
 	UpdateWebhookStatus    *pbUpdateWebhookStatusOp    `protobuf:"bytes,45,opt,name=update_webhook_status,json=updateWebhookStatus,proto3" json:"update_webhook_status,omitempty"`
 	SetNamespaceRateLimit  *pbSetNamespaceRateLimitOp  `protobuf:"bytes,46,opt,name=set_namespace_rate_limit,json=setNamespaceRateLimit,proto3" json:"set_namespace_rate_limit,omitempty"`
+	ExpireJobs             *pbExpireJobsOp             `protobuf:"bytes,47,opt,name=expire_jobs,json=expireJobs,proto3" json:"expire_jobs,omitempty"`
+	PurgeJobs              *pbPurgeJobsOp              `protobuf:"bytes,48,opt,name=purge_jobs,json=purgeJobs,proto3" json:"purge_jobs,omitempty"`
 }
 
 func (m *pbOp) Reset()         { *m = pbOp{} }
@@ -392,6 +396,22 @@ type pbCleanRateOp struct {
 func (m *pbCleanRateOp) Reset()         { *m = pbCleanRateOp{} }
 func (m *pbCleanRateOp) String() string { return oldproto.CompactTextString(m) }
 func (*pbCleanRateOp) ProtoMessage()    {}
+
+type pbExpireJobsOp struct {
+	NowNs uint64 `protobuf:"varint,1,opt,name=now_ns,json=nowNs,proto3" json:"now_ns,omitempty"`
+}
+
+func (m *pbExpireJobsOp) Reset()         { *m = pbExpireJobsOp{} }
+func (m *pbExpireJobsOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbExpireJobsOp) ProtoMessage()    {}
+
+type pbPurgeJobsOp struct {
+	CutoffNs uint64 `protobuf:"varint,1,opt,name=cutoff_ns,json=cutoffNs,proto3" json:"cutoff_ns,omitempty"`
+}
+
+func (m *pbPurgeJobsOp) Reset()         { *m = pbPurgeJobsOp{} }
+func (m *pbPurgeJobsOp) String() string { return oldproto.CompactTextString(m) }
+func (*pbPurgeJobsOp) ProtoMessage()    {}
 
 type pbSetBudgetOp struct {
 	ID          string  `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -715,6 +735,18 @@ func buildPBOp(opType OpType, data any) (*pbOp, error) {
 			return nil, fmt.Errorf("set namespace rate limit op type mismatch: %T", data)
 		}
 		op.SetNamespaceRateLimit = toPBSetNamespaceRateLimit(v)
+	case OpExpireJobs:
+		v, ok := data.(ExpireJobsOp)
+		if !ok {
+			return nil, fmt.Errorf("expire jobs op type mismatch: %T", data)
+		}
+		op.ExpireJobs = toPBExpireJobs(v)
+	case OpPurgeJobs:
+		v, ok := data.(PurgeJobsOp)
+		if !ok {
+			return nil, fmt.Errorf("purge jobs op type mismatch: %T", data)
+		}
+		op.PurgeJobs = toPBPurgeJobs(v)
 	case OpMulti:
 		v, ok := data.(MultiOp)
 		if !ok {
@@ -984,6 +1016,18 @@ func buildPBSubOp(sub Op) (*pbOp, error) {
 			return nil, err
 		}
 		op.SetNamespaceRateLimit = toPBSetNamespaceRateLimit(v)
+	case OpExpireJobs:
+		var v ExpireJobsOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.ExpireJobs = toPBExpireJobs(v)
+	case OpPurgeJobs:
+		var v PurgeJobsOp
+		if err := json.Unmarshal(sub.Data, &v); err != nil {
+			return nil, err
+		}
+		op.PurgeJobs = toPBPurgeJobs(v)
 	default:
 		return nil, fmt.Errorf("unsupported multi sub-op type: %d", sub.Type)
 	}
@@ -1206,6 +1250,16 @@ func fromPBOp(op *pbOp) (*DecodedRaftOp, error) {
 	if op.SetNamespaceRateLimit != nil {
 		v := fromPBSetNamespaceRateLimit(op.SetNamespaceRateLimit)
 		out.SetNamespaceRateLimit = &v
+		return out, nil
+	}
+	if op.ExpireJobs != nil {
+		v := fromPBExpireJobs(op.ExpireJobs)
+		out.ExpireJobs = &v
+		return out, nil
+	}
+	if op.PurgeJobs != nil {
+		v := fromPBPurgeJobs(op.PurgeJobs)
+		out.PurgeJobs = &v
 		return out, nil
 	}
 	return nil, fmt.Errorf("protobuf op %d missing payload", op.Type)
@@ -1616,6 +1670,22 @@ func toPBCleanRate(op CleanRateLimitOp) *pbCleanRateOp {
 
 func fromPBCleanRate(op *pbCleanRateOp) CleanRateLimitOp {
 	return CleanRateLimitOp{CutoffNs: op.CutoffNs}
+}
+
+func toPBExpireJobs(op ExpireJobsOp) *pbExpireJobsOp {
+	return &pbExpireJobsOp{NowNs: op.NowNs}
+}
+
+func fromPBExpireJobs(op *pbExpireJobsOp) ExpireJobsOp {
+	return ExpireJobsOp{NowNs: op.NowNs}
+}
+
+func toPBPurgeJobs(op PurgeJobsOp) *pbPurgeJobsOp {
+	return &pbPurgeJobsOp{CutoffNs: op.CutoffNs}
+}
+
+func fromPBPurgeJobs(op *pbPurgeJobsOp) PurgeJobsOp {
+	return PurgeJobsOp{CutoffNs: op.CutoffNs}
 }
 
 type pbSetProviderOp struct {
