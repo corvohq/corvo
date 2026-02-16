@@ -144,6 +144,11 @@ Exit criteria:
   - Removed global HTTP client timeout for long-lived lifecycle streams
   - Added HTTP/2 keepalive/read-idle transport settings
   - Serialized lifecycle stream `Exchange`/`Close` to avoid client-side race/EOF churn
+- [x] Leader redirect for lifecycle streams:
+  - `StreamLifecycle` on non-leader returns `NOT_LEADER` error with leader HTTP address instead of proxying
+  - Go SDK `ErrNotLeader` type + `ResilientLifecycleStream` auto-reconnects to leader
+  - Fixed `proxyToLeader` to use h2c transport with flush for correct stream proxying
+  - Cloud-proxied streams (`X-Corvo-Proxy-Stream: 1`) still use follower→leader h2c proxy
 - [x] FSM typed decode expansion:
   - Protobuf decode now dispatches directly to typed handlers for heartbeat/retry/cancel/move/delete/queue-control/promote/reclaim/bulk/cleanup ops
   - Removed JSON bridge conversion in protobuf dispatch path (`applyTypedViaJSON`)

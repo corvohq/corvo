@@ -126,7 +126,7 @@ Read (search, get job, list queues, list workers):
 - **Writes**: serialize as Op → bounded queue + group-commit batch → raft.Apply → FSM applies to Pebble + SQLite on all nodes
 - **Reads**: query local SQLite directly (any node)
 - **Fetch** is a write (claims a job) → goes through Raft
-- **Leader forwarding**: followers proxy write requests to the leader internally (transparent to clients)
+- **Leader forwarding**: followers proxy write requests to the leader internally (transparent to clients). Exception: `StreamLifecycle` bidi streams return a `NOT_LEADER` error with the leader's HTTP address so the SDK can reconnect directly, avoiding double-hop latency on long-lived streams. Cloud-proxied streams (identified by `X-Corvo-Proxy-Stream: 1`) are still proxied via h2c.
 - **Determinism**: all timestamps pre-computed by leader (FSM never calls `time.Now()`)
 - **Backpressure**: overloaded requests are rejected with `429 Too Many Requests` / `ResourceExhausted` and retry hints
 
@@ -1367,6 +1367,10 @@ Corvo servers cluster automatically using hashicorp/raft for consensus and SQLit
 Client → HTTP POST /api/v1/enqueue → any Corvo node
   → If leader: serialize Op → raft.Apply() → committed to quorum → FSM applies to Pebble + SQLite → respond
   → If follower: proxy request to leader internally → leader applies via Raft → respond
+
+Client → StreamLifecycle (bidi stream) → any Corvo node
+  → If leader: process frames normally
+  → If follower: return NOT_LEADER error with leader HTTP address → client reconnects directly to leader
 ```
 
 **Read path (local):**
@@ -2379,6 +2383,7 @@ Replaced SQLite-only store with Pebble (source of truth) + Raft (consensus) + SQ
 **Clustering:**
 - [x] Multi-node Raft (bootstrap, join, AddVoter, RemoveServer)
 - [x] Write proxying (follower → leader)
+- [x] Leader redirect for lifecycle streams (NOT_LEADER + leader addr, SDK auto-reconnect)
 - [x] Automatic failover + rejoin
 - [x] Raft snapshots + log compaction
 - [x] Cluster status endpoint with histograms + queue/pending pressure stats
