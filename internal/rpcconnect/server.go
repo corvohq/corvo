@@ -37,6 +37,7 @@ type StreamConfig struct {
 	AcquireTimeout  time.Duration // Max wait to acquire in-flight slot; <=0 blocks until available
 	FetchPollInterval  time.Duration // Unary Fetch/FetchBatch long-poll retry interval (default 100ms)
 	IdleFetchSleep     time.Duration // Stream sleep when fetch returns zero jobs (default 100ms)
+	DisableCompression bool          // Disable gzip compression on ConnectRPC responses
 }
 
 func (c StreamConfig) withDefaults() StreamConfig {
@@ -147,7 +148,11 @@ func NewHandler(s *store.Store, opts ...func(*Server)) (string, http.Handler, *S
 	}
 	srv.streamCfg = srv.streamCfg.withDefaults()
 	srv.frameSem = make(chan struct{}, srv.streamCfg.MaxInFlight)
-	path, handler := corvov1connect.NewWorkerServiceHandler(srv)
+	var handlerOpts []connect.HandlerOption
+	if srv.streamCfg.DisableCompression {
+		handlerOpts = append(handlerOpts, connect.WithCompression("gzip", nil, nil))
+	}
+	path, handler := corvov1connect.NewWorkerServiceHandler(srv, handlerOpts...)
 	return path, handler, srv
 }
 

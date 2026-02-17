@@ -25,6 +25,7 @@ type ClusterConfig struct {
 	ApplyMaxPending         int           // Max pending apply requests before fail-fast backpressure
 	ApplyMaxFetchQueueInFly int           // Max concurrent in-flight fetch/fetch-batch applies per queue
 	ApplySubBatchMax        int           // Max requests per raft.Apply execution (splits large mixed batches)
+	ApplyMultiMode          string        // "grouped" (default): group ops by type into 2-3 commits; "indexed": single indexed batch commit; "individual": legacy per-op commits
 	LifecycleEvents         bool          // Persist per-job lifecycle event log in Pebble
 	SQLitePath              string        // Optional explicit SQLite mirror path (defaults to <DataDir>/corvo.db)
 }
@@ -49,6 +50,7 @@ func DefaultClusterConfig() ClusterConfig {
 		ApplyMaxPending:         16384,
 		ApplyMaxFetchQueueInFly: 64,
 		ApplySubBatchMax:        1024,
+		ApplyMultiMode:          "grouped",
 		LifecycleEvents:         false,
 	}
 }

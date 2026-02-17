@@ -47,6 +47,12 @@ type FSM struct {
 	// activeCount caches the number of active keys per queue, maintained
 	// deterministically during FSM.Apply to avoid O(n) Pebble prefix scans.
 	activeCount map[string]int
+
+	// applyMultiMode controls how mixed-type OpMulti batches are executed:
+	// "grouped" (default): group ops by type, 2-3 Pebble commits per batch
+	// "indexed": single indexed Pebble batch for all ops, 1 commit
+	// "individual": legacy per-op commits (N commits)
+	applyMultiMode string
 }
 
 // NewFSM creates a new FSM with the given Pebble and SQLite databases.
@@ -455,6 +461,7 @@ func (f *FSM) applyMultiDecoded(ops []*store.DecodedRaftOp) *store.OpResult {
 		return &store.OpResult{Data: []*store.OpResult{}}
 	}
 
+	// Fast path: all-same-type batches use a single Pebble commit regardless of mode.
 	allEnqueue := true
 	enqueues := make([]store.EnqueueOp, len(ops))
 	for i, sub := range ops {
@@ -481,8 +488,6 @@ func (f *FSM) applyMultiDecoded(ops []*store.DecodedRaftOp) *store.OpResult {
 		return f.applyMultiEnqueueBatch(enqueueBatches)
 	}
 
-	// Fast path: merge all AckBatch ops into a single combined batch so
-	// they share one Pebble commit instead of N separate commits.
 	allAckBatch := true
 	for _, sub := range ops {
 		if sub.Type != store.OpAckBatch || sub.AckBatch == nil {
@@ -494,6 +499,31 @@ func (f *FSM) applyMultiDecoded(ops []*store.DecodedRaftOp) *store.OpResult {
 		return f.applyMultiAckBatch(ops)
 	}
 
+	allFetchBatch := true
+	for _, sub := range ops {
+		if sub.Type != store.OpFetchBatch || sub.FetchBatch == nil {
+			allFetchBatch = false
+			break
+		}
+	}
+	if allFetchBatch {
+		return f.applyMultiFetchBatch(ops)
+	}
+
+	// Mixed-type batch: dispatch based on configured mode.
+	switch f.applyMultiMode {
+	case "indexed":
+		return f.applyMultiIndexed(ops)
+	case "individual":
+		return f.applyMultiIndividual(ops)
+	default: // "grouped"
+		return f.applyMultiGrouped(ops)
+	}
+}
+
+// applyMultiIndividual processes each op individually with its own Pebble commit.
+// This is the legacy behavior — N ops = N commits.
+func (f *FSM) applyMultiIndividual(ops []*store.DecodedRaftOp) *store.OpResult {
 	results := make([]*store.OpResult, 0, len(ops))
 	for _, sub := range ops {
 		if sub.Type == store.OpMulti {
@@ -502,6 +532,177 @@ func (f *FSM) applyMultiDecoded(ops []*store.DecodedRaftOp) *store.OpResult {
 		}
 		results = append(results, f.applyDecoded(sub))
 	}
+	return &store.OpResult{Data: results}
+}
+
+// applyMultiGrouped groups ops by type and processes each group with a merged
+// handler that shares a single Pebble commit. Mixed types use 2-3 commits
+// instead of N individual commits.
+func (f *FSM) applyMultiGrouped(ops []*store.DecodedRaftOp) *store.OpResult {
+	results := make([]*store.OpResult, len(ops))
+
+	// Partition ops by type, preserving original indices for result placement.
+	type indexedOp struct {
+		idx int
+		op  *store.DecodedRaftOp
+	}
+	var ackBatchOps, fetchBatchOps, otherOps []indexedOp
+
+	for i, sub := range ops {
+		switch sub.Type {
+		case store.OpAckBatch:
+			if sub.AckBatch != nil {
+				ackBatchOps = append(ackBatchOps, indexedOp{i, sub})
+			} else {
+				otherOps = append(otherOps, indexedOp{i, sub})
+			}
+		case store.OpFetchBatch:
+			if sub.FetchBatch != nil {
+				fetchBatchOps = append(fetchBatchOps, indexedOp{i, sub})
+			} else {
+				otherOps = append(otherOps, indexedOp{i, sub})
+			}
+		default:
+			otherOps = append(otherOps, indexedOp{i, sub})
+		}
+	}
+
+	// Process acks first — frees active slots that fetches can use.
+	if len(ackBatchOps) > 0 {
+		grouped := make([]*store.DecodedRaftOp, len(ackBatchOps))
+		for i, iop := range ackBatchOps {
+			grouped[i] = iop.op
+		}
+		res := f.applyMultiAckBatch(grouped)
+		subResults := res.Data.([]*store.OpResult)
+		for i, iop := range ackBatchOps {
+			results[iop.idx] = subResults[i]
+		}
+	}
+
+	// Then fetches — benefits from ack-freed capacity.
+	if len(fetchBatchOps) > 0 {
+		grouped := make([]*store.DecodedRaftOp, len(fetchBatchOps))
+		for i, iop := range fetchBatchOps {
+			grouped[i] = iop.op
+		}
+		res := f.applyMultiFetchBatch(grouped)
+		subResults := res.Data.([]*store.OpResult)
+		for i, iop := range fetchBatchOps {
+			results[iop.idx] = subResults[i]
+		}
+	}
+
+	// Remaining ops processed individually.
+	for _, iop := range otherOps {
+		if iop.op.Type == store.OpMulti {
+			results[iop.idx] = &store.OpResult{Err: fmt.Errorf("nested multi op is not allowed")}
+		} else {
+			results[iop.idx] = f.applyDecoded(iop.op)
+		}
+	}
+
+	return &store.OpResult{Data: results}
+}
+
+// applyMultiIndexed processes all ops using a single indexed Pebble batch.
+// Reads go through the batch (seeing prior writes), writes accumulate,
+// and a single Commit() flushes everything. This is the most efficient
+// mode: N ops = 1 Pebble commit.
+func (f *FSM) applyMultiIndexed(ops []*store.DecodedRaftOp) *store.OpResult {
+	results := make([]*store.OpResult, len(ops))
+
+	batch := f.pebble.NewIndexedBatch()
+	defer batch.Close()
+
+	// Sort: acks before fetches before others. Acks free active slots that
+	// subsequent fetches can use. We track original indices for result placement.
+	type indexedOp struct {
+		idx int
+		op  *store.DecodedRaftOp
+	}
+	sorted := make([]indexedOp, 0, len(ops))
+
+	// Pass 1: ack-batch ops.
+	for i, sub := range ops {
+		if sub.Type == store.OpAckBatch {
+			sorted = append(sorted, indexedOp{i, sub})
+		}
+	}
+	// Pass 2: fetch-batch ops.
+	for i, sub := range ops {
+		if sub.Type == store.OpFetchBatch {
+			sorted = append(sorted, indexedOp{i, sub})
+		}
+	}
+	// Pass 3: everything else.
+	for i, sub := range ops {
+		if sub.Type != store.OpAckBatch && sub.Type != store.OpFetchBatch {
+			sorted = append(sorted, indexedOp{i, sub})
+		}
+	}
+
+	// Track claimed jobs across all FetchBatch ops to prevent double-fetch.
+	claimed := make(map[string]struct{})
+	var allSqliteCallbacks []func(db sqlExecer) error
+	anyWrite := false
+
+	for _, iop := range sorted {
+		sub := iop.op
+		switch sub.Type {
+		case store.OpAckBatch:
+			res := f.applyAckBatchIntoBatch(batch, *sub.AckBatch, &allSqliteCallbacks)
+			results[iop.idx] = res
+			if res.Err == nil {
+				anyWrite = true
+			}
+		case store.OpFetchBatch:
+			res := f.applyFetchBatchIntoBatch(batch, *sub.FetchBatch, claimed, &allSqliteCallbacks)
+			results[iop.idx] = res
+			if res.Err == nil {
+				anyWrite = true
+			}
+		case store.OpMulti:
+			results[iop.idx] = &store.OpResult{Err: fmt.Errorf("nested multi op is not allowed")}
+		default:
+			// For non-hot-path ops, apply individually but into the shared batch.
+			// Fall back to per-op processing with its own internal batch.
+			results[iop.idx] = f.applyDecoded(sub)
+			anyWrite = true
+		}
+	}
+
+	if !anyWrite {
+		return &store.OpResult{Data: results}
+	}
+
+	if err := f.appendLifecycleCursor(batch); err != nil {
+		errResult := &store.OpResult{Err: err}
+		for i := range results {
+			results[i] = errResult
+		}
+		return &store.OpResult{Data: results}
+	}
+
+	if err := batch.Commit(f.writeOpts); err != nil {
+		errResult := &store.OpResult{Err: fmt.Errorf("pebble commit multi indexed: %w", err)}
+		for i := range results {
+			results[i] = errResult
+		}
+		return &store.OpResult{Data: results}
+	}
+
+	if len(allSqliteCallbacks) > 0 {
+		f.syncSQLite(func(db sqlExecer) error {
+			for _, cb := range allSqliteCallbacks {
+				if err := cb(db); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+
 	return &store.OpResult{Data: results}
 }
 
@@ -589,6 +790,16 @@ func (f *FSM) SetSQLiteMirrorAsync(async bool) {
 	f.sqliteQueue = nil
 	f.sqliteStop = nil
 	f.sqliteDone = nil
+}
+
+// SetApplyMultiMode sets how mixed-type multi-apply batches are processed.
+func (f *FSM) SetApplyMultiMode(mode string) {
+	switch mode {
+	case "indexed", "individual":
+		f.applyMultiMode = mode
+	default:
+		f.applyMultiMode = "grouped"
+	}
 }
 
 // SetPebbleNoSync toggles Pebble fsync behavior for benchmark mode.

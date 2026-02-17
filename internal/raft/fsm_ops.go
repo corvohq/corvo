@@ -1341,6 +1341,581 @@ func (f *FSM) applyMultiAckBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 	return &store.OpResult{Data: results}
 }
 
+// applyMultiFetchBatch merges multiple FetchBatch ops from a single raft.Apply
+// into one Pebble batch commit, reducing write amplification under high
+// concurrency. Each FetchBatch still gets its own result slice.
+func (f *FSM) applyMultiFetchBatch(ops []*store.DecodedRaftOp) *store.OpResult {
+	results := make([]*store.OpResult, len(ops))
+	if len(ops) == 0 {
+		return &store.OpResult{Data: results}
+	}
+
+	batch := f.pebble.NewBatch()
+	defer batch.Close()
+
+	type sqliteFetch struct {
+		jobs []store.Job
+		op   store.FetchBatchOp
+	}
+	var allSqliteFetches []sqliteFetch
+	totalFetched := 0
+
+	// Global claimed set prevents two FetchBatch ops from claiming the same job.
+	claimed := make(map[string]struct{})
+
+	for i, sub := range ops {
+		op := sub.FetchBatch
+		if op == nil || len(op.Queues) == 0 || op.Count <= 0 {
+			results[i] = &store.OpResult{Data: []store.FetchResult{}}
+			continue
+		}
+
+		nowNs := op.NowNs
+		leaseDuration := op.LeaseDuration
+		if leaseDuration <= 0 {
+			leaseDuration = 60
+		}
+		leaseExpiresNs := nowNs + uint64(leaseDuration)*1_000_000_000
+
+		startedAt := time.Unix(0, int64(nowNs))
+		leaseExp := time.Unix(0, int64(leaseExpiresNs))
+		worker := store.Worker{
+			ID:            op.WorkerID,
+			Queues:        marshalStringSlice(op.Queues),
+			LastHeartbeat: startedAt,
+			StartedAt:     startedAt,
+		}
+		if op.Hostname != "" {
+			worker.Hostname = &op.Hostname
+		}
+		workerData, _ := json.Marshal(worker)
+		batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts)
+
+		type queueState struct {
+			name        string
+			activeLimit int
+			activeCount int
+			rateLimit   int
+			rateCount   int
+		}
+
+		states := make([]queueState, 0, len(op.Queues))
+		for _, queue := range op.Queues {
+			qs := queueState{name: queue}
+			qcKey := kv.QueueConfigKey(queue)
+			if qcVal, closer, err := f.pebble.Get(qcKey); err == nil {
+				var qc store.Queue
+				if err := json.Unmarshal(qcVal, &qc); err != nil {
+					closer.Close()
+					continue
+				}
+				closer.Close()
+				if qc.Paused {
+					continue
+				}
+				if qc.MaxConcurrency != nil && *qc.MaxConcurrency > 0 {
+					qs.activeLimit = *qc.MaxConcurrency
+					qs.activeCount = f.getActiveCount(queue)
+				}
+				if qc.RateLimit != nil && qc.RateWindowMs != nil && *qc.RateLimit > 0 {
+					qs.rateLimit = *qc.RateLimit
+					windowNs := uint64(*qc.RateWindowMs) * 1_000_000
+					windowStart := nowNs - windowNs
+					qs.rateCount = countPrefixFrom(f.pebble, kv.RateLimitPrefix(queue), kv.RateLimitWindowStart(queue, windowStart))
+				}
+			}
+			states = append(states, qs)
+		}
+
+		fetchResults := make([]store.FetchResult, 0, op.Count)
+		sqliteJobs := make([]store.Job, 0, op.Count)
+		rateSeq := uint64(0)
+
+		for len(fetchResults) < op.Count {
+			progress := false
+			for qi := range states {
+				qs := &states[qi]
+				if qs.activeLimit > 0 && qs.activeCount >= qs.activeLimit {
+					continue
+				}
+				if qs.rateLimit > 0 && qs.rateCount >= qs.rateLimit {
+					continue
+				}
+				jobID, pendingKey, appendKey, job, ok := f.findPendingOrAppendJobForQueue(qs.name, claimed)
+				if !ok {
+					continue
+				}
+				progress = true
+				claimed[jobID] = struct{}{}
+
+				job.State = store.StateActive
+				job.WorkerID = &op.WorkerID
+				job.Hostname = &op.Hostname
+				job.Attempt++
+				job.StartedAt = &startedAt
+				job.LeaseExpiresAt = &leaseExp
+
+				jobData, _ := encodeJobDoc(job)
+				batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+				if len(pendingKey) > 0 {
+					batch.Delete(pendingKey, f.writeOpts)
+				}
+				if len(appendKey) > 0 {
+					batch.Delete(appendKey, f.writeOpts)
+					batch.Set(kv.QueueCursorKey(qs.name), appendKey, f.writeOpts)
+				}
+				batch.Set(kv.ActiveKey(qs.name, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+				f.incrActive(qs.name)
+				batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+				rateSeq++
+				if err := f.appendLifecycleEvent(batch, "started", jobID, qs.name, nowNs); err != nil {
+					results[i] = &store.OpResult{Err: err}
+					break
+				}
+				if qs.activeLimit > 0 {
+					qs.activeCount++
+				}
+				if qs.rateLimit > 0 {
+					qs.rateCount++
+				}
+				sqliteJobs = append(sqliteJobs, job)
+				fetchResults = append(fetchResults, store.FetchResult{
+					JobID:         jobID,
+					Queue:         qs.name,
+					Payload:       job.Payload,
+					Attempt:       job.Attempt,
+					MaxRetries:    job.MaxRetries,
+					LeaseDuration: leaseDuration,
+					Tags:          job.Tags,
+					Checkpoint:    job.Checkpoint,
+					Agent:         job.Agent,
+				})
+				if len(fetchResults) >= op.Count {
+					break
+				}
+			}
+			if !progress {
+				break
+			}
+		}
+
+		if results[i] == nil {
+			results[i] = &store.OpResult{Data: fetchResults}
+		}
+		if len(sqliteJobs) > 0 {
+			allSqliteFetches = append(allSqliteFetches, sqliteFetch{
+				jobs: sqliteJobs,
+				op:   *op,
+			})
+		}
+		totalFetched += len(fetchResults)
+	}
+
+	if totalFetched == 0 {
+		return &store.OpResult{Data: results}
+	}
+	if err := f.appendLifecycleCursor(batch); err != nil {
+		errResult := &store.OpResult{Err: err}
+		for i := range results {
+			results[i] = errResult
+		}
+		return &store.OpResult{Data: results}
+	}
+
+	if err := batch.Commit(f.writeOpts); err != nil {
+		errResult := &store.OpResult{Err: fmt.Errorf("pebble commit multi fetch batch: %w", err)}
+		for i := range results {
+			results[i] = errResult
+		}
+		return &store.OpResult{Data: results}
+	}
+
+	f.syncSQLite(func(db sqlExecer) error {
+		for _, sf := range allSqliteFetches {
+			for _, job := range sf.jobs {
+				if err := sqliteFetchJob(db, job, store.FetchOp{
+					Queues:        sf.op.Queues,
+					WorkerID:      sf.op.WorkerID,
+					Hostname:      sf.op.Hostname,
+					LeaseDuration: sf.op.LeaseDuration,
+					NowNs:         sf.op.NowNs,
+					RandomSeed:    sf.op.RandomSeed,
+				}); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+
+	return &store.OpResult{Data: results}
+}
+
+// applyAckBatchIntoBatch processes a single AckBatch op into a shared Pebble
+// batch (indexed mode). Reads go through the batch to see prior writes.
+// The caller is responsible for batch.Commit() and lifecycle cursor.
+func (f *FSM) applyAckBatchIntoBatch(batch *pebble.Batch, op store.AckBatchOp, sqliteCbs *[]func(db sqlExecer) error) *store.OpResult {
+	if len(op.Acks) == 0 {
+		return &store.OpResult{Data: 0}
+	}
+	now := time.Unix(0, int64(op.NowNs))
+	acked := 0
+
+	type sqliteAck struct {
+		job           store.Job
+		ack           store.AckOp
+		callbackJobID string
+	}
+	var sqliteAcks []sqliteAck
+
+	for _, ack := range op.Acks {
+		if ack.JobID == "" {
+			continue
+		}
+		// Read from batch (indexed) to see writes from earlier ops.
+		jobVal, closer, err := batch.Get(kv.JobKey(ack.JobID))
+		if err != nil {
+			continue
+		}
+		var job store.Job
+		if err := decodeJobDoc(jobVal, &job); err != nil {
+			closer.Close()
+			continue
+		}
+		closer.Close()
+		if job.State != store.StateActive {
+			continue
+		}
+
+		job.State = store.StateCompleted
+		job.ProviderError = false
+		job.CompletedAt = &now
+		if len(ack.Result) > 0 {
+			job.Result = ack.Result
+		}
+		job.WorkerID = nil
+		job.Hostname = nil
+		job.LeaseExpiresAt = nil
+
+		jobData, _ := encodeJobDoc(job)
+		batch.Set(kv.JobKey(ack.JobID), jobData, f.writeOpts)
+		batch.Delete(kv.ActiveKey(job.Queue, ack.JobID), f.writeOpts)
+		f.decrActive(job.Queue)
+		if job.UniqueKey != nil {
+			batch.Delete(kv.UniqueKey(job.Queue, *job.UniqueKey), f.writeOpts)
+		}
+		callbackJobID := ""
+		if job.BatchID != nil {
+			callbackJobID = f.updateBatchPebble(batch, *job.BatchID, "success", op.NowNs)
+		}
+		if err := f.appendLifecycleEvent(batch, "completed", ack.JobID, job.Queue, op.NowNs); err != nil {
+			return &store.OpResult{Err: err}
+		}
+		sqliteAcks = append(sqliteAcks, sqliteAck{job: job, ack: store.AckOp{JobID: ack.JobID, Result: ack.Result, NowNs: op.NowNs}, callbackJobID: callbackJobID})
+		acked++
+	}
+
+	if len(sqliteAcks) > 0 {
+		*sqliteCbs = append(*sqliteCbs, func(db sqlExecer) error {
+			for _, a := range sqliteAcks {
+				if err := sqliteAckJob(db, a.job, a.ack, a.callbackJobID); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+
+	return &store.OpResult{Data: acked}
+}
+
+// applyFetchBatchIntoBatch processes a single FetchBatch op into a shared Pebble
+// batch (indexed mode). Uses the batch for reads to see writes from prior ops
+// (e.g., acks that freed active slots). The claimed map prevents double-fetching
+// across multiple FetchBatch ops in the same indexed batch.
+func (f *FSM) applyFetchBatchIntoBatch(batch *pebble.Batch, op store.FetchBatchOp, claimed map[string]struct{}, sqliteCbs *[]func(db sqlExecer) error) *store.OpResult {
+	if len(op.Queues) == 0 || op.Count <= 0 {
+		return &store.OpResult{Data: []store.FetchResult{}}
+	}
+
+	nowNs := op.NowNs
+	leaseDuration := op.LeaseDuration
+	if leaseDuration <= 0 {
+		leaseDuration = 60
+	}
+	leaseExpiresNs := nowNs + uint64(leaseDuration)*1_000_000_000
+
+	startedAt := time.Unix(0, int64(nowNs))
+	leaseExp := time.Unix(0, int64(leaseExpiresNs))
+	worker := store.Worker{
+		ID:            op.WorkerID,
+		Queues:        marshalStringSlice(op.Queues),
+		LastHeartbeat: startedAt,
+		StartedAt:     startedAt,
+	}
+	if op.Hostname != "" {
+		worker.Hostname = &op.Hostname
+	}
+	workerData, _ := json.Marshal(worker)
+	batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts)
+
+	type queueState struct {
+		name        string
+		activeLimit int
+		activeCount int
+		rateLimit   int
+		rateCount   int
+	}
+
+	states := make([]queueState, 0, len(op.Queues))
+	for _, queue := range op.Queues {
+		qs := queueState{name: queue}
+		qcKey := kv.QueueConfigKey(queue)
+		// Read queue config from batch to see any prior writes.
+		if qcVal, closer, err := batch.Get(qcKey); err == nil {
+			var qc store.Queue
+			if err := json.Unmarshal(qcVal, &qc); err != nil {
+				closer.Close()
+				continue
+			}
+			closer.Close()
+			if qc.Paused {
+				continue
+			}
+			if qc.MaxConcurrency != nil && *qc.MaxConcurrency > 0 {
+				qs.activeLimit = *qc.MaxConcurrency
+				qs.activeCount = f.getActiveCount(queue)
+			}
+			if qc.RateLimit != nil && qc.RateWindowMs != nil && *qc.RateLimit > 0 {
+				qs.rateLimit = *qc.RateLimit
+				windowNs := uint64(*qc.RateWindowMs) * 1_000_000
+				windowStart := nowNs - windowNs
+				qs.rateCount = countPrefixFromReader(batch, kv.RateLimitPrefix(queue), kv.RateLimitWindowStart(queue, windowStart))
+			}
+		}
+		states = append(states, qs)
+	}
+
+	results := make([]store.FetchResult, 0, op.Count)
+	var sqliteJobs []store.Job
+	rateSeq := uint64(0)
+
+	for len(results) < op.Count {
+		progress := false
+		for qi := range states {
+			qs := &states[qi]
+			if qs.activeLimit > 0 && qs.activeCount >= qs.activeLimit {
+				continue
+			}
+			if qs.rateLimit > 0 && qs.rateCount >= qs.rateLimit {
+				continue
+			}
+			// Read from batch to see prior writes (e.g., pending keys deleted
+			// by earlier fetch ops in this indexed batch).
+			jobID, pendingKey, appendKey, job, ok := findPendingOrAppendJobFromReader(batch, qs.name, claimed)
+			if !ok {
+				continue
+			}
+			progress = true
+			claimed[jobID] = struct{}{}
+
+			job.State = store.StateActive
+			job.WorkerID = &op.WorkerID
+			job.Hostname = &op.Hostname
+			job.Attempt++
+			job.StartedAt = &startedAt
+			job.LeaseExpiresAt = &leaseExp
+
+			jobData, _ := encodeJobDoc(job)
+			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			if len(pendingKey) > 0 {
+				batch.Delete(pendingKey, f.writeOpts)
+			}
+			if len(appendKey) > 0 {
+				batch.Delete(appendKey, f.writeOpts)
+				batch.Set(kv.QueueCursorKey(qs.name), appendKey, f.writeOpts)
+			}
+			batch.Set(kv.ActiveKey(qs.name, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+			f.incrActive(qs.name)
+			batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+			rateSeq++
+			if err := f.appendLifecycleEvent(batch, "started", jobID, qs.name, nowNs); err != nil {
+				return &store.OpResult{Err: err}
+			}
+			if qs.activeLimit > 0 {
+				qs.activeCount++
+			}
+			if qs.rateLimit > 0 {
+				qs.rateCount++
+			}
+			sqliteJobs = append(sqliteJobs, job)
+			results = append(results, store.FetchResult{
+				JobID:         jobID,
+				Queue:         qs.name,
+				Payload:       job.Payload,
+				Attempt:       job.Attempt,
+				MaxRetries:    job.MaxRetries,
+				LeaseDuration: leaseDuration,
+				Tags:          job.Tags,
+				Checkpoint:    job.Checkpoint,
+				Agent:         job.Agent,
+			})
+			if len(results) >= op.Count {
+				break
+			}
+		}
+		if !progress {
+			break
+		}
+	}
+
+	if len(sqliteJobs) > 0 {
+		opCopy := op
+		*sqliteCbs = append(*sqliteCbs, func(db sqlExecer) error {
+			for _, job := range sqliteJobs {
+				if err := sqliteFetchJob(db, job, store.FetchOp{
+					Queues:        opCopy.Queues,
+					WorkerID:      opCopy.WorkerID,
+					Hostname:      opCopy.Hostname,
+					LeaseDuration: opCopy.LeaseDuration,
+					NowNs:         opCopy.NowNs,
+					RandomSeed:    opCopy.RandomSeed,
+				}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+
+	return &store.OpResult{Data: results}
+}
+
+// findPendingOrAppendJobFromReader is like findPendingOrAppendJobForQueue but
+// reads from a pebble.Reader (which can be an indexed batch) instead of f.pebble.
+func findPendingOrAppendJobFromReader(r pebble.Reader, queue string, claimed map[string]struct{}) (jobID string, pendingKey []byte, appendKey []byte, job store.Job, ok bool) {
+	if jobID, pendingKey, job, ok = findPendingJobFromReader(r, queue, claimed); ok {
+		return jobID, pendingKey, nil, job, true
+	}
+	jobID, appendKey, job, ok = findAppendJobFromReader(r, queue, claimed)
+	return jobID, nil, appendKey, job, ok
+}
+
+func findPendingJobFromReader(r pebble.Reader, queue string, claimed map[string]struct{}) (jobID string, pendingKey []byte, job store.Job, ok bool) {
+	prefix := kv.PendingPrefix(queue)
+	iter, err := r.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return "", nil, store.Job{}, false
+	}
+	defer iter.Close()
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		key := iter.Key()
+		idOffset := len(prefix) + 1 + 8
+		if len(key) <= idOffset {
+			continue
+		}
+		id := string(key[idOffset:])
+		if _, exists := claimed[id]; exists {
+			continue
+		}
+		val, closer, err := r.Get(kv.JobKey(id))
+		if err != nil {
+			continue
+		}
+		var doc store.Job
+		if err := decodeJobDoc(val, &doc); err != nil {
+			closer.Close()
+			continue
+		}
+		closer.Close()
+		if doc.State != store.StatePending {
+			continue
+		}
+		pk := make([]byte, len(key))
+		copy(pk, key)
+		return id, pk, doc, true
+	}
+	return "", nil, store.Job{}, false
+}
+
+func findAppendJobFromReader(r pebble.Reader, queue string, claimed map[string]struct{}) (jobID string, appendKey []byte, job store.Job, ok bool) {
+	prefix := kv.QueueAppendPrefix(queue)
+	var lower []byte
+	if cursor, closer, err := r.Get(kv.QueueCursorKey(queue)); err == nil {
+		lower = append([]byte(nil), cursor...)
+		closer.Close()
+	}
+
+	iter, err := r.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return "", nil, store.Job{}, false
+	}
+	defer iter.Close()
+
+	var valid bool
+	if len(lower) > 0 {
+		valid = iter.SeekGE(lower)
+		if valid && bytes.Equal(iter.Key(), lower) {
+			valid = iter.Next()
+		}
+	} else {
+		valid = iter.First()
+	}
+
+	for ; valid; valid = iter.Next() {
+		key := iter.Key()
+		idOffset := len(prefix) + 8
+		if len(key) <= idOffset {
+			continue
+		}
+		id := string(key[idOffset:])
+		if _, exists := claimed[id]; exists {
+			continue
+		}
+		val, closer, err := r.Get(kv.JobKey(id))
+		if err != nil {
+			continue
+		}
+		var doc store.Job
+		if err := decodeJobDoc(val, &doc); err != nil {
+			closer.Close()
+			continue
+		}
+		closer.Close()
+		if doc.State != store.StatePending {
+			continue
+		}
+		ak := make([]byte, len(key))
+		copy(ak, key)
+		return id, ak, doc, true
+	}
+	return "", nil, store.Job{}, false
+}
+
+// countPrefixFromReader is like countPrefixFrom but reads from a pebble.Reader.
+func countPrefixFromReader(r pebble.Reader, prefix, startKey []byte) int {
+	iter, err := r.NewIter(&pebble.IterOptions{
+		LowerBound: startKey,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return 0
+	}
+	defer iter.Close()
+	count := 0
+	for iter.First(); iter.Valid(); iter.Next() {
+		count++
+	}
+	return count
+}
+
 // --- Fail ---
 
 func (f *FSM) applyFail(data json.RawMessage) *store.OpResult {

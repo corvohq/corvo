@@ -146,6 +146,7 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 	fsm.SetSQLiteMirrorEnabled(cfg.SQLiteMirror)
 	fsm.SetSQLiteMirrorAsync(cfg.SQLiteMirrorAsync)
 	fsm.SetLifecycleEventsEnabled(cfg.LifecycleEvents)
+	fsm.SetApplyMultiMode(cfg.ApplyMultiMode)
 
 	// Raft config
 	raftConfig := raft.DefaultConfig()

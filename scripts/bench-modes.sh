@@ -31,6 +31,7 @@ FETCH_POLL_INTERVAL="${FETCH_POLL_INTERVAL:-}"
 IDLE_FETCH_SLEEP="${IDLE_FETCH_SLEEP:-}"
 STREAM_MAX_FPS="${STREAM_MAX_FPS:-}"
 SQLITE_MIRROR="${SQLITE_MIRROR:-}"
+APPLY_MULTI_MODE="${APPLY_MULTI_MODE:-}"
 
 SERVER_PID=""
 
@@ -110,6 +111,9 @@ run_one() {
     fi
     if [ "$SQLITE_MIRROR" = "false" ]; then
         server_args+=(--sqlite-mirror=false)
+    fi
+    if [ -n "$APPLY_MULTI_MODE" ]; then
+        server_args+=(--apply-multi-mode "$APPLY_MULTI_MODE")
     fi
 
     "$BINARY" "${server_args[@]}" &
