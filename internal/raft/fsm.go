@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/hashicorp/raft"
+	"github.com/user/corvo/internal/kv"
 	"github.com/user/corvo/internal/store"
 
 	_ "modernc.org/sqlite"
@@ -41,11 +43,15 @@ type FSM struct {
 	lastRebuildDur  time.Duration
 	lastRebuildErr  string
 	lastRebuildGood bool
+
+	// activeCount caches the number of active keys per queue, maintained
+	// deterministically during FSM.Apply to avoid O(n) Pebble prefix scans.
+	activeCount map[string]int
 }
 
 // NewFSM creates a new FSM with the given Pebble and SQLite databases.
 func NewFSM(pdb *pebble.DB, sqliteDB *sql.DB) *FSM {
-	return &FSM{
+	f := &FSM{
 		pebble:       pdb,
 		sqlite:       sqliteDB,
 		writeOpts:    pebble.Sync,
@@ -53,6 +59,8 @@ func NewFSM(pdb *pebble.DB, sqliteDB *sql.DB) *FSM {
 		lifecycleOn:  false,
 		eventSeq:     loadEventCursor(pdb),
 	}
+	f.rebuildActiveCount()
+	return f
 }
 
 // Apply implements raft.FSM. It dispatches the log entry to the appropriate handler.
@@ -505,7 +513,11 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 // Restore implements raft.FSM.
 func (f *FSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
-	return restoreFromSnapshot(f.pebble, f.sqlite, rc)
+	if err := restoreFromSnapshot(f.pebble, f.sqlite, rc); err != nil {
+		return err
+	}
+	f.rebuildActiveCount()
+	return nil
 }
 
 // PebbleDB returns the underlying Pebble database.
@@ -786,4 +798,54 @@ func (f *FSM) sqliteMirrorLoop() {
 		timer.Reset(flushInterval)
 	next:
 	}
+}
+
+// rebuildActiveCount scans Pebble for all active keys and populates the
+// in-memory activeCount map. Called on startup and after snapshot restore.
+func (f *FSM) rebuildActiveCount() {
+	m := make(map[string]int)
+	prefix := []byte(kv.PrefixActive)
+	iter, err := f.pebble.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		f.activeCount = m
+		return
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		// Active key format: a|{queue}\x00{job_id}
+		rest := key[len(kv.PrefixActive):]
+		if idx := bytes.IndexByte(rest, 0); idx >= 0 {
+			queue := string(rest[:idx])
+			m[queue]++
+		}
+	}
+	f.activeCount = m
+}
+
+// incrActive increments the in-memory active count for a queue.
+func (f *FSM) incrActive(queue string) {
+	f.activeCount[queue]++
+}
+
+// decrActive decrements the in-memory active count for a queue.
+func (f *FSM) decrActive(queue string) {
+	if n := f.activeCount[queue] - 1; n > 0 {
+		f.activeCount[queue] = n
+	} else {
+		delete(f.activeCount, queue)
+	}
+}
+
+// resetActiveCount sets the active count for a queue to zero.
+func (f *FSM) resetActiveCount(queue string) {
+	delete(f.activeCount, queue)
+}
+
+// getActiveCount returns the cached active count for a queue.
+func (f *FSM) getActiveCount(queue string) int {
+	return f.activeCount[queue]
 }

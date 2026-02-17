@@ -40,7 +40,7 @@ type StreamConfig struct {
 }
 
 func (c StreamConfig) withDefaults() StreamConfig {
-	if c.MaxFramesPerSec <= 0 {
+	if c.MaxFramesPerSec < 0 {
 		c.MaxFramesPerSec = 500
 	}
 	if c.StrikeLimit <= 0 {
@@ -337,13 +337,16 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 	}
 	defer s.openCount.Add(-1)
 
-	minInterval := time.Second / time.Duration(cfg.MaxFramesPerSec)
+	var minInterval time.Duration
+	if cfg.MaxFramesPerSec > 0 {
+		minInterval = time.Second / time.Duration(cfg.MaxFramesPerSec)
+	}
 	var lastFrame time.Time
 	var strikes int
 
 	for {
 		// Per-stream frame rate limiting.
-		if !lastFrame.IsZero() {
+		if minInterval > 0 && !lastFrame.IsZero() {
 			if elapsed := time.Since(lastFrame); elapsed < minInterval {
 				time.Sleep(minInterval - elapsed)
 			}

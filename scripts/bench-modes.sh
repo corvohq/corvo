@@ -29,6 +29,7 @@ WORKERS="${WORKERS:-}"
 WORKER_QUEUES="${WORKER_QUEUES:-}"
 FETCH_POLL_INTERVAL="${FETCH_POLL_INTERVAL:-}"
 IDLE_FETCH_SLEEP="${IDLE_FETCH_SLEEP:-}"
+STREAM_MAX_FPS="${STREAM_MAX_FPS:-}"
 
 SERVER_PID=""
 
@@ -102,6 +103,9 @@ run_one() {
     fi
     if [ -n "$IDLE_FETCH_SLEEP" ]; then
         server_args+=(--idle-fetch-sleep "$IDLE_FETCH_SLEEP")
+    fi
+    if [ -n "$STREAM_MAX_FPS" ]; then
+        server_args+=(--stream-max-fps "$STREAM_MAX_FPS")
     fi
 
     "$BINARY" "${server_args[@]}" &

@@ -130,7 +130,7 @@ func init() {
 	serverCmd.Flags().DurationVar(&retentionInterval, "retention-interval", 1*time.Hour, "How often to run the purge sweep for old terminal jobs")
 	serverCmd.Flags().IntVar(&streamMaxInFlight, "stream-max-inflight", 2048, "Max concurrently processing lifecycle stream frames")
 	serverCmd.Flags().IntVar(&streamMaxOpen, "stream-max-open", 4096, "Max concurrently open lifecycle streams")
-	serverCmd.Flags().IntVar(&streamMaxFPS, "stream-max-fps", 500, "Max frames/sec per lifecycle stream")
+	serverCmd.Flags().IntVar(&streamMaxFPS, "stream-max-fps", 500, "Max frames/sec per lifecycle stream (0 = unlimited)")
 	serverCmd.Flags().DurationVar(&fetchPollInterval, "fetch-poll-interval", 100*time.Millisecond, "Unary Fetch/FetchBatch long-poll retry interval")
 	serverCmd.Flags().DurationVar(&idleFetchSleep, "idle-fetch-sleep", 100*time.Millisecond, "Stream sleep when fetch returns zero jobs")
 	serverCmd.Flags().IntVar(&raftMaxPending, "raft-max-pending", 16384, "Max pending Raft apply requests before backpressure")

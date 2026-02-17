@@ -416,7 +416,7 @@ func (f *FSM) applyFetchOp(op store.FetchOp) *store.OpResult {
 
 			// Check concurrency limit
 			if qc.MaxConcurrency != nil && *qc.MaxConcurrency > 0 {
-				activeCount := countPrefix(f.pebble, kv.ActivePrefix(queue))
+				activeCount := f.getActiveCount(queue)
 				if activeCount >= *qc.MaxConcurrency {
 					continue
 				}
@@ -460,6 +460,7 @@ func (f *FSM) applyFetchOp(op store.FetchOp) *store.OpResult {
 			batch.Set(kv.QueueCursorKey(queue), appendKey, f.writeOpts)
 		}
 		batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+		f.incrActive(queue)
 
 		// Record rate limit entry
 		batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed), nil, f.writeOpts)
@@ -571,7 +572,7 @@ func (f *FSM) applyFetchBatchOp(op store.FetchBatchOp) *store.OpResult {
 			}
 			if qc.MaxConcurrency != nil && *qc.MaxConcurrency > 0 {
 				qs.activeLimit = *qc.MaxConcurrency
-				qs.activeCount = countPrefix(f.pebble, kv.ActivePrefix(queue))
+				qs.activeCount = f.getActiveCount(queue)
 			}
 			if qc.RateLimit != nil && qc.RateWindowMs != nil && *qc.RateLimit > 0 {
 				qs.rateLimit = *qc.RateLimit
@@ -626,6 +627,7 @@ func (f *FSM) applyFetchBatchOp(op store.FetchBatchOp) *store.OpResult {
 				batch.Set(kv.QueueCursorKey(qs.name), appendKey, f.writeOpts)
 			}
 			batch.Set(kv.ActiveKey(qs.name, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+			f.incrActive(qs.name)
 			batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
 			rateSeq++
 			if err := f.appendLifecycleEvent(batch, "started", jobID, qs.name, nowNs); err != nil {
@@ -704,7 +706,7 @@ func (f *FSM) fetchQueueAllowed(queue string, nowNs uint64) bool {
 		return false
 	}
 	if qc.MaxConcurrency != nil && *qc.MaxConcurrency > 0 {
-		activeCount := countPrefix(f.pebble, kv.ActivePrefix(queue))
+		activeCount := f.getActiveCount(queue)
 		if activeCount >= *qc.MaxConcurrency {
 			return false
 		}
@@ -1016,6 +1018,7 @@ func (f *FSM) applyAckOp(op store.AckOp) *store.OpResult {
 	jobData, _ := encodeJobDoc(job)
 	batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts)
 	batch.Delete(kv.ActiveKey(job.Queue, op.JobID), f.writeOpts)
+	f.decrActive(job.Queue)
 
 	if nextState == store.StatePending {
 		createdNs := uint64(now.UnixNano())
@@ -1150,6 +1153,7 @@ func (f *FSM) applyAckBatchOp(op store.AckBatchOp) *store.OpResult {
 		jobData, _ := encodeJobDoc(job)
 		batch.Set(kv.JobKey(ack.JobID), jobData, f.writeOpts)
 		batch.Delete(kv.ActiveKey(job.Queue, ack.JobID), f.writeOpts)
+		f.decrActive(job.Queue)
 		if job.UniqueKey != nil {
 			batch.Delete(kv.UniqueKey(job.Queue, *job.UniqueKey), f.writeOpts)
 		}
@@ -1266,6 +1270,7 @@ func (f *FSM) applyMultiAckBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 			jobData, _ := encodeJobDoc(job)
 			batch.Set(kv.JobKey(ack.JobID), jobData, f.writeOpts)
 			batch.Delete(kv.ActiveKey(job.Queue, ack.JobID), f.writeOpts)
+			f.decrActive(job.Queue)
 			if job.UniqueKey != nil {
 				batch.Delete(kv.UniqueKey(job.Queue, *job.UniqueKey), f.writeOpts)
 			}
@@ -1381,6 +1386,7 @@ func (f *FSM) applyFailOp(op store.FailOp) *store.OpResult {
 
 	// Remove from active set
 	batch.Delete(kv.ActiveKey(job.Queue, op.JobID), f.writeOpts)
+	f.decrActive(job.Queue)
 	if err := f.appendLifecycleEvent(batch, "failed", op.JobID, job.Queue, op.NowNs); err != nil {
 		return &store.OpResult{Err: err}
 	}
@@ -1721,7 +1727,7 @@ func (f *FSM) applyRetryJobOp(op store.RetryJobOp) *store.OpResult {
 	defer batch.Close()
 
 	// Remove from previous sorted set (e.g. scheduled key).
-	removeFromSortedSet(batch, f.pebble, job, f.writeOpts)
+	f.removeFromSortedSet(batch, job)
 
 	now := time.Unix(0, int64(op.NowNs))
 	createdNs := uint64(now.UnixNano())
@@ -1792,6 +1798,7 @@ func (f *FSM) applyCancelJobOp(op store.CancelJobOp) *store.OpResult {
 		resultStatus = store.StateCancelled
 	case store.StateActive:
 		batch.Delete(kv.ActiveKey(job.Queue, op.JobID), f.writeOpts)
+		f.decrActive(job.Queue)
 		resultStatus = "cancelling"
 	default:
 		return &store.OpResult{Err: fmt.Errorf("job %q cannot be cancelled from state %q", op.JobID, job.State)}
@@ -1844,6 +1851,7 @@ func (f *FSM) applyMoveJobOp(op store.MoveJobOp) *store.OpResult {
 		deletePendingOrAppendKey(batch, f.pebble, oldQueue, op.JobID, f.writeOpts)
 	case store.StateActive:
 		batch.Delete(kv.ActiveKey(oldQueue, op.JobID), f.writeOpts)
+		f.decrActive(oldQueue)
 	case store.StateScheduled:
 		deleteScheduledKey(batch, f.pebble, oldQueue, op.JobID, f.writeOpts)
 	case store.StateRetrying:
@@ -1870,6 +1878,7 @@ func (f *FSM) applyMoveJobOp(op store.MoveJobOp) *store.OpResult {
 			leaseNs = uint64(job.LeaseExpiresAt.UnixNano())
 		}
 		batch.Set(kv.ActiveKey(op.TargetQueue, op.JobID), kv.PutUint64BE(nil, leaseNs), f.writeOpts)
+		f.incrActive(op.TargetQueue)
 	case store.StateScheduled:
 		if job.ScheduledAt != nil {
 			schedNs := uint64(job.ScheduledAt.UnixNano())
@@ -1976,6 +1985,7 @@ func (f *FSM) applyDeleteJobOp(op store.DeleteJobOp) *store.OpResult {
 		deletePendingOrAppendKey(batch, f.pebble, job.Queue, op.JobID, f.writeOpts)
 	case store.StateActive:
 		batch.Delete(kv.ActiveKey(job.Queue, op.JobID), f.writeOpts)
+		f.decrActive(job.Queue)
 	case store.StateScheduled:
 		deleteScheduledKey(batch, f.pebble, job.Queue, op.JobID, f.writeOpts)
 	case store.StateRetrying:
@@ -2090,6 +2100,7 @@ func (f *FSM) applyDeleteQueueOp(op store.QueueOp) *store.OpResult {
 	// Delete all jobs in all states
 	f.deleteJobsByPrefix(batch, kv.PendingPrefix(op.Queue))
 	f.deleteJobsByPrefix(batch, kv.ActivePrefix(op.Queue))
+	f.resetActiveCount(op.Queue)
 	f.deleteJobsByPrefix(batch, kv.ScheduledScanPrefix(op.Queue))
 	f.deleteJobsByPrefix(batch, kv.RetryingScanPrefix(op.Queue))
 
@@ -2407,7 +2418,8 @@ func (f *FSM) applyReclaimOp(op store.ReclaimOp) *store.OpResult {
 			jobData, _ := encodeJobDoc(job)
 
 			batch.Set(kv.JobKey(entry.jobID), jobData, f.writeOpts)
-			batch.Delete(entry.key, f.writeOpts)
+			batch.Delete(entry.key, f.writeOpts) // active key
+			f.decrActive(queue)
 			createdNs := op.NowNs
 			if job.Priority == store.PriorityNormal {
 				batch.Set(kv.QueueAppendKey(queue, createdNs, entry.jobID), nil, f.writeOpts)
@@ -2470,7 +2482,7 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 			if job.State != store.StateDead && job.State != store.StateCancelled && job.State != store.StateCompleted && job.State != store.StateScheduled {
 				continue
 			}
-			removeFromSortedSet(batch, f.pebble, job, f.writeOpts)
+			f.removeFromSortedSet(batch, job)
 			now := time.Unix(0, int64(op.NowNs))
 			createdNs := uint64(now.UnixNano())
 			job.State = store.StatePending
@@ -2491,7 +2503,7 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 			affected++
 
 		case "delete":
-			removeFromSortedSet(batch, f.pebble, job, f.writeOpts)
+			f.removeFromSortedSet(batch, job)
 			batch.Delete(kv.JobKey(jobID), f.writeOpts)
 			deletePrefix(batch, f.pebble, kv.JobErrorPrefix(jobID), f.writeOpts)
 			affected++
@@ -2501,14 +2513,14 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 				job.State != store.StateScheduled && job.State != store.StateRetrying {
 				continue
 			}
-			removeFromSortedSet(batch, f.pebble, job, f.writeOpts)
+			f.removeFromSortedSet(batch, job)
 			job.State = store.StateCancelled
 			jobData, _ := encodeJobDoc(job)
 			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
 			affected++
 
 		case "move":
-			removeFromSortedSet(batch, f.pebble, job, f.writeOpts)
+			f.removeFromSortedSet(batch, job)
 			oldQueue := job.Queue
 			_ = oldQueue
 			job.Queue = op.MoveToQueue
@@ -2571,7 +2583,7 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 				job.State != store.StateScheduled && job.State != store.StateRetrying {
 				continue
 			}
-			removeFromSortedSet(batch, f.pebble, job, f.writeOpts)
+			f.removeFromSortedSet(batch, job)
 			job.State = store.StateHeld
 			job.WorkerID = nil
 			job.Hostname = nil
@@ -3086,16 +3098,17 @@ func deleteRetryingKey(batch *pebble.Batch, db *pebble.DB, queue, jobID string, 
 }
 
 // removeFromSortedSet removes a job from whatever sorted set it's in.
-func removeFromSortedSet(batch *pebble.Batch, db *pebble.DB, job store.Job, writeOpts *pebble.WriteOptions) {
+func (f *FSM) removeFromSortedSet(batch *pebble.Batch, job store.Job) {
 	switch job.State {
 	case store.StatePending:
-		deletePendingOrAppendKey(batch, db, job.Queue, job.ID, writeOpts)
+		deletePendingOrAppendKey(batch, f.pebble, job.Queue, job.ID, f.writeOpts)
 	case store.StateActive:
-		batch.Delete(kv.ActiveKey(job.Queue, job.ID), writeOpts)
+		batch.Delete(kv.ActiveKey(job.Queue, job.ID), f.writeOpts)
+		f.decrActive(job.Queue)
 	case store.StateScheduled:
-		deleteScheduledKey(batch, db, job.Queue, job.ID, writeOpts)
+		deleteScheduledKey(batch, f.pebble, job.Queue, job.ID, f.writeOpts)
 	case store.StateRetrying:
-		deleteRetryingKey(batch, db, job.Queue, job.ID, writeOpts)
+		deleteRetryingKey(batch, f.pebble, job.Queue, job.ID, f.writeOpts)
 	}
 }
 
