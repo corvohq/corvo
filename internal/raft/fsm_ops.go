@@ -403,6 +403,7 @@ func (f *FSM) applyFetchOp(op store.FetchOp) *store.OpResult {
 	for _, queue := range op.Queues {
 		// Check if queue is paused
 		qcKey := kv.QueueConfigKey(queue)
+		hasRateLimit := false
 		if qcVal, closer, err := f.pebble.Get(qcKey); err == nil {
 			var qc store.Queue
 			if err := json.Unmarshal(qcVal, &qc); err != nil {
@@ -424,6 +425,7 @@ func (f *FSM) applyFetchOp(op store.FetchOp) *store.OpResult {
 
 			// Check rate limit
 			if qc.RateLimit != nil && qc.RateWindowMs != nil && *qc.RateLimit > 0 {
+				hasRateLimit = true
 				windowNs := uint64(*qc.RateWindowMs) * 1_000_000
 				windowStart := nowNs - windowNs
 				count := countPrefixFrom(f.pebble, kv.RateLimitPrefix(queue), kv.RateLimitWindowStart(queue, windowStart))
@@ -463,7 +465,9 @@ func (f *FSM) applyFetchOp(op store.FetchOp) *store.OpResult {
 		f.incrActive(queue)
 
 		// Record rate limit entry
-		batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed), nil, f.writeOpts)
+		if hasRateLimit {
+			batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed), nil, f.writeOpts)
+		}
 
 		// Upsert worker
 		worker := store.Worker{
@@ -631,16 +635,16 @@ func (f *FSM) applyFetchBatchOp(op store.FetchBatchOp) *store.OpResult {
 			}
 			batch.Set(kv.ActiveKey(qs.name, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
 			f.incrActive(qs.name)
-			batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
-			rateSeq++
+			if qs.rateLimit > 0 {
+				batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+				rateSeq++
+				qs.rateCount++
+			}
 			if err := f.appendLifecycleEvent(batch, "started", jobID, qs.name, nowNs); err != nil {
 				return &store.OpResult{Err: err}
 			}
 			if qs.activeLimit > 0 {
 				qs.activeCount++
-			}
-			if qs.rateLimit > 0 {
-				qs.rateCount++
 			}
 
 			sqliteJobs = append(sqliteJobs, job)
@@ -2046,16 +2050,16 @@ func (f *FSM) applyFetchBatchIntoBatch(batch *pebble.Batch, op store.FetchBatchO
 			}
 			batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
 			f.incrActive(queue)
-			batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
-			rateSeq++
+			if qs.rateLimit > 0 {
+				batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+				rateSeq++
+				qs.rateCount++
+			}
 			if err := f.appendLifecycleEvent(batch, "started", jobID, queue, nowNs); err != nil {
 				return &store.OpResult{Err: err}
 			}
 			if qs.activeLimit > 0 {
 				qs.activeCount++
-			}
-			if qs.rateLimit > 0 {
-				qs.rateCount++
 			}
 			sqliteJobs = append(sqliteJobs, job)
 			results = append(results, store.FetchResult{
@@ -2110,16 +2114,16 @@ func (f *FSM) applyFetchBatchIntoBatch(batch *pebble.Batch, op store.FetchBatchO
 			}
 			batch.Set(kv.ActiveKey(qs.name, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
 			f.incrActive(qs.name)
-			batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
-			rateSeq++
+			if qs.rateLimit > 0 {
+				batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+				rateSeq++
+				qs.rateCount++
+			}
 			if err := f.appendLifecycleEvent(batch, "started", jobID, qs.name, nowNs); err != nil {
 				return &store.OpResult{Err: err}
 			}
 			if qs.activeLimit > 0 {
 				qs.activeCount++
-			}
-			if qs.rateLimit > 0 {
-				qs.rateCount++
 			}
 			sqliteJobs = append(sqliteJobs, job)
 			results = append(results, store.FetchResult{
