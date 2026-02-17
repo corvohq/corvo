@@ -59,6 +59,9 @@ func (s *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request)
 		fmt.Fprintln(w, "# HELP corvo_lifecycle_overload_total Frames rejected (stream saturated).")
 		fmt.Fprintln(w, "# TYPE corvo_lifecycle_overload_total counter")
 		fmt.Fprintf(w, "corvo_lifecycle_overload_total %d\n", st.OverloadTotal)
+		fmt.Fprintln(w, "# HELP corvo_lifecycle_idle_fetch_total Fetches that returned zero jobs (triggers 100ms server-side sleep).")
+		fmt.Fprintln(w, "# TYPE corvo_lifecycle_idle_fetch_total counter")
+		fmt.Fprintf(w, "corvo_lifecycle_idle_fetch_total %d\n", st.IdleFetchTotal)
 	}
 
 	// --- Cluster / Raft ---

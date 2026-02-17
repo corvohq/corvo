@@ -92,16 +92,16 @@ type benchServerConfig struct {
 }
 
 type benchPhaseResult struct {
-	OpsPerSec   float64 `json:"ops_per_sec"`
-	P50Us       int64   `json:"p50_us"`
-	P90Us       int64   `json:"p90_us"`
-	P99Us       int64   `json:"p99_us"`
-	MinUs       int64   `json:"min_us"`
-	MaxUs       int64   `json:"max_us"`
-	StddevUs    int64   `json:"stddev_us"`
-	CvPct       float64 `json:"cv_pct"`
-	ServerCvPct float64 `json:"server_cv_pct,omitempty"`
-	Completed   int     `json:"completed"`
+	OpsPerSec     float64 `json:"ops_per_sec"`
+	P50Us         int64   `json:"p50_us"`
+	P90Us         int64   `json:"p90_us"`
+	P99Us         int64   `json:"p99_us"`
+	MinUs         int64   `json:"min_us"`
+	MaxUs         int64   `json:"max_us"`
+	StddevUs      int64   `json:"stddev_us"`
+	CvPct         float64 `json:"cv_pct"`
+	ServerCvPct   float64 `json:"server_cv_pct,omitempty"`
+	Completed     int     `json:"completed"`
 	ServerCPUPct  float64 `json:"server_cpu_pct,omitempty"`
 	ServerRSSMB   float64 `json:"server_rss_mb,omitempty"`
 	ServerGcP99Us int64   `json:"server_gc_p99_us,omitempty"`
@@ -184,7 +184,7 @@ func init() {
 	f.DurationVar(&benchRepeatPause, "repeat-pause", 0, "Pause between repeats")
 	f.StringVar(&benchQueue, "queue", "bench.q", "Queue name")
 	f.IntVar(&benchEnqBatchSize, "enqueue-batch-size", 64, "Jobs per enqueue stream frame")
-	f.IntVar(&benchFetchBatchSize, "fetch-batch-size", 64, "Jobs per fetch request")
+	f.IntVar(&benchFetchBatchSize, "fetch-batch-size", 8, "Jobs per fetch request")
 	f.IntVar(&benchAckBatchSize, "ack-batch-size", 64, "ACKs per batch")
 	f.DurationVar(&benchWorkDuration, "work-duration", 0, "Simulated per-job work duration")
 

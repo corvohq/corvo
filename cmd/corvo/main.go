@@ -91,6 +91,8 @@ var (
 	streamMaxInFlight      = 2048
 	streamMaxOpen          = 4096
 	streamMaxFPS           = 500
+	fetchPollInterval      = 100 * time.Millisecond
+	idleFetchSleep         = 100 * time.Millisecond
 	raftMaxPending         = 16384
 	raftMaxFetchInflight   = 64
 )
@@ -129,6 +131,8 @@ func init() {
 	serverCmd.Flags().IntVar(&streamMaxInFlight, "stream-max-inflight", 2048, "Max concurrently processing lifecycle stream frames")
 	serverCmd.Flags().IntVar(&streamMaxOpen, "stream-max-open", 4096, "Max concurrently open lifecycle streams")
 	serverCmd.Flags().IntVar(&streamMaxFPS, "stream-max-fps", 500, "Max frames/sec per lifecycle stream")
+	serverCmd.Flags().DurationVar(&fetchPollInterval, "fetch-poll-interval", 100*time.Millisecond, "Unary Fetch/FetchBatch long-poll retry interval")
+	serverCmd.Flags().DurationVar(&idleFetchSleep, "idle-fetch-sleep", 100*time.Millisecond, "Stream sleep when fetch returns zero jobs")
 	serverCmd.Flags().IntVar(&raftMaxPending, "raft-max-pending", 16384, "Max pending Raft apply requests before backpressure")
 	serverCmd.Flags().IntVar(&raftMaxFetchInflight, "raft-max-fetch-inflight", 64, "Max concurrent fetch/fetch-batch applies per queue")
 
@@ -378,9 +382,11 @@ func runServer(cmd *cobra.Command, args []string) error {
 		WriteBurst: rateLimitWriteBurst,
 	}))
 	streamCfg := rpcsvc.StreamConfig{
-		MaxInFlight:    streamMaxInFlight,
-		MaxOpenStreams:  streamMaxOpen,
-		MaxFramesPerSec: streamMaxFPS,
+		MaxInFlight:       streamMaxInFlight,
+		MaxOpenStreams:     streamMaxOpen,
+		MaxFramesPerSec:   streamMaxFPS,
+		FetchPollInterval: fetchPollInterval,
+		IdleFetchSleep:    idleFetchSleep,
 	}
 	if raftShards > 1 {
 		streamCfg.MaxOpenStreams *= raftShards

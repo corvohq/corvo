@@ -35,6 +35,8 @@ type StreamConfig struct {
 	MaxOpenStreams  int           // Max concurrently open lifecycle streams (default 4096)
 	MaxInFlight     int           // Max concurrently processing lifecycle frames (default 2048)
 	AcquireTimeout  time.Duration // Max wait to acquire in-flight slot; <=0 blocks until available
+	FetchPollInterval  time.Duration // Unary Fetch/FetchBatch long-poll retry interval (default 100ms)
+	IdleFetchSleep     time.Duration // Stream sleep when fetch returns zero jobs (default 100ms)
 }
 
 func (c StreamConfig) withDefaults() StreamConfig {
@@ -52,6 +54,12 @@ func (c StreamConfig) withDefaults() StreamConfig {
 	if c.MaxInFlight <= 0 {
 		c.MaxInFlight = 2048
 	}
+	if c.FetchPollInterval <= 0 {
+		c.FetchPollInterval = 100 * time.Millisecond
+	}
+	if c.IdleFetchSleep <= 0 {
+		c.IdleFetchSleep = 100 * time.Millisecond
+	}
 	return c
 }
 
@@ -63,13 +71,14 @@ type LeaderCheck interface {
 
 // StreamStats exposes lifecycle stream metrics for Prometheus scraping.
 type StreamStats struct {
-	OpenStreams    int64
-	MaxOpenStreams int
-	InFlight      int
-	MaxInFlight   int
-	FramesTotal   uint64
-	StreamsTotal  uint64
-	OverloadTotal uint64
+	OpenStreams     int64
+	MaxOpenStreams  int
+	InFlight       int
+	MaxInFlight    int
+	FramesTotal    uint64
+	StreamsTotal   uint64
+	OverloadTotal  uint64
+	IdleFetchTotal uint64
 }
 
 // Server implements the Connect WorkerService API.
@@ -79,9 +88,10 @@ type Server struct {
 	frameSem      chan struct{}
 	openCount     atomic.Int64
 	leaderCheck   LeaderCheck
-	framesTotal   atomic.Uint64
-	streamsTotal  atomic.Uint64
-	overloadTotal atomic.Uint64
+	framesTotal    atomic.Uint64
+	streamsTotal   atomic.Uint64
+	overloadTotal  atomic.Uint64
+	idleFetchTotal atomic.Uint64
 }
 
 // Stats returns a snapshot of lifecycle stream metrics.
@@ -93,7 +103,8 @@ func (s *Server) Stats() StreamStats {
 		MaxInFlight:   s.streamCfg.MaxInFlight,
 		FramesTotal:   s.framesTotal.Load(),
 		StreamsTotal:  s.streamsTotal.Load(),
-		OverloadTotal: s.overloadTotal.Load(),
+		OverloadTotal:  s.overloadTotal.Load(),
+		IdleFetchTotal: s.idleFetchTotal.Load(),
 	}
 }
 
@@ -107,7 +118,7 @@ func longPollTimeout(lease int) time.Duration {
 	return time.Duration(lease) * time.Second
 }
 
-func waitForFetch(ctx context.Context, timeout time.Duration, poll func() (bool, error)) error {
+func waitForFetch(ctx context.Context, timeout time.Duration, pollInterval time.Duration, poll func() (bool, error)) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		ok, err := poll()
@@ -123,7 +134,7 @@ func waitForFetch(ctx context.Context, timeout time.Duration, poll func() (bool,
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(pollInterval):
 		}
 	}
 }
@@ -193,7 +204,7 @@ func (s *Server) Fetch(ctx context.Context, req *connect.Request[corvov1.FetchRe
 		Hostname:      req.Msg.GetHostname(),
 		LeaseDuration: int(req.Msg.GetLeaseDuration()),
 	}
-	err := waitForFetch(ctx, longPollTimeout(fetchReq.LeaseDuration), func() (bool, error) {
+	err := waitForFetch(ctx, longPollTimeout(fetchReq.LeaseDuration), s.streamCfg.FetchPollInterval, func() (bool, error) {
 		r, err := s.store.Fetch(fetchReq)
 		if err != nil {
 			return false, err
@@ -235,7 +246,7 @@ func (s *Server) FetchBatch(ctx context.Context, req *connect.Request[corvov1.Fe
 		LeaseDuration: int(req.Msg.GetLeaseDuration()),
 	}
 	var jobs []store.FetchResult
-	err := waitForFetch(ctx, longPollTimeout(fetchReq.LeaseDuration), func() (bool, error) {
+	err := waitForFetch(ctx, longPollTimeout(fetchReq.LeaseDuration), s.streamCfg.FetchPollInterval, func() (bool, error) {
 		r, err := s.store.FetchBatch(fetchReq, count)
 		if err != nil {
 			return false, err
@@ -519,13 +530,16 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 			<-s.frameSem
 			s.framesTotal.Add(1)
 		}
-		// If fetch was empty, sleep outside semaphore so idle long-polling
-		// streams do not consume global in-flight slots.
-		if idleFetchSleep {
+		// If fetch was empty AND no other work was done (no acks, no enqueues),
+		// sleep outside semaphore to prevent idle busy-looping. Skip the sleep
+		// when acks or enqueues were processed so their responses aren't delayed.
+		didWork := resp.Acked > 0 || len(resp.EnqueuedJobIds) > 0
+		if idleFetchSleep && !didWork {
+			s.idleFetchTotal.Add(1)
 			select {
 			case <-ctx.Done():
 				return nil
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(cfg.IdleFetchSleep):
 			}
 		}
 

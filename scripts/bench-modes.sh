@@ -27,6 +27,8 @@ DURABLE="${DURABLE:-false}"
 CONCURRENCY="${CONCURRENCY:-}"
 WORKERS="${WORKERS:-}"
 WORKER_QUEUES="${WORKER_QUEUES:-}"
+FETCH_POLL_INTERVAL="${FETCH_POLL_INTERVAL:-}"
+IDLE_FETCH_SLEEP="${IDLE_FETCH_SLEEP:-}"
 
 SERVER_PID=""
 
@@ -95,6 +97,12 @@ run_one() {
     if [ "$DURABLE" = "true" ]; then
         server_args+=(--durable)
     fi
+    if [ -n "$FETCH_POLL_INTERVAL" ]; then
+        server_args+=(--fetch-poll-interval "$FETCH_POLL_INTERVAL")
+    fi
+    if [ -n "$IDLE_FETCH_SLEEP" ]; then
+        server_args+=(--idle-fetch-sleep "$IDLE_FETCH_SLEEP")
+    fi
 
     "$BINARY" "${server_args[@]}" &
     SERVER_PID=$!
@@ -155,7 +163,17 @@ if [ ${#results[@]} -lt 2 ]; then
     exit 0
 fi
 
-# Header.
+echo "Legend:"
+echo "  Config     bench run name: {store}-s{shards}-{protocol}"
+echo "  Jobs       total jobs enqueued then processed"
+echo "  Conc       parallel lifecycle streams (workers x concurrency)"
+echo "  Enq ops/s  enqueue throughput (jobs/sec, fire-and-forget)"
+echo "  Enq p99    99th percentile enqueue latency (client round-trip)"
+echo "  Enq CV     enqueue coefficient of variation (stddev/mean; lower = more consistent)"
+echo "  LC ops/s   lifecycle throughput (jobs/sec, each op = fetch + ack on serialized stream)"
+echo "  LC p99     99th percentile lifecycle latency (fetch receipt to ack confirmation)"
+echo "  LC CV      lifecycle coefficient of variation"
+echo ""
 printf "%-24s  %6s  %5s  %10s  %10s  %7s  %10s  %10s  %7s\n" "Config" "Jobs" "Conc" "Enq ops/s" "Enq p99" "Enq CV" "LC ops/s" "LC p99" "LC CV"
 printf "%-24s  %6s  %5s  %10s  %10s  %7s  %10s  %10s  %7s\n" "------------------------" "------" "-----" "----------" "----------" "-------" "----------" "----------" "-------"
 
