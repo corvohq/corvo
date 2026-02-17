@@ -30,6 +30,7 @@ WORKER_QUEUES="${WORKER_QUEUES:-}"
 FETCH_POLL_INTERVAL="${FETCH_POLL_INTERVAL:-}"
 IDLE_FETCH_SLEEP="${IDLE_FETCH_SLEEP:-}"
 STREAM_MAX_FPS="${STREAM_MAX_FPS:-}"
+SQLITE_MIRROR="${SQLITE_MIRROR:-}"
 
 SERVER_PID=""
 
@@ -106,6 +107,9 @@ run_one() {
     fi
     if [ -n "$STREAM_MAX_FPS" ]; then
         server_args+=(--stream-max-fps "$STREAM_MAX_FPS")
+    fi
+    if [ "$SQLITE_MIRROR" = "false" ]; then
+        server_args+=(--sqlite-mirror=false)
     fi
 
     "$BINARY" "${server_args[@]}" &

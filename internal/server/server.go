@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	netpprof "net/http/pprof"
 	"sync"
 	"net/http/httputil"
 	"net/url"
@@ -325,6 +326,14 @@ func (s *Server) buildRouter() chi.Router {
 	})
 
 	r.Get("/healthz", s.handleHealthz)
+	r.Route("/debug/pprof", func(r chi.Router) {
+		r.Get("/", netpprof.Index)
+		r.Get("/cmdline", netpprof.Cmdline)
+		r.Get("/profile", netpprof.Profile)
+		r.Get("/symbol", netpprof.Symbol)
+		r.Get("/trace", netpprof.Trace)
+		r.Get("/{name}", netpprof.Index)
+	})
 
 	// Embedded UI SPA
 	if s.uiFS != nil {

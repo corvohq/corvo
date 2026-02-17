@@ -135,6 +135,7 @@ func init() {
 	serverCmd.Flags().DurationVar(&idleFetchSleep, "idle-fetch-sleep", 100*time.Millisecond, "Stream sleep when fetch returns zero jobs")
 	serverCmd.Flags().IntVar(&raftMaxPending, "raft-max-pending", 16384, "Max pending Raft apply requests before backpressure")
 	serverCmd.Flags().IntVar(&raftMaxFetchInflight, "raft-max-fetch-inflight", 64, "Max concurrent fetch/fetch-batch applies per queue")
+	serverCmd.Flags().BoolVar(&sqliteMirrorEnabled, "sqlite-mirror", true, "Enable SQLite materialized view for UI queries (disable for max throughput)")
 
 	rootCmd.AddCommand(serverCmd)
 }
