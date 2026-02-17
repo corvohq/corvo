@@ -56,7 +56,7 @@ PROFILE_FILE="${PROFILE_DIR}/corvo-${PROFILE_TYPE}-${TIMESTAMP}.prof"
 
 # --- Build ---
 echo "=== Building ==="
-CGO_ENABLED=1 go build -o "$BINARY" ./cmd/corvo
+go build -o "$BINARY" ./cmd/corvo
 
 # --- Cleanup ---
 cleanup() {

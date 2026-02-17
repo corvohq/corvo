@@ -8,7 +8,7 @@ Corvo is a Raft-based distributed job queue written in Go. It provides durable, 
 
 ### Build
 ```bash
-CGO_ENABLED=1 go build -o bin/corvo ./cmd/corvo
+go build -o bin/corvo ./cmd/corvo
 # Or:
 make build  # builds UI + Go binary
 ```

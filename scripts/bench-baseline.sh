@@ -301,7 +301,7 @@ echo ""
 
 # Build once.
 echo "==> Building corvo..."
-CGO_ENABLED=1 go build -o "$BINARY" ./cmd/corvo
+go build -o "$BINARY" ./cmd/corvo
 
 mkdir -p "$RESULTS_DIR"
 

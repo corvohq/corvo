@@ -7,7 +7,7 @@ ui:
 	cd ui && npm install && npm run build
 
 build: ui
-	CGO_ENABLED=1 go build -o $(BUILD_DIR)/$(BINARY) ./cmd/corvo
+	go build -o $(BUILD_DIR)/$(BINARY) ./cmd/corvo
 
 bench: build
 	./$(BUILD_DIR)/$(BINARY) bench
@@ -25,10 +25,10 @@ run: build
 	./$(BUILD_DIR)/$(BINARY) server
 
 test:
-	CGO_ENABLED=1 go test ./... -v -count=1
+	go test ./... -v -count=1
 
 perf:
-	CGO_ENABLED=1 go test -tags perf ./tests/perf -v -count=1
+	go test -tags perf ./tests/perf -v -count=1
 
 lint:
 	golangci-lint run ./...

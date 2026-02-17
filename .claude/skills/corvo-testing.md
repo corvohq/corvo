@@ -3,28 +3,28 @@
 ## Running Tests
 
 ```bash
-# All unit + integration tests (CGO required for SQLite)
+# All unit + integration tests
 make test
-# equivalent: CGO_ENABLED=1 go test ./... -v -count=1
+# equivalent: go test ./... -v -count=1
 
 # Perf tests only (gated by build tag)
 make perf
-# equivalent: CGO_ENABLED=1 go test -tags perf ./tests/perf -v -count=1
+# equivalent: go test -tags perf ./tests/perf -v -count=1
 
 # Raft benchmarks (excluded under race detector via !race tag)
-CGO_ENABLED=1 go test ./internal/raft -bench=. -run='^$' -v
+go test ./internal/raft -bench=. -run='^$' -v
 
 # With race detector (bench_test.go auto-excluded)
-CGO_ENABLED=1 go test -race ./...
+go test -race ./...
 
 # Specific package
-CGO_ENABLED=1 go test ./internal/store -v -run TestGetJob
+go test ./internal/store -v -run TestGetJob
 
 # Bench command (not go test — uses the built binary)
 make bench
 ```
 
-`CGO_ENABLED=1` is always required (SQLite needs CGo).
+No CGO needed — Corvo uses `modernc.org/sqlite` (pure Go).
 
 ## Build Tags
 

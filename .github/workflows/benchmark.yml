@@ -1,0 +1,82 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Benchmark mode"
+        required: true
+        default: quick
+        type: choice
+        options:
+          - quick
+          - standard
+  pull_request:
+    types: [labeled]
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'benchmark'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Build binary
+        run: go build -o bin/corvo ./cmd/corvo
+        env:
+          CGO_ENABLED: "0"
+
+      - name: Run benchmarks
+        run: |
+          MODE="${{ github.event.inputs.mode || 'quick' }}"
+          CI=true ./scripts/bench-baseline.sh "$MODE"
+        env:
+          CGO_ENABLED: "0"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: bench-results/
+
+      - name: Post summary
+        if: always()
+        run: |
+          RESULTS_DIR=$(ls -d bench-results/*/ 2>/dev/null | head -1)
+          if [ -z "$RESULTS_DIR" ]; then
+            echo "No benchmark results found." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "## Benchmark Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Run | ops/sec | p99 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|---------|-----|" >> "$GITHUB_STEP_SUMMARY"
+
+          for f in "$RESULTS_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f" .json)
+            cb_ops=$(jq -r '.combined.ops_per_sec // 0 | floor' "$f" 2>/dev/null || echo "0")
+            cb_p99=$(jq -r 'if .combined.p99_us then (.combined.p99_us / 1000 | . * 10 | floor / 10 | tostring + "ms") else "-" end' "$f" 2>/dev/null || echo "-")
+            enq_ops=$(jq -r '.enqueue.ops_per_sec // 0 | floor' "$f" 2>/dev/null || echo "0")
+            lc_ops=$(jq -r '.lifecycle.ops_per_sec // 0 | floor' "$f" 2>/dev/null || echo "0")
+            lc_p99=$(jq -r 'if .lifecycle.p99_us then (.lifecycle.p99_us / 1000 | . * 10 | floor / 10 | tostring + "ms") else "-" end' "$f" 2>/dev/null || echo "-")
+
+            if [ "$cb_ops" != "0" ]; then
+              echo "| $name | $cb_ops | $cb_p99 |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| $name | $lc_ops (enq: $enq_ops) | $lc_p99 |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
