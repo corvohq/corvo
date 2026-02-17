@@ -278,7 +278,7 @@ Jobs with `ChainConfig{Steps, OnFailure, OnExit}`:
 | Area | Files |
 |------|-------|
 | Add new FSM op | `store/ops.go` (op type), `fsm_ops.go` (handler), `fsm.go` (dispatch) |
-| Add new API endpoint | `server/routes.go` (HTTP), `rpcconnect/server.go` (RPC) |
+| Add new API endpoint | `server/server.go` (HTTP routes), `server/handlers_*.go` (handlers), `rpcconnect/server.go` (RPC) |
 | Change Pebble key layout | `kv/keys.go` |
 | Change batching behavior | `cluster.go` (`applyLoop`, `flushApplyBatch`) |
 | Change stream behavior | `rpcconnect/server.go` (`StreamLifecycle`) |

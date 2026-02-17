@@ -101,6 +101,16 @@ POST /api/v1/fail/{job_id}        {"error":"msg","backtrace":"..."}
 POST /api/v1/heartbeat            {"jobs":{"id":{"progress_json":"..."}}}
 ```
 
+### Webhooks
+```
+POST /api/v1/webhooks/{queue}      Body becomes payload; queue from URL path
+  ?priority=high                   Optional priority
+  ?unique_key=monitor_123          Optional dedup key
+  ?max_retries=5                   Optional retry limit
+  ?scheduled_at=2025-01-01T00:00:00Z  Optional schedule
+  ?tags=env:prod,team:infra        Optional comma-separated key:value tags
+```
+
 ### Reads (any node)
 ```
 GET  /api/v1/queues

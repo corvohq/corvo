@@ -250,6 +250,7 @@ func (s *Server) buildRouter() chi.Router {
 			// Worker endpoints
 			r.Post("/enqueue", s.handleEnqueue)
 			r.Post("/enqueue/batch", s.handleEnqueueBatch)
+			r.Post("/webhooks/{queue}", s.handleWebhookEnqueue)
 			r.Post("/fetch", s.handleFetch)
 			r.Post("/fetch/batch", s.handleFetchBatch)
 			r.Post("/ack/batch", s.handleAckBatch)
@@ -807,6 +808,11 @@ func (s *Server) requestShardTargets(r *http.Request, sharded shardLeaderInfo) (
 		}
 	}
 
+	if strings.HasPrefix(path, "/api/v1/webhooks/") {
+		principal := principalFromContext(r.Context())
+		addQueue(namespaceQueue(principal.Namespace, chi.URLParam(r, "queue")))
+		return sortedShards(shards), nil
+	}
 	if strings.HasPrefix(path, "/api/v1/queues/") {
 		principal := principalFromContext(r.Context())
 		addQueue(namespaceQueue(principal.Namespace, chi.URLParam(r, "name")))

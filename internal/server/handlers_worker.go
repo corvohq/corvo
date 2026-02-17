@@ -2,12 +2,101 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/user/corvo/internal/store"
 )
+
+func (s *Server) handleWebhookEnqueue(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
+	queue := chi.URLParam(r, "queue")
+	if queue == "" {
+		writeError(w, http.StatusBadRequest, "queue is required in URL path", "VALIDATION_ERROR")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body", "PARSE_ERROR")
+		return
+	}
+
+	var payload json.RawMessage
+	if len(body) == 0 {
+		payload = json.RawMessage(`{}`)
+	} else if json.Valid(body) {
+		payload = json.RawMessage(body)
+	} else {
+		quoted, _ := json.Marshal(string(body))
+		payload = json.RawMessage(quoted)
+	}
+
+	req := store.EnqueueRequest{
+		Queue:   namespaceQueue(principal.Namespace, queue),
+		Payload: payload,
+	}
+
+	q := r.URL.Query()
+	if v := q.Get("priority"); v != "" {
+		req.Priority = v
+	}
+	if v := q.Get("unique_key"); v != "" {
+		req.UniqueKey = v
+	}
+	if v := q.Get("max_retries"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid max_retries value", "VALIDATION_ERROR")
+			return
+		}
+		req.MaxRetries = &n
+	}
+	if v := q.Get("scheduled_at"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid scheduled_at value (use RFC3339)", "VALIDATION_ERROR")
+			return
+		}
+		req.ScheduledAt = &t
+	}
+	if v := q.Get("tags"); v != "" {
+		tags := map[string]string{}
+		for _, pair := range strings.Split(v, ",") {
+			pair = strings.TrimSpace(pair)
+			if pair == "" {
+				continue
+			}
+			parts := strings.SplitN(pair, ":", 2)
+			if len(parts) == 2 {
+				tags[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			} else {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid tag format %q (expected key:value)", pair), "VALIDATION_ERROR")
+				return
+			}
+		}
+		tagsJSON, _ := json.Marshal(tags)
+		req.Tags = json.RawMessage(tagsJSON)
+	}
+
+	result, err := s.store.Enqueue(req)
+	if err != nil {
+		writeStoreError(w, err, http.StatusInternalServerError, "INTERNAL_ERROR")
+		return
+	}
+	s.throughput.Inc("enqueued")
+
+	status := http.StatusCreated
+	if result.UniqueExisting {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, result)
+}
 
 func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
