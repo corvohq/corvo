@@ -69,7 +69,7 @@ generate_runs() {
             ;;
         standard)
             local base_jobs=50000
-            local shards_list="1 4"
+            local shards_list="1 3"
             local workers_list="2 8 32"
             local conc_list="8 32"
 
@@ -96,7 +96,7 @@ generate_runs() {
             local jobs_list="100000 500000"
             local workers_list="2 8 32 128"
             local conc_list="8 32"
-            local shards_list="1 4"
+            local shards_list="1 2 3"
             local nodes_list="1 3"
 
             if is_ci; then
@@ -341,7 +341,7 @@ while IFS=' ' read -r bench_type jobs workers conc shards nodes; do
         LAST_NODES="$nodes"
     fi
 
-    local bench_args=(
+    bench_args=(
         bench
         --server "$SERVER_URL"
         --protocol rpc
@@ -374,24 +374,52 @@ if [ ${#results[@]} -eq 0 ]; then
     exit 1
 fi
 
+# -- Combined (steady-state): enqueue + fetch + ack interleaved --
+echo "Combined (steady-state)"
+echo "  Enqueue and lifecycle run concurrently. CV measures latency consistency under load."
+echo ""
+printf "%-60s  %10s  %10s  %10s  %8s\n" "Run" "ops/sec" "p99" "stddev" "CV%"
+printf "%-60s  %10s  %10s  %10s  %8s\n" "------------------------------------------------------------" "----------" "----------" "----------" "--------"
+
+has_combined=false
+for f in "${results[@]}"; do
+    name=$(basename "$f" .json)
+    cb_ops=$(jq -r '.combined.ops_per_sec // 0 | floor' "$f" 2>/dev/null || echo "0")
+    [ "$cb_ops" = "0" ] && continue
+    has_combined=true
+    cb_p99=$(jq -r 'if .combined.p99_us then (.combined.p99_us / 1000 | . * 10 | floor / 10 | tostring + "ms") else "-" end' "$f" 2>/dev/null || echo "-")
+    cb_stddev=$(jq -r 'if .combined.stddev_us then (.combined.stddev_us / 1000 | . * 10 | floor / 10 | tostring + "ms") else "-" end' "$f" 2>/dev/null || echo "-")
+    cb_cv=$(jq -r '.combined.cv_pct // 0 | . * 10 | floor / 10' "$f" 2>/dev/null || echo "-")
+    printf "%-60s  %10s  %10s  %10s  %8s\n" "$name" "$cb_ops" "$cb_p99" "$cb_stddev" "$cb_cv"
+done
+if [ "$has_combined" = "false" ]; then
+    echo "  (none)"
+fi
+
+# -- Separate (burst): enqueue first, then fetch + ack --
+echo ""
+echo "Separate (burst)"
+echo "  Enqueue runs to completion, then lifecycle processes all jobs. Shows per-phase ceilings."
+echo ""
 printf "%-60s  %10s  %10s\n" "Run" "ops/sec" "p99"
 printf "%-60s  %10s  %10s\n" "------------------------------------------------------------" "----------" "----------"
 
+has_separate=false
 for f in "${results[@]}"; do
     name=$(basename "$f" .json)
-    # Use combined or enqueue+lifecycle depending on mode.
     cb_ops=$(jq -r '.combined.ops_per_sec // 0 | floor' "$f" 2>/dev/null || echo "0")
-    cb_p99=$(jq -r 'if .combined.p99_us then (.combined.p99_us / 1000 | . * 10 | floor / 10 | tostring + "ms") else "-" end' "$f" 2>/dev/null || echo "-")
+    [ "$cb_ops" != "0" ] && continue
+    has_separate=true
     enq_ops=$(jq -r '.enqueue.ops_per_sec // 0 | floor' "$f" 2>/dev/null || echo "0")
+    enq_p99=$(jq -r 'if .enqueue.p99_us then (.enqueue.p99_us / 1000 | . * 10 | floor / 10 | tostring + "ms") else "-" end' "$f" 2>/dev/null || echo "-")
     lc_ops=$(jq -r '.lifecycle.ops_per_sec // 0 | floor' "$f" 2>/dev/null || echo "0")
     lc_p99=$(jq -r 'if .lifecycle.p99_us then (.lifecycle.p99_us / 1000 | . * 10 | floor / 10 | tostring + "ms") else "-" end' "$f" 2>/dev/null || echo "-")
-
-    if [ "$cb_ops" != "0" ]; then
-        printf "%-60s  %10s  %10s\n" "$name" "$cb_ops" "$cb_p99"
-    else
-        printf "%-60s  %10s  %10s  (enq: %s ops/s)\n" "$name" "$lc_ops" "$lc_p99" "$enq_ops"
-    fi
+    printf "%-60s  %10s  %10s\n" "$name" "$lc_ops" "$lc_p99"
+    printf "%-60s  %10s  %10s\n" "  enqueue" "$enq_ops" "$enq_p99"
 done
+if [ "$has_separate" = "false" ]; then
+    echo "  (none)"
+fi
 
 echo ""
 echo "Results saved to $RESULTS_DIR/"

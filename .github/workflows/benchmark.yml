@@ -60,7 +60,26 @@ jobs:
             exit 0
           fi
 
-          echo "## Benchmark Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Combined (steady-state)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Enqueue and lifecycle run concurrently. CV measures latency consistency under load." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Run | ops/sec | p99 | stddev | CV% |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|---------|-----|--------|-----|" >> "$GITHUB_STEP_SUMMARY"
+
+          for f in "$RESULTS_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f" .json)
+            cb_ops=$(jq -r '.combined.ops_per_sec // 0 | floor' "$f" 2>/dev/null || echo "0")
+            [ "$cb_ops" = "0" ] && continue
+            cb_p99=$(jq -r 'if .combined.p99_us then (.combined.p99_us / 1000 | . * 10 | floor / 10 | tostring + "ms") else "-" end' "$f" 2>/dev/null || echo "-")
+            cb_stddev=$(jq -r 'if .combined.stddev_us then (.combined.stddev_us / 1000 | . * 10 | floor / 10 | tostring + "ms") else "-" end' "$f" 2>/dev/null || echo "-")
+            cb_cv=$(jq -r '.combined.cv_pct // 0 | . * 10 | floor / 10' "$f" 2>/dev/null || echo "-")
+            echo "| $name | $cb_ops | $cb_p99 | $cb_stddev | $cb_cv |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Separate (burst)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Enqueue runs to completion, then lifecycle processes all jobs. Shows per-phase ceilings." >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Run | ops/sec | p99 |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-----|---------|-----|" >> "$GITHUB_STEP_SUMMARY"
@@ -69,14 +88,11 @@ jobs:
             [ -f "$f" ] || continue
             name=$(basename "$f" .json)
             cb_ops=$(jq -r '.combined.ops_per_sec // 0 | floor' "$f" 2>/dev/null || echo "0")
-            cb_p99=$(jq -r 'if .combined.p99_us then (.combined.p99_us / 1000 | . * 10 | floor / 10 | tostring + "ms") else "-" end' "$f" 2>/dev/null || echo "-")
+            [ "$cb_ops" != "0" ] && continue
             enq_ops=$(jq -r '.enqueue.ops_per_sec // 0 | floor' "$f" 2>/dev/null || echo "0")
+            enq_p99=$(jq -r 'if .enqueue.p99_us then (.enqueue.p99_us / 1000 | . * 10 | floor / 10 | tostring + "ms") else "-" end' "$f" 2>/dev/null || echo "-")
             lc_ops=$(jq -r '.lifecycle.ops_per_sec // 0 | floor' "$f" 2>/dev/null || echo "0")
             lc_p99=$(jq -r 'if .lifecycle.p99_us then (.lifecycle.p99_us / 1000 | . * 10 | floor / 10 | tostring + "ms") else "-" end' "$f" 2>/dev/null || echo "-")
-
-            if [ "$cb_ops" != "0" ]; then
-              echo "| $name | $cb_ops | $cb_p99 |" >> "$GITHUB_STEP_SUMMARY"
-            else
-              echo "| $name | $lc_ops (enq: $enq_ops) | $lc_p99 |" >> "$GITHUB_STEP_SUMMARY"
-            fi
+            echo "| $name | $lc_ops | $lc_p99 |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| &nbsp;&nbsp;enqueue | $enq_ops | $enq_p99 |" >> "$GITHUB_STEP_SUMMARY"
           done
