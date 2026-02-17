@@ -599,6 +599,11 @@ func (c *Cluster) applyLoop() {
 		case backlog > 0:
 			wait = minWindow / 2
 		}
+		// When the exec pipeline is idle, flush sooner — accumulating
+		// adds latency without improving throughput.
+		if len(c.applyExec) < cap(c.applyExec) && wait > 20*time.Microsecond {
+			wait = 20 * time.Microsecond
+		}
 		if wait < 20*time.Microsecond {
 			wait = 20 * time.Microsecond
 		}
