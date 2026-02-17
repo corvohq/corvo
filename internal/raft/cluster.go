@@ -782,6 +782,12 @@ func (c *Cluster) IsLeader() bool {
 	return c.raft.State() == raft.Leader
 }
 
+// IsUnderLoad returns true when the apply pipeline has pending work. Used by
+// the scheduler to skip expensive maintenance ops during high throughput.
+func (c *Cluster) IsUnderLoad() bool {
+	return len(c.applyCh) > 0
+}
+
 // LeaderAddr returns the address of the current Raft leader.
 func (c *Cluster) LeaderAddr() string {
 	addr, _ := c.raft.LeaderWithID()

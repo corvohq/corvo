@@ -644,6 +644,8 @@ func (f *FSM) applyMultiIndexed(ops []*store.DecodedRaftOp) *store.OpResult {
 
 	// Track claimed jobs across all FetchBatch ops to prevent double-fetch.
 	claimed := make(map[string]struct{})
+	// Track workers already written in this batch to skip redundant json.Marshal + Set.
+	seenWorkers := make(map[string]struct{})
 	var allSqliteCallbacks []func(db sqlExecer) error
 	anyWrite := false
 
@@ -657,7 +659,7 @@ func (f *FSM) applyMultiIndexed(ops []*store.DecodedRaftOp) *store.OpResult {
 				anyWrite = true
 			}
 		case store.OpFetchBatch:
-			res := f.applyFetchBatchIntoBatch(batch, *sub.FetchBatch, claimed, &allSqliteCallbacks)
+			res := f.applyFetchBatchIntoBatch(batch, *sub.FetchBatch, claimed, seenWorkers, &allSqliteCallbacks)
 			results[iop.idx] = res
 			if res.Err == nil {
 				anyWrite = true

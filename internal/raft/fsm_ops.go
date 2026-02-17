@@ -1923,7 +1923,7 @@ func (f *FSM) applyAckBatchIntoBatch(batch *pebble.Batch, op store.AckBatchOp, s
 // batch (indexed mode). Uses the batch for reads to see writes from prior ops
 // (e.g., acks that freed active slots). The claimed map prevents double-fetching
 // across multiple FetchBatch ops in the same indexed batch.
-func (f *FSM) applyFetchBatchIntoBatch(batch *pebble.Batch, op store.FetchBatchOp, claimed map[string]struct{}, sqliteCbs *[]func(db sqlExecer) error) *store.OpResult {
+func (f *FSM) applyFetchBatchIntoBatch(batch *pebble.Batch, op store.FetchBatchOp, claimed map[string]struct{}, seenWorkers map[string]struct{}, sqliteCbs *[]func(db sqlExecer) error) *store.OpResult {
 	if len(op.Queues) == 0 || op.Count <= 0 {
 		return &store.OpResult{Data: []store.FetchResult{}}
 	}
@@ -1946,8 +1946,12 @@ func (f *FSM) applyFetchBatchIntoBatch(batch *pebble.Batch, op store.FetchBatchO
 	if op.Hostname != "" {
 		worker.Hostname = &op.Hostname
 	}
-	workerData, _ := json.Marshal(worker)
-	batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts)
+	// Skip redundant worker writes within the same indexed batch.
+	if _, already := seenWorkers[op.WorkerID]; !already {
+		workerData, _ := json.Marshal(worker)
+		batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts)
+		seenWorkers[op.WorkerID] = struct{}{}
+	}
 
 	type queueState struct {
 		name        string

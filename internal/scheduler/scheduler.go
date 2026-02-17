@@ -58,6 +58,13 @@ type LeaderCheck interface {
 	IsLeader() bool
 }
 
+// LoadChecker is an optional interface that LeaderCheck implementations can
+// satisfy. When the system is under load, the scheduler skips expensive ops
+// (Promote, Reclaim, ExpireJobs) to avoid competing with the hot path.
+type LoadChecker interface {
+	IsUnderLoad() bool
+}
+
 // Scheduler runs periodic maintenance tasks.
 type Scheduler struct {
 	store       *store.Store
@@ -128,7 +135,14 @@ func (s *Scheduler) tick(force bool) {
 
 	now := time.Now()
 
-	if force || now.Sub(s.lastPromote) >= s.config.PromoteInterval {
+	// When the apply pipeline is busy, skip expensive ops (Promote, Reclaim,
+	// ExpireJobs) to avoid competing with fetch/ack on the serial FSM goroutine.
+	underLoad := false
+	if lc, ok := s.leaderCheck.(LoadChecker); ok {
+		underLoad = lc.IsUnderLoad()
+	}
+
+	if (force || now.Sub(s.lastPromote) >= s.config.PromoteInterval) && !underLoad {
 		if err := s.store.Promote(); err != nil {
 			slog.Error("promote scheduled jobs", "error", err)
 			if s.metrics != nil {
@@ -141,7 +155,7 @@ func (s *Scheduler) tick(force bool) {
 		}
 		s.lastPromote = now
 	}
-	if force || now.Sub(s.lastReclaim) >= s.config.ReclaimInterval {
+	if (force || now.Sub(s.lastReclaim) >= s.config.ReclaimInterval) && !underLoad {
 		if err := s.store.Reclaim(); err != nil {
 			slog.Error("reclaim expired leases", "error", err)
 			if s.metrics != nil {
@@ -166,7 +180,7 @@ func (s *Scheduler) tick(force bool) {
 		}
 		s.lastRate = now
 	}
-	if force || now.Sub(s.lastExpire) >= s.config.ExpireInterval {
+	if (force || now.Sub(s.lastExpire) >= s.config.ExpireInterval) && !underLoad {
 		if err := s.store.ExpireJobs(); err != nil {
 			slog.Error("expire jobs past deadline", "error", err)
 			if s.metrics != nil {
