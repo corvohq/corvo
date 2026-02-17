@@ -175,6 +175,18 @@ func (m *MultiCluster) shardsForQueues(queues []string) map[int][]string {
 	return out
 }
 
+// HasPendingJobs checks if any of the given queues have pending jobs across
+// all relevant shards.
+func (m *MultiCluster) HasPendingJobs(queues []string) bool {
+	groups := m.shardsForQueues(queues)
+	for idx, qs := range groups {
+		if m.shards[idx].HasPendingJobs(qs) {
+			return true
+		}
+	}
+	return false
+}
+
 // Apply routes mutating operations to the owning shard.
 func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 	if len(m.shards) == 0 {
@@ -191,6 +203,7 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 		res := m.shards[idx].Apply(opType, op)
 		if res != nil && res.Err == nil {
 			m.cacheJobShard(op.JobID, idx)
+			m.shards[idx].InvalidatePendingCache(op.Queue)
 		}
 		return res
 	case store.OpEnqueueBatch:
@@ -219,6 +232,7 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 			}
 			for _, j := range jobs {
 				m.cacheJobShard(j.JobID, idx)
+				m.shards[idx].InvalidatePendingCache(j.Queue)
 			}
 			if out, ok := res.Data.(*store.BatchEnqueueResult); ok && out != nil {
 				merged.JobIDs = append(merged.JobIDs, out.JobIDs...)
@@ -267,6 +281,15 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 			if remaining <= 0 {
 				break
 			}
+			// Skip shards with no pending jobs to avoid wasted raft consensus.
+			// Uses cached result; Raft FSM will return empty if nothing is actually pending.
+			if !m.shards[idx].HasPendingJobs(qs) {
+				// Only skip if the check is fast (cache hit). When the cache
+				// says empty, skip; when it says pending or needs a fresh scan,
+				// let the Raft FSM handle it — the FSM scan is authoritative
+				// and we avoid the expensive tombstone walk on the read path.
+				continue
+			}
 			sub := op
 			sub.Queues = qs
 			sub.Count = remaining
@@ -275,6 +298,12 @@ func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 				return res
 			}
 			jobs, _ := res.Data.([]store.FetchResult)
+			if len(jobs) == 0 {
+				// Shard had no pending jobs; cache this so future checks skip it.
+				for _, q := range qs {
+					m.shards[idx].MarkQueueEmpty(q)
+				}
+			}
 			for _, j := range jobs {
 				m.cacheJobShard(j.JobID, idx)
 			}

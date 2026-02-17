@@ -97,6 +97,7 @@ var (
 	raftMaxFetchInflight   = 64
 	applyMultiMode         = "grouped"
 	noCompression          = true
+	snapshotThreshold      = 0 // 0 = use default (4096)
 )
 
 func init() {
@@ -140,6 +141,7 @@ func init() {
 	serverCmd.Flags().StringVar(&applyMultiMode, "apply-multi-mode", "grouped", "Multi-apply batch mode: grouped (2-3 commits), indexed (1 commit), individual (N commits)")
 	serverCmd.Flags().BoolVar(&noCompression, "no-compression", true, "Disable gzip compression on ConnectRPC responses (enabled by default; set --no-compression=false to enable gzip)")
 	serverCmd.Flags().BoolVar(&sqliteMirrorEnabled, "sqlite-mirror", true, "Enable SQLite materialized view for UI queries (disable for max throughput)")
+	serverCmd.Flags().IntVar(&snapshotThreshold, "snapshot-threshold", 0, "Raft log entries between snapshots (0 = default 4096)")
 
 	rootCmd.AddCommand(serverCmd)
 }
@@ -227,6 +229,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 	clusterCfg.ApplyMultiMode = applyMultiMode
 	clusterCfg.Bootstrap = bootstrap
 	clusterCfg.JoinAddr = joinAddr
+	if snapshotThreshold > 0 {
+		clusterCfg.SnapshotThreshold = uint64(snapshotThreshold)
+	}
 
 	type clusterRuntime interface {
 		store.Applier

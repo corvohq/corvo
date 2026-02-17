@@ -997,7 +997,8 @@ func (f *FSM) findAppendJobForQueue(queue string, claimed map[string]struct{}) (
 	defer iter.Close()
 
 	var valid bool
-	if len(lower) > 0 {
+	hasCursor := len(lower) > 0
+	if hasCursor {
 		valid = iter.SeekGE(lower)
 		if valid && bytes.Equal(iter.Key(), lower) {
 			valid = iter.Next()
@@ -1045,6 +1046,60 @@ func (f *FSM) findAppendJobForQueue(queue string, claimed map[string]struct{}) (
 		ak := make([]byte, len(key))
 		copy(ak, key)
 		return id, ak, doc, true
+	}
+
+	// Cursor-based scan found nothing. Rescan before the cursor to catch
+	// entries inserted with timestamps before the cursor position (can
+	// happen when concurrent producers have out-of-order timestamps).
+	if hasCursor {
+		iter2, err := f.pebble.NewIter(&pebble.IterOptions{
+			LowerBound: prefix,
+			UpperBound: lower,
+		})
+		if err != nil {
+			return "", nil, store.Job{}, false
+		}
+		defer iter2.Close()
+
+		for valid := iter2.First(); valid; valid = iter2.Next() {
+			key := iter2.Key()
+			idOffset := len(prefix) + 8
+			if len(key) <= idOffset {
+				continue
+			}
+			id := string(key[idOffset:])
+			if _, exists := claimed[id]; exists {
+				continue
+			}
+			val, closer, err := f.pebble.Get(kv.JobKey(id))
+			if err != nil {
+				k := make([]byte, len(key))
+				copy(k, key)
+				_ = f.pebble.Delete(k, pebble.NoSync)
+				continue
+			}
+			var doc store.Job
+			if err := decodeJobDoc(val, &doc); err != nil {
+				closer.Close()
+				k := make([]byte, len(key))
+				copy(k, key)
+				_ = f.pebble.Delete(k, pebble.NoSync)
+				continue
+			}
+			closer.Close()
+			if doc.State != store.StatePending {
+				k := make([]byte, len(key))
+				copy(k, key)
+				_ = f.pebble.Delete(k, pebble.NoSync)
+				continue
+			}
+			if !f.dependenciesSatisfied(doc) {
+				continue
+			}
+			ak := make([]byte, len(key))
+			copy(ak, key)
+			return id, ak, doc, true
+		}
 	}
 
 	return "", nil, store.Job{}, false
@@ -2242,7 +2297,8 @@ func findAppendJobFromReader(r pebble.Reader, queue string, claimed map[string]s
 	defer iter.Close()
 
 	var valid bool
-	if len(lower) > 0 {
+	hasCursor := len(lower) > 0
+	if hasCursor {
 		valid = iter.SeekGE(lower)
 		if valid && bytes.Equal(iter.Key(), lower) {
 			valid = iter.Next()
@@ -2278,6 +2334,48 @@ func findAppendJobFromReader(r pebble.Reader, queue string, claimed map[string]s
 		copy(ak, key)
 		return id, ak, doc, true
 	}
+
+	// Cursor-based scan found nothing. Rescan before the cursor for
+	// entries with timestamps before the cursor position.
+	if hasCursor {
+		iter2, err := r.NewIter(&pebble.IterOptions{
+			LowerBound: prefix,
+			UpperBound: lower,
+		})
+		if err != nil {
+			return "", nil, store.Job{}, false
+		}
+		defer iter2.Close()
+
+		for valid := iter2.First(); valid; valid = iter2.Next() {
+			key := iter2.Key()
+			idOffset := len(prefix) + 8
+			if len(key) <= idOffset {
+				continue
+			}
+			id := string(key[idOffset:])
+			if _, exists := claimed[id]; exists {
+				continue
+			}
+			val, closer, err := r.Get(kv.JobKey(id))
+			if err != nil {
+				continue
+			}
+			var doc store.Job
+			if err := decodeJobDoc(val, &doc); err != nil {
+				closer.Close()
+				continue
+			}
+			closer.Close()
+			if doc.State != store.StatePending {
+				continue
+			}
+			ak := make([]byte, len(key))
+			copy(ak, key)
+			return id, ak, doc, true
+		}
+	}
+
 	return "", nil, store.Job{}, false
 }
 

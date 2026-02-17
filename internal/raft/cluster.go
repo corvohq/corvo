@@ -47,6 +47,10 @@ type Cluster struct {
 	// streams from pre-resolving the same job.
 	fetchReserved sync.Map
 
+	// pendingCache caches HasPendingJobs results; maps queue name → pendingCacheEntry.
+	// Avoids hammering Pebble iterators when many workers poll the same queues.
+	pendingCache sync.Map
+
 	overloadTotal      atomic.Uint64
 	fetchOverloadTotal atomic.Uint64
 	appliedTotal       atomic.Uint64
@@ -414,14 +418,14 @@ func (c *Cluster) preResolveFetch(op store.FetchBatchOp) (store.FetchBatchOp, []
 			break
 		}
 
-		// Scan append-log keys.
+		// Scan append-log keys from cursor position, with fallback before
+		// cursor for entries with out-of-order timestamps.
 		appendPrefix := kv.QueueAppendPrefix(queue)
-		var lower []byte
-		if cursor, closer, err := pdb.Get(kv.QueueCursorKey(queue)); err == nil {
-			lower = append([]byte(nil), cursor...)
+		var cursor []byte
+		if c, closer, err := pdb.Get(kv.QueueCursorKey(queue)); err == nil {
+			cursor = append([]byte(nil), c...)
 			closer.Close()
 		}
-
 		iter, err = pdb.NewIter(&pebble.IterOptions{
 			LowerBound: appendPrefix,
 			UpperBound: prefixUpperBound(appendPrefix),
@@ -429,9 +433,9 @@ func (c *Cluster) preResolveFetch(op store.FetchBatchOp) (store.FetchBatchOp, []
 		if err == nil {
 			idOffset := len(appendPrefix) + 8 // createdNs(8)
 			var valid bool
-			if len(lower) > 0 {
-				valid = iter.SeekGE(lower)
-				if valid && bytes.Equal(iter.Key(), lower) {
+			if len(cursor) > 0 {
+				valid = iter.SeekGE(cursor)
+				if valid && bytes.Equal(iter.Key(), cursor) {
 					valid = iter.Next()
 				}
 			} else {
@@ -447,6 +451,24 @@ func (c *Cluster) preResolveFetch(op store.FetchBatchOp) (store.FetchBatchOp, []
 					reservedIDs = append(reservedIDs, id)
 					candidateIDs = append(candidateIDs, id)
 					candidateQueues = append(candidateQueues, queue)
+				}
+			}
+			// Fallback: scan before cursor for stranded entries.
+			if len(candidateIDs) < op.Count && len(cursor) > 0 {
+				for valid := iter.SeekGE(appendPrefix); valid && len(candidateIDs) < op.Count; valid = iter.Next() {
+					if bytes.Compare(iter.Key(), cursor) >= 0 {
+						break
+					}
+					key := iter.Key()
+					if len(key) <= idOffset {
+						continue
+					}
+					id := string(key[idOffset:])
+					if _, loaded := c.fetchReserved.LoadOrStore(id, struct{}{}); !loaded {
+						reservedIDs = append(reservedIDs, id)
+						candidateIDs = append(candidateIDs, id)
+						candidateQueues = append(candidateQueues, queue)
+					}
 				}
 			}
 			iter.Close()
@@ -828,6 +850,71 @@ func (c *Cluster) SQLiteReadDB() *sql.DB {
 // PebbleDB returns the underlying Pebble database.
 func (c *Cluster) PebbleDB() *pebble.DB {
 	return c.fsm.PebbleDB()
+}
+
+// pendingCacheEntry caches the result of a Pebble prefix scan.
+type pendingCacheEntry struct {
+	hasPending bool
+	deadline   int64 // UnixNano
+}
+
+// HasPendingJobs checks if any of the given queues have pending or append-log
+// jobs. Uses a per-queue cache to avoid expensive Pebble tombstone walks.
+// False positives are cheap (one wasted Raft apply that returns empty).
+// False negatives add up to 500ms latency to job pickup.
+func (c *Cluster) HasPendingJobs(queues []string) bool {
+	now := time.Now().UnixNano()
+	allCached := true
+	for _, q := range queues {
+		if entry, ok := c.pendingCache.Load(q); ok {
+			e := entry.(pendingCacheEntry)
+			if now < e.deadline {
+				if e.hasPending {
+					return true
+				}
+				continue // cached as empty, skip
+			}
+		}
+		// Cache miss or expired — assume jobs exist rather than doing
+		// an expensive Pebble scan (tombstone walks are costly).
+		// The Raft FSM will return empty results if wrong.
+		allCached = false
+	}
+	if allCached {
+		return false // all queues cached as empty
+	}
+	return true // at least one queue has expired/missing cache → assume pending
+}
+
+// InvalidatePendingCache marks a queue as having pending jobs, called after
+// the FSM enqueues a job so workers discover it without waiting for cache expiry.
+func (c *Cluster) InvalidatePendingCache(queue string) {
+	c.pendingCache.Store(queue, pendingCacheEntry{
+		hasPending: true,
+		deadline:   time.Now().UnixNano() + 500_000_000, // 500ms
+	})
+}
+
+// MarkQueueEmpty caches that a queue has no pending jobs, called when a fetch
+// returns zero results so we avoid repeated Raft applies for empty queues.
+func (c *Cluster) MarkQueueEmpty(queue string) {
+	c.pendingCache.Store(queue, pendingCacheEntry{
+		hasPending: false,
+		deadline:   time.Now().UnixNano() + 50_000_000, // 50ms — short to avoid missing new jobs
+	})
+}
+
+// prefixHasKey returns true if there is at least one key with the given prefix.
+func prefixHasKey(pdb *pebble.DB, prefix []byte) bool {
+	iter, err := pdb.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return false
+	}
+	defer iter.Close()
+	return iter.First()
 }
 
 // Stats returns Raft cluster statistics.

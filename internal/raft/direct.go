@@ -3,6 +3,8 @@ package raft
 import (
 	"database/sql"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	hashraft "github.com/hashicorp/raft"
@@ -12,9 +14,10 @@ import (
 // DirectApplier applies operations directly through the FSM without Raft networking.
 // Useful for testing and single-node non-HA operation.
 type DirectApplier struct {
-	fsm    *FSM
-	pdb    *pebble.DB
-	sqlite *sql.DB
+	fsm          *FSM
+	pdb          *pebble.DB
+	sqlite       *sql.DB
+	pendingCache sync.Map
 }
 
 // NewDirectApplier creates a DirectApplier with Pebble and SQLite in dataDir.
@@ -47,6 +50,25 @@ func (d *DirectApplier) Apply(opType store.OpType, data any) *store.OpResult {
 	}
 	result := d.fsm.Apply(&hashraft.Log{Data: opBytes})
 	return result.(*store.OpResult)
+}
+
+// HasPendingJobs checks the in-memory cache for pending jobs.
+// Returns true on cache miss (assumes pending) to avoid expensive Pebble scans.
+func (d *DirectApplier) HasPendingJobs(queues []string) bool {
+	now := time.Now().UnixNano()
+	for _, q := range queues {
+		if entry, ok := d.pendingCache.Load(q); ok {
+			e := entry.(pendingCacheEntry)
+			if now < e.deadline {
+				if e.hasPending {
+					return true
+				}
+				continue
+			}
+		}
+		return true // cache miss → assume pending
+	}
+	return false
 }
 
 // SQLiteDB returns the SQLite database for read access.

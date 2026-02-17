@@ -81,6 +81,10 @@ type OpResult struct {
 // Applier submits operations to the Raft cluster.
 type Applier interface {
 	Apply(opType OpType, data any) *OpResult
+	// HasPendingJobs returns true if any of the given queues have pending or
+	// append-log jobs. Used as a cheap pre-check to avoid submitting empty
+	// fetches through Raft consensus.
+	HasPendingJobs(queues []string) bool
 }
 
 // MarshalOp creates a serialized Op from type and data.

@@ -47,6 +47,7 @@ var (
 	benchScenario       string
 	benchCompare        string
 	benchSave           string
+	benchCombined       bool
 	benchDockerCtrs     []string
 	benchDockerNetwork  string
 	benchFaultDuration  time.Duration
@@ -124,6 +125,7 @@ type benchSaveData struct {
 	Config    map[string]any     `json:"config"`
 	Enqueue   *benchPhaseResult  `json:"enqueue,omitempty"`
 	Lifecycle *benchPhaseResult  `json:"lifecycle,omitempty"`
+	Combined  *benchPhaseResult  `json:"combined,omitempty"`
 	Fault     *benchFaultResult  `json:"fault,omitempty"`
 }
 
@@ -149,6 +151,10 @@ var benchCmd = &cobra.Command{
 	Short: "Run benchmarks against a Corvo server",
 	Long: `Run enqueue and lifecycle processing benchmarks with optional presets,
 docker-based fault injection scenarios, and run-to-run comparison.
+
+By default, runs enqueue and lifecycle (fetch+ack) as separate phases.
+Use --combined to run them concurrently, measuring end-to-end throughput
+where producers enqueue while workers fetch and ack simultaneously.
 
 Presets (--preset):
   single-node   10k jobs, 10 concurrency, 1 worker
@@ -187,6 +193,7 @@ func init() {
 	f.IntVar(&benchFetchBatchSize, "fetch-batch-size", 64, "Jobs per fetch request")
 	f.IntVar(&benchAckBatchSize, "ack-batch-size", 64, "ACKs per batch")
 	f.DurationVar(&benchWorkDuration, "work-duration", 0, "Simulated per-job work duration")
+	f.BoolVar(&benchCombined, "combined", false, "Run combined enqueue+fetch+ack benchmark (producers and workers run concurrently)")
 
 	f.StringVar(&benchPreset, "preset", "", "Preset: single-node, cluster, or failure")
 	f.StringVar(&benchScenario, "scenario", "", "Fault scenario (requires --preset failure)")
@@ -273,6 +280,7 @@ func runBench(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  fetch-batch: %d\n", benchFetchBatchSize)
 	fmt.Printf("  ack-batch:   %d\n", benchAckBatchSize)
 	fmt.Printf("  work:        %s\n", benchWorkDuration.String())
+	fmt.Printf("  combined:    %t\n", benchCombined)
 	if benchPreset != "" {
 		fmt.Printf("  preset:      %s\n", benchPreset)
 	}
@@ -324,8 +332,8 @@ func runBench(cmd *cobra.Command, args []string) error {
 		faultTracker = &benchFaultTracker{}
 	}
 
-	var enqSummary, lcSummary benchRunSummary
-	var enqServerMetrics, lcServerMetrics *benchServerMetrics
+	var enqSummary, lcSummary, combinedSummary benchRunSummary
+	var enqServerMetrics, lcServerMetrics, combinedServerMetrics *benchServerMetrics
 
 	run := func(mode string) {
 		if benchProtocol == "matrix" {
@@ -333,6 +341,7 @@ func runBench(cmd *cobra.Command, args []string) error {
 		}
 		enqRuns := make([]benchRunSummary, 0, benchRepeats)
 		lcRuns := make([]benchRunSummary, 0, benchRepeats)
+		combinedRuns := make([]benchRunSummary, 0, benchRepeats)
 		for i := 1; i <= benchRepeats; i++ {
 			benchClearQueues(httpC, benchServer, benchQueue, benchWorkers, benchWorkerQueues)
 			if benchRepeats > 1 {
@@ -343,36 +352,54 @@ func runBench(cmd *cobra.Command, args []string) error {
 				go benchRunFaultScenario(faultTracker)
 			}
 
-			fmt.Println("=== Enqueue Benchmark ===")
-			enqStatsBefore := benchFetchServerStats(httpC, benchServer)
-			enqStart := time.Now()
-			enqResult := benchDoEnqueue(mode, benchServer, benchJobs, benchConcurrency, benchWorkers, benchQueue, benchEnqBatchSize, benchWorkerQueues)
-			enqWall := time.Since(enqStart)
-			enqStatsAfter := benchFetchServerStats(httpC, benchServer)
-			s := benchPrintStats(enqResult)
-			if sm := benchComputeServerMetrics(enqStatsBefore, enqStatsAfter, enqWall); sm != nil {
-				enqServerMetrics = sm
-				benchPrintServerMetrics(sm)
-			}
-			enqRuns = append(enqRuns, s)
-			if i == benchRepeats {
-				enqSummary = s
-			}
+			if benchCombined {
+				fmt.Println("=== Combined Benchmark (enqueue + fetch + ack) ===")
+				cbStatsBefore := benchFetchServerStats(httpC, benchServer)
+				cbStart := time.Now()
+				cbResult := benchDoCombined(mode, httpC, benchServer, benchJobs, benchConcurrency, benchWorkers, benchQueue, benchEnqBatchSize, benchFetchBatchSize, benchAckBatchSize, benchWorkDuration, benchWorkerQueues)
+				cbWall := time.Since(cbStart)
+				cbStatsAfter := benchFetchServerStats(httpC, benchServer)
+				s := benchPrintStats(cbResult)
+				if sm := benchComputeServerMetrics(cbStatsBefore, cbStatsAfter, cbWall); sm != nil {
+					combinedServerMetrics = sm
+					benchPrintServerMetrics(sm)
+				}
+				combinedRuns = append(combinedRuns, s)
+				if i == benchRepeats {
+					combinedSummary = s
+				}
+			} else {
+				fmt.Println("=== Enqueue Benchmark ===")
+				enqStatsBefore := benchFetchServerStats(httpC, benchServer)
+				enqStart := time.Now()
+				enqResult := benchDoEnqueue(mode, benchServer, benchJobs, benchConcurrency, benchWorkers, benchQueue, benchEnqBatchSize, benchWorkerQueues)
+				enqWall := time.Since(enqStart)
+				enqStatsAfter := benchFetchServerStats(httpC, benchServer)
+				s := benchPrintStats(enqResult)
+				if sm := benchComputeServerMetrics(enqStatsBefore, enqStatsAfter, enqWall); sm != nil {
+					enqServerMetrics = sm
+					benchPrintServerMetrics(sm)
+				}
+				enqRuns = append(enqRuns, s)
+				if i == benchRepeats {
+					enqSummary = s
+				}
 
-			fmt.Println("\n=== Processing Benchmark (fetch -> ack) ===")
-			lcStatsBefore := benchFetchServerStats(httpC, benchServer)
-			lcStart := time.Now()
-			lcResult := benchDoLifecycle(mode, httpC, benchServer, benchJobs, benchWorkers, benchConcurrency, benchQueue, benchFetchBatchSize, benchAckBatchSize, benchWorkDuration, benchWorkerQueues)
-			lcWall := time.Since(lcStart)
-			lcStatsAfter := benchFetchServerStats(httpC, benchServer)
-			s = benchPrintStats(lcResult)
-			if sm := benchComputeServerMetrics(lcStatsBefore, lcStatsAfter, lcWall); sm != nil {
-				lcServerMetrics = sm
-				benchPrintServerMetrics(sm)
-			}
-			lcRuns = append(lcRuns, s)
-			if i == benchRepeats {
-				lcSummary = s
+				fmt.Println("\n=== Processing Benchmark (fetch -> ack) ===")
+				lcStatsBefore := benchFetchServerStats(httpC, benchServer)
+				lcStart := time.Now()
+				lcResult := benchDoLifecycle(mode, httpC, benchServer, benchJobs, benchWorkers, benchConcurrency, benchQueue, benchFetchBatchSize, benchAckBatchSize, benchWorkDuration, benchWorkerQueues)
+				lcWall := time.Since(lcStart)
+				lcStatsAfter := benchFetchServerStats(httpC, benchServer)
+				s = benchPrintStats(lcResult)
+				if sm := benchComputeServerMetrics(lcStatsBefore, lcStatsAfter, lcWall); sm != nil {
+					lcServerMetrics = sm
+					benchPrintServerMetrics(sm)
+				}
+				lcRuns = append(lcRuns, s)
+				if i == benchRepeats {
+					lcSummary = s
+				}
 			}
 
 			if i < benchRepeats && benchRepeatPause > 0 {
@@ -380,10 +407,15 @@ func runBench(cmd *cobra.Command, args []string) error {
 			}
 		}
 		if benchRepeats > 1 {
-			fmt.Println("\n=== Repeat Summary: Enqueue ===")
-			benchPrintRunAggregate(enqRuns)
-			fmt.Println("\n=== Repeat Summary: Lifecycle ===")
-			benchPrintRunAggregate(lcRuns)
+			if benchCombined {
+				fmt.Println("\n=== Repeat Summary: Combined ===")
+				benchPrintRunAggregate(combinedRuns)
+			} else {
+				fmt.Println("\n=== Repeat Summary: Enqueue ===")
+				benchPrintRunAggregate(enqRuns)
+				fmt.Println("\n=== Repeat Summary: Lifecycle ===")
+				benchPrintRunAggregate(lcRuns)
+			}
 		}
 	}
 
@@ -415,7 +447,7 @@ func runBench(cmd *cobra.Command, args []string) error {
 	}
 
 	// Save results.
-	saveData := benchBuildSaveData(enqSummary, lcSummary, faultTracker, serverCfg, enqServerMetrics, lcServerMetrics)
+	saveData := benchBuildSaveData(enqSummary, lcSummary, combinedSummary, faultTracker, serverCfg, enqServerMetrics, lcServerMetrics, combinedServerMetrics)
 	savePath := benchSave
 	if savePath == "" {
 		savePath = fmt.Sprintf("bench-%s.json", time.Now().Format("20060102-150405"))
@@ -923,6 +955,504 @@ func benchDoLifecycle(protocol string, httpC *http.Client, serverURL string, tot
 	return benchResult{lats: lats[:actual], elapsed: elapsed}
 }
 
+// ── combined benchmark ──────────────────────────────────────────────────────
+
+// benchDoCombined runs enqueue producers and lifecycle workers concurrently,
+// measuring end-to-end throughput. Latency is measured per-job from enqueue
+// submission to ack confirmation.
+func benchDoCombined(protocol string, httpC *http.Client, serverURL string, total, concurrency, workers int, queue string, enqueueBatchSize, fetchBatchSize, ackBatchSize int, workDuration time.Duration, workerQueues bool) benchResult {
+	if enqueueBatchSize <= 0 {
+		enqueueBatchSize = 1
+	}
+	if fetchBatchSize <= 0 {
+		fetchBatchSize = 1
+	}
+	if ackBatchSize <= 0 {
+		ackBatchSize = 1
+	}
+	if workers <= 0 {
+		workers = 1
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
+	// Track enqueue timestamps for e2e latency calculation.
+	var enqTimeMu sync.RWMutex
+	enqTimes := make(map[string]time.Time, total)
+	setEnqTime := func(id string, t time.Time) {
+		enqTimeMu.Lock()
+		enqTimes[id] = t
+		enqTimeMu.Unlock()
+	}
+	getEnqTime := func(id string) (time.Time, bool) {
+		enqTimeMu.RLock()
+		t, ok := enqTimes[id]
+		enqTimeMu.RUnlock()
+		return t, ok
+	}
+
+	// e2e latencies: one per completed job.
+	lats := make([]time.Duration, total)
+	var latIdx atomic.Int64
+
+	// Counters.
+	var enqueued atomic.Int64
+	var overloads atomic.Int64
+
+	// Completed tracking for lifecycle side.
+	// Use sync.Map for lock-free reads + atomic counter for fast count.
+	var completedIDs sync.Map
+	var completedN atomic.Int64
+	isCompleted := func(id string) bool {
+		_, ok := completedIDs.Load(id)
+		return ok
+	}
+	markCompleted := func(id string) bool {
+		if _, loaded := completedIDs.LoadOrStore(id, struct{}{}); loaded {
+			return false
+		}
+		completedN.Add(1)
+		return true
+	}
+	completedCount := func() int {
+		return int(completedN.Load())
+	}
+
+	var rpcClients []*worker.Client
+	if protocol != "http" {
+		// Pool shared by both producers and workers.
+		rpcClients = benchNewRPCClientPool(serverURL, concurrency+workers*concurrency)
+	}
+	var queueRR atomic.Int64
+
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	// ── Enqueue producers ──
+	perProducer := total / concurrency
+	producerRemainder := total % concurrency
+	for i := range concurrency {
+		n := perProducer
+		if i < producerRemainder {
+			n++
+		}
+		wg.Add(1)
+		go func(count int, goroutineIdx int) {
+			defer wg.Done()
+
+			if protocol == "http" {
+				c := client.New(serverURL)
+				remaining := count
+				for remaining > 0 {
+					batchN := enqueueBatchSize
+					if batchN > remaining {
+						batchN = remaining
+					}
+					jobs := make([]client.BatchJob, 0, batchN)
+					for range batchN {
+						targetQueue := queue
+						if workerQueues {
+							targetQueue = benchWorkerQueueName(queue, workers, int(queueRR.Add(1)-1)%max(workers, 1))
+						}
+						jobs = append(jobs, client.BatchJob{Queue: targetQueue, Payload: map[string]any{}})
+					}
+					opStart := time.Now()
+					resp, err := c.EnqueueBatch(client.BatchRequest{Jobs: jobs})
+					if err != nil {
+						if benchIsOverloadErr(err) {
+							overloads.Add(1)
+							time.Sleep(benchOverloadBackoff(overloads.Load()))
+							continue
+						}
+						fmt.Fprintf(os.Stderr, "combined enqueue error: %v\n", err)
+						continue
+					}
+					for _, id := range resp.JobIDs {
+						setEnqTime(id, opStart)
+						enqueued.Add(1)
+						remaining--
+					}
+				}
+				return
+			}
+
+			// RPC stream path.
+			wc := rpcClients[goroutineIdx%len(rpcClients)]
+			ctx := context.Background()
+			stream := wc.OpenLifecycleStream(ctx)
+			defer stream.Close()
+			var streamErrs int64
+			var reqID uint64 = 1
+
+			remaining := count
+			for remaining > 0 {
+				batchN := enqueueBatchSize
+				if batchN > remaining {
+					batchN = remaining
+				}
+				enqueues := make([]worker.LifecycleEnqueueItem, 0, batchN)
+				for range batchN {
+					targetQueue := queue
+					if workerQueues {
+						targetQueue = benchWorkerQueueName(queue, workers, int(queueRR.Add(1)-1)%max(workers, 1))
+					}
+					enqueues = append(enqueues, worker.LifecycleEnqueueItem{
+						Queue:   targetQueue,
+						Payload: json.RawMessage(`{}`),
+					})
+				}
+				opStart := time.Now()
+				resp, err := stream.Exchange(worker.LifecycleRequest{
+					RequestID: reqID,
+					Enqueues:  enqueues,
+				})
+				reqID++
+				if err != nil {
+					if benchIsOverloadErr(err) {
+						overloads.Add(1)
+						time.Sleep(benchOverloadBackoff(overloads.Load()))
+						continue
+					}
+					streamErrs++
+					if streamErrs <= 3 || streamErrs%1000 == 0 {
+						fmt.Fprintf(os.Stderr, "combined enqueue stream error: %v\n", err)
+					}
+					stream.Close()
+					stream = wc.OpenLifecycleStream(ctx)
+					time.Sleep(2 * time.Millisecond)
+					continue
+				}
+				if resp.Error != "" {
+					if benchIsOverloadMsg(resp.Error) {
+						overloads.Add(1)
+						time.Sleep(benchOverloadBackoff(overloads.Load()))
+						continue
+					}
+					fmt.Fprintf(os.Stderr, "combined enqueue frame error: %s\n", resp.Error)
+					continue
+				}
+				for _, id := range resp.EnqueuedJobIDs {
+					setEnqTime(id, opStart)
+					enqueued.Add(1)
+					remaining--
+				}
+			}
+		}(n, i)
+	}
+
+	// ── Lifecycle workers (fetch + ack) ──
+	// Match producer concurrency: one consumer stream per producer goroutine.
+	// Too few streams can't keep up with producers; too many generate empty
+	// raft fetches. Each stream uses fetchBatchSize to grab multiple jobs per
+	// round-trip.
+	threshold := int64(total / 10)
+	if threshold < 1 {
+		threshold = 1
+	}
+
+	// Use the larger of fetchBatchSize and ackBatchSize for combined mode
+	// to maximize jobs processed per raft round-trip.
+	combinedFetchBatch := fetchBatchSize
+	if combinedFetchBatch < ackBatchSize {
+		combinedFetchBatch = ackBatchSize
+	}
+
+	totalStreams := concurrency
+	for i := range totalStreams {
+		workerIdx := i % max(workers, 1)
+		workerID := fmt.Sprintf("bench-worker-%d", workerIdx)
+		workerQueue := queue
+		if workerQueues {
+			workerQueue = benchWorkerQueueName(queue, workers, workerIdx)
+		}
+		wg.Add(1)
+		go func(wid, wq string, streamIdx int) {
+			defer wg.Done()
+
+			// Wait for producers to get ahead before fetching.
+			for enqueued.Load() < threshold {
+				time.Sleep(5 * time.Millisecond)
+			}
+
+
+			if protocol == "http" {
+				pending := make([]benchFetchedItem, 0, ackBatchSize*2)
+				for {
+					done := completedCount()
+					if done >= total && len(pending) == 0 {
+						break
+					}
+
+					// Ack pending.
+					if len(pending) > 0 {
+						ackN := ackBatchSize
+						if ackN > len(pending) {
+							ackN = len(pending)
+						}
+						ids := make([]string, 0, ackN)
+						for j := 0; j < ackN; j++ {
+							ids = append(ids, pending[j].jobID)
+						}
+						if err := benchAckJobs(httpC, serverURL, ids); err != nil {
+							if benchIsOverloadErr(err) {
+								overloads.Add(1)
+								time.Sleep(benchOverloadBackoff(overloads.Load()))
+								continue
+							}
+							fmt.Fprintf(os.Stderr, "combined http ack error: %v\n", err)
+							time.Sleep(1 * time.Millisecond)
+							continue
+						}
+						now := time.Now()
+						for j := 0; j < ackN; j++ {
+							id := pending[j].jobID
+							if markCompleted(id) {
+								if enqTime, ok := getEnqTime(id); ok {
+									pos := latIdx.Add(1) - 1
+									if pos < int64(total) {
+										lats[pos] = now.Sub(enqTime)
+									}
+								}
+							}
+						}
+						pending = pending[ackN:]
+					}
+
+					// Fetch more.
+					remaining := total - completedCount()
+					if remaining <= 0 {
+						continue
+					}
+					fetchN := combinedFetchBatch
+					if fetchN > remaining {
+						fetchN = remaining
+					}
+					fetched, err := benchFetchJobs(httpC, serverURL, wq, wid, fetchN)
+					if err != nil {
+						if benchIsOverloadErr(err) {
+							overloads.Add(1)
+							time.Sleep(benchOverloadBackoff(overloads.Load()))
+						} else {
+							time.Sleep(1 * time.Millisecond)
+						}
+						continue
+					}
+					if len(fetched) == 0 && len(pending) == 0 {
+						time.Sleep(5 * time.Millisecond)
+					}
+					for _, it := range fetched {
+						if workDuration > 0 {
+							time.Sleep(workDuration)
+						}
+						pending = append(pending, it)
+					}
+				}
+				return
+			}
+
+			// RPC stream path.
+			wc := rpcClients[(concurrency+streamIdx)%len(rpcClients)]
+			ctx := context.Background()
+			stream := wc.OpenLifecycleStream(ctx)
+			defer stream.Close()
+			var streamErrs int64
+
+			pendingOrder := make([]string, 0, ackBatchSize*2)
+			pendingStart := make(map[string]time.Time, ackBatchSize*2)
+			ackMisses := make(map[string]int, ackBatchSize*2)
+			var requestID uint64 = 1
+			var totalFetched, totalAcked, emptyFetches int
+			var lastProgressCount int
+			lastProgressTime := time.Now()
+			var logTicker int
+
+			for {
+				doneNow := completedCount()
+				if doneNow >= total && len(pendingOrder) == 0 {
+					break
+				}
+
+				// Periodic progress logging.
+				logTicker++
+				if logTicker%500 == 0 {
+					fmt.Fprintf(os.Stderr, "  [%s q=%s] completed=%d/%d pending=%d fetched=%d acked=%d empty=%d errs=%d\n",
+						wid, wq, doneNow, total, len(pendingOrder), totalFetched, totalAcked, emptyFetches, streamErrs)
+				}
+
+				// Stall detection.
+				if doneNow != lastProgressCount {
+					lastProgressCount = doneNow
+					lastProgressTime = time.Now()
+				} else if time.Since(lastProgressTime) > 15*time.Second {
+					fmt.Fprintf(os.Stderr, "  [%s q=%s] STALLED: completed=%d/%d pending=%d fetched=%d acked=%d empty=%d\n",
+						wid, wq, doneNow, total, len(pendingOrder), totalFetched, totalAcked, emptyFetches)
+					for _, id := range pendingOrder {
+						markCompleted(id)
+					}
+					pendingOrder = nil
+					break
+				}
+
+				ackN := ackBatchSize
+				if ackN > len(pendingOrder) {
+					ackN = len(pendingOrder)
+				}
+				ackIDs := pendingOrder[:ackN]
+				acks := make([]worker.AckBatchItem, 0, ackN)
+				for _, id := range ackIDs {
+					acks = append(acks, worker.AckBatchItem{
+						JobID:  id,
+						Result: json.RawMessage(`{}`),
+					})
+				}
+
+				remainingToComplete := total - doneNow
+				fetchN := combinedFetchBatch
+				if fetchN > remainingToComplete {
+					fetchN = remainingToComplete
+				}
+				if fetchN < 0 {
+					fetchN = 0
+				}
+
+				resp, err := stream.Exchange(worker.LifecycleRequest{
+					RequestID:    requestID,
+					Queues:       []string{wq},
+					WorkerID:     wid,
+					Hostname:     "bench-host",
+					LeaseSeconds: 30,
+					FetchCount:   fetchN,
+					Acks:         acks,
+				})
+				requestID++
+				if err != nil {
+					if benchIsOverloadErr(err) {
+						overloads.Add(1)
+						time.Sleep(benchOverloadBackoff(overloads.Load()))
+						continue
+					}
+					streamErrs++
+					if streamErrs <= 3 || streamErrs%1000 == 0 {
+						fmt.Fprintf(os.Stderr, "combined lifecycle stream error: %v\n", err)
+					}
+					stream.Close()
+					stream = wc.OpenLifecycleStream(ctx)
+					time.Sleep(2 * time.Millisecond)
+					continue
+				}
+				if resp.Error != "" {
+					if benchIsOverloadMsg(resp.Error) {
+						overloads.Add(1)
+					} else {
+						streamErrs++
+						if streamErrs <= 3 || streamErrs%1000 == 0 {
+							fmt.Fprintf(os.Stderr, "combined lifecycle frame error: %s\n", resp.Error)
+						}
+					}
+					time.Sleep(benchOverloadBackoff(overloads.Load()))
+				}
+
+				acked := resp.Acked
+				if acked > len(ackIDs) {
+					acked = len(ackIDs)
+				}
+				now := time.Now()
+				for j := 0; j < acked; j++ {
+					id := ackIDs[j]
+					if isCompleted(id) {
+						continue
+					}
+					if !markCompleted(id) {
+						delete(pendingStart, id)
+						delete(ackMisses, id)
+						continue
+					}
+					// Use enqueue time for e2e latency.
+					if enqTime, ok := getEnqTime(id); ok {
+						pos := latIdx.Add(1) - 1
+						if pos < int64(total) {
+							lats[pos] = now.Sub(enqTime)
+						}
+					}
+					delete(pendingStart, id)
+					delete(ackMisses, id)
+				}
+				totalAcked += acked
+				pendingOrder = pendingOrder[acked:]
+
+				if resp.Error == "" && acked < len(ackIDs) {
+					drop := map[string]struct{}{}
+					for _, id := range ackIDs[acked:] {
+						ackMisses[id]++
+						if ackMisses[id] < 3 {
+							continue
+						}
+						drop[id] = struct{}{}
+						delete(pendingStart, id)
+						delete(ackMisses, id)
+						// Count dropped jobs as completed to prevent bench from hanging.
+						markCompleted(id)
+					}
+					if len(drop) > 0 {
+						filtered := pendingOrder[:0]
+						for _, id := range pendingOrder {
+							if _, ok := drop[id]; ok {
+								continue
+							}
+							filtered = append(filtered, id)
+						}
+						pendingOrder = filtered
+					}
+				}
+
+				fetchedCount := 0
+				doneCheck := completedCount()
+				for _, fetched := range resp.Jobs {
+					if doneCheck >= total {
+						break
+					}
+					if workDuration > 0 {
+						time.Sleep(workDuration)
+					}
+					if fetched.JobID == "" {
+						continue
+					}
+					if _, pending := pendingStart[fetched.JobID]; pending {
+						continue
+					}
+					// Always add to pending so it gets acked, even if another
+					// worker already completed it. The server assigned this job
+					// to us — we must ack it to release the active lease.
+					pendingOrder = append(pendingOrder, fetched.JobID)
+					pendingStart[fetched.JobID] = now
+					fetchedCount++
+				}
+				totalFetched += fetchedCount
+				if fetchedCount == 0 && len(resp.Jobs) == 0 {
+					emptyFetches++
+				}
+				// Back off when no jobs available to avoid hammering raft with empty fetches.
+				if fetchedCount == 0 && len(pendingOrder) == 0 {
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
+		}(workerID, workerQueue, i)
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	actual := int(latIdx.Load())
+	fmt.Printf("  enqueued:  %d\n", enqueued.Load())
+	fmt.Printf("  completed: %d/%d in %s\n", actual, total, elapsed.Round(time.Millisecond))
+	fmt.Printf("  acked:     %d/%d\n", completedN.Load(), total)
+	if n := overloads.Load(); n > 0 {
+		fmt.Printf("  overloaded: %d\n", n)
+	}
+	return benchResult{lats: lats[:actual], elapsed: elapsed}
+}
+
 // ── HTTP helpers ────────────────────────────────────────────────────────────
 
 func benchFetchJobs(httpC *http.Client, serverURL, queue, workerID string, count int) ([]benchFetchedItem, error) {
@@ -1314,7 +1844,7 @@ func benchDetectDockerNetwork(container string) string {
 
 // ── save / compare ──────────────────────────────────────────────────────────
 
-func benchBuildSaveData(enq, lc benchRunSummary, ft *benchFaultTracker, sc *benchServerConfig, enqSM, lcSM *benchServerMetrics) *benchSaveData {
+func benchBuildSaveData(enq, lc, combined benchRunSummary, ft *benchFaultTracker, sc *benchServerConfig, enqSM, lcSM, combinedSM *benchServerMetrics) *benchSaveData {
 	data := &benchSaveData{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Commit:    benchGitCommit(),
@@ -1332,6 +1862,7 @@ func benchBuildSaveData(enq, lc benchRunSummary, ft *benchFaultTracker, sc *benc
 			"fetch_batch":   benchFetchBatchSize,
 			"ack_batch":     benchAckBatchSize,
 			"work_duration": benchWorkDuration.String(),
+			"combined":      benchCombined,
 		},
 	}
 	if enq.completed > 0 {
@@ -1370,6 +1901,25 @@ func benchBuildSaveData(enq, lc benchRunSummary, ft *benchFaultTracker, sc *benc
 			data.Lifecycle.ServerCPUPct = lcSM.cpuPct
 			data.Lifecycle.ServerRSSMB = lcSM.rssMB
 			data.Lifecycle.ServerGcP99Us = lcSM.gcP99Us
+		}
+	}
+	if combined.completed > 0 {
+		data.Combined = &benchPhaseResult{
+			OpsPerSec:   combined.opsPerSec,
+			P50Us:       combined.p50.Microseconds(),
+			P90Us:       combined.p90.Microseconds(),
+			P99Us:       combined.p99.Microseconds(),
+			MinUs:       combined.min.Microseconds(),
+			MaxUs:       combined.max.Microseconds(),
+			StddevUs:    combined.stddev.Microseconds(),
+			CvPct:       combined.cvPct,
+			ServerCvPct: combined.serverCvPct,
+			Completed:   combined.completed,
+		}
+		if combinedSM != nil {
+			data.Combined.ServerCPUPct = combinedSM.cpuPct
+			data.Combined.ServerRSSMB = combinedSM.rssMB
+			data.Combined.ServerGcP99Us = combinedSM.gcP99Us
 		}
 	}
 	if ft != nil {
@@ -1450,6 +2000,10 @@ func benchPrintComparison(baseline, current *benchSaveData) {
 	if baseline.Lifecycle != nil && current.Lifecycle != nil {
 		printRow("lifecycle", "ops/sec", baseline.Lifecycle.OpsPerSec, current.Lifecycle.OpsPerSec, "", false)
 		printRow("lifecycle", "p99", float64(baseline.Lifecycle.P99Us)/1000, float64(current.Lifecycle.P99Us)/1000, "ms", true)
+	}
+	if baseline.Combined != nil && current.Combined != nil {
+		printRow("combined", "ops/sec", baseline.Combined.OpsPerSec, current.Combined.OpsPerSec, "", false)
+		printRow("combined", "p99", float64(baseline.Combined.P99Us)/1000, float64(current.Combined.P99Us)/1000, "ms", true)
 	}
 }
 
