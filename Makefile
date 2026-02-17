@@ -1,4 +1,4 @@
-.PHONY: build run test perf lint clean ui ui-dev bench bench-modes bench-profile
+.PHONY: build run test perf lint clean ui ui-dev bench bench-modes bench-baseline bench-profile
 
 BINARY := corvo
 BUILD_DIR := bin
@@ -14,6 +14,9 @@ bench: build
 
 bench-modes:
 	./scripts/bench-modes.sh
+
+bench-baseline:
+	./scripts/bench-baseline.sh
 
 bench-profile:
 	./scripts/bench-profile.sh

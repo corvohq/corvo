@@ -1019,10 +1019,13 @@ func benchDoCombined(protocol string, httpC *http.Client, serverURL string, tota
 		return int(completedN.Load())
 	}
 
-	var rpcClients []*worker.Client
+	var producerClients, workerClients []*worker.Client
 	if protocol != "http" {
-		// Pool shared by both producers and workers.
-		rpcClients = benchNewRPCClientPool(serverURL, concurrency+workers*concurrency)
+		// Separate pools for producers and workers — matching real-world usage
+		// where client SDK and worker SDK use different connections. This avoids
+		// head-of-line blocking between enqueue and fetch frames on the same stream.
+		producerClients = benchNewRPCClientPool(serverURL, concurrency)
+		workerClients = benchNewRPCClientPool(serverURL, workers*concurrency)
 	}
 	var queueRR atomic.Int64
 
@@ -1078,7 +1081,7 @@ func benchDoCombined(protocol string, httpC *http.Client, serverURL string, tota
 			}
 
 			// RPC stream path.
-			wc := rpcClients[goroutineIdx%len(rpcClients)]
+			wc := producerClients[goroutineIdx%len(producerClients)]
 			ctx := context.Background()
 			stream := wc.OpenLifecycleStream(ctx)
 			defer stream.Close()
@@ -1252,7 +1255,7 @@ func benchDoCombined(protocol string, httpC *http.Client, serverURL string, tota
 			}
 
 			// RPC stream path.
-			wc := rpcClients[(concurrency+streamIdx)%len(rpcClients)]
+			wc := workerClients[streamIdx%len(workerClients)]
 			ctx := context.Background()
 			stream := wc.OpenLifecycleStream(ctx)
 			defer stream.Close()

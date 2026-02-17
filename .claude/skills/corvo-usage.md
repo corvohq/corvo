@@ -202,12 +202,25 @@ bin/corvo bench --save baseline.json
 bin/corvo bench --compare baseline.json
 ```
 
-### Multi-Configuration
+### Multi-Configuration (store comparison)
 ```bash
 ./scripts/bench-modes.sh                           # all stores
 STORES=badger SHARDS="1 4" ./scripts/bench-modes.sh  # specific config
 PRESET=cluster ./scripts/bench-modes.sh             # 3-node cluster
 COMBINED=true JOBS=100000 ./scripts/bench-modes.sh   # combined mode
+```
+
+### Baseline & Comparison (performance regression testing)
+```bash
+# Run structured baseline (results in bench-results/{commit}/)
+./scripts/bench-baseline.sh              # standard mode (~10-15 min)
+./scripts/bench-baseline.sh quick        # smoke test (~2 min)
+./scripts/bench-baseline.sh full         # comprehensive (~45-60 min)
+CI=true ./scripts/bench-baseline.sh standard  # GitHub Actions safe (~3 min)
+STORE=pebble ./scripts/bench-baseline.sh      # override store backend
+
+# Compare two baselines
+./scripts/bench-compare.sh bench-results/abc1234 bench-results/def5678
 ```
 
 ### Profiling
