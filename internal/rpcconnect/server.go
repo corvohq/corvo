@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -418,10 +419,10 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 			}
 		}
 
-		// Process ACKs before fetch: ACKs are time-sensitive (lease
-		// expiry) and must not be delayed by a fetch long-poll.
+		// Parse ack items (cheap, no I/O).
+		var acks []store.AckOp
 		if acquired && len(req.GetAcks()) > 0 {
-			acks := make([]store.AckOp, 0, len(req.GetAcks()))
+			acks = make([]store.AckOp, 0, len(req.GetAcks()))
 			for _, item := range req.GetAcks() {
 				jobID := strings.TrimSpace(item.GetJobId())
 				if jobID == "" {
@@ -441,58 +442,91 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 					Usage:  usageFromPB(item.GetUsage()),
 				})
 			}
-			if len(acks) > 0 {
-				acked, err := s.store.AckBatch(acks)
-				if err != nil {
-					frameHadError = true
-					if resp.Error == "" {
-						if store.IsOverloadedError(err) {
-							resp.Error = "OVERLOADED: ack: " + err.Error()
-						} else {
-							resp.Error = "ack: " + err.Error()
-						}
-					}
-				} else {
-					resp.Acked = int32(acked)
-				}
-			}
 		}
 
+		fetchCount := 0
 		if acquired {
-			if n := int(req.GetFetchCount()); n > 0 {
-				fetchReq := store.FetchRequest{
-					Queues:        req.GetQueues(),
-					WorkerID:      req.GetWorkerId(),
-					Hostname:      req.GetHostname(),
-					LeaseDuration: int(req.GetLeaseDuration()),
-				}
-				jobs, err := s.store.FetchBatch(fetchReq, n)
-				if err != nil {
-					frameHadError = true
-					if store.IsOverloadedError(err) {
-						resp.Error = "OVERLOADED: fetch: " + err.Error()
+			fetchCount = int(req.GetFetchCount())
+		}
+
+		// Fire ack and fetch into the Raft pipeline concurrently.
+		// Both land in the same applyLoop batch window and get merged
+		// into a single Raft entry via applyMultiIndexed (which sorts
+		// acks before fetches, so freed concurrency slots are visible
+		// to the fetch).
+		if acquired && (len(acks) > 0 || fetchCount > 0) {
+			var wg sync.WaitGroup
+			var ackErr error
+			var acked int
+			var fetchErr error
+			var jobs []store.FetchResult
+
+			if len(acks) > 0 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					acked, ackErr = s.store.AckBatch(acks)
+				}()
+			}
+
+			if fetchCount > 0 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					fetchReq := store.FetchRequest{
+						Queues:        req.GetQueues(),
+						WorkerID:      req.GetWorkerId(),
+						Hostname:      req.GetHostname(),
+						LeaseDuration: int(req.GetLeaseDuration()),
+					}
+					jobs, fetchErr = s.store.FetchBatch(fetchReq, fetchCount)
+				}()
+			}
+
+			wg.Wait()
+
+			// Collect ack result.
+			if ackErr != nil {
+				frameHadError = true
+				if resp.Error == "" {
+					if store.IsOverloadedError(ackErr) {
+						resp.Error = "OVERLOADED: ack: " + ackErr.Error()
 					} else {
-						resp.Error = "fetch: " + err.Error()
+						resp.Error = "ack: " + ackErr.Error()
 					}
-				} else {
-					respJobs := make([]*corvov1.FetchBatchJob, 0, len(jobs))
-					for _, j := range jobs {
-						respJobs = append(respJobs, &corvov1.FetchBatchJob{
-							JobId:          j.JobID,
-							Queue:          j.Queue,
-							PayloadJson:    string(j.Payload),
-							Attempt:        int32(j.Attempt),
-							MaxRetries:     int32(j.MaxRetries),
-							LeaseDuration:  int32(j.LeaseDuration),
-							CheckpointJson: string(j.Checkpoint),
-							TagsJson:       string(j.Tags),
-							Agent:          agentStateToPB(j.Agent),
-						})
+				}
+			} else if len(acks) > 0 {
+				resp.Acked = int32(acked)
+			}
+
+			// Collect fetch result.
+			if fetchErr != nil {
+				frameHadError = true
+				if resp.Error == "" {
+					if store.IsOverloadedError(fetchErr) {
+						resp.Error = "OVERLOADED: fetch: " + fetchErr.Error()
+					} else {
+						resp.Error = "fetch: " + fetchErr.Error()
 					}
-					resp.Jobs = respJobs
-					if len(respJobs) == 0 {
-						idleFetchSleep = true
-					}
+				}
+			} else if fetchCount > 0 {
+				respJobs := make([]*corvov1.FetchBatchJob, 0, len(jobs))
+				for _, j := range jobs {
+					respJobs = append(respJobs, &corvov1.FetchBatchJob{
+						JobId:          j.JobID,
+						Queue:          j.Queue,
+						PayloadJson:    string(j.Payload),
+						Attempt:        int32(j.Attempt),
+						MaxRetries:     int32(j.MaxRetries),
+						LeaseDuration:  int32(j.LeaseDuration),
+						CheckpointJson: string(j.Checkpoint),
+						TagsJson:       string(j.Tags),
+						Agent:          agentStateToPB(j.Agent),
+					})
+				}
+				resp.Jobs = respJobs
+				if len(respJobs) == 0 {
+					idleFetchSleep = true
 				}
 			}
 		}
