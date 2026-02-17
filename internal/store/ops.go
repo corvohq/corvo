@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
 	"time"
 )
@@ -9,55 +10,55 @@ import (
 type OpType uint8
 
 const (
-	OpEnqueue        OpType = 1
-	OpEnqueueBatch   OpType = 2
-	OpFetch          OpType = 3
-	OpAck            OpType = 4
-	OpFail           OpType = 5
-	OpHeartbeat      OpType = 6
-	OpRetryJob       OpType = 7
-	OpCancelJob      OpType = 8
-	OpMoveJob        OpType = 9
-	OpDeleteJob      OpType = 10
-	OpPauseQueue     OpType = 11
-	OpResumeQueue    OpType = 12
-	OpClearQueue     OpType = 13
-	OpDeleteQueue    OpType = 14
-	OpSetConcurrency OpType = 15
-	OpSetThrottle    OpType = 16
-	OpRemoveThrottle OpType = 17
-	OpPromote        OpType = 18
-	OpReclaim        OpType = 19
-	OpBulkAction     OpType = 20
-	OpCleanUnique    OpType = 21
-	OpCleanRateLimit OpType = 22
-	OpAckBatch       OpType = 23
-	OpMulti          OpType = 24
-	OpFetchBatch     OpType = 25
-	OpSetBudget          OpType = 26
-	OpDeleteBudget       OpType = 27
-	OpSetProvider        OpType = 28
-	OpDeleteProvider     OpType = 29
-	OpSetQueueProvider   OpType = 30
+	OpEnqueue          OpType = 1
+	OpEnqueueBatch     OpType = 2
+	OpFetch            OpType = 3
+	OpAck              OpType = 4
+	OpFail             OpType = 5
+	OpHeartbeat        OpType = 6
+	OpRetryJob         OpType = 7
+	OpCancelJob        OpType = 8
+	OpMoveJob          OpType = 9
+	OpDeleteJob        OpType = 10
+	OpPauseQueue       OpType = 11
+	OpResumeQueue      OpType = 12
+	OpClearQueue       OpType = 13
+	OpDeleteQueue      OpType = 14
+	OpSetConcurrency   OpType = 15
+	OpSetThrottle      OpType = 16
+	OpRemoveThrottle   OpType = 17
+	OpPromote          OpType = 18
+	OpReclaim          OpType = 19
+	OpBulkAction       OpType = 20
+	OpCleanUnique      OpType = 21
+	OpCleanRateLimit   OpType = 22
+	OpAckBatch         OpType = 23
+	OpMulti            OpType = 24
+	OpFetchBatch       OpType = 25
+	OpSetBudget        OpType = 26
+	OpDeleteBudget     OpType = 27
+	OpSetProvider      OpType = 28
+	OpDeleteProvider   OpType = 29
+	OpSetQueueProvider OpType = 30
 
 	// Enterprise ops (SQLite-only, no Pebble keys).
-	OpCreateNamespace     OpType = 31
-	OpDeleteNamespace     OpType = 32
-	OpSetAuthRole         OpType = 33
-	OpDeleteAuthRole      OpType = 34
-	OpAssignAPIKeyRole    OpType = 35
-	OpUnassignAPIKeyRole  OpType = 36
-	OpSetSSOSettings      OpType = 37
-	OpUpsertAPIKey        OpType = 38
-	OpDeleteAPIKey        OpType = 39
-	OpInsertAuditLog      OpType = 40
-	OpUpdateAPIKeyUsed    OpType = 41
-	OpUpsertWebhook       OpType = 42
-	OpDeleteWebhook       OpType = 43
-	OpUpdateWebhookStatus      OpType = 44
-	OpSetNamespaceRateLimit    OpType = 45
-	OpExpireJobs               OpType = 46
-	OpPurgeJobs                OpType = 47
+	OpCreateNamespace       OpType = 31
+	OpDeleteNamespace       OpType = 32
+	OpSetAuthRole           OpType = 33
+	OpDeleteAuthRole        OpType = 34
+	OpAssignAPIKeyRole      OpType = 35
+	OpUnassignAPIKeyRole    OpType = 36
+	OpSetSSOSettings        OpType = 37
+	OpUpsertAPIKey          OpType = 38
+	OpDeleteAPIKey          OpType = 39
+	OpInsertAuditLog        OpType = 40
+	OpUpdateAPIKeyUsed      OpType = 41
+	OpUpsertWebhook         OpType = 42
+	OpDeleteWebhook         OpType = 43
+	OpUpdateWebhookStatus   OpType = 44
+	OpSetNamespaceRateLimit OpType = 45
+	OpExpireJobs            OpType = 46
+	OpPurgeJobs             OpType = 47
 )
 
 // Op is the Raft log entry payload.
@@ -87,14 +88,17 @@ func MarshalOp(opType OpType, data any) ([]byte, error) {
 	return encodeRaftOp(opType, data)
 }
 
-// DecodeRaftOp decodes a protobuf-encoded Raft log entry.
+// DecodeRaftOp decodes a Raft log entry (CB1 binary or PB1 protobuf).
 func DecodeRaftOp(data []byte) (*DecodedRaftOp, error) {
+	if bytes.HasPrefix(data, raftBinaryPrefix) {
+		return decodeMultiBinary(data)
+	}
 	return decodeRaftOp(data)
 }
 
-// MarshalMulti builds a protobuf MultiOp envelope directly from typed inputs.
+// MarshalMulti builds a binary-encoded MultiOp envelope from typed inputs.
 func MarshalMulti(inputs []OpInput) ([]byte, error) {
-	return MarshalMultiInputs(inputs)
+	return marshalMultiBinary(inputs)
 }
 
 // BuildOp creates an Op envelope from type and payload.
@@ -201,9 +205,9 @@ type HeartbeatOp struct {
 }
 
 type HeartbeatJobOp struct {
-	Progress    json.RawMessage `json:"progress,omitempty"`
-	Checkpoint  json.RawMessage `json:"checkpoint,omitempty"`
-	Usage       *UsageReport    `json:"usage,omitempty"`
+	Progress   json.RawMessage `json:"progress,omitempty"`
+	Checkpoint json.RawMessage `json:"checkpoint,omitempty"`
+	Usage      *UsageReport    `json:"usage,omitempty"`
 }
 
 type RetryJobOp struct {
