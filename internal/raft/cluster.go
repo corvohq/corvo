@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 	"github.com/hashicorp/raft"
 	"github.com/user/corvo/internal/kv"
 	"github.com/user/corvo/internal/store"
@@ -123,13 +124,27 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 
 	// Open Pebble with write-heavy tuning to reduce flush/compaction stalls
 	// on enqueue-heavy workloads.
-	pdb, err := pebble.Open(pebbleDir, &pebble.Options{
-		MemTableSize:          64 << 20, // 64MB
-		L0CompactionThreshold: 8,
+	cache := pebble.NewCache(128 << 20) // 128 MB block cache
+	defer cache.Unref()
+
+	pebbleOpts := &pebble.Options{
+		Cache:                       cache,
+		MemTableSize:                64 << 20, // 64MB
+		L0CompactionThreshold:       8,
+		L0CompactionFileThreshold:   4,
+		L0StopWritesThreshold:       24,
 		MaxConcurrentCompactions: func() int {
 			return 4
 		},
-	})
+		Levels: []pebble.LevelOptions{
+			{FilterPolicy: bloom.FilterPolicy(10)},
+		},
+	}
+	if !cfg.PebbleNoSync {
+		pebbleOpts.WALMinSyncInterval = func() time.Duration { return 2 * time.Millisecond }
+	}
+
+	pdb, err := pebble.Open(pebbleDir, pebbleOpts)
 	if err != nil {
 		return nil, fmt.Errorf("open pebble: %w", err)
 	}

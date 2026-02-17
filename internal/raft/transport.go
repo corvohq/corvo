@@ -23,7 +23,7 @@ func newTCPTransport(bindAddr, advertiseAddr string) (*raft.NetworkTransport, er
 	transport, err := raft.NewTCPTransport(
 		bind.String(),
 		advertise,
-		3,              // maxPool
+		8,              // maxPool
 		10*time.Second, // timeout
 		nil,            // logOutput (uses default logger)
 	)
