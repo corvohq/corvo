@@ -202,13 +202,15 @@ func (m *pbFetchOp) String() string { return oldproto.CompactTextString(m) }
 func (*pbFetchOp) ProtoMessage()    {}
 
 type pbFetchBatchOp struct {
-	Queues        []string `protobuf:"bytes,1,rep,name=queues,proto3" json:"queues,omitempty"`
-	WorkerID      string   `protobuf:"bytes,2,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
-	Hostname      string   `protobuf:"bytes,3,opt,name=hostname,proto3" json:"hostname,omitempty"`
-	LeaseDuration int32    `protobuf:"varint,4,opt,name=lease_duration,json=leaseDuration,proto3" json:"lease_duration,omitempty"`
-	Count         int32    `protobuf:"varint,5,opt,name=count,proto3" json:"count,omitempty"`
-	NowNs         uint64   `protobuf:"varint,6,opt,name=now_ns,json=nowNs,proto3" json:"now_ns,omitempty"`
-	RandomSeed    uint64   `protobuf:"varint,7,opt,name=random_seed,json=randomSeed,proto3" json:"random_seed,omitempty"`
+	Queues          []string `protobuf:"bytes,1,rep,name=queues,proto3" json:"queues,omitempty"`
+	WorkerID        string   `protobuf:"bytes,2,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	Hostname        string   `protobuf:"bytes,3,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	LeaseDuration   int32    `protobuf:"varint,4,opt,name=lease_duration,json=leaseDuration,proto3" json:"lease_duration,omitempty"`
+	Count           int32    `protobuf:"varint,5,opt,name=count,proto3" json:"count,omitempty"`
+	NowNs           uint64   `protobuf:"varint,6,opt,name=now_ns,json=nowNs,proto3" json:"now_ns,omitempty"`
+	RandomSeed      uint64   `protobuf:"varint,7,opt,name=random_seed,json=randomSeed,proto3" json:"random_seed,omitempty"`
+	CandidateJobIDs []string `protobuf:"bytes,8,rep,name=candidate_job_ids,json=candidateJobIds,proto3" json:"candidate_job_ids,omitempty"`
+	CandidateQueues []string `protobuf:"bytes,9,rep,name=candidate_queues,json=candidateQueues,proto3" json:"candidate_queues,omitempty"`
 }
 
 func (m *pbFetchBatchOp) Reset()         { *m = pbFetchBatchOp{} }
@@ -1413,7 +1415,7 @@ func fromPBFetch(op *pbFetchOp) FetchOp {
 }
 
 func toPBFetchBatch(op FetchBatchOp) *pbFetchBatchOp {
-	return &pbFetchBatchOp{
+	pb := &pbFetchBatchOp{
 		Queues:        append([]string(nil), op.Queues...),
 		WorkerID:      op.WorkerID,
 		Hostname:      op.Hostname,
@@ -1422,10 +1424,15 @@ func toPBFetchBatch(op FetchBatchOp) *pbFetchBatchOp {
 		NowNs:         op.NowNs,
 		RandomSeed:    op.RandomSeed,
 	}
+	if len(op.CandidateJobIDs) > 0 {
+		pb.CandidateJobIDs = append([]string(nil), op.CandidateJobIDs...)
+		pb.CandidateQueues = append([]string(nil), op.CandidateQueues...)
+	}
+	return pb
 }
 
 func fromPBFetchBatch(op *pbFetchBatchOp) FetchBatchOp {
-	return FetchBatchOp{
+	out := FetchBatchOp{
 		Queues:        append([]string(nil), op.Queues...),
 		WorkerID:      op.WorkerID,
 		Hostname:      op.Hostname,
@@ -1434,6 +1441,11 @@ func fromPBFetchBatch(op *pbFetchBatchOp) FetchBatchOp {
 		NowNs:         op.NowNs,
 		RandomSeed:    op.RandomSeed,
 	}
+	if len(op.CandidateJobIDs) > 0 {
+		out.CandidateJobIDs = append([]string(nil), op.CandidateJobIDs...)
+		out.CandidateQueues = append([]string(nil), op.CandidateQueues...)
+	}
+	return out
 }
 
 func toPBAck(op AckOp) *pbAckOp {

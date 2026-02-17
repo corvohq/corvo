@@ -184,7 +184,7 @@ func init() {
 	f.DurationVar(&benchRepeatPause, "repeat-pause", 0, "Pause between repeats")
 	f.StringVar(&benchQueue, "queue", "bench.q", "Queue name")
 	f.IntVar(&benchEnqBatchSize, "enqueue-batch-size", 64, "Jobs per enqueue stream frame")
-	f.IntVar(&benchFetchBatchSize, "fetch-batch-size", 8, "Jobs per fetch request")
+	f.IntVar(&benchFetchBatchSize, "fetch-batch-size", 64, "Jobs per fetch request")
 	f.IntVar(&benchAckBatchSize, "ack-batch-size", 64, "ACKs per batch")
 	f.DurationVar(&benchWorkDuration, "work-duration", 0, "Simulated per-job work duration")
 

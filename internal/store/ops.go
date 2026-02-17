@@ -163,6 +163,11 @@ type FetchBatchOp struct {
 	Count         int      `json:"count"`
 	NowNs         uint64   `json:"now_ns"`
 	RandomSeed    uint64   `json:"random_seed"`
+
+	// Pre-resolved candidate job IDs and their queues (parallel arrays).
+	// When populated, the FSM uses O(1) point lookups instead of iterator scans.
+	CandidateJobIDs []string `json:"candidate_job_ids,omitempty"`
+	CandidateQueues []string `json:"candidate_queues,omitempty"`
 }
 
 type AckOp struct {

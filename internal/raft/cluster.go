@@ -41,6 +41,11 @@ type Cluster struct {
 	doneCh    chan struct{}
 	workerCh  chan struct{}
 
+	// fetchReserved tracks job IDs that have been pre-resolved by a stream
+	// goroutine but not yet committed by the FSM. Prevents two concurrent
+	// streams from pre-resolving the same job.
+	fetchReserved sync.Map
+
 	overloadTotal      atomic.Uint64
 	fetchOverloadTotal atomic.Uint64
 	appliedTotal       atomic.Uint64
@@ -313,6 +318,21 @@ func (c *Cluster) Apply(opType store.OpType, data any) *store.OpResult {
 		defer releaseFetch()
 	}
 
+	// Pre-resolve fetch candidates outside the serial FSM goroutine.
+	var reservedIDs []string
+	if opType == store.OpFetchBatch {
+		if op, ok := data.(store.FetchBatchOp); ok && len(op.Queues) > 0 && op.Count > 0 {
+			data, reservedIDs = c.preResolveFetch(op)
+		}
+	}
+	if len(reservedIDs) > 0 {
+		defer func() {
+			for _, id := range reservedIDs {
+				c.fetchReserved.Delete(id)
+			}
+		}()
+	}
+
 	req := &applyRequest{
 		opType: opType,
 		data:   data,
@@ -334,6 +354,93 @@ func (c *Cluster) Apply(opType store.OpType, data any) *store.OpResult {
 	case <-c.stopCh:
 		return &store.OpResult{Err: fmt.Errorf("raft cluster stopping")}
 	}
+}
+
+// preResolveFetch scans Pebble for candidate pending/append jobs outside the
+// serial FSM goroutine. This moves the expensive iterator work to the calling
+// stream goroutine (which runs on any CPU), leaving only cheap O(1) point
+// lookups for the FSM. Returns the modified op and the list of reserved IDs
+// (caller must release via fetchReserved.Delete).
+func (c *Cluster) preResolveFetch(op store.FetchBatchOp) (store.FetchBatchOp, []string) {
+	pdb := c.fsm.PebbleDB()
+	candidateIDs := make([]string, 0, op.Count)
+	candidateQueues := make([]string, 0, op.Count)
+	var reservedIDs []string
+
+	for _, queue := range op.Queues {
+		if len(candidateIDs) >= op.Count {
+			break
+		}
+
+		// Scan priority-indexed pending keys first.
+		prefix := kv.PendingPrefix(queue)
+		iter, err := pdb.NewIter(&pebble.IterOptions{
+			LowerBound: prefix,
+			UpperBound: prefixUpperBound(prefix),
+		})
+		if err == nil {
+			idOffset := len(prefix) + 1 + 8 // sep already in prefix, +priority(1)+createdNs(8)
+			for valid := iter.First(); valid && len(candidateIDs) < op.Count; valid = iter.Next() {
+				key := iter.Key()
+				if len(key) <= idOffset {
+					continue
+				}
+				id := string(key[idOffset:])
+				if _, loaded := c.fetchReserved.LoadOrStore(id, struct{}{}); !loaded {
+					reservedIDs = append(reservedIDs, id)
+					candidateIDs = append(candidateIDs, id)
+					candidateQueues = append(candidateQueues, queue)
+				}
+			}
+			iter.Close()
+		}
+
+		if len(candidateIDs) >= op.Count {
+			break
+		}
+
+		// Scan append-log keys.
+		appendPrefix := kv.QueueAppendPrefix(queue)
+		var lower []byte
+		if cursor, closer, err := pdb.Get(kv.QueueCursorKey(queue)); err == nil {
+			lower = append([]byte(nil), cursor...)
+			closer.Close()
+		}
+
+		iter, err = pdb.NewIter(&pebble.IterOptions{
+			LowerBound: appendPrefix,
+			UpperBound: prefixUpperBound(appendPrefix),
+		})
+		if err == nil {
+			idOffset := len(appendPrefix) + 8 // createdNs(8)
+			var valid bool
+			if len(lower) > 0 {
+				valid = iter.SeekGE(lower)
+				if valid && bytes.Equal(iter.Key(), lower) {
+					valid = iter.Next()
+				}
+			} else {
+				valid = iter.First()
+			}
+			for ; valid && len(candidateIDs) < op.Count; valid = iter.Next() {
+				key := iter.Key()
+				if len(key) <= idOffset {
+					continue
+				}
+				id := string(key[idOffset:])
+				if _, loaded := c.fetchReserved.LoadOrStore(id, struct{}{}); !loaded {
+					reservedIDs = append(reservedIDs, id)
+					candidateIDs = append(candidateIDs, id)
+					candidateQueues = append(candidateQueues, queue)
+				}
+			}
+			iter.Close()
+		}
+	}
+
+	op.CandidateJobIDs = candidateIDs
+	op.CandidateQueues = candidateQueues
+	return op, reservedIDs
 }
 
 func fetchQueueForOp(opType store.OpType, data any) string {

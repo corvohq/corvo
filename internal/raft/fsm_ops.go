@@ -519,6 +519,9 @@ func (f *FSM) applyFetchBatch(data json.RawMessage) *store.OpResult {
 }
 
 func (f *FSM) applyFetchBatchOp(op store.FetchBatchOp) *store.OpResult {
+	if len(op.CandidateJobIDs) > 0 {
+		return f.applyFetchBatchPreresolved(op)
+	}
 	if len(op.Queues) == 0 || op.Count <= 0 {
 		return &store.OpResult{Data: []store.FetchResult{}}
 	}
@@ -659,6 +662,200 @@ func (f *FSM) applyFetchBatchOp(op store.FetchBatchOp) *store.OpResult {
 		if !progress {
 			break
 		}
+	}
+
+	if len(results) == 0 {
+		return &store.OpResult{Data: []store.FetchResult{}}
+	}
+	if err := f.appendLifecycleCursor(batch); err != nil {
+		return &store.OpResult{Err: err}
+	}
+	if err := batch.Commit(f.writeOpts); err != nil {
+		return &store.OpResult{Err: fmt.Errorf("pebble commit fetch batch: %w", err)}
+	}
+
+	f.syncSQLite(func(db sqlExecer) error {
+		for _, job := range sqliteJobs {
+			if err := sqliteFetchJob(db, job, store.FetchOp{
+				Queues:        op.Queues,
+				WorkerID:      op.WorkerID,
+				Hostname:      op.Hostname,
+				LeaseDuration: op.LeaseDuration,
+				NowNs:         op.NowNs,
+				RandomSeed:    op.RandomSeed,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	return &store.OpResult{Data: results}
+}
+
+// applyFetchBatchPreresolved handles a FetchBatch where candidates were
+// pre-resolved outside the FSM goroutine. Each candidate gets a cheap O(1)
+// point lookup instead of an iterator scan.
+func (f *FSM) applyFetchBatchPreresolved(op store.FetchBatchOp) *store.OpResult {
+	if len(op.Queues) == 0 || op.Count <= 0 {
+		return &store.OpResult{Data: []store.FetchResult{}}
+	}
+
+	nowNs := op.NowNs
+	leaseDuration := op.LeaseDuration
+	if leaseDuration <= 0 {
+		leaseDuration = 60
+	}
+	leaseExpiresNs := nowNs + uint64(leaseDuration)*1_000_000_000
+
+	batch := f.pebble.NewBatch()
+	defer batch.Close()
+
+	startedAt := time.Unix(0, int64(nowNs))
+	leaseExp := time.Unix(0, int64(leaseExpiresNs))
+	worker := store.Worker{
+		ID:            op.WorkerID,
+		Queues:        marshalStringSlice(op.Queues),
+		LastHeartbeat: startedAt,
+		StartedAt:     startedAt,
+	}
+	if op.Hostname != "" {
+		worker.Hostname = &op.Hostname
+	}
+	workerData, _ := json.Marshal(worker)
+	batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts)
+
+	// Build per-queue state for concurrency/rate limit checks.
+	type queueState struct {
+		activeLimit int
+		activeCount int
+		rateLimit   int
+		rateCount   int
+	}
+	queueStates := make(map[string]*queueState, len(op.Queues))
+	for _, queue := range op.Queues {
+		qs := &queueState{}
+		qcKey := kv.QueueConfigKey(queue)
+		if qcVal, closer, err := f.pebble.Get(qcKey); err == nil {
+			var qc store.Queue
+			if err := json.Unmarshal(qcVal, &qc); err != nil {
+				closer.Close()
+				continue
+			}
+			closer.Close()
+			if qc.Paused {
+				qs.activeLimit = -1 // sentinel: paused
+				queueStates[queue] = qs
+				continue
+			}
+			if qc.MaxConcurrency != nil && *qc.MaxConcurrency > 0 {
+				qs.activeLimit = *qc.MaxConcurrency
+				qs.activeCount = f.getActiveCount(queue)
+			}
+			if qc.RateLimit != nil && qc.RateWindowMs != nil && *qc.RateLimit > 0 {
+				qs.rateLimit = *qc.RateLimit
+				windowNs := uint64(*qc.RateWindowMs) * 1_000_000
+				windowStart := nowNs - windowNs
+				qs.rateCount = countPrefixFrom(f.pebble, kv.RateLimitPrefix(queue), kv.RateLimitWindowStart(queue, windowStart))
+			}
+		}
+		queueStates[queue] = qs
+	}
+
+	results := make([]store.FetchResult, 0, op.Count)
+	sqliteJobs := make([]store.Job, 0, op.Count)
+	rateSeq := uint64(0)
+
+	for i, jobID := range op.CandidateJobIDs {
+		if len(results) >= op.Count {
+			break
+		}
+		queue := op.CandidateQueues[i]
+
+		qs := queueStates[queue]
+		if qs == nil {
+			continue
+		}
+		if qs.activeLimit < 0 {
+			continue // paused
+		}
+		if qs.activeLimit > 0 && qs.activeCount >= qs.activeLimit {
+			continue
+		}
+		if qs.rateLimit > 0 && qs.rateCount >= qs.rateLimit {
+			continue
+		}
+
+		// O(1) point lookup for the job.
+		val, closer, err := f.pebble.Get(kv.JobKey(jobID))
+		if err != nil {
+			continue // job deleted or not found
+		}
+		var job store.Job
+		if err := decodeJobDoc(val, &job); err != nil {
+			closer.Close()
+			continue
+		}
+		closer.Close()
+
+		if job.State != store.StatePending {
+			continue // stale candidate
+		}
+		if !f.dependenciesSatisfied(job) {
+			continue
+		}
+
+		// Claim the job — same mutation as the scan-based path.
+		job.State = store.StateActive
+		job.WorkerID = &op.WorkerID
+		job.Hostname = &op.Hostname
+		job.Attempt++
+		job.StartedAt = &startedAt
+		job.LeaseExpiresAt = &leaseExp
+
+		jobData, _ := encodeJobDoc(job)
+		batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+
+		// Delete pending/append index keys. We don't know which one exists,
+		// so we try to delete the append key based on queue/createdNs and
+		// also scan for a pending key. Since we have the job doc, we know
+		// createdNs from CreatedAt.
+		createdNs := uint64(job.CreatedAt.UnixNano())
+		if job.Priority == store.PriorityNormal {
+			appendKey := kv.QueueAppendKey(queue, createdNs, jobID)
+			batch.Delete(appendKey, f.writeOpts)
+			batch.Set(kv.QueueCursorKey(queue), appendKey, f.writeOpts)
+		} else {
+			pendingKey := kv.PendingKey(queue, uint8(job.Priority), createdNs, jobID)
+			batch.Delete(pendingKey, f.writeOpts)
+		}
+
+		batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+		f.incrActive(queue)
+		batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+		rateSeq++
+		if err := f.appendLifecycleEvent(batch, "started", jobID, queue, nowNs); err != nil {
+			return &store.OpResult{Err: err}
+		}
+		if qs.activeLimit > 0 {
+			qs.activeCount++
+		}
+		if qs.rateLimit > 0 {
+			qs.rateCount++
+		}
+
+		sqliteJobs = append(sqliteJobs, job)
+		results = append(results, store.FetchResult{
+			JobID:         jobID,
+			Queue:         queue,
+			Payload:       job.Payload,
+			Attempt:       job.Attempt,
+			MaxRetries:    job.MaxRetries,
+			LeaseDuration: leaseDuration,
+			Tags:          job.Tags,
+			Checkpoint:    job.Checkpoint,
+			Agent:         job.Agent,
+		})
 	}
 
 	if len(results) == 0 {
@@ -1431,6 +1628,94 @@ func (f *FSM) applyMultiFetchBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 		sqliteJobs := make([]store.Job, 0, op.Count)
 		rateSeq := uint64(0)
 
+		// Pre-resolved path: iterate candidates with O(1) lookups.
+		if len(op.CandidateJobIDs) > 0 {
+			stateMap := make(map[string]*queueState, len(states))
+			for qi := range states {
+				stateMap[states[qi].name] = &states[qi]
+			}
+			for ci, jobID := range op.CandidateJobIDs {
+				if len(fetchResults) >= op.Count {
+					break
+				}
+				queue := op.CandidateQueues[ci]
+				qs := stateMap[queue]
+				if qs == nil {
+					continue
+				}
+				if qs.activeLimit > 0 && qs.activeCount >= qs.activeLimit {
+					continue
+				}
+				if qs.rateLimit > 0 && qs.rateCount >= qs.rateLimit {
+					continue
+				}
+				if _, exists := claimed[jobID]; exists {
+					continue
+				}
+				val, closer, err := f.pebble.Get(kv.JobKey(jobID))
+				if err != nil {
+					continue
+				}
+				var job store.Job
+				if err := decodeJobDoc(val, &job); err != nil {
+					closer.Close()
+					continue
+				}
+				closer.Close()
+				if job.State != store.StatePending {
+					continue
+				}
+				if !f.dependenciesSatisfied(job) {
+					continue
+				}
+				claimed[jobID] = struct{}{}
+				job.State = store.StateActive
+				job.WorkerID = &op.WorkerID
+				job.Hostname = &op.Hostname
+				job.Attempt++
+				job.StartedAt = &startedAt
+				job.LeaseExpiresAt = &leaseExp
+				jobData, _ := encodeJobDoc(job)
+				batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+				createdNs := uint64(job.CreatedAt.UnixNano())
+				if job.Priority == store.PriorityNormal {
+					appendKey := kv.QueueAppendKey(queue, createdNs, jobID)
+					batch.Delete(appendKey, f.writeOpts)
+					batch.Set(kv.QueueCursorKey(queue), appendKey, f.writeOpts)
+				} else {
+					pendingKey := kv.PendingKey(queue, uint8(job.Priority), createdNs, jobID)
+					batch.Delete(pendingKey, f.writeOpts)
+				}
+				batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+				f.incrActive(queue)
+				batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+				rateSeq++
+				if err := f.appendLifecycleEvent(batch, "started", jobID, queue, nowNs); err != nil {
+					results[i] = &store.OpResult{Err: err}
+					break
+				}
+				if qs.activeLimit > 0 {
+					qs.activeCount++
+				}
+				if qs.rateLimit > 0 {
+					qs.rateCount++
+				}
+				sqliteJobs = append(sqliteJobs, job)
+				fetchResults = append(fetchResults, store.FetchResult{
+					JobID:         jobID,
+					Queue:         queue,
+					Payload:       job.Payload,
+					Attempt:       job.Attempt,
+					MaxRetries:    job.MaxRetries,
+					LeaseDuration: leaseDuration,
+					Tags:          job.Tags,
+					Checkpoint:    job.Checkpoint,
+					Agent:         job.Agent,
+				})
+			}
+			goto multiFetchDone
+		}
+
 		for len(fetchResults) < op.Count {
 			progress := false
 			for qi := range states {
@@ -1499,6 +1784,7 @@ func (f *FSM) applyMultiFetchBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 			}
 		}
 
+	multiFetchDone:
 		if results[i] == nil {
 			results[i] = &store.OpResult{Data: fetchResults}
 		}
@@ -1700,6 +1986,93 @@ func (f *FSM) applyFetchBatchIntoBatch(batch *pebble.Batch, op store.FetchBatchO
 	var sqliteJobs []store.Job
 	rateSeq := uint64(0)
 
+	// Pre-resolved path: O(1) point lookups from batch (sees prior writes).
+	if len(op.CandidateJobIDs) > 0 {
+		stateMap := make(map[string]*queueState, len(states))
+		for qi := range states {
+			stateMap[states[qi].name] = &states[qi]
+		}
+		for ci, jobID := range op.CandidateJobIDs {
+			if len(results) >= op.Count {
+				break
+			}
+			queue := op.CandidateQueues[ci]
+			qs := stateMap[queue]
+			if qs == nil {
+				continue
+			}
+			if qs.activeLimit > 0 && qs.activeCount >= qs.activeLimit {
+				continue
+			}
+			if qs.rateLimit > 0 && qs.rateCount >= qs.rateLimit {
+				continue
+			}
+			if _, exists := claimed[jobID]; exists {
+				continue
+			}
+			val, closer, err := batch.Get(kv.JobKey(jobID))
+			if err != nil {
+				continue
+			}
+			var job store.Job
+			if err := decodeJobDoc(val, &job); err != nil {
+				closer.Close()
+				continue
+			}
+			closer.Close()
+			if job.State != store.StatePending {
+				continue
+			}
+			if !f.dependenciesSatisfied(job) {
+				continue
+			}
+			claimed[jobID] = struct{}{}
+			job.State = store.StateActive
+			job.WorkerID = &op.WorkerID
+			job.Hostname = &op.Hostname
+			job.Attempt++
+			job.StartedAt = &startedAt
+			job.LeaseExpiresAt = &leaseExp
+			jobData, _ := encodeJobDoc(job)
+			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			createdNs := uint64(job.CreatedAt.UnixNano())
+			if job.Priority == store.PriorityNormal {
+				appendKey := kv.QueueAppendKey(queue, createdNs, jobID)
+				batch.Delete(appendKey, f.writeOpts)
+				batch.Set(kv.QueueCursorKey(queue), appendKey, f.writeOpts)
+			} else {
+				pendingKey := kv.PendingKey(queue, uint8(job.Priority), createdNs, jobID)
+				batch.Delete(pendingKey, f.writeOpts)
+			}
+			batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+			f.incrActive(queue)
+			batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+			rateSeq++
+			if err := f.appendLifecycleEvent(batch, "started", jobID, queue, nowNs); err != nil {
+				return &store.OpResult{Err: err}
+			}
+			if qs.activeLimit > 0 {
+				qs.activeCount++
+			}
+			if qs.rateLimit > 0 {
+				qs.rateCount++
+			}
+			sqliteJobs = append(sqliteJobs, job)
+			results = append(results, store.FetchResult{
+				JobID:         jobID,
+				Queue:         queue,
+				Payload:       job.Payload,
+				Attempt:       job.Attempt,
+				MaxRetries:    job.MaxRetries,
+				LeaseDuration: leaseDuration,
+				Tags:          job.Tags,
+				Checkpoint:    job.Checkpoint,
+				Agent:         job.Agent,
+			})
+		}
+		goto indexedFetchDone
+	}
+
 	for len(results) < op.Count {
 		progress := false
 		for qi := range states {
@@ -1768,6 +2141,7 @@ func (f *FSM) applyFetchBatchIntoBatch(batch *pebble.Batch, op store.FetchBatchO
 			break
 		}
 	}
+indexedFetchDone:
 
 	if len(sqliteJobs) > 0 {
 		opCopy := op

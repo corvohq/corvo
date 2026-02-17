@@ -96,7 +96,7 @@ var (
 	raftMaxPending         = 16384
 	raftMaxFetchInflight   = 64
 	applyMultiMode         = "grouped"
-	noCompression          = false
+	noCompression          = true
 )
 
 func init() {
@@ -138,7 +138,7 @@ func init() {
 	serverCmd.Flags().IntVar(&raftMaxPending, "raft-max-pending", 16384, "Max pending Raft apply requests before backpressure")
 	serverCmd.Flags().IntVar(&raftMaxFetchInflight, "raft-max-fetch-inflight", 64, "Max concurrent fetch/fetch-batch applies per queue")
 	serverCmd.Flags().StringVar(&applyMultiMode, "apply-multi-mode", "grouped", "Multi-apply batch mode: grouped (2-3 commits), indexed (1 commit), individual (N commits)")
-	serverCmd.Flags().BoolVar(&noCompression, "no-compression", false, "Disable gzip compression on ConnectRPC responses")
+	serverCmd.Flags().BoolVar(&noCompression, "no-compression", true, "Disable gzip compression on ConnectRPC responses (enabled by default; set --no-compression=false to enable gzip)")
 	serverCmd.Flags().BoolVar(&sqliteMirrorEnabled, "sqlite-mirror", true, "Enable SQLite materialized view for UI queries (disable for max throughput)")
 
 	rootCmd.AddCommand(serverCmd)
