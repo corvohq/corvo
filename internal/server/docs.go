@@ -5,7 +5,7 @@ import (
 	"net/http"
 )
 
-//go:generate swag init -g ../../../cmd/corvo/main.go -o ./openapi --outputTypes json
+//go:generate swag init -g docs.go -d ../../cmd/corvo,.,../store,../search -o ./openapi --outputTypes json
 
 //go:embed openapi/swagger.json
 var openapiSpec []byte

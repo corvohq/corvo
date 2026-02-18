@@ -9,6 +9,14 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
+// @Summary Get bulk operation status
+// @Tags Bulk
+// @Produce json
+// @Param id path string true "Bulk operation ID"
+// @Success 200 {object} bulkTask
+// @Failure 404 {object} ErrorResponse
+// @Security ApiKeyAuth
+// @Router /bulk/{id} [get]
 func (s *Server) handleBulkStatus(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	task, ok := s.bulkAsync.get(id)
@@ -19,6 +27,15 @@ func (s *Server) handleBulkStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, task)
 }
 
+// @Summary Stream bulk operation progress
+// @Description SSE stream for real-time progress updates on a bulk operation.
+// @Tags Bulk
+// @Produce text/event-stream
+// @Param id path string true "Bulk operation ID"
+// @Success 200 "SSE progress stream"
+// @Failure 404 {object} ErrorResponse
+// @Security ApiKeyAuth
+// @Router /bulk/{id}/progress [get]
 func (s *Server) handleBulkProgress(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	task, ok := s.bulkAsync.get(id)

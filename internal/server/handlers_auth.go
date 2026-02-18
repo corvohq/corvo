@@ -2,12 +2,24 @@ package server
 
 import "net/http"
 
+// @Summary Auth configuration status
+// @Tags System
+// @Produce json
+// @Success 200 {object} object
+// @Security ApiKeyAuth
+// @Router /auth/status [get]
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"admin_password_set": s.adminPassword != "",
 	})
 }
 
+// @Summary List API keys
+// @Tags System
+// @Produce json
+// @Success 200 {array} object
+// @Security ApiKeyAuth
+// @Router /auth/keys [get]
 func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
 	keys, err := s.listAPIKeys()
 	if err != nil {
@@ -17,6 +29,15 @@ func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, keys)
 }
 
+// @Summary Create or update an API key
+// @Tags System
+// @Accept json
+// @Produce json
+// @Param body body SetAPIKeyRequest true "API key request"
+// @Success 200 {object} SetAPIKeyResponse
+// @Failure 400 {object} ErrorResponse
+// @Security ApiKeyAuth
+// @Router /auth/keys [post]
 func (s *Server) handleSetAPIKey(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name       string `json:"name"`
@@ -43,6 +64,15 @@ func (s *Server) handleSetAPIKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "api_key": key})
 }
 
+// @Summary Delete an API key
+// @Tags System
+// @Accept json
+// @Produce json
+// @Param body body DeleteAPIKeyRequest true "Delete API key request"
+// @Success 200 {object} StatusResponse
+// @Failure 400 {object} ErrorResponse
+// @Security ApiKeyAuth
+// @Router /auth/keys [delete]
 func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		KeyHash string `json:"key_hash"`

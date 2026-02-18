@@ -8,6 +8,14 @@ import (
 	"time"
 )
 
+// @Summary Server-Sent Events stream
+// @Description Real-time event stream for job and queue state changes. Use last_event_id to resume.
+// @Tags System
+// @Produce text/event-stream
+// @Param last_event_id query integer false "Resume from sequence number"
+// @Success 200 "SSE stream"
+// @Security ApiKeyAuth
+// @Router /events [get]
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {

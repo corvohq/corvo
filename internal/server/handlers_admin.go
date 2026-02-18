@@ -7,6 +7,12 @@ import (
 	"time"
 )
 
+// @Summary List connected workers
+// @Tags System
+// @Produce json
+// @Success 200 {array} object
+// @Security ApiKeyAuth
+// @Router /workers [get]
 func (s *Server) handleListWorkers(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.store.ReadDB().Query(
 		"SELECT id, hostname, queues, last_heartbeat, started_at FROM workers ORDER BY last_heartbeat DESC",
@@ -39,6 +45,12 @@ func (s *Server) handleListWorkers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, workers)
 }
 
+// @Summary Cluster status
+// @Tags Cluster
+// @Produce json
+// @Success 200 {object} object
+// @Security ApiKeyAuth
+// @Router /cluster/status [get]
 func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	if s.cluster == nil {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -54,6 +66,12 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.cluster.ClusterStatus())
 }
 
+// @Summary Health check
+// @Tags System
+// @Produce json
+// @Success 200 {object} object
+// @Failure 503 {object} ErrorResponse
+// @Router /healthz [get]
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	// Check DB is accessible
 	if err := s.store.ReadDB().Ping(); err != nil {
@@ -69,6 +87,14 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// @Summary Cluster event log
+// @Tags Cluster
+// @Produce json
+// @Param after_seq query integer false "Return events after this sequence number"
+// @Param limit query integer false "Max events to return (default: 100)"
+// @Success 200 {object} object
+// @Security ApiKeyAuth
+// @Router /cluster/events [get]
 func (s *Server) handleClusterEvents(w http.ResponseWriter, r *http.Request) {
 	if s.cluster == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"events": []map[string]any{}})
@@ -129,6 +155,15 @@ type clusterShardVoter interface {
 	ShardCount() int
 }
 
+// @Summary Join a cluster node
+// @Tags Cluster
+// @Accept json
+// @Produce json
+// @Param body body object true "Join request"
+// @Success 200 {object} object
+// @Failure 400 {object} ErrorResponse
+// @Security ApiKeyAuth
+// @Router /cluster/join [post]
 func (s *Server) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
 	if s.cluster == nil {
 		writeError(w, http.StatusNotImplemented, "cluster join unavailable", "UNSUPPORTED")

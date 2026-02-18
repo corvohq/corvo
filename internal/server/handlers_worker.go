@@ -13,6 +13,22 @@ import (
 	"github.com/corvohq/corvo/internal/store"
 )
 
+// @Summary Enqueue via webhook
+// @Description Enqueues a job using the raw HTTP body as payload. Useful for receiving webhooks from third-party services.
+// @Tags Jobs
+// @Accept json
+// @Produce json
+// @Param queue path string true "Queue name"
+// @Param priority query string false "Priority: low, normal, high, critical"
+// @Param unique_key query string false "Deduplication key"
+// @Param max_retries query integer false "Max retry attempts"
+// @Param scheduled_at query string false "RFC3339 schedule time"
+// @Param tags query string false "Tags as comma-separated key:value pairs"
+// @Success 201 {object} store.EnqueueResult "Job enqueued"
+// @Success 200 {object} store.EnqueueResult "Duplicate exists (unique_key)"
+// @Failure 400 {object} ErrorResponse
+// @Security ApiKeyAuth
+// @Router /webhooks/{queue} [post]
 func (s *Server) handleWebhookEnqueue(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	queue := chi.URLParam(r, "queue")
@@ -104,6 +120,17 @@ func (s *Server) handleWebhookEnqueue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, result)
 }
 
+// @Summary Enqueue a job
+// @Tags Jobs
+// @Accept json
+// @Produce json
+// @Param body body store.EnqueueRequest true "Enqueue request"
+// @Success 201 {object} store.EnqueueResult "Job enqueued"
+// @Success 200 {object} store.EnqueueResult "Duplicate exists (unique_key)"
+// @Failure 400 {object} ErrorResponse
+// @Failure 429 {object} ErrorResponse "Rate limited or budget exceeded"
+// @Security ApiKeyAuth
+// @Router /enqueue [post]
 func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	var req store.EnqueueRequest
@@ -155,6 +182,15 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, result)
 }
 
+// @Summary Enqueue a batch of jobs
+// @Tags Jobs
+// @Accept json
+// @Produce json
+// @Param body body store.BatchEnqueueRequest true "Batch enqueue request"
+// @Success 201 {object} store.BatchEnqueueResult
+// @Failure 400 {object} ErrorResponse
+// @Security ApiKeyAuth
+// @Router /enqueue/batch [post]
 func (s *Server) handleEnqueueBatch(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	var req store.BatchEnqueueRequest
@@ -191,6 +227,17 @@ func (s *Server) handleEnqueueBatch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, result)
 }
 
+// @Summary Fetch a job (long-poll)
+// @Description Long-polls until a job is available or timeout expires. Returns one job or 204 if none available.
+// @Tags Worker
+// @Accept json
+// @Produce json
+// @Param body body store.FetchRequest true "Fetch request"
+// @Success 200 {object} store.FetchResult
+// @Success 204 "No job available"
+// @Failure 400 {object} ErrorResponse
+// @Security ApiKeyAuth
+// @Router /fetch [post]
 func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	var req store.FetchRequest
@@ -245,6 +292,16 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// @Summary Fetch multiple jobs (long-poll)
+// @Description Long-polls until jobs are available or timeout expires. Returns up to count jobs.
+// @Tags Worker
+// @Accept json
+// @Produce json
+// @Param body body FetchBatchRequest true "Fetch batch request"
+// @Success 200 {object} FetchBatchResponse
+// @Failure 400 {object} ErrorResponse
+// @Security ApiKeyAuth
+// @Router /fetch/batch [post]
 func (s *Server) handleFetchBatch(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	var req struct {
@@ -310,6 +367,17 @@ func (s *Server) handleFetchBatch(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// @Summary Acknowledge (complete) a job
+// @Tags Worker
+// @Accept json
+// @Produce json
+// @Param job_id path string true "Job ID"
+// @Param body body AckBody false "Ack body"
+// @Success 200 {object} StatusResponse
+// @Failure 400 {object} ErrorResponse
+// @Failure 404 {object} ErrorResponse
+// @Security ApiKeyAuth
+// @Router /ack/{job_id} [post]
 func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	jobID := chi.URLParam(r, "job_id")
@@ -346,6 +414,15 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// @Summary Acknowledge multiple jobs
+// @Tags Worker
+// @Accept json
+// @Produce json
+// @Param body body AckBatchRequest true "Ack batch request"
+// @Success 200 {object} AckedCountResponse
+// @Failure 400 {object} ErrorResponse
+// @Security ApiKeyAuth
+// @Router /ack/batch [post]
 func (s *Server) handleAckBatch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Acks []struct {
@@ -388,6 +465,18 @@ func (s *Server) handleAckBatch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]int{"acked": acked})
 }
 
+// @Summary Fail a job
+// @Description Marks the job as failed. If retries remain it will be retried according to the backoff policy.
+// @Tags Worker
+// @Accept json
+// @Produce json
+// @Param job_id path string true "Job ID"
+// @Param body body FailBody false "Fail body"
+// @Success 200 {object} object
+// @Failure 400 {object} ErrorResponse
+// @Failure 404 {object} ErrorResponse
+// @Security ApiKeyAuth
+// @Router /fail/{job_id} [post]
 func (s *Server) handleFail(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	jobID := chi.URLParam(r, "job_id")
@@ -414,10 +503,26 @@ func (s *Server) handleFail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+// @Summary Real-time throughput stats
+// @Tags System
+// @Produce json
+// @Success 200 {object} object
+// @Security ApiKeyAuth
+// @Router /metrics/throughput [get]
 func (s *Server) handleThroughput(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.throughput.Snapshot())
 }
 
+// @Summary Worker heartbeat
+// @Description Extends leases for active jobs. Can include progress and checkpoint data. Returns cancellation signals.
+// @Tags Worker
+// @Accept json
+// @Produce json
+// @Param body body store.HeartbeatRequest true "Heartbeat request"
+// @Success 200 {object} store.HeartbeatResponse
+// @Failure 400 {object} ErrorResponse
+// @Security ApiKeyAuth
+// @Router /heartbeat [post]
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	principal := principalFromContext(r.Context())
 	var req store.HeartbeatRequest
