@@ -51,7 +51,7 @@ release:
     owner: corvohq
     name: corvo
 
-homebrew:
+brews:
   - name: corvo
     repository:
       owner: corvohq
