@@ -55,7 +55,7 @@ brews:
   - name: corvo
     repository:
       owner: corvohq
-      name: homebrew-corvo
+      name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: "https://corvohq.com"
     description: "Language-agnostic distributed job processing system"
