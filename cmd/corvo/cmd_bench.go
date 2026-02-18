@@ -20,8 +20,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/user/corvo/sdk/go/client"
-	"github.com/user/corvo/sdk/go/worker"
+	"github.com/corvohq/corvo/sdk/go/client"
+	"github.com/corvohq/corvo/sdk/go/worker"
 )
 
 const benchStreamsPerRPCClient = 200

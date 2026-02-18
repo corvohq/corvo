@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 func (s *Server) handleGetSSOSettings(w http.ResponseWriter, r *http.Request) {

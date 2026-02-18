@@ -16,11 +16,11 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	"github.com/user/corvo/internal/enterprise"
-	"github.com/user/corvo/internal/raft"
-	corvov1 "github.com/user/corvo/internal/rpcconnect/gen/corvo/v1"
-	"github.com/user/corvo/internal/rpcconnect/gen/corvo/v1/corvov1connect"
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/enterprise"
+	"github.com/corvohq/corvo/internal/raft"
+	corvov1 "github.com/corvohq/corvo/internal/rpcconnect/gen/corvo/v1"
+	"github.com/corvohq/corvo/internal/rpcconnect/gen/corvo/v1/corvov1connect"
+	"github.com/corvohq/corvo/internal/store"
 	"golang.org/x/net/http2"
 )
 

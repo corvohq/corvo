@@ -20,8 +20,8 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
 	"github.com/hashicorp/raft"
-	"github.com/user/corvo/internal/kv"
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/kv"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 // Cluster manages the Raft node, Pebble KV store, and SQLite materialized view.

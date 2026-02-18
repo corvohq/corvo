@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	corvov1 "github.com/user/corvo/internal/rpcconnect/gen/corvo/v1"
-	"github.com/user/corvo/internal/rpcconnect/gen/corvo/v1/corvov1connect"
+	corvov1 "github.com/corvohq/corvo/internal/rpcconnect/gen/corvo/v1"
+	"github.com/corvohq/corvo/internal/rpcconnect/gen/corvo/v1/corvov1connect"
 	"golang.org/x/net/http2"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )

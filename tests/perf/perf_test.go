@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/corvo/sdk/go/client"
-	"github.com/user/corvo/sdk/go/worker"
+	"github.com/corvohq/corvo/sdk/go/client"
+	"github.com/corvohq/corvo/sdk/go/worker"
 )
 
 func TestPerfE2EEnqueueHTTP(t *testing.T) {

@@ -8,11 +8,11 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/user/corvo/internal/raft"
-	"github.com/user/corvo/internal/scheduler"
-	"github.com/user/corvo/internal/server"
-	"github.com/user/corvo/internal/store"
-	"github.com/user/corvo/sdk/go/client"
+	"github.com/corvohq/corvo/internal/raft"
+	"github.com/corvohq/corvo/internal/scheduler"
+	"github.com/corvohq/corvo/internal/server"
+	"github.com/corvohq/corvo/internal/store"
+	"github.com/corvohq/corvo/sdk/go/client"
 )
 
 // testEnv holds a fully wired test stack.

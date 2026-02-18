@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/corvo/internal/raft"
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/raft"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 // testStore creates a Store backed by a DirectApplier for testing.

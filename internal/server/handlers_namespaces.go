@@ -6,7 +6,7 @@ import (
 	"regexp"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 var validNamespace = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)

@@ -8,7 +8,7 @@ import (
 	connect "connectrpc.com/connect"
 	context "context"
 	errors "errors"
-	v1 "github.com/user/corvo/internal/rpcconnect/gen/corvo/v1"
+	v1 "github.com/corvohq/corvo/internal/rpcconnect/gen/corvo/v1"
 	http "net/http"
 	strings "strings"
 )

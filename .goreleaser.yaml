@@ -1,0 +1,66 @@
+version: 2
+
+before:
+  hooks:
+    - cd ui && npm ci && npm run build
+
+builds:
+  - id: corvo
+    main: ./cmd/corvo
+    binary: corvo
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+        -X main.version={{.Version}}
+        -X main.commit={{.Commit}}
+        -X main.date={{.Date}}
+
+archives:
+  - id: corvo
+    name_template: "corvo_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format: tar.gz
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+release:
+  github:
+    owner: corvohq
+    name: corvo
+
+brews:
+  - name: corvo
+    repository:
+      owner: corvohq
+      name: homebrew-corvo
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://corvohq.com"
+    description: "Language-agnostic distributed job processing system"
+    license: "MIT"
+    install: |
+      bin.install "corvo"
+    test: |
+      system "#{bin}/corvo", "--version"

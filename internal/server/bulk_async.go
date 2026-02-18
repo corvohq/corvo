@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/user/corvo/internal/search"
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/search"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 const bulkAsyncChunkSize = 500

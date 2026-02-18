@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 func makeEnqueueOp(jobID, queue string, now time.Time) store.EnqueueOp {

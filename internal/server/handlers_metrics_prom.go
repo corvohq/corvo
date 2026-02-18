@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	raftcluster "github.com/user/corvo/internal/raft"
+	raftcluster "github.com/corvohq/corvo/internal/raft"
 )
 
 // raftHistogramProvider is optionally implemented by cluster backends that

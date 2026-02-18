@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 func benchCluster(b *testing.B) (*Cluster, *store.Store) {

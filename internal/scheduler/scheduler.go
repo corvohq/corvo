@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 // Metrics holds atomic counters for scheduler operations, safe for concurrent

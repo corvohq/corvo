@@ -7,8 +7,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/user/corvo/internal/raft"
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/raft"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 func setupTest(t *testing.T) (*Server, *store.Store) {

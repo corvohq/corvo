@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 func (s *Server) handleUsageSummary(w http.ResponseWriter, r *http.Request) {

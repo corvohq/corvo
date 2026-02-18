@@ -2,7 +2,7 @@
 
 ## Module Path
 ```
-github.com/user/corvo
+github.com/corvohq/corvo
 ```
 
 ## Import Ordering
@@ -21,8 +21,8 @@ import (
     "github.com/spf13/cobra"
 
     // 3. internal
-    "github.com/user/corvo/internal/kv"
-    "github.com/user/corvo/internal/store"
+    "github.com/corvohq/corvo/internal/kv"
+    "github.com/corvohq/corvo/internal/store"
 )
 ```
 

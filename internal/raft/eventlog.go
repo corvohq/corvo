@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/pebble"
-	"github.com/user/corvo/internal/kv"
+	"github.com/corvohq/corvo/internal/kv"
 )
 
 type lifecycleEvent struct {

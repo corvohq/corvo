@@ -14,8 +14,8 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/hashicorp/raft"
-	"github.com/user/corvo/internal/kv"
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/kv"
+	"github.com/corvohq/corvo/internal/store"
 
 	_ "modernc.org/sqlite"
 )

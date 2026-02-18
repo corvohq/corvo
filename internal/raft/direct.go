@@ -8,7 +8,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	hashraft "github.com/hashicorp/raft"
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 // DirectApplier applies operations directly through the FSM without Raft networking.

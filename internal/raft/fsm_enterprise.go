@@ -3,7 +3,7 @@ package raft
 import (
 	"encoding/json"
 
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 // Enterprise FSM handlers — SQLite-only operations (no Pebble writes).

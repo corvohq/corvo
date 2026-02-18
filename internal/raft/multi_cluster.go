@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 // MultiCluster runs N independent raft groups in one process and routes ops

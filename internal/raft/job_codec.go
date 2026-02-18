@@ -7,7 +7,7 @@ import (
 	"time"
 
 	oldproto "github.com/golang/protobuf/proto"
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 var jobProtoPrefix = []byte{0x4a, 0x42, 0x31} // "JB1"

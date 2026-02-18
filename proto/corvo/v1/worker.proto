@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package corvo.v1;
 
-option go_package = "github.com/user/corvo/internal/rpcconnect/gen/corvo/v1;corvov1";
+option go_package = "github.com/corvohq/corvo/internal/rpcconnect/gen/corvo/v1;corvov1";
 
 import "google/protobuf/timestamp.proto";
 

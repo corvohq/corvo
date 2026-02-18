@@ -16,14 +16,14 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/user/corvo/internal/enterprise"
-	"github.com/user/corvo/internal/observability"
-	raftcluster "github.com/user/corvo/internal/raft"
-	rpcsvc "github.com/user/corvo/internal/rpcconnect"
-	"github.com/user/corvo/internal/scheduler"
-	"github.com/user/corvo/internal/server"
-	"github.com/user/corvo/internal/store"
-	uiassets "github.com/user/corvo/ui"
+	"github.com/corvohq/corvo/internal/enterprise"
+	"github.com/corvohq/corvo/internal/observability"
+	raftcluster "github.com/corvohq/corvo/internal/raft"
+	rpcsvc "github.com/corvohq/corvo/internal/rpcconnect"
+	"github.com/corvohq/corvo/internal/scheduler"
+	"github.com/corvohq/corvo/internal/server"
+	"github.com/corvohq/corvo/internal/store"
+	uiassets "github.com/corvohq/corvo/ui"
 )
 
 var (

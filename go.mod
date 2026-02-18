@@ -1,4 +1,4 @@
-module github.com/user/corvo
+module github.com/corvohq/corvo
 
 go 1.24.0
 

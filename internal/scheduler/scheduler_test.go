@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/corvo/internal/raft"
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/raft"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 func testSetup(t *testing.T) (*store.Store, *Scheduler, *sql.DB) {

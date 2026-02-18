@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/corvo/internal/kv"
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/kv"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 func makeChainEnqueueOp(jobID, queue string, now time.Time, chain *store.ChainDefinition) store.EnqueueOp {

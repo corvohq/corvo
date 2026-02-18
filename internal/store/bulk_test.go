@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/user/corvo/internal/search"
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/search"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 func TestBulkRetryByIDs(t *testing.T) {

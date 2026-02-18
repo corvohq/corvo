@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/user/corvo/internal/kv"
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/kv"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 // sqlExecer abstracts *sql.DB and *sql.Tx.

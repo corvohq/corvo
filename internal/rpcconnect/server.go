@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	corvov1 "github.com/user/corvo/internal/rpcconnect/gen/corvo/v1"
-	"github.com/user/corvo/internal/rpcconnect/gen/corvo/v1/corvov1connect"
-	"github.com/user/corvo/internal/store"
+	corvov1 "github.com/corvohq/corvo/internal/rpcconnect/gen/corvo/v1"
+	"github.com/corvohq/corvo/internal/rpcconnect/gen/corvo/v1/corvov1connect"
+	"github.com/corvohq/corvo/internal/store"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 

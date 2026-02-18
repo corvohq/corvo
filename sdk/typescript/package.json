@@ -1,5 +1,5 @@
 {
-  "name": "@corvo/client",
+  "name": "@corvohq/client",
   "version": "0.1.0",
   "description": "TypeScript client for Corvo",
   "type": "module",

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 // Server is a lightweight RESP-compatible TCP server for high-throughput enqueue.

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/user/corvo/internal/store"
+	"github.com/corvohq/corvo/internal/store"
 )
 
 type tenantBackup struct {
