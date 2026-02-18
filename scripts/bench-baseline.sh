@@ -259,34 +259,6 @@ stop_server() {
     sleep 1
 }
 
-run_bench() {
-    local bench_type="$1" jobs="$2" workers="$3" conc="$4" shards="$5" nodes="$6"
-    local label="${MODE}-${bench_type}-w${workers}-c${conc}-s${shards}-n${nodes}-j${jobs}"
-    local save_path="${RESULTS_DIR}/${label}.json"
-
-    echo ""
-    echo "--- ${label} ---"
-
-    start_server "$shards" "$nodes"
-
-    local bench_args=(
-        bench
-        --server "$SERVER_URL"
-        --protocol rpc
-        --jobs "$jobs"
-        --workers "$workers"
-        --concurrency "$conc"
-        --save "$save_path"
-    )
-    if [ "$bench_type" = "combined" ]; then
-        bench_args+=(--combined)
-    fi
-
-    "$BINARY" "${bench_args[@]}" || true
-
-    stop_server
-}
-
 # ── Main ────────────────────────────────────────────────────────────────────
 
 echo "==> Corvo Baseline Benchmark"
