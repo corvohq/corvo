@@ -189,7 +189,7 @@ func BuildQuery(f Filter) (query string, countQuery string, args []interface{}, 
 	query = fmt.Sprintf(`
 		SELECT j.id, j.queue, j.state, j.payload, j.priority, j.attempt, j.max_retries,
 			j.unique_key, j.batch_id, j.worker_id, j.tags, j.parent_id, j.chain_id, j.chain_step,
-			j.created_at, j.started_at, j.completed_at, j.failed_at
+			j.scheduled_at, j.created_at, j.started_at, j.completed_at, j.failed_at
 		FROM jobs j
 		%s
 		ORDER BY %s %s

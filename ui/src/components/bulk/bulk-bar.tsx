@@ -20,10 +20,11 @@ export function BulkBar({ selectedIds, onClear, showRunNow }: BulkBarProps) {
 
   const handleConfirm = () => {
     if (!action) return;
+    const apiAction = action === "run_now" ? "retry" : action;
     bulk.mutate(
       {
         job_ids: selectedIds,
-        action,
+        action: apiAction,
         ...(action === "move" ? { move_to_queue: moveQueue } : {}),
       },
       {
@@ -57,7 +58,7 @@ export function BulkBar({ selectedIds, onClear, showRunNow }: BulkBarProps) {
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => setAction("retry")}
+                    onClick={() => setAction("run_now")}
                   >
                     <Play className="mr-1 h-3 w-3" /> Run Now
                   </Button>

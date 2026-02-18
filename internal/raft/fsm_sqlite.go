@@ -485,7 +485,7 @@ func sqliteBulkAction(db sqlExecer, op store.BulkActionOp) error {
 	case "retry":
 		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'pending', attempt = 0, failed_at = NULL, completed_at = NULL,
 			worker_id = NULL, hostname = NULL, lease_expires_at = NULL, scheduled_at = NULL
-			WHERE id IN (%s) AND state IN ('dead', 'cancelled', 'completed')`, inClause), args...)
+			WHERE id IN (%s) AND state IN ('dead', 'cancelled', 'completed', 'scheduled')`, inClause), args...)
 	case "delete":
 		db.Exec(fmt.Sprintf("DELETE FROM job_errors WHERE job_id IN (%s)", inClause), args...)
 		db.Exec(fmt.Sprintf("DELETE FROM jobs WHERE id IN (%s)", inClause), args...)

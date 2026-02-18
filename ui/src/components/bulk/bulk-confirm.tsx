@@ -33,14 +33,15 @@ export function BulkConfirm({
   onQueueChange,
 }: BulkConfirmProps) {
   const isDestructive = action === "delete";
+  const displayAction = action === "run_now" ? "run now" : action;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle className="capitalize">Bulk {action}</DialogTitle>
+          <DialogTitle className="capitalize">Bulk {displayAction}</DialogTitle>
           <DialogDescription>
-            This will {action} {count} job{count !== 1 ? "s" : ""}. This action
+            This will {displayAction} {count} job{count !== 1 ? "s" : ""}. This action
             cannot be undone.
           </DialogDescription>
         </DialogHeader>
@@ -71,7 +72,7 @@ export function BulkConfirm({
             onClick={onConfirm}
             disabled={isPending || (showQueueInput && !queueValue)}
           >
-            {isPending ? "Processing..." : `${action} ${count} jobs`}
+            {isPending ? "Processing..." : `${displayAction} ${count} jobs`}
           </Button>
         </DialogFooter>
       </DialogContent>

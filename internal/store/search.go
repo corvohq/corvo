@@ -34,6 +34,7 @@ type JobSummary struct {
 	ParentID    *string         `json:"parent_id,omitempty"`
 	ChainID     *string         `json:"chain_id,omitempty"`
 	ChainStep   *int            `json:"chain_step,omitempty"`
+	ScheduledAt *string         `json:"scheduled_at,omitempty"`
 	CreatedAt   *string         `json:"created_at,omitempty"`
 	StartedAt   *string         `json:"started_at,omitempty"`
 	CompletedAt *string         `json:"completed_at,omitempty"`
@@ -68,11 +69,11 @@ func (s *Store) SearchJobs(filter search.Filter) (*SearchResult, error) {
 		var payload sql.NullString
 		var uniqueKey, batchID, workerID, tags, parentID, chainID sql.NullString
 		var chainStep sql.NullInt64
-		var createdAt, startedAt, completedAt, failedAt sql.NullString
+		var scheduledAt, createdAt, startedAt, completedAt, failedAt sql.NullString
 		err := rows.Scan(
 			&j.ID, &j.Queue, &j.State, &payload, &j.Priority, &j.Attempt, &j.MaxRetries,
 			&uniqueKey, &batchID, &workerID, &tags, &parentID, &chainID, &chainStep,
-			&createdAt, &startedAt, &completedAt, &failedAt,
+			&scheduledAt, &createdAt, &startedAt, &completedAt, &failedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan job: %w", err)
@@ -101,6 +102,9 @@ func (s *Store) SearchJobs(filter search.Filter) (*SearchResult, error) {
 		if chainStep.Valid {
 			s := int(chainStep.Int64)
 			j.ChainStep = &s
+		}
+		if scheduledAt.Valid {
+			j.ScheduledAt = &scheduledAt.String
 		}
 		if createdAt.Valid {
 			j.CreatedAt = &createdAt.String
