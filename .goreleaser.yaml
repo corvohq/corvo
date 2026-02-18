@@ -2,7 +2,7 @@ version: 2
 
 before:
   hooks:
-    - cd ui && npm ci && npm run build
+    - sh -c "cd ui && npm ci && npm run build"
 
 builds:
   - id: corvo
@@ -29,10 +29,10 @@ builds:
 archives:
   - id: corvo
     name_template: "corvo_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    format: tar.gz
+    formats: [tar.gz]
     format_overrides:
       - goos: windows
-        format: zip
+        formats: [zip]
 
 checksum:
   name_template: "checksums.txt"
@@ -51,7 +51,7 @@ release:
     owner: corvohq
     name: corvo
 
-brews:
+homebrew:
   - name: corvo
     repository:
       owner: corvohq
