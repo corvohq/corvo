@@ -1,0 +1,1183 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Corvo API",
+    "description": "Corvo is a distributed background job queue. All endpoints are under `/api/v1`. Authentication via `X-API-Key` header or `Authorization: Bearer` token.",
+    "version": "v1",
+    "contact": {
+      "url": "https://corvohq.com"
+    }
+  },
+  "host": "localhost:8080",
+  "basePath": "/api/v1",
+  "schemes": ["http", "https"],
+  "consumes": ["application/json"],
+  "produces": ["application/json"],
+  "securityDefinitions": {
+    "ApiKeyAuth": {
+      "type": "apiKey",
+      "in": "header",
+      "name": "X-API-Key"
+    },
+    "BearerAuth": {
+      "type": "apiKey",
+      "in": "header",
+      "name": "Authorization",
+      "description": "Bearer token: `Authorization: Bearer <token>`"
+    }
+  },
+  "security": [{ "ApiKeyAuth": [] }],
+  "tags": [
+    { "name": "Jobs", "description": "Enqueue, search, and manage jobs" },
+    { "name": "Worker", "description": "Worker-facing: fetch, ack, fail, heartbeat" },
+    { "name": "Queues", "description": "Queue control: pause, resume, throttle, concurrency" },
+    { "name": "Bulk", "description": "Bulk operations on jobs" },
+    { "name": "Budgets", "description": "Spending budgets for AI/agent workloads" },
+    { "name": "Approvals", "description": "Human-in-the-loop approval policies" },
+    { "name": "Cluster", "description": "Cluster status and events" },
+    { "name": "System", "description": "Health, metrics, events" }
+  ],
+  "paths": {
+    "/enqueue": {
+      "post": {
+        "tags": ["Jobs"],
+        "summary": "Enqueue a job",
+        "operationId": "enqueueJob",
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/EnqueueRequest" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job enqueued",
+            "schema": { "$ref": "#/definitions/EnqueueResponse" }
+          },
+          "400": { "description": "Validation error", "schema": { "$ref": "#/definitions/ErrorResponse" } },
+          "429": { "description": "Rate limited or budget exceeded", "schema": { "$ref": "#/definitions/ErrorResponse" } }
+        }
+      }
+    },
+    "/enqueue/batch": {
+      "post": {
+        "tags": ["Jobs"],
+        "summary": "Enqueue a batch of jobs",
+        "operationId": "enqueueBatch",
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/BatchEnqueueRequest" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Batch enqueued",
+            "schema": { "$ref": "#/definitions/BatchEnqueueResponse" }
+          },
+          "400": { "description": "Validation error", "schema": { "$ref": "#/definitions/ErrorResponse" } }
+        }
+      }
+    },
+    "/fetch": {
+      "post": {
+        "tags": ["Worker"],
+        "summary": "Fetch a job (long-poll)",
+        "description": "Long-polls until a job is available or the timeout expires. Returns one job or empty if none available.",
+        "operationId": "fetchJob",
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/FetchRequest" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job or empty response",
+            "schema": { "$ref": "#/definitions/FetchResponse" }
+          }
+        }
+      }
+    },
+    "/fetch/batch": {
+      "post": {
+        "tags": ["Worker"],
+        "summary": "Fetch multiple jobs (long-poll)",
+        "operationId": "fetchBatch",
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/FetchBatchRequest" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Jobs",
+            "schema": { "$ref": "#/definitions/FetchBatchResponse" }
+          }
+        }
+      }
+    },
+    "/ack/{job_id}": {
+      "post": {
+        "tags": ["Worker"],
+        "summary": "Acknowledge (complete) a job",
+        "operationId": "ackJob",
+        "parameters": [
+          { "in": "path", "name": "job_id", "required": true, "type": "string" },
+          {
+            "in": "body",
+            "name": "body",
+            "schema": { "$ref": "#/definitions/AckRequest" }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Job acknowledged" },
+          "404": { "description": "Job not found", "schema": { "$ref": "#/definitions/ErrorResponse" } }
+        }
+      }
+    },
+    "/ack/batch": {
+      "post": {
+        "tags": ["Worker"],
+        "summary": "Acknowledge multiple jobs",
+        "operationId": "ackBatch",
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/AckBatchRequest" }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Jobs acknowledged" }
+        }
+      }
+    },
+    "/fail/{job_id}": {
+      "post": {
+        "tags": ["Worker"],
+        "summary": "Fail a job",
+        "description": "Marks the job as failed. If retries remain it will be retried according to the backoff policy.",
+        "operationId": "failJob",
+        "parameters": [
+          { "in": "path", "name": "job_id", "required": true, "type": "string" },
+          {
+            "in": "body",
+            "name": "body",
+            "schema": { "$ref": "#/definitions/FailRequest" }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Job failed" },
+          "404": { "description": "Job not found", "schema": { "$ref": "#/definitions/ErrorResponse" } }
+        }
+      }
+    },
+    "/heartbeat": {
+      "post": {
+        "tags": ["Worker"],
+        "summary": "Worker heartbeat",
+        "description": "Extends leases for active jobs. Can include progress and checkpoint data. Returns cancellation signals for jobs that have been cancelled.",
+        "operationId": "heartbeat",
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/HeartbeatRequest" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Heartbeat acknowledged",
+            "schema": { "$ref": "#/definitions/HeartbeatResponse" }
+          }
+        }
+      }
+    },
+    "/jobs/{id}": {
+      "get": {
+        "tags": ["Jobs"],
+        "summary": "Get a job",
+        "operationId": "getJob",
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job detail",
+            "schema": { "$ref": "#/definitions/Job" }
+          },
+          "404": { "description": "Not found", "schema": { "$ref": "#/definitions/ErrorResponse" } }
+        }
+      },
+      "delete": {
+        "tags": ["Jobs"],
+        "summary": "Delete a job",
+        "operationId": "deleteJob",
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "Deleted" },
+          "404": { "description": "Not found", "schema": { "$ref": "#/definitions/ErrorResponse" } }
+        }
+      }
+    },
+    "/jobs/{id}/iterations": {
+      "get": {
+        "tags": ["Jobs"],
+        "summary": "List agent iterations",
+        "description": "Returns the iteration history for an agent job (AI loop tracking).",
+        "operationId": "getJobIterations",
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Iterations",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "iterations": {
+                  "type": "array",
+                  "items": { "$ref": "#/definitions/Iteration" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs/search": {
+      "post": {
+        "tags": ["Jobs"],
+        "summary": "Search jobs",
+        "operationId": "searchJobs",
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/SearchRequest" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Search results",
+            "schema": { "$ref": "#/definitions/SearchResponse" }
+          }
+        }
+      }
+    },
+    "/jobs/{id}/retry": {
+      "post": {
+        "tags": ["Jobs"],
+        "summary": "Retry a failed job",
+        "operationId": "retryJob",
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "Job queued for retry" },
+          "404": { "description": "Not found", "schema": { "$ref": "#/definitions/ErrorResponse" } }
+        }
+      }
+    },
+    "/jobs/{id}/cancel": {
+      "post": {
+        "tags": ["Jobs"],
+        "summary": "Cancel a job",
+        "operationId": "cancelJob",
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "Job cancelled" }
+        }
+      }
+    },
+    "/jobs/{id}/hold": {
+      "post": {
+        "tags": ["Jobs"],
+        "summary": "Hold a job for approval",
+        "operationId": "holdJob",
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "Job held" }
+        }
+      }
+    },
+    "/jobs/{id}/approve": {
+      "post": {
+        "tags": ["Jobs"],
+        "summary": "Approve a held job",
+        "operationId": "approveJob",
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "Job approved" }
+        }
+      }
+    },
+    "/jobs/{id}/reject": {
+      "post": {
+        "tags": ["Jobs"],
+        "summary": "Reject a held job",
+        "operationId": "rejectJob",
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "Job rejected" }
+        }
+      }
+    },
+    "/jobs/{id}/replay": {
+      "post": {
+        "tags": ["Jobs"],
+        "summary": "Replay a completed job",
+        "description": "Re-enqueues the job from a specific iteration checkpoint.",
+        "operationId": "replayJob",
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "type": "string" },
+          {
+            "in": "body",
+            "name": "body",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "from_iteration": { "type": "integer", "description": "Iteration number to replay from" }
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "New job ID",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "job_id": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs/{id}/move": {
+      "post": {
+        "tags": ["Jobs"],
+        "summary": "Move a job to another queue",
+        "operationId": "moveJob",
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "type": "string" },
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "type": "object",
+              "required": ["queue"],
+              "properties": {
+                "queue": { "type": "string" }
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Job moved" }
+        }
+      }
+    },
+    "/jobs/bulk": {
+      "post": {
+        "tags": ["Bulk"],
+        "summary": "Bulk operation on jobs",
+        "description": "Perform bulk actions by ID list or search filter. Supported actions: `retry`, `delete`, `cancel`, `move`, `requeue`, `change_priority`, `hold`, `approve`, `reject`.",
+        "operationId": "bulkJobs",
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/BulkRequest" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bulk operation started or completed",
+            "schema": { "$ref": "#/definitions/BulkResponse" }
+          }
+        }
+      }
+    },
+    "/bulk/{id}": {
+      "get": {
+        "tags": ["Bulk"],
+        "summary": "Get bulk operation status",
+        "operationId": "getBulkStatus",
+        "parameters": [
+          { "in": "path", "name": "id", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bulk operation status",
+            "schema": { "$ref": "#/definitions/BulkStatus" }
+          }
+        }
+      }
+    },
+    "/queues": {
+      "get": {
+        "tags": ["Queues"],
+        "summary": "List queues",
+        "operationId": "listQueues",
+        "responses": {
+          "200": {
+            "description": "Queues",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "queues": {
+                  "type": "array",
+                  "items": { "$ref": "#/definitions/Queue" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/queues/{name}/pause": {
+      "post": {
+        "tags": ["Queues"],
+        "summary": "Pause a queue",
+        "description": "Paused queues stop dispatching jobs to workers. In-flight jobs continue.",
+        "operationId": "pauseQueue",
+        "parameters": [
+          { "in": "path", "name": "name", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "Queue paused" }
+        }
+      }
+    },
+    "/queues/{name}/resume": {
+      "post": {
+        "tags": ["Queues"],
+        "summary": "Resume a paused queue",
+        "operationId": "resumeQueue",
+        "parameters": [
+          { "in": "path", "name": "name", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "Queue resumed" }
+        }
+      }
+    },
+    "/queues/{name}/clear": {
+      "post": {
+        "tags": ["Queues"],
+        "summary": "Clear all jobs from a queue",
+        "description": "Deletes all pending (non-active) jobs from the queue.",
+        "operationId": "clearQueue",
+        "parameters": [
+          { "in": "path", "name": "name", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "Queue cleared" }
+        }
+      }
+    },
+    "/queues/{name}/drain": {
+      "post": {
+        "tags": ["Queues"],
+        "summary": "Drain a queue",
+        "description": "Stops new jobs from being fetched while allowing in-flight jobs to complete.",
+        "operationId": "drainQueue",
+        "parameters": [
+          { "in": "path", "name": "name", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "Queue drained" }
+        }
+      }
+    },
+    "/queues/{name}/concurrency": {
+      "post": {
+        "tags": ["Queues"],
+        "summary": "Set queue concurrency limit",
+        "description": "Limits the number of jobs from this queue that can be active (in-flight) at once.",
+        "operationId": "setQueueConcurrency",
+        "parameters": [
+          { "in": "path", "name": "name", "required": true, "type": "string" },
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "type": "object",
+              "required": ["max"],
+              "properties": {
+                "max": { "type": "integer", "description": "Max concurrent jobs (0 to disable limit)" }
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Concurrency limit set" }
+        }
+      }
+    },
+    "/queues/{name}/throttle": {
+      "post": {
+        "tags": ["Queues"],
+        "summary": "Set queue rate throttle",
+        "description": "Limits the rate at which jobs are dispatched from the queue.",
+        "operationId": "setQueueThrottle",
+        "parameters": [
+          { "in": "path", "name": "name", "required": true, "type": "string" },
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "type": "object",
+              "properties": {
+                "rate": { "type": "number", "description": "Jobs per second" },
+                "burst": { "type": "integer", "description": "Burst capacity" }
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Throttle set" }
+        }
+      },
+      "delete": {
+        "tags": ["Queues"],
+        "summary": "Remove queue throttle",
+        "operationId": "deleteQueueThrottle",
+        "parameters": [
+          { "in": "path", "name": "name", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "Throttle removed" }
+        }
+      }
+    },
+    "/queues/{name}": {
+      "delete": {
+        "tags": ["Queues"],
+        "summary": "Delete a queue",
+        "description": "Deletes the queue and all its pending jobs.",
+        "operationId": "deleteQueue",
+        "parameters": [
+          { "in": "path", "name": "name", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "Queue deleted" }
+        }
+      }
+    },
+    "/budgets": {
+      "get": {
+        "tags": ["Budgets"],
+        "summary": "List budgets",
+        "operationId": "listBudgets",
+        "responses": {
+          "200": {
+            "description": "Budgets",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "budgets": { "type": "array", "items": { "$ref": "#/definitions/Budget" } }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["Budgets"],
+        "summary": "Create or update a budget",
+        "description": "Sets a spending cap for AI/agent jobs by queue or globally. Jobs exceeding the budget will be failed with `BUDGET_EXCEEDED`.",
+        "operationId": "setBudget",
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/BudgetRequest" }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Budget set" }
+        }
+      }
+    },
+    "/budgets/{scope}/{target}": {
+      "delete": {
+        "tags": ["Budgets"],
+        "summary": "Delete a budget",
+        "operationId": "deleteBudget",
+        "parameters": [
+          { "in": "path", "name": "scope", "required": true, "type": "string", "description": "Scope: `queue` or `global`" },
+          { "in": "path", "name": "target", "required": true, "type": "string", "description": "Queue name or `*` for global" }
+        ],
+        "responses": {
+          "200": { "description": "Budget deleted" }
+        }
+      }
+    },
+    "/approval-policies": {
+      "get": {
+        "tags": ["Approvals"],
+        "summary": "List approval policies",
+        "operationId": "listApprovalPolicies",
+        "responses": {
+          "200": {
+            "description": "Policies",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "policies": { "type": "array", "items": { "$ref": "#/definitions/ApprovalPolicy" } }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["Approvals"],
+        "summary": "Create or update an approval policy",
+        "description": "Configures human-in-the-loop review for jobs. Jobs matching the policy will be held awaiting approval before processing.",
+        "operationId": "setApprovalPolicy",
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/ApprovalPolicyRequest" }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Policy set" }
+        }
+      }
+    },
+    "/workers": {
+      "get": {
+        "tags": ["System"],
+        "summary": "List connected workers",
+        "operationId": "listWorkers",
+        "responses": {
+          "200": {
+            "description": "Workers",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "workers": { "type": "array", "items": { "$ref": "#/definitions/Worker" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/events": {
+      "get": {
+        "tags": ["System"],
+        "summary": "Server-Sent Events stream",
+        "description": "Real-time event stream for job and queue state changes. Returns `text/event-stream`.",
+        "operationId": "eventStream",
+        "produces": ["text/event-stream"],
+        "responses": {
+          "200": { "description": "SSE stream" }
+        }
+      }
+    },
+    "/cluster/status": {
+      "get": {
+        "tags": ["Cluster"],
+        "summary": "Cluster status",
+        "operationId": "clusterStatus",
+        "responses": {
+          "200": {
+            "description": "Cluster status",
+            "schema": { "$ref": "#/definitions/ClusterStatus" }
+          }
+        }
+      }
+    },
+    "/cluster/events": {
+      "get": {
+        "tags": ["Cluster"],
+        "summary": "Cluster event log",
+        "operationId": "clusterEvents",
+        "responses": {
+          "200": {
+            "description": "Cluster events",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "events": { "type": "array", "items": { "type": "object" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics/throughput": {
+      "get": {
+        "tags": ["System"],
+        "summary": "Real-time throughput stats",
+        "operationId": "throughput",
+        "responses": {
+          "200": {
+            "description": "Throughput counters"
+          }
+        }
+      }
+    },
+    "/usage/summary": {
+      "get": {
+        "tags": ["Budgets"],
+        "summary": "Token and cost usage summary",
+        "description": "Returns aggregate token/cost data for AI/agent jobs.",
+        "operationId": "usageSummary",
+        "responses": {
+          "200": { "description": "Usage summary" }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "EnqueueRequest": {
+      "type": "object",
+      "required": ["queue", "payload"],
+      "properties": {
+        "queue": { "type": "string", "description": "Target queue name", "example": "emails" },
+        "payload": { "type": "object", "description": "Arbitrary JSON payload passed to the worker" },
+        "priority": {
+          "type": "string",
+          "enum": ["low", "normal", "high", "critical"],
+          "description": "Job priority (default: normal)"
+        },
+        "max_retries": { "type": "integer", "description": "Max retry attempts on failure (default: 0)" },
+        "retry_backoff": {
+          "type": "string",
+          "enum": ["fixed", "exponential"],
+          "description": "Retry delay strategy"
+        },
+        "retry_base_delay": { "type": "string", "description": "Base delay for retries (e.g. `1s`, `500ms`)" },
+        "retry_max_delay": { "type": "string", "description": "Max delay cap for exponential backoff (e.g. `5m`)" },
+        "unique_key": { "type": "string", "description": "Deduplication key. Duplicate enqueues with the same key within `unique_period` are ignored." },
+        "unique_period": { "type": "integer", "description": "Deduplication window in seconds" },
+        "tags": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Arbitrary key-value metadata for filtering and observability"
+        },
+        "scheduled_at": { "type": "string", "format": "date-time", "description": "Schedule job for a future time" },
+        "expire_after": { "type": "string", "description": "TTL; job is cancelled if not started within this duration (e.g. `1h`)" },
+        "agent": { "$ref": "#/definitions/AgentConfig" },
+        "chain": { "$ref": "#/definitions/ChainConfig" }
+      }
+    },
+    "AgentConfig": {
+      "type": "object",
+      "description": "Configuration for AI/agent workloads with iteration tracking and cost enforcement.",
+      "properties": {
+        "max_iterations": { "type": "integer", "description": "Max agent loop iterations before job is failed" },
+        "max_cost_usd": { "type": "number", "format": "double", "description": "Spending cap in USD. Exceeding it fails the job with BUDGET_EXCEEDED." },
+        "iteration_timeout": { "type": "string", "description": "Max time per iteration (e.g. `30s`)" }
+      }
+    },
+    "ChainConfig": {
+      "type": "object",
+      "description": "Chains multiple jobs in sequence. Each step is enqueued after the previous one completes.",
+      "properties": {
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "queue": { "type": "string" },
+              "payload": { "type": "object" }
+            }
+          }
+        },
+        "on_failure": {
+          "type": "object",
+          "description": "Job to enqueue if any step fails",
+          "properties": {
+            "queue": { "type": "string" },
+            "payload": { "type": "object" }
+          }
+        },
+        "on_exit": {
+          "type": "object",
+          "description": "Job to enqueue when a step ACKs with step_status=exit",
+          "properties": {
+            "queue": { "type": "string" },
+            "payload": { "type": "object" }
+          }
+        }
+      }
+    },
+    "EnqueueResponse": {
+      "type": "object",
+      "properties": {
+        "job_id": { "type": "string", "description": "ULID job identifier" },
+        "status": { "type": "string", "description": "Initial job status" },
+        "unique_existing": { "type": "boolean", "description": "True if a duplicate job with the same unique_key already exists" }
+      }
+    },
+    "BatchEnqueueRequest": {
+      "type": "object",
+      "required": ["jobs"],
+      "properties": {
+        "jobs": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/EnqueueRequest" }
+        },
+        "batch": {
+          "type": "object",
+          "description": "Optional batch tracking. When all jobs complete, a callback job is enqueued.",
+          "properties": {
+            "callback_queue": { "type": "string" },
+            "callback_payload": { "type": "object" }
+          }
+        }
+      }
+    },
+    "BatchEnqueueResponse": {
+      "type": "object",
+      "properties": {
+        "job_ids": { "type": "array", "items": { "type": "string" } },
+        "batch_id": { "type": "string" }
+      }
+    },
+    "FetchRequest": {
+      "type": "object",
+      "required": ["queues", "worker_id"],
+      "properties": {
+        "queues": { "type": "array", "items": { "type": "string" }, "description": "Queue names to fetch from (priority order)" },
+        "worker_id": { "type": "string", "description": "Unique worker identifier" },
+        "hostname": { "type": "string", "description": "Worker hostname for observability" },
+        "timeout": { "type": "integer", "description": "Long-poll timeout in seconds (default: 30)" }
+      }
+    },
+    "FetchResponse": {
+      "type": "object",
+      "properties": {
+        "job_id": { "type": "string" },
+        "queue": { "type": "string" },
+        "payload": { "type": "object" },
+        "attempt": { "type": "integer" },
+        "max_retries": { "type": "integer" },
+        "lease_duration": { "type": "integer", "description": "Lease duration in seconds. Send heartbeats before expiry." },
+        "checkpoint": { "type": "object", "description": "Last checkpoint from a previous iteration (agent jobs)" },
+        "tags": { "type": "object", "additionalProperties": { "type": "string" } },
+        "agent": { "$ref": "#/definitions/AgentConfig" }
+      }
+    },
+    "FetchBatchRequest": {
+      "type": "object",
+      "required": ["queues", "worker_id"],
+      "properties": {
+        "queues": { "type": "array", "items": { "type": "string" } },
+        "worker_id": { "type": "string" },
+        "hostname": { "type": "string" },
+        "count": { "type": "integer", "description": "Max jobs to fetch (default: 1, max: 100)" },
+        "timeout": { "type": "integer" }
+      }
+    },
+    "FetchBatchResponse": {
+      "type": "object",
+      "properties": {
+        "jobs": { "type": "array", "items": { "$ref": "#/definitions/FetchResponse" } }
+      }
+    },
+    "AckRequest": {
+      "type": "object",
+      "properties": {
+        "result": { "type": "object", "description": "Optional result data stored with the job" },
+        "step_status": {
+          "type": "string",
+          "enum": ["continue", "exit"],
+          "description": "Chain step control: `continue` advances to next step (default), `exit` skips remaining steps"
+        },
+        "checkpoint": { "type": "object", "description": "Checkpoint to store for agent iteration replay" },
+        "cost_usd": { "type": "number", "description": "Cost of this iteration in USD (for budget tracking)" },
+        "tokens": { "type": "integer", "description": "Token count for this iteration" }
+      }
+    },
+    "AckBatchRequest": {
+      "type": "object",
+      "properties": {
+        "acks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "job_id": { "type": "string" },
+              "result": { "type": "object" }
+            }
+          }
+        }
+      }
+    },
+    "FailRequest": {
+      "type": "object",
+      "properties": {
+        "error": { "type": "string", "description": "Error message" },
+        "backtrace": { "type": "string", "description": "Stack trace or additional context" }
+      }
+    },
+    "HeartbeatRequest": {
+      "type": "object",
+      "required": ["jobs"],
+      "properties": {
+        "jobs": {
+          "type": "object",
+          "description": "Map of job_id to heartbeat data",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "progress": {
+                "type": "object",
+                "properties": {
+                  "current": { "type": "integer" },
+                  "total": { "type": "integer" },
+                  "message": { "type": "string" }
+                }
+              },
+              "checkpoint": { "type": "object" }
+            }
+          }
+        }
+      }
+    },
+    "HeartbeatResponse": {
+      "type": "object",
+      "properties": {
+        "jobs": {
+          "type": "object",
+          "description": "Map of job_id to status. Check for `cancelled` to abort in-flight work.",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "status": { "type": "string", "enum": ["ok", "cancelled"] }
+            }
+          }
+        }
+      }
+    },
+    "Job": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "queue": { "type": "string" },
+        "state": {
+          "type": "string",
+          "enum": ["pending", "active", "completed", "failed", "cancelled", "retrying", "dead", "scheduled", "held"]
+        },
+        "payload": { "type": "object" },
+        "priority": { "type": "integer", "description": "1=low, 2=normal, 3=high, 4=critical" },
+        "attempt": { "type": "integer" },
+        "max_retries": { "type": "integer" },
+        "tags": { "type": "object", "additionalProperties": { "type": "string" } },
+        "result": { "type": "object" },
+        "error": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "scheduled_at": { "type": "string", "format": "date-time" },
+        "started_at": { "type": "string", "format": "date-time" },
+        "completed_at": { "type": "string", "format": "date-time" },
+        "lease_expires_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "Iteration": {
+      "type": "object",
+      "properties": {
+        "n": { "type": "integer", "description": "Iteration number" },
+        "started_at": { "type": "string", "format": "date-time" },
+        "completed_at": { "type": "string", "format": "date-time" },
+        "cost_usd": { "type": "number" },
+        "tokens": { "type": "integer" },
+        "checkpoint": { "type": "object" }
+      }
+    },
+    "SearchRequest": {
+      "type": "object",
+      "properties": {
+        "queue": { "type": "string" },
+        "state": { "type": "array", "items": { "type": "string" } },
+        "priority": { "type": "string" },
+        "tags": { "type": "object", "additionalProperties": { "type": "string" } },
+        "payload_contains": { "type": "string", "description": "Full-text search within job payloads" },
+        "sort": { "type": "string", "enum": ["created_at", "updated_at", "priority"], "description": "Sort field" },
+        "order": { "type": "string", "enum": ["asc", "desc"] },
+        "limit": { "type": "integer", "description": "Page size (default: 20, max: 1000)" },
+        "cursor": { "type": "string", "description": "Pagination cursor from previous response" }
+      }
+    },
+    "SearchResponse": {
+      "type": "object",
+      "properties": {
+        "jobs": { "type": "array", "items": { "$ref": "#/definitions/Job" } },
+        "total": { "type": "integer" },
+        "cursor": { "type": "string" },
+        "has_more": { "type": "boolean" },
+        "duration_ms": { "type": "integer" }
+      }
+    },
+    "BulkRequest": {
+      "type": "object",
+      "required": ["action"],
+      "properties": {
+        "ids": { "type": "array", "items": { "type": "string" }, "description": "Explicit list of job IDs" },
+        "filter": { "$ref": "#/definitions/SearchRequest", "description": "Or filter by search criteria" },
+        "action": {
+          "type": "string",
+          "enum": ["retry", "delete", "cancel", "move", "requeue", "change_priority", "hold", "approve", "reject"]
+        },
+        "params": { "type": "object", "description": "Action-specific params (e.g. `{\"queue\": \"new-queue\"}` for move)" },
+        "async": { "type": "boolean", "description": "Run as background operation and return immediately with bulk_id" }
+      }
+    },
+    "BulkResponse": {
+      "type": "object",
+      "properties": {
+        "bulk_id": { "type": "string", "description": "Operation ID when async=true" },
+        "affected": { "type": "integer", "description": "Jobs affected when async=false" }
+      }
+    },
+    "BulkStatus": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "action": { "type": "string" },
+        "state": { "type": "string", "enum": ["pending", "running", "completed", "failed"] },
+        "total": { "type": "integer" },
+        "processed": { "type": "integer" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "completed_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "Queue": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "state": { "type": "string", "enum": ["active", "paused", "draining"] },
+        "pending": { "type": "integer" },
+        "active": { "type": "integer" },
+        "scheduled": { "type": "integer" },
+        "completed": { "type": "integer" },
+        "failed": { "type": "integer" },
+        "dead": { "type": "integer" },
+        "concurrency_limit": { "type": "integer" },
+        "throttle_rps": { "type": "number" }
+      }
+    },
+    "Budget": {
+      "type": "object",
+      "properties": {
+        "scope": { "type": "string", "enum": ["queue", "global"] },
+        "target": { "type": "string" },
+        "max_cost_usd": { "type": "number" },
+        "period": { "type": "string", "description": "Reset period (e.g. `24h`, `168h`)" },
+        "spent_usd": { "type": "number" },
+        "reset_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "BudgetRequest": {
+      "type": "object",
+      "required": ["scope", "target", "max_cost_usd"],
+      "properties": {
+        "scope": { "type": "string", "enum": ["queue", "global"] },
+        "target": { "type": "string", "description": "Queue name or `*` for global" },
+        "max_cost_usd": { "type": "number" },
+        "period": { "type": "string", "description": "Reset period (e.g. `24h`)" }
+      }
+    },
+    "ApprovalPolicy": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "queue": { "type": "string" },
+        "condition": { "type": "object", "description": "Conditions that trigger the hold (e.g. cost threshold, tags)" },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "ApprovalPolicyRequest": {
+      "type": "object",
+      "required": ["queue"],
+      "properties": {
+        "queue": { "type": "string" },
+        "condition": { "type": "object" }
+      }
+    },
+    "Worker": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "hostname": { "type": "string" },
+        "queues": { "type": "array", "items": { "type": "string" } },
+        "active_jobs": { "type": "integer" },
+        "connected_at": { "type": "string", "format": "date-time" },
+        "last_heartbeat_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "ClusterStatus": {
+      "type": "object",
+      "properties": {
+        "leader": { "type": "string" },
+        "is_leader": { "type": "boolean" },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "addr": { "type": "string" },
+              "state": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "ErrorResponse": {
+      "type": "object",
+      "properties": {
+        "error": { "type": "string" },
+        "code": {
+          "type": "string",
+          "description": "Machine-readable error code",
+          "enum": [
+            "NOT_FOUND",
+            "VALIDATION_ERROR",
+            "RATE_LIMITED",
+            "OVERLOADED",
+            "BUDGET_EXCEEDED",
+            "LEADER_UNAVAILABLE",
+            "LICENSE_ERROR",
+            "UNAUTHORIZED"
+          ]
+        }
+      }
+    }
+  }
+}

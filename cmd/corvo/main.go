@@ -99,6 +99,7 @@ var (
 	noCompression          = true
 	snapshotThreshold      = 0 // 0 = use default (4096)
 	maxPayloadSize         = 256 * 1024 // 256KB default
+	docsEnabled            = true
 )
 
 func init() {
@@ -144,6 +145,7 @@ func init() {
 	serverCmd.Flags().BoolVar(&sqliteMirrorEnabled, "sqlite-mirror", true, "Enable SQLite materialized view for UI queries (disable for max throughput)")
 	serverCmd.Flags().IntVar(&snapshotThreshold, "snapshot-threshold", 0, "Raft log entries between snapshots (0 = default 4096)")
 	serverCmd.Flags().IntVar(&maxPayloadSize, "max-payload-size", 256*1024, "Maximum job payload size in bytes (default 256KB; 0 to disable)")
+	serverCmd.Flags().BoolVar(&docsEnabled, "docs-enabled", true, "Serve API docs at /docs and /openapi.json")
 
 	rootCmd.AddCommand(serverCmd)
 }
@@ -408,6 +410,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 	opts = append(opts, server.WithRPCStreamConfig(streamCfg))
 	opts = append(opts, server.WithSchedulerMetrics(schedMetrics))
 	opts = append(opts, server.WithMaxPayloadSize(maxPayloadSize))
+	if !docsEnabled {
+		opts = append(opts, server.WithDocsDisabled())
+	}
 	srv := server.New(s, cluster, bindAddr, uiFS, opts...)
 	go func() {
 		if err := srv.Start(); err != nil && err != http.ErrServerClosed {

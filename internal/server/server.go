@@ -61,6 +61,7 @@ type Server struct {
 	bindAddr         string
 	h2cTransport     http.RoundTripper
 	maxPayloadBytes  int // 0 means no limit
+	docsDisabled     bool
 }
 
 // Option mutates server behavior.
@@ -127,6 +128,14 @@ func WithSchedulerMetrics(m *scheduler.Metrics) Option {
 func WithMaxPayloadSize(bytes int) Option {
 	return func(s *Server) error {
 		s.maxPayloadBytes = bytes
+		return nil
+	}
+}
+
+// WithDocsDisabled disables the /docs and /openapi.json routes.
+func WithDocsDisabled() Option {
+	return func(s *Server) error {
+		s.docsDisabled = true
 		return nil
 	}
 }
@@ -336,6 +345,12 @@ func (s *Server) buildRouter() chi.Router {
 		r.Use(s.requireLeader)
 		r.Mount(strings.TrimSuffix(rpcPath, "/"), rpcHandler)
 	})
+
+	// API documentation (Scalar UI + OpenAPI spec)
+	if !s.docsDisabled {
+		r.Get("/openapi.json", s.handleOpenAPISpec)
+		r.Get("/docs", s.handleDocs)
+	}
 
 	r.Get("/healthz", s.handleHealthz)
 	r.Route("/debug/pprof", func(r chi.Router) {
