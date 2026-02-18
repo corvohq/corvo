@@ -161,44 +161,56 @@ func restoreFromSnapshot(pdb *pebble.DB, sqliteDB *sql.DB, rc io.Reader) error {
 			return fmt.Errorf("open snapshot pebble: %w", err)
 		}
 
-		// Clear existing data
-		iter, err := pdb.NewIter(nil)
-		if err != nil {
-			snapDB.Close()
-			return fmt.Errorf("create clear iter: %w", err)
-		}
-		batch := pdb.NewBatch()
-		for iter.First(); iter.Valid(); iter.Next() {
-			k := make([]byte, len(iter.Key()))
-			copy(k, iter.Key())
-			batch.Delete(k, pebble.Sync)
-		}
-		iter.Close()
-		if err := batch.Commit(pebble.Sync); err != nil {
+		// Clear existing data using a single range tombstone (O(1) memory).
+		clearBatch := pdb.NewBatch()
+		if err := clearBatch.DeleteRange([]byte{0x00}, []byte{0xff}, pebble.Sync); err != nil {
+			clearBatch.Close()
 			snapDB.Close()
 			return fmt.Errorf("clear pebble: %w", err)
 		}
+		if err := clearBatch.Commit(pebble.Sync); err != nil {
+			clearBatch.Close()
+			snapDB.Close()
+			return fmt.Errorf("clear pebble: %w", err)
+		}
+		clearBatch.Close()
 
-		// Copy from snapshot
+		// Copy from snapshot in chunks of 10 000 keys to bound memory usage.
+		const chunkSize = 10_000
 		snapIter, err := snapDB.NewIter(nil)
 		if err != nil {
 			snapDB.Close()
 			return fmt.Errorf("create snapshot iter: %w", err)
 		}
-		batch = pdb.NewBatch()
+		batch := pdb.NewBatch()
+		count := 0
 		for snapIter.First(); snapIter.Valid(); snapIter.Next() {
 			k := make([]byte, len(snapIter.Key()))
 			copy(k, snapIter.Key())
 			v := make([]byte, len(snapIter.Value()))
 			copy(v, snapIter.Value())
 			batch.Set(k, v, pebble.Sync)
+			count++
+			if count >= chunkSize {
+				if err := batch.Commit(pebble.Sync); err != nil {
+					batch.Close()
+					snapIter.Close()
+					snapDB.Close()
+					return fmt.Errorf("restore pebble chunk: %w", err)
+				}
+				batch.Close()
+				batch = pdb.NewBatch()
+				count = 0
+			}
 		}
 		snapIter.Close()
 		snapDB.Close()
 
 		if err := batch.Commit(pebble.Sync); err != nil {
+			batch.Close()
 			return fmt.Errorf("restore pebble: %w", err)
 		}
+		batch.Close()
 	}
 
 	// Restore SQLite: exec from backup
@@ -230,23 +242,49 @@ func restoreFromSnapshot(pdb *pebble.DB, sqliteDB *sql.DB, rc io.Reader) error {
 		}
 		rows.Close()
 
-		// Clear and repopulate each table
-		for _, table := range tables {
-			sqliteDB.Exec("DELETE FROM " + table)
+		// Disable foreign key enforcement during restore — SQLite is a
+		// rebuildable materialized view, not the source of truth, so it is safe
+		// to load tables without worrying about reference ordering.
+		if _, err := sqliteDB.Exec("PRAGMA foreign_keys=OFF"); err != nil {
+			slog.Error("restore: disable foreign keys", "error", err)
 		}
 
-		// For each table, read all rows from backup and insert into main
+		// Wrap the entire delete + repopulate in a single transaction so the
+		// database is never partially restored if the process is interrupted.
+		tx, err := sqliteDB.Begin()
+		if err != nil {
+			sqliteDB.Exec("PRAGMA foreign_keys=ON") //nolint:errcheck
+			return fmt.Errorf("begin sqlite restore tx: %w", err)
+		}
+
 		for _, table := range tables {
-			if err := copyTable(backupDB, sqliteDB, table); err != nil {
+			tx.Exec("DELETE FROM " + table) //nolint:errcheck
+		}
+
+		// For each table, read all rows from backup and insert into main.
+		// Errors are logged but do not abort the restore — partial data is
+		// better than no data for a rebuildable materialized view.
+		for _, table := range tables {
+			if err := copyTable(backupDB, tx, table); err != nil {
 				slog.Error("restore table failed", "table", table, "error", err)
 			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			tx.Rollback() //nolint:errcheck
+			sqliteDB.Exec("PRAGMA foreign_keys=ON") //nolint:errcheck
+			return fmt.Errorf("commit sqlite restore tx: %w", err)
+		}
+
+		if _, err := sqliteDB.Exec("PRAGMA foreign_keys=ON"); err != nil {
+			slog.Error("restore: re-enable foreign keys", "error", err)
 		}
 	}
 
 	return nil
 }
 
-func copyTable(src, dst *sql.DB, table string) error {
+func copyTable(src *sql.DB, dst sqlExecer, table string) error {
 	rows, err := src.Query("SELECT * FROM " + table)
 	if err != nil {
 		return err

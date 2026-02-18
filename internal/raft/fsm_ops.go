@@ -212,7 +212,9 @@ func (f *FSM) applyMultiEnqueue(ops []store.EnqueueOp) *store.OpResult {
 
 	if err := batch.Commit(f.writeOpts); err != nil {
 		for i := range results {
-			results[i] = &store.OpResult{Err: fmt.Errorf("pebble commit: %w", err)}
+			if results[i] == nil || results[i].Err == nil {
+				results[i] = &store.OpResult{Err: fmt.Errorf("pebble commit: %w", err)}
+			}
 		}
 		return &store.OpResult{Data: results}
 	}
@@ -358,12 +360,19 @@ func (f *FSM) applyMultiEnqueueBatch(ops []store.EnqueueBatchOp) *store.OpResult
 		}}
 	}
 	if err := f.appendLifecycleCursor(batch); err != nil {
-		return &store.OpResult{Err: err}
+		for i := range results {
+			if results[i] == nil || results[i].Err == nil {
+				results[i] = &store.OpResult{Err: err}
+			}
+		}
+		return &store.OpResult{Data: results}
 	}
 
 	if err := batch.Commit(f.writeOpts); err != nil {
 		for i := range results {
-			results[i] = &store.OpResult{Err: fmt.Errorf("pebble commit: %w", err)}
+			if results[i] == nil || results[i].Err == nil {
+				results[i] = &store.OpResult{Err: fmt.Errorf("pebble commit: %w", err)}
+			}
 		}
 		return &store.OpResult{Data: results}
 	}
@@ -1558,7 +1567,9 @@ func (f *FSM) applyMultiAckBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 	if err := f.appendLifecycleCursor(batch); err != nil {
 		errResult := &store.OpResult{Err: err}
 		for i := range results {
-			results[i] = errResult
+			if results[i] == nil || results[i].Err == nil {
+				results[i] = errResult
+			}
 		}
 		return &store.OpResult{Data: results}
 	}
@@ -1566,7 +1577,9 @@ func (f *FSM) applyMultiAckBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 	if err := batch.Commit(f.writeOpts); err != nil {
 		errResult := &store.OpResult{Err: fmt.Errorf("pebble commit multi ack batch: %w", err)}
 		for i := range results {
-			results[i] = errResult
+			if results[i] == nil || results[i].Err == nil {
+				results[i] = errResult
+			}
 		}
 		return &store.OpResult{Data: results}
 	}
@@ -1862,7 +1875,9 @@ func (f *FSM) applyMultiFetchBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 	if err := f.appendLifecycleCursor(batch); err != nil {
 		errResult := &store.OpResult{Err: err}
 		for i := range results {
-			results[i] = errResult
+			if results[i] == nil || results[i].Err == nil {
+				results[i] = errResult
+			}
 		}
 		return &store.OpResult{Data: results}
 	}
@@ -1870,7 +1885,9 @@ func (f *FSM) applyMultiFetchBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 	if err := batch.Commit(f.writeOpts); err != nil {
 		errResult := &store.OpResult{Err: fmt.Errorf("pebble commit multi fetch batch: %w", err)}
 		for i := range results {
-			results[i] = errResult
+			if results[i] == nil || results[i].Err == nil {
+				results[i] = errResult
+			}
 		}
 		return &store.OpResult{Data: results}
 	}

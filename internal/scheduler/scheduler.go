@@ -36,6 +36,7 @@ type Config struct {
 	ExpireInterval         time.Duration // expire jobs past their expire_at
 	PurgeInterval          time.Duration // purge old terminal-state jobs
 	RetentionPeriod        time.Duration // how long to keep terminal jobs
+	MaxDeferDuration       time.Duration // max time to defer under-load ops before forcing a run (default 10s)
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -49,6 +50,7 @@ func DefaultConfig() Config {
 		ExpireInterval:         10 * time.Second,
 		PurgeInterval:          1 * time.Hour,
 		RetentionPeriod:        7 * 24 * time.Hour,
+		MaxDeferDuration:       10 * time.Second,
 	}
 }
 
@@ -107,6 +109,9 @@ func New(s *store.Store, leaderCheck LeaderCheck, config Config, metrics *Metric
 	if config.RetentionPeriod == 0 {
 		config.RetentionPeriod = def.RetentionPeriod
 	}
+	if config.MaxDeferDuration == 0 {
+		config.MaxDeferDuration = def.MaxDeferDuration
+	}
 	return &Scheduler{store: s, leaderCheck: leaderCheck, config: config, metrics: metrics}
 }
 
@@ -137,15 +142,21 @@ func (s *Scheduler) tick(force bool) {
 
 	// When the apply pipeline is busy, skip expensive ops (Promote, Reclaim,
 	// ExpireJobs) to avoid competing with fetch/ack on the serial FSM goroutine.
-	// Note: underLoad also suppresses force=true (used by RunOnce in tests).
-	// This is safe because DirectApplier (used in tests) doesn't implement
-	// LoadChecker, so underLoad stays false in test environments.
+	// However, if an op has been deferred for longer than MaxDeferDuration, run
+	// it anyway to guarantee liveness under sustained load.
+	// Note: DirectApplier (used in tests) doesn't implement LoadChecker, so
+	// underLoad stays false in test environments and force=true always works.
 	underLoad := false
 	if lc, ok := s.leaderCheck.(LoadChecker); ok {
 		underLoad = lc.IsUnderLoad()
 	}
 
-	if (force || now.Sub(s.lastPromote) >= s.config.PromoteInterval) && !underLoad {
+	maxDefer := s.config.MaxDeferDuration
+	promoteOverdue := now.Sub(s.lastPromote) >= maxDefer
+	reclaimOverdue := now.Sub(s.lastReclaim) >= maxDefer
+	expireOverdue := now.Sub(s.lastExpire) >= maxDefer
+
+	if (force || now.Sub(s.lastPromote) >= s.config.PromoteInterval) && (!underLoad || promoteOverdue) {
 		if err := s.store.Promote(); err != nil {
 			slog.Error("promote scheduled jobs", "error", err)
 			if s.metrics != nil {
@@ -158,7 +169,7 @@ func (s *Scheduler) tick(force bool) {
 		}
 		s.lastPromote = now
 	}
-	if (force || now.Sub(s.lastReclaim) >= s.config.ReclaimInterval) && !underLoad {
+	if (force || now.Sub(s.lastReclaim) >= s.config.ReclaimInterval) && (!underLoad || reclaimOverdue) {
 		if err := s.store.Reclaim(); err != nil {
 			slog.Error("reclaim expired leases", "error", err)
 			if s.metrics != nil {
@@ -183,7 +194,7 @@ func (s *Scheduler) tick(force bool) {
 		}
 		s.lastRate = now
 	}
-	if (force || now.Sub(s.lastExpire) >= s.config.ExpireInterval) && !underLoad {
+	if (force || now.Sub(s.lastExpire) >= s.config.ExpireInterval) && (!underLoad || expireOverdue) {
 		if err := s.store.ExpireJobs(); err != nil {
 			slog.Error("expire jobs past deadline", "error", err)
 			if s.metrics != nil {

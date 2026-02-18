@@ -606,9 +606,12 @@ func (f *FSM) applyMultiGrouped(ops []*store.DecodedRaftOp) *store.OpResult {
 }
 
 // applyMultiIndexed processes all ops using a single indexed Pebble batch.
-// Reads go through the batch (seeing prior writes), writes accumulate,
-// and a single Commit() flushes everything. This is the most efficient
-// mode: N ops = 1 Pebble commit.
+// For ack and fetch ops, reads go through the batch (seeing prior writes) and
+// a single Commit() flushes them together. For other op types (the default
+// case), applyDecoded is called which commits its own internal batch, so mixed
+// batches do not achieve a single Pebble commit. In practice, "indexed" mode
+// is opt-in and mixed batches are uncommon since the homogeneous fast paths
+// (all-enqueue, all-fetch, all-ack) fire first.
 func (f *FSM) applyMultiIndexed(ops []*store.DecodedRaftOp) *store.OpResult {
 	results := make([]*store.OpResult, len(ops))
 
@@ -681,7 +684,9 @@ func (f *FSM) applyMultiIndexed(ops []*store.DecodedRaftOp) *store.OpResult {
 	if err := f.appendLifecycleCursor(batch); err != nil {
 		errResult := &store.OpResult{Err: err}
 		for i := range results {
-			results[i] = errResult
+			if results[i] == nil || results[i].Err == nil {
+				results[i] = errResult
+			}
 		}
 		return &store.OpResult{Data: results}
 	}
@@ -689,7 +694,9 @@ func (f *FSM) applyMultiIndexed(ops []*store.DecodedRaftOp) *store.OpResult {
 	if err := batch.Commit(f.writeOpts); err != nil {
 		errResult := &store.OpResult{Err: fmt.Errorf("pebble commit multi indexed: %w", err)}
 		for i := range results {
-			results[i] = errResult
+			if results[i] == nil || results[i].Err == nil {
+				results[i] = errResult
+			}
 		}
 		return &store.OpResult{Data: results}
 	}

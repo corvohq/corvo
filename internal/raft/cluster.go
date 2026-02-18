@@ -306,32 +306,15 @@ func prepareFSMForRecovery(pdb *pebble.DB, snapshotStore raft.SnapshotStore) err
 }
 
 func clearPebbleAll(pdb *pebble.DB) error {
-	iter, err := pdb.NewIter(nil)
-	if err != nil {
-		return fmt.Errorf("create pebble iterator: %w", err)
-	}
-	defer iter.Close()
-
+	// Use a single range tombstone to clear all keys in O(1) memory,
+	// regardless of DB size. All Corvo keys use ASCII prefixes (0x61–0x77),
+	// so [0x00, 0xff) covers the entire practical keyspace.
 	batch := pdb.NewBatch()
 	defer batch.Close()
-	var n int
-	for iter.First(); iter.Valid(); iter.Next() {
-		k := append([]byte(nil), iter.Key()...)
-		if err := batch.Delete(k, pebble.Sync); err != nil {
-			return fmt.Errorf("delete pebble key: %w", err)
-		}
-		n++
+	if err := batch.DeleteRange([]byte{0x00}, []byte{0xff}, pebble.Sync); err != nil {
+		return fmt.Errorf("delete range pebble: %w", err)
 	}
-	if err := iter.Error(); err != nil {
-		return fmt.Errorf("iterate pebble keys: %w", err)
-	}
-	if n == 0 {
-		return nil
-	}
-	if err := batch.Commit(pebble.Sync); err != nil {
-		return fmt.Errorf("commit pebble clear batch: %w", err)
-	}
-	return nil
+	return batch.Commit(pebble.Sync)
 }
 
 // Apply submits an operation to the Raft cluster and returns the result.
@@ -537,6 +520,16 @@ func (c *Cluster) fetchSemaphore(queue string) chan struct{} {
 
 func (c *Cluster) overloadedResult(msg string) *store.OpResult {
 	return &store.OpResult{Err: store.NewOverloadedErrorRetry(msg, c.overloadRetryAfterMs())}
+}
+
+// cleanupDeletedQueue removes fetchSem and pendingCache entries for a deleted
+// queue. Called after a successful OpDeleteQueue apply so the map does not
+// grow without bound as queues are created and deleted over time.
+func (c *Cluster) cleanupDeletedQueue(queue string) {
+	c.fetchMu.Lock()
+	delete(c.fetchSem, queue)
+	c.fetchMu.Unlock()
+	c.pendingCache.Delete(queue)
 }
 
 func (c *Cluster) overloadRetryAfterMs() int {
@@ -757,6 +750,11 @@ func (c *Cluster) flushApplyBatch(batch []*applyRequest) {
 		req.respCh <- c.applyImmediate(req.opType, req.data)
 		c.applyHist.observe(time.Since(start))
 		c.appliedTotal.Add(1)
+		if req.opType == store.OpDeleteQueue {
+			if op, ok := req.data.(store.QueueOp); ok {
+				c.cleanupDeletedQueue(op.Queue)
+			}
+		}
 		return
 	}
 
@@ -803,6 +801,11 @@ func (c *Cluster) flushApplyBatch(batch []*applyRequest) {
 
 	for i, req := range validReqs {
 		req.respCh <- subResults[i]
+		if req.opType == store.OpDeleteQueue {
+			if op, ok := req.data.(store.QueueOp); ok {
+				c.cleanupDeletedQueue(op.Queue)
+			}
+		}
 	}
 }
 
