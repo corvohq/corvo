@@ -1178,7 +1178,6 @@ func benchDoCombined(protocol string, httpC *http.Client, serverURL string, tota
 				time.Sleep(5 * time.Millisecond)
 			}
 
-
 			if protocol == "http" {
 				pending := make([]benchFetchedItem, 0, ackBatchSize*2)
 				for {

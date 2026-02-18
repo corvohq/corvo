@@ -137,6 +137,9 @@ func (s *Scheduler) tick(force bool) {
 
 	// When the apply pipeline is busy, skip expensive ops (Promote, Reclaim,
 	// ExpireJobs) to avoid competing with fetch/ack on the serial FSM goroutine.
+	// Note: underLoad also suppresses force=true (used by RunOnce in tests).
+	// This is safe because DirectApplier (used in tests) doesn't implement
+	// LoadChecker, so underLoad stays false in test environments.
 	underLoad := false
 	if lc, ok := s.leaderCheck.(LoadChecker); ok {
 		underLoad = lc.IsUnderLoad()

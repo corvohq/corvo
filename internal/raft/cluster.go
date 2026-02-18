@@ -140,10 +140,17 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 		MaxConcurrentCompactions: func() int {
 			return 4
 		},
+		// Bloom filter on L0 only to reduce SSTable reads on point lookups
+		// (job doc fetches by key). L1+ levels are not covered, so reads that
+		// miss L0 still walk the full level stack — acceptable given L0 absorbs
+		// most recent writes and the 128MB block cache covers hot keys.
 		Levels: []pebble.LevelOptions{
 			{FilterPolicy: bloom.FilterPolicy(10)},
 		},
 	}
+	// PebbleNoSync=true means non-durable mode (no fsync); WAL sync batching
+	// only makes sense when durability is enabled, since it amortizes fsync
+	// cost across writes within a 2ms window.
 	if !cfg.PebbleNoSync {
 		pebbleOpts.WALMinSyncInterval = func() time.Duration { return 2 * time.Millisecond }
 	}
@@ -826,6 +833,9 @@ func (c *Cluster) IsLeader() bool {
 
 // IsUnderLoad returns true when the apply pipeline has pending work. Used by
 // the scheduler to skip expensive maintenance ops during high throughput.
+// Note: any non-zero depth triggers "under load" (threshold=1). Under sustained
+// traffic this may indefinitely defer Promote/Reclaim/ExpireJobs. If that
+// becomes an issue, consider a higher threshold or a max-deferral duration.
 func (c *Cluster) IsUnderLoad() bool {
 	return len(c.applyCh) > 0
 }

@@ -836,16 +836,16 @@ func (f *FSM) applyFetchBatchPreresolved(op store.FetchBatchOp) *store.OpResult 
 
 		batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
 		f.incrActive(queue)
-		batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
-		rateSeq++
+		if qs.rateLimit > 0 {
+			batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+			rateSeq++
+			qs.rateCount++
+		}
 		if err := f.appendLifecycleEvent(batch, "started", jobID, queue, nowNs); err != nil {
 			return &store.OpResult{Err: err}
 		}
 		if qs.activeLimit > 0 {
 			qs.activeCount++
-		}
-		if qs.rateLimit > 0 {
-			qs.rateCount++
 		}
 
 		sqliteJobs = append(sqliteJobs, job)
@@ -1747,17 +1747,17 @@ func (f *FSM) applyMultiFetchBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 				}
 				batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
 				f.incrActive(queue)
-				batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
-				rateSeq++
+				if qs.rateLimit > 0 {
+					batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+					rateSeq++
+					qs.rateCount++
+				}
 				if err := f.appendLifecycleEvent(batch, "started", jobID, queue, nowNs); err != nil {
 					results[i] = &store.OpResult{Err: err}
 					break
 				}
 				if qs.activeLimit > 0 {
 					qs.activeCount++
-				}
-				if qs.rateLimit > 0 {
-					qs.rateCount++
 				}
 				sqliteJobs = append(sqliteJobs, job)
 				fetchResults = append(fetchResults, store.FetchResult{
@@ -1810,17 +1810,17 @@ func (f *FSM) applyMultiFetchBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 				}
 				batch.Set(kv.ActiveKey(qs.name, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
 				f.incrActive(qs.name)
-				batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
-				rateSeq++
+				if qs.rateLimit > 0 {
+					batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+					rateSeq++
+					qs.rateCount++
+				}
 				if err := f.appendLifecycleEvent(batch, "started", jobID, qs.name, nowNs); err != nil {
 					results[i] = &store.OpResult{Err: err}
 					break
 				}
 				if qs.activeLimit > 0 {
 					qs.activeCount++
-				}
-				if qs.rateLimit > 0 {
-					qs.rateCount++
 				}
 				sqliteJobs = append(sqliteJobs, job)
 				fetchResults = append(fetchResults, store.FetchResult{
@@ -2337,6 +2337,10 @@ func findAppendJobFromReader(r pebble.Reader, queue string, claimed map[string]s
 
 	// Cursor-based scan found nothing. Rescan before the cursor for
 	// entries with timestamps before the cursor position.
+	// Note: stale append keys (non-pending jobs) are not deleted here because
+	// this function operates on a pebble.Reader (read-only interface, used in
+	// applyMultiIndexed's IndexedBatch path). Cleanup of stale keys happens in
+	// findAppendJobForQueue, which has direct *pebble.DB write access.
 	if hasCursor {
 		iter2, err := r.NewIter(&pebble.IterOptions{
 			LowerBound: prefix,
