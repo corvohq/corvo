@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,20 @@ import (
 	"strings"
 	"time"
 )
+
+// PayloadTooLargeError is returned when a job payload exceeds the server's configured limit.
+// This error is not retryable; the payload must be reduced before re-enqueuing.
+type PayloadTooLargeError struct {
+	Message string
+}
+
+func (e *PayloadTooLargeError) Error() string { return e.Message }
+
+// IsPayloadTooLargeError reports whether err is a PayloadTooLargeError.
+func IsPayloadTooLargeError(err error) bool {
+	var e *PayloadTooLargeError
+	return errors.As(err, &e)
+}
 
 // Client is a thin HTTP wrapper for the Corvo API.
 type Client struct {
@@ -496,6 +511,9 @@ func (c *Client) doRequestWithContext(ctx context.Context, method, path string, 
 			Code  string `json:"code"`
 		}
 		json.Unmarshal(data, &apiErr)
+		if apiErr.Code == "PAYLOAD_TOO_LARGE" {
+			return &PayloadTooLargeError{Message: apiErr.Error}
+		}
 		return fmt.Errorf("%s: %s", apiErr.Code, apiErr.Error)
 	}
 

@@ -124,6 +124,17 @@ export type AuthOptions = {
   tokenProvider?: () => Promise<string> | string;
 };
 
+export class PayloadTooLargeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PayloadTooLargeError";
+  }
+}
+
+export function isPayloadTooLargeError(err: unknown): err is PayloadTooLargeError {
+  return err instanceof PayloadTooLargeError;
+}
+
 export class CorvoClient {
   readonly baseURL: string;
   readonly fetchImpl: typeof fetch;
@@ -260,12 +271,15 @@ export class CorvoClient {
 
     if (!res.ok) {
       let details = `HTTP ${res.status}`;
+      let code = "";
       try {
-        const body = (await res.json()) as { error?: string };
+        const body = (await res.json()) as { error?: string; code?: string };
         if (body.error) details = body.error;
+        if (body.code) code = body.code;
       } catch {
         // ignore decode errors for non-JSON responses
       }
+      if (code === "PAYLOAD_TOO_LARGE") throw new PayloadTooLargeError(details);
       throw new Error(details);
     }
 

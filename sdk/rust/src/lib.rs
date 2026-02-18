@@ -10,6 +10,9 @@ pub enum CorvoError {
     Http(#[from] reqwest::Error),
     #[error("api error: {0}")]
     Api(String),
+    /// Payload exceeded the server's configured limit. Not retryable.
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -488,6 +491,13 @@ impl CorvoClient {
                 .and_then(|v| v.as_str())
                 .unwrap_or("request failed")
                 .to_string();
+            let code = body
+                .get("code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if code == "PAYLOAD_TOO_LARGE" {
+                return Err(CorvoError::PayloadTooLarge(msg));
+            }
             return Err(CorvoError::Api(msg));
         }
         Ok(resp.json().await?)

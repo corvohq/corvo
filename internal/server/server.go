@@ -60,6 +60,7 @@ type Server struct {
 	adminPassword    string
 	bindAddr         string
 	h2cTransport     http.RoundTripper
+	maxPayloadBytes  int // 0 means no limit
 }
 
 // Option mutates server behavior.
@@ -116,6 +117,16 @@ func WithRateLimit(cfg RateLimitConfig) Option {
 func WithSchedulerMetrics(m *scheduler.Metrics) Option {
 	return func(s *Server) error {
 		s.schedulerMetrics = m
+		return nil
+	}
+}
+
+// WithMaxPayloadSize sets the maximum allowed job payload size in bytes.
+// Enqueue requests with a larger payload are rejected with HTTP 413 and code "PAYLOAD_TOO_LARGE".
+// 0 disables the limit.
+func WithMaxPayloadSize(bytes int) Option {
+	return func(s *Server) error {
+		s.maxPayloadBytes = bytes
 		return nil
 	}
 }

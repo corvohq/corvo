@@ -1,4 +1,5 @@
-import { CorvoClient } from "@corvo/client";
+import { CorvoClient, PayloadTooLargeError } from "@corvo/client";
+export { PayloadTooLargeError } from "@corvo/client";
 
 declare const process:
   | {
@@ -258,12 +259,15 @@ export class CorvoWorker {
     });
     if (!res.ok) {
       let details = `HTTP ${res.status}`;
+      let code = "";
       try {
-        const body = (await res.json()) as { error?: string };
+        const body = (await res.json()) as { error?: string; code?: string };
         if (body.error) details = body.error;
+        if (body.code) code = body.code;
       } catch {
         // ignore
       }
+      if (code === "PAYLOAD_TOO_LARGE") throw new PayloadTooLargeError(details);
       throw new Error(details);
     }
     if (res.status === 204) return {} as T;

@@ -2,6 +2,8 @@
 {-# LANGUAGE RecordWildCards #-}
 module Corvo.Client
   ( CorvoClient(..)
+  , CorvoApiError(..)
+  , isPayloadTooLargeError
   , EnqueueOptions(..)
   , EnqueueResult(..)
   , BatchJob(..)
@@ -41,10 +43,38 @@ module Corvo.Client
 import Prelude hiding (fail)
 import Data.Aeson
 import Data.Aeson.Types (Pair)
+import Data.Maybe (fromMaybe)
 import qualified Data.ByteString.Char8 as B
+import qualified Data.ByteString.Lazy as LBS
 import qualified Data.HashMap.Strict as HM
 import qualified Data.Text as T
 import Network.HTTP.Simple
+import Network.HTTP.Types (statusIsSuccessful)
+
+-- | Error type returned by all Corvo API calls.
+data CorvoApiError
+  = ApiError T.Text
+    -- ^ Generic API or HTTP error.
+  | PayloadTooLarge T.Text
+    -- ^ Payload exceeded the server-configured limit. Not retryable.
+  deriving (Show, Eq)
+
+-- | Returns 'True' when the error is a 'PayloadTooLarge' error.
+isPayloadTooLargeError :: CorvoApiError -> Bool
+isPayloadTooLargeError (PayloadTooLarge _) = True
+isPayloadTooLargeError _                   = False
+
+-- Internal: error body shape returned by the server on non-2xx responses.
+data ErrorResponse = ErrorResponse
+  { errCode    :: T.Text
+  , errMessage :: T.Text
+  }
+
+instance FromJSON ErrorResponse where
+  parseJSON = withObject "ErrorResponse" $ \o ->
+    ErrorResponse
+      <$> o .:? "code"  .!= ""
+      <*> o .:? "error" .!= "request failed"
 
 -- | Client configuration.
 data CorvoClient = CorvoClient
@@ -241,18 +271,32 @@ applyAuth client req =
       r2 = maybe r1 (\t -> addRequestHeader "Authorization" (B.pack $ "Bearer " <> t) r1) (bearerToken client)
   in r2
 
+-- | Internal: execute a prepared request and decode the response.
+-- On non-2xx responses, decodes the error body and returns 'Left CorvoApiError'.
+doRequest :: FromJSON a => Request -> IO (Either CorvoApiError a)
+doRequest req = do
+  resp <- httpLBS req
+  let body = getResponseBody resp
+  if statusIsSuccessful (getResponseStatus resp)
+    then case eitherDecode body of
+           Left e  -> pure . Left . ApiError . T.pack $ e
+           Right v -> pure (Right v)
+    else do
+      let er = fromMaybe (ErrorResponse "" "request failed") (decode body)
+      pure . Left $ case errCode er of
+        "PAYLOAD_TOO_LARGE" -> PayloadTooLarge (errMessage er)
+        _                   -> ApiError (errMessage er)
+
 -- | Simple enqueue with queue name and payload.
-enqueue :: CorvoClient -> T.Text -> Value -> IO (Either String EnqueueResult)
+enqueue :: CorvoClient -> T.Text -> Value -> IO (Either CorvoApiError EnqueueResult)
 enqueue client queue payload = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/enqueue")
-  let req1 = setRequestMethod "POST"
-          $ setRequestBodyJSON (object ["queue" .= queue, "payload" .= payload]) req0
-      req2 = applyAuth client req1
-  resp <- httpJSONEither req2
-  pure (getResponseBody resp)
+  doRequest . applyAuth client
+    $ setRequestMethod "POST"
+    $ setRequestBodyJSON (object ["queue" .= queue, "payload" .= payload]) req0
 
 -- | Enqueue with full options.
-enqueueWith :: CorvoClient -> EnqueueOptions -> IO (Either String EnqueueResult)
+enqueueWith :: CorvoClient -> EnqueueOptions -> IO (Either CorvoApiError EnqueueResult)
 enqueueWith client EnqueueOptions{..} = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/enqueue")
   let pairs = concat
@@ -266,146 +310,125 @@ enqueueWith client EnqueueOptions{..} = do
         , maybe [] (\v -> ["expire_after" .= v]) eoExpireAfter
         , maybe [] (\v -> ["chain" .= v]) eoChain
         ] :: [Pair]
-      req1 = setRequestMethod "POST" $ setRequestBodyJSON (object pairs) req0
-      req2 = applyAuth client req1
-  resp <- httpJSONEither req2
-  pure (getResponseBody resp)
+  doRequest . applyAuth client
+    $ setRequestMethod "POST"
+    $ setRequestBodyJSON (object pairs) req0
 
 -- | Batch enqueue.
-enqueueBatch :: CorvoClient -> [BatchJob] -> Maybe BatchConfig -> IO (Either String BatchResult)
+enqueueBatch :: CorvoClient -> [BatchJob] -> Maybe BatchConfig -> IO (Either CorvoApiError BatchResult)
 enqueueBatch client jobs mbatch = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/enqueue/batch")
   let body = object $ ["jobs" .= jobs] <> maybe [] (\b -> ["batch" .= b]) mbatch
-      req1 = setRequestMethod "POST" $ setRequestBodyJSON body req0
-      req2 = applyAuth client req1
-  resp <- httpJSONEither req2
-  pure (getResponseBody resp)
+  doRequest . applyAuth client
+    $ setRequestMethod "POST"
+    $ setRequestBodyJSON body req0
 
 -- | Batch fetch for multiple jobs.
-fetchBatch :: CorvoClient -> [T.Text] -> T.Text -> T.Text -> Int -> Int -> IO (Either String FetchBatchResult)
+fetchBatch :: CorvoClient -> [T.Text] -> T.Text -> T.Text -> Int -> Int -> IO (Either CorvoApiError FetchBatchResult)
 fetchBatch client queues workerId hostname timeout count = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/fetch/batch")
   let body = object [ "queues" .= queues, "worker_id" .= workerId
                      , "hostname" .= hostname, "timeout" .= timeout, "count" .= count ]
-      req1 = setRequestMethod "POST" $ setRequestBodyJSON body req0
-      req2 = applyAuth client req1
-  resp <- httpJSONEither req2
-  pure (getResponseBody resp)
+  doRequest . applyAuth client
+    $ setRequestMethod "POST"
+    $ setRequestBodyJSON body req0
 
 -- | Batch acknowledge multiple jobs.
-ackBatch :: CorvoClient -> [AckBatchItem] -> IO (Either String AckBatchResult)
+ackBatch :: CorvoClient -> [AckBatchItem] -> IO (Either CorvoApiError AckBatchResult)
 ackBatch client items = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/ack/batch")
-  let body = object ["acks" .= items]
-      req1 = setRequestMethod "POST" $ setRequestBodyJSON body req0
-      req2 = applyAuth client req1
-  resp <- httpJSONEither req2
-  pure (getResponseBody resp)
+  doRequest . applyAuth client
+    $ setRequestMethod "POST"
+    $ setRequestBodyJSON (object ["acks" .= items]) req0
 
 -- | Long-poll fetch for a job.
-fetch :: CorvoClient -> [T.Text] -> T.Text -> T.Text -> Int -> IO (Either String (Maybe FetchedJob))
+fetch :: CorvoClient -> [T.Text] -> T.Text -> T.Text -> Int -> IO (Either CorvoApiError (Maybe FetchedJob))
 fetch client queues workerId hostname timeout = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/fetch")
   let body = object [ "queues" .= queues, "worker_id" .= workerId
                      , "hostname" .= hostname, "timeout" .= timeout ]
-      req1 = setRequestMethod "POST" $ setRequestBodyJSON body req0
-      req2 = applyAuth client req1
-  resp <- httpJSONEither req2
-  case getResponseBody resp of
-    Left err -> pure (Left err)
-    Right job -> if fjJobId job == "" then pure (Right Nothing) else pure (Right (Just job))
+  result <- doRequest . applyAuth client
+    $ setRequestMethod "POST"
+    $ setRequestBodyJSON body req0
+  pure $ fmap (\job -> if fjJobId job == "" then Nothing else Just job) result
 
 -- | Acknowledge a job as complete.
-ack :: CorvoClient -> T.Text -> Value -> IO (Either String Value)
+ack :: CorvoClient -> T.Text -> Value -> IO (Either CorvoApiError Value)
 ack client jobId body = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/ack/" ++ T.unpack jobId)
-  let req1 = setRequestMethod "POST" $ setRequestBodyJSON body req0
-      req2 = applyAuth client req1
-  resp <- httpJSONEither req2
-  pure (getResponseBody resp)
+  doRequest . applyAuth client
+    $ setRequestMethod "POST"
+    $ setRequestBodyJSON body req0
 
 -- | Fail a job.
-fail :: CorvoClient -> T.Text -> T.Text -> T.Text -> IO (Either String Value)
+fail :: CorvoClient -> T.Text -> T.Text -> T.Text -> IO (Either CorvoApiError Value)
 fail client jobId errMsg backtrace = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/fail/" ++ T.unpack jobId)
   let body = object ["error" .= errMsg, "backtrace" .= backtrace]
-      req1 = setRequestMethod "POST" $ setRequestBodyJSON body req0
-      req2 = applyAuth client req1
-  resp <- httpJSONEither req2
-  pure (getResponseBody resp)
+  doRequest . applyAuth client
+    $ setRequestMethod "POST"
+    $ setRequestBodyJSON body req0
 
 -- | Batched heartbeat.
-heartbeat :: CorvoClient -> Value -> IO (Either String HeartbeatResult)
+heartbeat :: CorvoClient -> Value -> IO (Either CorvoApiError HeartbeatResult)
 heartbeat client jobs = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/heartbeat")
-  let req1 = setRequestMethod "POST" $ setRequestBodyJSON (object ["jobs" .= jobs]) req0
-      req2 = applyAuth client req1
-  resp <- httpJSONEither req2
-  pure (getResponseBody resp)
+  doRequest . applyAuth client
+    $ setRequestMethod "POST"
+    $ setRequestBodyJSON (object ["jobs" .= jobs]) req0
 
 -- | Get a job by ID.
-getJob :: CorvoClient -> T.Text -> IO (Either String Value)
+getJob :: CorvoClient -> T.Text -> IO (Either CorvoApiError Value)
 getJob client jobId = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/jobs/" ++ T.unpack jobId)
-  let req1 = applyAuth client req0
-  resp <- httpJSONEither req1
-  pure (getResponseBody resp)
+  doRequest (applyAuth client req0)
 
 -- | Retry a failed/dead job.
-retryJob :: CorvoClient -> T.Text -> IO (Either String Value)
+retryJob :: CorvoClient -> T.Text -> IO (Either CorvoApiError Value)
 retryJob client jobId = postEmpty client ("/api/v1/jobs/" ++ T.unpack jobId ++ "/retry")
 
 -- | Cancel a pending/active job.
-cancelJob :: CorvoClient -> T.Text -> IO (Either String Value)
+cancelJob :: CorvoClient -> T.Text -> IO (Either CorvoApiError Value)
 cancelJob client jobId = postEmpty client ("/api/v1/jobs/" ++ T.unpack jobId ++ "/cancel")
 
 -- | Move a job to a different queue.
-moveJob :: CorvoClient -> T.Text -> T.Text -> IO (Either String Value)
+moveJob :: CorvoClient -> T.Text -> T.Text -> IO (Either CorvoApiError Value)
 moveJob client jobId targetQueue = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/jobs/" ++ T.unpack jobId ++ "/move")
-  let req1 = setRequestMethod "POST" $ setRequestBodyJSON (object ["queue" .= targetQueue]) req0
-      req2 = applyAuth client req1
-  resp <- httpJSONEither req2
-  pure (getResponseBody resp)
+  doRequest . applyAuth client
+    $ setRequestMethod "POST"
+    $ setRequestBodyJSON (object ["queue" .= targetQueue]) req0
 
 -- | Delete a job.
-deleteJob :: CorvoClient -> T.Text -> IO (Either String Value)
+deleteJob :: CorvoClient -> T.Text -> IO (Either CorvoApiError Value)
 deleteJob client jobId = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/jobs/" ++ T.unpack jobId)
-  let req1 = setRequestMethod "DELETE" $ applyAuth client req0
-  resp <- httpJSONEither req1
-  pure (getResponseBody resp)
+  doRequest . applyAuth client $ setRequestMethod "DELETE" req0
 
 -- | Search for jobs with filters.
-search :: CorvoClient -> SearchFilter -> IO (Either String SearchResult)
+search :: CorvoClient -> SearchFilter -> IO (Either CorvoApiError SearchResult)
 search client filt = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/jobs/search")
-  let req1 = setRequestMethod "POST" $ setRequestBodyJSON filt req0
-      req2 = applyAuth client req1
-  resp <- httpJSONEither req2
-  pure (getResponseBody resp)
+  doRequest . applyAuth client
+    $ setRequestMethod "POST"
+    $ setRequestBodyJSON filt req0
 
 -- | Bulk operation on jobs.
-bulk :: CorvoClient -> BulkRequest -> IO (Either String BulkResult)
+bulk :: CorvoClient -> BulkRequest -> IO (Either CorvoApiError BulkResult)
 bulk client bulkReq = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/jobs/bulk")
-  let req1 = setRequestMethod "POST" $ setRequestBodyJSON bulkReq req0
-      req2 = applyAuth client req1
-  resp <- httpJSONEither req2
-  pure (getResponseBody resp)
+  doRequest . applyAuth client
+    $ setRequestMethod "POST"
+    $ setRequestBodyJSON bulkReq req0
 
 -- | Check status of an async bulk operation.
-bulkStatus :: CorvoClient -> T.Text -> IO (Either String BulkTask)
+bulkStatus :: CorvoClient -> T.Text -> IO (Either CorvoApiError BulkTask)
 bulkStatus client bulkId = do
   req0 <- parseRequest (baseUrl client ++ "/api/v1/bulk/" ++ T.unpack bulkId)
-  let req1 = applyAuth client req0
-  resp <- httpJSONEither req1
-  pure (getResponseBody resp)
+  doRequest (applyAuth client req0)
 
 -- | Helper: POST with empty body.
-postEmpty :: CorvoClient -> String -> IO (Either String Value)
+postEmpty :: CorvoClient -> String -> IO (Either CorvoApiError Value)
 postEmpty client path = do
   req0 <- parseRequest (baseUrl client ++ path)
-  let req1 = setRequestMethod "POST" $ applyAuth client req0
-  resp <- httpJSONEither req1
-  pure (getResponseBody resp)
+  doRequest . applyAuth client $ setRequestMethod "POST" req0

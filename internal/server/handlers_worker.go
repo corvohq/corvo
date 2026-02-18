@@ -36,6 +36,12 @@ func (s *Server) handleWebhookEnqueue(w http.ResponseWriter, r *http.Request) {
 		quoted, _ := json.Marshal(string(body))
 		payload = json.RawMessage(quoted)
 	}
+	if s.maxPayloadBytes > 0 && len(payload) > s.maxPayloadBytes {
+		writeError(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("payload too large: %d bytes (max %d)", len(payload), s.maxPayloadBytes),
+			"PAYLOAD_TOO_LARGE")
+		return
+	}
 
 	req := store.EnqueueRequest{
 		Queue:   namespaceQueue(principal.Namespace, queue),
@@ -112,6 +118,12 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 	if len(req.Payload) == 0 {
 		req.Payload = json.RawMessage(`{}`)
 	}
+	if s.maxPayloadBytes > 0 && len(req.Payload) > s.maxPayloadBytes {
+		writeError(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("payload too large: %d bytes (max %d)", len(req.Payload), s.maxPayloadBytes),
+			"PAYLOAD_TOO_LARGE")
+		return
+	}
 	req.Queue = namespaceQueue(principal.Namespace, req.Queue)
 	if req.Chain != nil {
 		for i := range req.Chain.Steps {
@@ -161,6 +173,12 @@ func (s *Server) handleEnqueueBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(j.Payload) == 0 {
 			req.Jobs[i].Payload = json.RawMessage(`{}`)
+		}
+		if s.maxPayloadBytes > 0 && len(req.Jobs[i].Payload) > s.maxPayloadBytes {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("job %d payload too large: %d bytes (max %d)", i, len(req.Jobs[i].Payload), s.maxPayloadBytes),
+				"PAYLOAD_TOO_LARGE")
+			return
 		}
 		req.Jobs[i].Queue = namespaceQueue(principal.Namespace, req.Jobs[i].Queue)
 	}

@@ -10,6 +10,14 @@ class CorvoError(Exception):
     pass
 
 
+class PayloadTooLargeError(CorvoError):
+    """Raised when a job payload exceeds the server's configured limit.
+
+    This error is not retryable; the payload must be reduced before re-enqueuing.
+    """
+    pass
+
+
 @dataclass
 class ChainStep:
     queue: str
@@ -142,12 +150,17 @@ class CorvoClient:
         resp = self.session.request(method=method, url=url, json=body, timeout=self.timeout, headers=headers)
         if not resp.ok:
             msg = f"HTTP {resp.status_code}"
+            code = ""
             try:
                 data = resp.json()
-                if isinstance(data, dict) and data.get("error"):
-                    msg = str(data["error"])
+                if isinstance(data, dict):
+                    if data.get("error"):
+                        msg = str(data["error"])
+                    code = str(data.get("code", ""))
             except Exception:
                 pass
+            if code == "PAYLOAD_TOO_LARGE":
+                raise PayloadTooLargeError(msg)
             raise CorvoError(msg)
         if resp.status_code == 204 or not resp.content:
             return {}
