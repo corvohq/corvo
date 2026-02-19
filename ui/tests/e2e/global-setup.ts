@@ -5,7 +5,7 @@ import * as net from "net";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CORVO_BIN = path.resolve(__dirname, "../../../corvo");
+const CORVO_BIN = path.resolve(__dirname, "../../../bin/corvo");
 const DATA_DIR = "/tmp/corvo-e2e-data";
 const SERVER_PORT = 8080;
 const SERVER_URL = `http://localhost:${SERVER_PORT}`;
