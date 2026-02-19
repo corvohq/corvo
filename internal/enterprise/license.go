@@ -89,7 +89,7 @@ func Validate(token string, pub ed25519.PublicKey, now time.Time) (*License, err
 	}
 	expires := time.Time{}
 	if c.ExpiresAt != nil {
-		expires = c.ExpiresAt.Time.UTC()
+		expires = c.ExpiresAt.UTC()
 	}
 	return &License{
 		Customer: strings.TrimSpace(c.Customer),

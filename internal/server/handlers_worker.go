@@ -395,7 +395,7 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 		StepStatus  string             `json:"step_status"`
 		ExitReason  string             `json:"exit_reason"`
 	}
-	decodeJSON(r, &body)
+	_ = decodeJSON(r, &body)
 
 	if err := s.store.AckJob(store.AckRequest{
 		JobID:       jobID,

@@ -29,7 +29,7 @@ func TestApplyMultiEnqueueFastPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	defer da.Close()
+	defer func() { _ = da.Close() }()
 
 	now := time.Now()
 	e1 := makeEnqueueOp(store.NewJobID(), "multi.q", now)
@@ -70,7 +70,7 @@ func TestApplyMultiEnqueueFastPath(t *testing.T) {
 	}
 
 	s := store.NewStore(da, da.SQLiteDB())
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	if _, err := s.GetJob(e1.JobID); err != nil {
 		t.Fatalf("GetJob e1: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestApplyMultiEnqueueUniqueDuplicateSameBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	defer da.Close()
+	defer func() { _ = da.Close() }()
 
 	now := time.Now()
 	e1 := makeEnqueueOp(store.NewJobID(), "multi.unique.q", now)
@@ -125,7 +125,7 @@ func TestApplyMultiEnqueueUniqueDuplicateSameBatch(t *testing.T) {
 	}
 
 	s := store.NewStore(da, da.SQLiteDB())
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	if _, err := s.GetJob(e1.JobID); err != nil {
 		t.Fatalf("GetJob first: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestApplyMultiEnqueueBatchFastPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	defer da.Close()
+	defer func() { _ = da.Close() }()
 
 	now := time.Now()
 	b1j1 := makeEnqueueOp(store.NewJobID(), "multi.batch.q", now)
@@ -184,7 +184,7 @@ func TestApplyMultiEnqueueBatchFastPath(t *testing.T) {
 	}
 
 	s := store.NewStore(da, da.SQLiteDB())
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	for _, id := range []string{b1j1.JobID, b1j2.JobID, b2j1.JobID, b2j2.JobID} {
 		if _, err := s.GetJob(id); err != nil {
 			t.Fatalf("GetJob %s: %v", id, err)

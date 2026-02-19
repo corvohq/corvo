@@ -13,7 +13,7 @@ func TestOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Verify the database file was created
 	if _, err := os.Stat(filepath.Join(dir, "corvo.db")); err != nil {
@@ -58,7 +58,7 @@ func TestMigrationCreatesAllTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	expectedTables := []string{
 		"jobs", "job_errors", "unique_locks", "batches",
@@ -86,13 +86,13 @@ func TestMigrationIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Open() error: %v", err)
 	}
-	db1.Close()
+	_ = db1.Close()
 
 	db2, err := Open(dir)
 	if err != nil {
 		t.Fatalf("second Open() error: %v", err)
 	}
-	defer db2.Close()
+	defer func() { _ = db2.Close() }()
 
 	// Verify migration version is still latest
 	var version int
@@ -112,7 +112,7 @@ func TestWriteConnMaxOne(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	stats := db.Write.Stats()
 	if stats.MaxOpenConnections != 1 {
@@ -127,7 +127,7 @@ func TestMigrationCreatesIndexes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	expectedIndexes := []string{
 		"idx_jobs_queue_state_priority",
@@ -171,7 +171,7 @@ func TestCanInsertAndQueryJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	_, err = db.Write.Exec(`INSERT INTO jobs (id, queue, payload) VALUES (?, ?, ?)`,
 		"job_test1", "test.queue", `{"hello":"world"}`)

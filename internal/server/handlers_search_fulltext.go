@@ -47,7 +47,7 @@ func (s *Server) handleFullTextSearch(w http.ResponseWriter, r *http.Request) {
 			LIMIT ?
 	`
 	readRows := func(rows *sql.Rows) []map[string]any {
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 		results := []map[string]any{}
 		for rows.Next() {
 			var id, queue, state, payload, tags, createdAt string

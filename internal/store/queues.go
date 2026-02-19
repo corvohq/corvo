@@ -34,7 +34,7 @@ func (s *Store) ListQueues() ([]QueueInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list queues: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var queues []QueueInfo
 	for rows.Next() {

@@ -343,7 +343,7 @@ func (s *Server) listAPIKeys() ([]map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := []map[string]any{}
 	for rows.Next() {
 		var keyHash, name, ns, role string

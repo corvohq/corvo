@@ -3,7 +3,6 @@ package raft
 import (
 	"bytes"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -78,101 +77,6 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 	return f.applyDecoded(op)
 }
 
-func (f *FSM) applyByType(opType store.OpType, data json.RawMessage) *store.OpResult {
-	switch opType {
-	case store.OpMulti:
-		return f.applyMulti(data)
-
-	case store.OpEnqueue:
-		return f.applyEnqueue(data)
-	case store.OpEnqueueBatch:
-		return f.applyEnqueueBatch(data)
-	case store.OpFetch:
-		return f.applyFetch(data)
-	case store.OpFetchBatch:
-		return f.applyFetchBatch(data)
-	case store.OpAck:
-		return f.applyAck(data)
-	case store.OpAckBatch:
-		return f.applyAckBatch(data)
-	case store.OpFail:
-		return f.applyFail(data)
-	case store.OpHeartbeat:
-		return f.applyHeartbeat(data)
-	case store.OpRetryJob:
-		return f.applyRetryJob(data)
-	case store.OpCancelJob:
-		return f.applyCancelJob(data)
-	case store.OpMoveJob:
-		return f.applyMoveJob(data)
-	case store.OpDeleteJob:
-		return f.applyDeleteJob(data)
-	case store.OpPauseQueue:
-		return f.applyPauseQueue(data)
-	case store.OpResumeQueue:
-		return f.applyResumeQueue(data)
-	case store.OpClearQueue:
-		return f.applyClearQueue(data)
-	case store.OpDeleteQueue:
-		return f.applyDeleteQueue(data)
-	case store.OpSetConcurrency:
-		return f.applySetConcurrency(data)
-	case store.OpSetThrottle:
-		return f.applySetThrottle(data)
-	case store.OpRemoveThrottle:
-		return f.applyRemoveThrottle(data)
-	case store.OpPromote:
-		return f.applyPromote(data)
-	case store.OpReclaim:
-		return f.applyReclaim(data)
-	case store.OpBulkAction:
-		return f.applyBulkAction(data)
-	case store.OpCleanUnique:
-		return f.applyCleanUnique(data)
-	case store.OpCleanRateLimit:
-		return f.applyCleanRateLimit(data)
-	case store.OpSetBudget:
-		return f.applySetBudget(data)
-	case store.OpDeleteBudget:
-		return f.applyDeleteBudget(data)
-	case store.OpCreateNamespace:
-		return f.applyCreateNamespace(data)
-	case store.OpDeleteNamespace:
-		return f.applyDeleteNamespace(data)
-	case store.OpSetAuthRole:
-		return f.applySetAuthRole(data)
-	case store.OpDeleteAuthRole:
-		return f.applyDeleteAuthRole(data)
-	case store.OpAssignAPIKeyRole:
-		return f.applyAssignAPIKeyRole(data)
-	case store.OpUnassignAPIKeyRole:
-		return f.applyUnassignAPIKeyRole(data)
-	case store.OpSetSSOSettings:
-		return f.applySetSSOSettings(data)
-	case store.OpUpsertAPIKey:
-		return f.applyUpsertAPIKey(data)
-	case store.OpDeleteAPIKey:
-		return f.applyDeleteAPIKey(data)
-	case store.OpInsertAuditLog:
-		return f.applyInsertAuditLog(data)
-	case store.OpUpdateAPIKeyUsed:
-		return f.applyUpdateAPIKeyUsed(data)
-	case store.OpUpsertWebhook:
-		return f.applyUpsertWebhook(data)
-	case store.OpDeleteWebhook:
-		return f.applyDeleteWebhook(data)
-	case store.OpUpdateWebhookStatus:
-		return f.applyUpdateWebhookStatus(data)
-	case store.OpSetNamespaceRateLimit:
-		return f.applySetNamespaceRateLimit(data)
-	case store.OpExpireJobs:
-		return f.applyExpireJobs(data)
-	case store.OpPurgeJobs:
-		return f.applyPurgeJobs(data)
-	default:
-		return &store.OpResult{Err: fmt.Errorf("unknown op type: %d", opType)}
-	}
-}
 
 func (f *FSM) applyDecoded(op *store.DecodedRaftOp) *store.OpResult {
 	switch op.Type {
@@ -401,60 +305,6 @@ func (f *FSM) applyDecoded(op *store.DecodedRaftOp) *store.OpResult {
 	}
 }
 
-func (f *FSM) applyMulti(data json.RawMessage) *store.OpResult {
-	var op store.MultiOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: fmt.Errorf("unmarshal multi op: %w", err)}
-	}
-	if len(op.Ops) == 0 {
-		return &store.OpResult{Data: []*store.OpResult{}}
-	}
-
-	// Fast path for enqueue-heavy workloads: apply all enqueues in a single
-	// Pebble batch and single SQLite mirror callback.
-	allEnqueue := true
-	enqueues := make([]store.EnqueueOp, len(op.Ops))
-	for i, sub := range op.Ops {
-		if sub.Type != store.OpEnqueue {
-			allEnqueue = false
-			break
-		}
-		if err := json.Unmarshal(sub.Data, &enqueues[i]); err != nil {
-			allEnqueue = false
-			break
-		}
-	}
-	if allEnqueue {
-		return f.applyMultiEnqueue(enqueues)
-	}
-
-	// Fast path when the group-commit batch contains only enqueue-batch ops.
-	allEnqueueBatch := true
-	enqueueBatches := make([]store.EnqueueBatchOp, len(op.Ops))
-	for i, sub := range op.Ops {
-		if sub.Type != store.OpEnqueueBatch {
-			allEnqueueBatch = false
-			break
-		}
-		if err := json.Unmarshal(sub.Data, &enqueueBatches[i]); err != nil {
-			allEnqueueBatch = false
-			break
-		}
-	}
-	if allEnqueueBatch {
-		return f.applyMultiEnqueueBatch(enqueueBatches)
-	}
-
-	results := make([]*store.OpResult, 0, len(op.Ops))
-	for _, sub := range op.Ops {
-		if sub.Type == store.OpMulti {
-			results = append(results, &store.OpResult{Err: fmt.Errorf("nested multi op is not allowed")})
-			continue
-		}
-		results = append(results, f.applyByType(sub.Type, sub.Data))
-	}
-	return &store.OpResult{Data: results}
-}
 
 func (f *FSM) applyMultiDecoded(ops []*store.DecodedRaftOp) *store.OpResult {
 	if len(ops) == 0 {
@@ -616,7 +466,7 @@ func (f *FSM) applyMultiIndexed(ops []*store.DecodedRaftOp) *store.OpResult {
 	results := make([]*store.OpResult, len(ops))
 
 	batch := f.pebble.NewIndexedBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	// Sort: acks before fetches before others. Acks free active slots that
 	// subsequent fetches can use. We track original indices for result placement.
@@ -722,7 +572,7 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 
 // Restore implements raft.FSM.
 func (f *FSM) Restore(rc io.ReadCloser) error {
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	if err := restoreFromSnapshot(f.pebble, f.sqlite, rc); err != nil {
 		return err
 	}
@@ -916,7 +766,7 @@ func tryFlush(f *FSM, batch []func(db sqlExecer) error) bool {
 		sp := fmt.Sprintf("sp%d", i)
 		if _, err := tx.Exec("SAVEPOINT " + sp); err != nil {
 			if isSQLiteBusy(err) {
-				tx.Rollback()
+				_ = tx.Rollback()
 				return false
 			}
 			slog.Error("sqlite mirror savepoint failed", "error", err)
@@ -925,7 +775,7 @@ func tryFlush(f *FSM, batch []func(db sqlExecer) error) bool {
 		}
 		if err := fn(tx); err != nil {
 			if isSQLiteBusy(err) {
-				tx.Rollback()
+				_ = tx.Rollback()
 				return false
 			}
 			_, _ = tx.Exec("ROLLBACK TO " + sp)
@@ -942,7 +792,7 @@ func tryFlush(f *FSM, batch []func(db sqlExecer) error) bool {
 
 	if err := tx.Commit(); err != nil {
 		if isSQLiteBusy(err) {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return false
 		}
 		slog.Error("sqlite mirror commit failed", "error", err)
@@ -1043,7 +893,7 @@ func (f *FSM) rebuildActiveCount() {
 		f.activeCount = m
 		return
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 	for iter.First(); iter.Valid(); iter.Next() {
 		key := iter.Key()
 		// Active key format: a|{queue}\x00{job_id}

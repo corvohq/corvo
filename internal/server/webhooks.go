@@ -38,7 +38,7 @@ func (s *Server) listWebhooks() ([]webhookConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := []webhookConfig{}
 	for rows.Next() {
 		var item webhookConfig

@@ -220,11 +220,11 @@ func benchApplyPreset(cmd *cobra.Command) error {
 		}
 		switch v := val.(type) {
 		case int:
-			cmd.Flags().Set(name, strconv.Itoa(v))
+			_ = cmd.Flags().Set(name, strconv.Itoa(v))
 		case bool:
-			cmd.Flags().Set(name, strconv.FormatBool(v))
+			_ = cmd.Flags().Set(name, strconv.FormatBool(v))
 		case time.Duration:
-			cmd.Flags().Set(name, v.String())
+			_ = cmd.Flags().Set(name, v.String())
 		}
 	}
 
@@ -295,7 +295,7 @@ func runBench(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("cannot reach server: %w", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("server unhealthy: status %d", resp.StatusCode)
 	}
@@ -572,7 +572,7 @@ func benchDoEnqueue(protocol, serverURL string, total, concurrency, workers int,
 			wc := rpcClients[goroutineIdx%len(rpcClients)]
 			ctx := context.Background()
 			stream := wc.OpenLifecycleStream(ctx)
-			defer stream.Close()
+			defer func() { _ = stream.Close() }()
 			var streamErrs int64
 			var reqID uint64 = 1
 
@@ -609,7 +609,7 @@ func benchDoEnqueue(protocol, serverURL string, total, concurrency, workers int,
 					if streamErrs <= 3 || streamErrs%1000 == 0 {
 						fmt.Fprintf(os.Stderr, "enqueue stream error: %v\n", err)
 					}
-					stream.Close()
+					_ = stream.Close()
 					stream = wc.OpenLifecycleStream(ctx)
 					time.Sleep(2 * time.Millisecond)
 					continue
@@ -795,7 +795,7 @@ func benchDoLifecycle(protocol string, httpC *http.Client, serverURL string, tot
 			wc := rpcClients[streamIdx%len(rpcClients)]
 			ctx := context.Background()
 			stream := wc.OpenLifecycleStream(ctx)
-			defer stream.Close()
+			defer func() { _ = stream.Close() }()
 			var streamErrs int64
 
 			pendingOrder := make([]string, 0, ackBatchSize*2)
@@ -852,7 +852,7 @@ func benchDoLifecycle(protocol string, httpC *http.Client, serverURL string, tot
 					if streamErrs <= 3 || streamErrs%1000 == 0 {
 						fmt.Fprintf(os.Stderr, "lifecycle stream error: %v\n", err)
 					}
-					stream.Close()
+					_ = stream.Close()
 					stream = wc.OpenLifecycleStream(ctx)
 					time.Sleep(2 * time.Millisecond)
 					continue
@@ -1084,7 +1084,7 @@ func benchDoCombined(protocol string, httpC *http.Client, serverURL string, tota
 			wc := producerClients[goroutineIdx%len(producerClients)]
 			ctx := context.Background()
 			stream := wc.OpenLifecycleStream(ctx)
-			defer stream.Close()
+			defer func() { _ = stream.Close() }()
 			var streamErrs int64
 			var reqID uint64 = 1
 
@@ -1121,7 +1121,7 @@ func benchDoCombined(protocol string, httpC *http.Client, serverURL string, tota
 					if streamErrs <= 3 || streamErrs%1000 == 0 {
 						fmt.Fprintf(os.Stderr, "combined enqueue stream error: %v\n", err)
 					}
-					stream.Close()
+					_ = stream.Close()
 					stream = wc.OpenLifecycleStream(ctx)
 					time.Sleep(2 * time.Millisecond)
 					continue
@@ -1257,7 +1257,7 @@ func benchDoCombined(protocol string, httpC *http.Client, serverURL string, tota
 			wc := workerClients[streamIdx%len(workerClients)]
 			ctx := context.Background()
 			stream := wc.OpenLifecycleStream(ctx)
-			defer stream.Close()
+			defer func() { _ = stream.Close() }()
 			var streamErrs int64
 
 			pendingOrder := make([]string, 0, ackBatchSize*2)
@@ -1338,7 +1338,7 @@ func benchDoCombined(protocol string, httpC *http.Client, serverURL string, tota
 					if streamErrs <= 3 || streamErrs%1000 == 0 {
 						fmt.Fprintf(os.Stderr, "combined lifecycle stream error: %v\n", err)
 					}
-					stream.Close()
+					_ = stream.Close()
 					stream = wc.OpenLifecycleStream(ctx)
 					time.Sleep(2 * time.Millisecond)
 					continue
@@ -1470,7 +1470,7 @@ func benchFetchJobs(httpC *http.Client, serverURL, queue, workerID string, count
 	if err != nil {
 		return nil, fmt.Errorf("fetch batch request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("fetch batch status %d: %s", resp.StatusCode, data)
@@ -1501,7 +1501,7 @@ func benchAckJob(httpC *http.Client, serverURL, jobID string) error {
 	if err != nil {
 		return fmt.Errorf("ack request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("ack status %d: %s", resp.StatusCode, data)
@@ -1522,7 +1522,7 @@ func benchAckJobs(httpC *http.Client, serverURL string, jobIDs []string) error {
 	if err != nil {
 		return fmt.Errorf("ack batch request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("ack batch status %d: %s", resp.StatusCode, data)
@@ -1536,7 +1536,7 @@ func benchClearQueue(httpC *http.Client, serverURL, queue string) {
 	if err != nil {
 		return
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 func benchClearQueues(httpC *http.Client, serverURL, baseQueue string, workers int, workerQueues bool) {
@@ -2026,7 +2026,7 @@ func benchFetchServerStats(httpC *http.Client, serverURL string) *benchServerSta
 	if err != nil {
 		return nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil
 	}
@@ -2078,7 +2078,7 @@ func benchFetchServerConfig(httpC *http.Client, serverURL string) *benchServerCo
 		fmt.Fprintf(os.Stderr, "warning: could not fetch server config: %v\n", err)
 		return nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil
 	}
@@ -2147,7 +2147,7 @@ func benchGetMemoryGB() int {
 		if err != nil {
 			return 0
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
 			line := scanner.Text()

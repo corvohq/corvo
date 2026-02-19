@@ -74,7 +74,7 @@ func (s *Server) handleListAuditLogs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type auditEntry struct {
 		ID         int64           `json:"id"`

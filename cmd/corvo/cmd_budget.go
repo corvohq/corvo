@@ -36,12 +36,12 @@ var budgetListCmd = &cobra.Command{
 			return nil
 		}
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "SCOPE\tTARGET\tDAILY_USD\tPER_JOB_USD\tON_EXCEED")
+		_, _ = fmt.Fprintln(w, "SCOPE\tTARGET\tDAILY_USD\tPER_JOB_USD\tON_EXCEED")
 		for _, r := range rows {
-			fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\n",
+			_, _ = fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\n",
 				r["scope"], r["target"], r["daily_usd"], r["per_job_usd"], r["on_exceed"])
 		}
-		w.Flush()
+		_ = w.Flush()
 		return nil
 	},
 }

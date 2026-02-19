@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -13,15 +14,16 @@ import (
 	"github.com/corvohq/corvo/internal/store"
 )
 
-// --- Enqueue ---
-
-func (f *FSM) applyEnqueue(data json.RawMessage) *store.OpResult {
-	var op store.EnqueueOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
+// logErr logs non-nil errors from Pebble batch operations (Set/Delete)
+// that are otherwise fire-and-forget within FSM apply methods.
+// The batch commit will also fail if something is truly wrong.
+func logErr(err error) {
+	if err != nil {
+		slog.Error("pebble batch op failed", "error", err)
 	}
-	return f.applyEnqueueOp(op)
 }
+
+// --- Enqueue ---
 
 func (f *FSM) applyEnqueueOp(op store.EnqueueOp) *store.OpResult {
 
@@ -30,7 +32,7 @@ func (f *FSM) applyEnqueueOp(op store.EnqueueOp) *store.OpResult {
 		uk := kv.UniqueKey(op.Queue, op.UniqueKey)
 		val, closer, err := f.pebble.Get(uk)
 		if err == nil {
-			defer closer.Close()
+			defer func() { _ = closer.Close() }()
 			jobID, expiresNs := kv.DecodeUniqueValue(val)
 			if expiresNs > op.NowNs {
 				// Lock still valid — return existing job
@@ -46,24 +48,24 @@ func (f *FSM) applyEnqueueOp(op store.EnqueueOp) *store.OpResult {
 	}
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	jobData, _ := encodeJobDoc(jobToDoc(op))
-	batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts)
-	batch.Set(kv.QueueNameKey(op.Queue), nil, f.writeOpts)
+	logErr(batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts))
+	logErr(batch.Set(kv.QueueNameKey(op.Queue), nil, f.writeOpts))
 
 	// Add to appropriate queue structure.
 	createdNs := uint64(op.CreatedAt.UnixNano())
 	if op.State == store.StateScheduled && op.ScheduledAt != nil {
 		schedNs := uint64(op.ScheduledAt.UnixNano())
-		batch.Set(kv.ScheduledKey(op.Queue, schedNs, op.JobID), nil, f.writeOpts)
+		logErr(batch.Set(kv.ScheduledKey(op.Queue, schedNs, op.JobID), nil, f.writeOpts))
 	} else {
 		// Hot path for default jobs: append-first queue log.
 		// Keep priority-indexed pending keys for non-normal priority.
 		if op.Priority == store.PriorityNormal {
-			batch.Set(kv.QueueAppendKey(op.Queue, createdNs, op.JobID), nil, f.writeOpts)
+			logErr(batch.Set(kv.QueueAppendKey(op.Queue, createdNs, op.JobID), nil, f.writeOpts))
 		} else {
-			batch.Set(kv.PendingKey(op.Queue, uint8(op.Priority), createdNs, op.JobID), nil, f.writeOpts)
+			logErr(batch.Set(kv.PendingKey(op.Queue, uint8(op.Priority), createdNs, op.JobID), nil, f.writeOpts))
 		}
 	}
 
@@ -74,7 +76,7 @@ func (f *FSM) applyEnqueueOp(op store.EnqueueOp) *store.OpResult {
 			period = 3600
 		}
 		expiresNs := op.NowNs + uint64(period)*1_000_000_000
-		batch.Set(kv.UniqueKey(op.Queue, op.UniqueKey), kv.EncodeUniqueValue(op.JobID, expiresNs), f.writeOpts)
+		logErr(batch.Set(kv.UniqueKey(op.Queue, op.UniqueKey), kv.EncodeUniqueValue(op.JobID, expiresNs), f.writeOpts))
 	}
 	if err := f.appendLifecycleEvent(batch, "enqueued", op.JobID, op.Queue, op.NowNs); err != nil {
 		return &store.OpResult{Err: err}
@@ -104,7 +106,7 @@ func (f *FSM) applyMultiEnqueue(ops []store.EnqueueOp) *store.OpResult {
 	}
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	type uniqueLock struct {
 		jobID     string
@@ -129,7 +131,7 @@ func (f *FSM) applyMultiEnqueue(ops []store.EnqueueOp) *store.OpResult {
 			val, closer, err := f.pebble.Get(ukey)
 			if err == nil {
 				jobID, expiresNs := kv.DecodeUniqueValue(val)
-				closer.Close()
+				_ = closer.Close()
 				if expiresNs > op.NowNs {
 					results[i] = &store.OpResult{Data: &store.EnqueueResult{
 						JobID:          jobID,
@@ -235,18 +237,10 @@ func (f *FSM) applyMultiEnqueue(ops []store.EnqueueOp) *store.OpResult {
 
 // --- EnqueueBatch ---
 
-func (f *FSM) applyEnqueueBatch(data json.RawMessage) *store.OpResult {
-	var op store.EnqueueBatchOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyEnqueueBatchOp(op)
-}
-
 func (f *FSM) applyEnqueueBatchOp(op store.EnqueueBatchOp) *store.OpResult {
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	// Create batch record if needed
 	if op.BatchID != "" && op.Batch != nil {
@@ -263,7 +257,7 @@ func (f *FSM) applyEnqueueBatchOp(op store.EnqueueBatchOp) *store.OpResult {
 			batchDoc.CallbackPayload = op.Batch.CallbackPayload
 		}
 		batchData, _ := json.Marshal(batchDoc)
-		batch.Set(kv.BatchKey(op.BatchID), batchData, f.writeOpts)
+		logErr(batch.Set(kv.BatchKey(op.BatchID), batchData, f.writeOpts))
 	}
 
 	jobIDs := make([]string, len(op.Jobs))
@@ -272,13 +266,13 @@ func (f *FSM) applyEnqueueBatchOp(op store.EnqueueBatchOp) *store.OpResult {
 		j := op.Jobs[i]
 		jobIDs[i] = j.JobID
 		jobData, _ := encodeJobDoc(jobToDoc(j))
-		batch.Set(kv.JobKey(j.JobID), jobData, f.writeOpts)
-		batch.Set(kv.QueueNameKey(j.Queue), nil, f.writeOpts)
+		logErr(batch.Set(kv.JobKey(j.JobID), jobData, f.writeOpts))
+		logErr(batch.Set(kv.QueueNameKey(j.Queue), nil, f.writeOpts))
 		createdNs := uint64(j.CreatedAt.UnixNano())
 		if j.Priority == store.PriorityNormal {
-			batch.Set(kv.QueueAppendKey(j.Queue, createdNs, j.JobID), nil, f.writeOpts)
+			logErr(batch.Set(kv.QueueAppendKey(j.Queue, createdNs, j.JobID), nil, f.writeOpts))
 		} else {
-			batch.Set(kv.PendingKey(j.Queue, uint8(j.Priority), createdNs, j.JobID), nil, f.writeOpts)
+			logErr(batch.Set(kv.PendingKey(j.Queue, uint8(j.Priority), createdNs, j.JobID), nil, f.writeOpts))
 		}
 		if err := f.appendLifecycleEvent(batch, "enqueued", j.JobID, j.Queue, j.NowNs); err != nil {
 			return &store.OpResult{Err: err}
@@ -309,7 +303,7 @@ func (f *FSM) applyMultiEnqueueBatch(ops []store.EnqueueBatchOp) *store.OpResult
 	}
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	for i, op := range ops {
 		if op.BatchID != "" && op.Batch != nil {
@@ -330,7 +324,7 @@ func (f *FSM) applyMultiEnqueueBatch(ops []store.EnqueueBatchOp) *store.OpResult
 				batchDoc.CallbackPayload = op.Batch.CallbackPayload
 			}
 			batchData, _ := json.Marshal(batchDoc)
-			batch.Set(kv.BatchKey(op.BatchID), batchData, f.writeOpts)
+			logErr(batch.Set(kv.BatchKey(op.BatchID), batchData, f.writeOpts))
 		}
 
 		jobIDs := make([]string, len(op.Jobs))
@@ -340,13 +334,13 @@ func (f *FSM) applyMultiEnqueueBatch(ops []store.EnqueueBatchOp) *store.OpResult
 			jobIDs[j] = job.JobID
 
 			jobData, _ := encodeJobDoc(jobToDoc(job))
-			batch.Set(kv.JobKey(job.JobID), jobData, f.writeOpts)
-			batch.Set(kv.QueueNameKey(job.Queue), nil, f.writeOpts)
+			logErr(batch.Set(kv.JobKey(job.JobID), jobData, f.writeOpts))
+			logErr(batch.Set(kv.QueueNameKey(job.Queue), nil, f.writeOpts))
 			createdNs := uint64(job.CreatedAt.UnixNano())
 			if job.Priority == store.PriorityNormal {
-				batch.Set(kv.QueueAppendKey(job.Queue, createdNs, job.JobID), nil, f.writeOpts)
+				logErr(batch.Set(kv.QueueAppendKey(job.Queue, createdNs, job.JobID), nil, f.writeOpts))
 			} else {
-				batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, job.JobID), nil, f.writeOpts)
+				logErr(batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, job.JobID), nil, f.writeOpts))
 			}
 
 			if err := f.appendLifecycleEvent(batch, "enqueued", job.JobID, job.Queue, job.NowNs); err != nil {
@@ -391,14 +385,6 @@ func (f *FSM) applyMultiEnqueueBatch(ops []store.EnqueueBatchOp) *store.OpResult
 
 // --- Fetch ---
 
-func (f *FSM) applyFetch(data json.RawMessage) *store.OpResult {
-	var op store.FetchOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyFetchOp(op)
-}
-
 func (f *FSM) applyFetchOp(op store.FetchOp) *store.OpResult {
 
 	nowNs := op.NowNs
@@ -416,10 +402,10 @@ func (f *FSM) applyFetchOp(op store.FetchOp) *store.OpResult {
 		if qcVal, closer, err := f.pebble.Get(qcKey); err == nil {
 			var qc store.Queue
 			if err := json.Unmarshal(qcVal, &qc); err != nil {
-				closer.Close()
+				_ = closer.Close()
 				continue
 			}
-			closer.Close()
+			_ = closer.Close()
 			if qc.Paused {
 				continue
 			}
@@ -451,7 +437,7 @@ func (f *FSM) applyFetchOp(op store.FetchOp) *store.OpResult {
 
 		// Apply the fetch: update job, move from pending to active
 		batch := f.pebble.NewBatch()
-		defer batch.Close()
+		defer func() { _ = batch.Close() }()
 		job.State = store.StateActive
 		job.WorkerID = &op.WorkerID
 		job.Hostname = &op.Hostname
@@ -462,20 +448,20 @@ func (f *FSM) applyFetchOp(op store.FetchOp) *store.OpResult {
 		job.LeaseExpiresAt = &leaseExp
 
 		jobData, _ := encodeJobDoc(job)
-		batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+		logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 		if len(pendingKey) > 0 {
-			batch.Delete(pendingKey, f.writeOpts)
+			_ = batch.Delete(pendingKey, f.writeOpts)
 		}
 		if len(appendKey) > 0 {
-			batch.Delete(appendKey, f.writeOpts)
-			batch.Set(kv.QueueCursorKey(queue), appendKey, f.writeOpts)
+			_ = batch.Delete(appendKey, f.writeOpts)
+			logErr(batch.Set(kv.QueueCursorKey(queue), appendKey, f.writeOpts))
 		}
-		batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+		logErr(batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts))
 		f.incrActive(queue)
 
 		// Record rate limit entry
 		if hasRateLimit {
-			batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed), nil, f.writeOpts)
+			logErr(batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed), nil, f.writeOpts))
 		}
 
 		// Upsert worker
@@ -489,7 +475,7 @@ func (f *FSM) applyFetchOp(op store.FetchOp) *store.OpResult {
 			worker.Hostname = &op.Hostname
 		}
 		workerData, _ := json.Marshal(worker)
-		batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts)
+		logErr(batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts))
 		if err := f.appendLifecycleEvent(batch, "started", jobID, queue, nowNs); err != nil {
 			return &store.OpResult{Err: err}
 		}
@@ -523,14 +509,6 @@ func (f *FSM) applyFetchOp(op store.FetchOp) *store.OpResult {
 	return &store.OpResult{Data: (*store.FetchResult)(nil)}
 }
 
-func (f *FSM) applyFetchBatch(data json.RawMessage) *store.OpResult {
-	var op store.FetchBatchOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyFetchBatchOp(op)
-}
-
 func (f *FSM) applyFetchBatchOp(op store.FetchBatchOp) *store.OpResult {
 	if len(op.CandidateJobIDs) > 0 {
 		return f.applyFetchBatchPreresolved(op)
@@ -547,7 +525,7 @@ func (f *FSM) applyFetchBatchOp(op store.FetchBatchOp) *store.OpResult {
 	leaseExpiresNs := nowNs + uint64(leaseDuration)*1_000_000_000
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	startedAt := time.Unix(0, int64(nowNs))
 	leaseExp := time.Unix(0, int64(leaseExpiresNs))
@@ -561,7 +539,7 @@ func (f *FSM) applyFetchBatchOp(op store.FetchBatchOp) *store.OpResult {
 		worker.Hostname = &op.Hostname
 	}
 	workerData, _ := json.Marshal(worker)
-	batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts)
+	logErr(batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts))
 
 	type queueState struct {
 		name        string
@@ -579,10 +557,10 @@ func (f *FSM) applyFetchBatchOp(op store.FetchBatchOp) *store.OpResult {
 		if qcVal, closer, err := f.pebble.Get(qcKey); err == nil {
 			var qc store.Queue
 			if err := json.Unmarshal(qcVal, &qc); err != nil {
-				closer.Close()
+				_ = closer.Close()
 				continue
 			}
-			closer.Close()
+			_ = closer.Close()
 			if qc.Paused {
 				continue
 			}
@@ -634,18 +612,18 @@ func (f *FSM) applyFetchBatchOp(op store.FetchBatchOp) *store.OpResult {
 			job.LeaseExpiresAt = &leaseExp
 
 			jobData, _ := encodeJobDoc(job)
-			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 			if len(pendingKey) > 0 {
-				batch.Delete(pendingKey, f.writeOpts)
+				_ = batch.Delete(pendingKey, f.writeOpts)
 			}
 			if len(appendKey) > 0 {
-				batch.Delete(appendKey, f.writeOpts)
-				batch.Set(kv.QueueCursorKey(qs.name), appendKey, f.writeOpts)
+				_ = batch.Delete(appendKey, f.writeOpts)
+				logErr(batch.Set(kv.QueueCursorKey(qs.name), appendKey, f.writeOpts))
 			}
-			batch.Set(kv.ActiveKey(qs.name, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+			logErr(batch.Set(kv.ActiveKey(qs.name, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts))
 			f.incrActive(qs.name)
 			if qs.rateLimit > 0 {
-				batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+				logErr(batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts))
 				rateSeq++
 				qs.rateCount++
 			}
@@ -722,7 +700,7 @@ func (f *FSM) applyFetchBatchPreresolved(op store.FetchBatchOp) *store.OpResult 
 	leaseExpiresNs := nowNs + uint64(leaseDuration)*1_000_000_000
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	startedAt := time.Unix(0, int64(nowNs))
 	leaseExp := time.Unix(0, int64(leaseExpiresNs))
@@ -736,7 +714,7 @@ func (f *FSM) applyFetchBatchPreresolved(op store.FetchBatchOp) *store.OpResult 
 		worker.Hostname = &op.Hostname
 	}
 	workerData, _ := json.Marshal(worker)
-	batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts)
+	logErr(batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts))
 
 	// Build per-queue state for concurrency/rate limit checks.
 	type queueState struct {
@@ -752,10 +730,10 @@ func (f *FSM) applyFetchBatchPreresolved(op store.FetchBatchOp) *store.OpResult 
 		if qcVal, closer, err := f.pebble.Get(qcKey); err == nil {
 			var qc store.Queue
 			if err := json.Unmarshal(qcVal, &qc); err != nil {
-				closer.Close()
+				_ = closer.Close()
 				continue
 			}
-			closer.Close()
+			_ = closer.Close()
 			if qc.Paused {
 				qs.activeLimit = -1 // sentinel: paused
 				queueStates[queue] = qs
@@ -806,10 +784,10 @@ func (f *FSM) applyFetchBatchPreresolved(op store.FetchBatchOp) *store.OpResult 
 		}
 		var job store.Job
 		if err := decodeJobDoc(val, &job); err != nil {
-			closer.Close()
+			_ = closer.Close()
 			continue
 		}
-		closer.Close()
+		_ = closer.Close()
 
 		if job.State != store.StatePending {
 			continue // stale candidate
@@ -827,7 +805,7 @@ func (f *FSM) applyFetchBatchPreresolved(op store.FetchBatchOp) *store.OpResult 
 		job.LeaseExpiresAt = &leaseExp
 
 		jobData, _ := encodeJobDoc(job)
-		batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+		logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 
 		// Delete pending/append index keys. We don't know which one exists,
 		// so we try to delete the append key based on queue/createdNs and
@@ -836,17 +814,17 @@ func (f *FSM) applyFetchBatchPreresolved(op store.FetchBatchOp) *store.OpResult 
 		createdNs := uint64(job.CreatedAt.UnixNano())
 		if job.Priority == store.PriorityNormal {
 			appendKey := kv.QueueAppendKey(queue, createdNs, jobID)
-			batch.Delete(appendKey, f.writeOpts)
-			batch.Set(kv.QueueCursorKey(queue), appendKey, f.writeOpts)
+			_ = batch.Delete(appendKey, f.writeOpts)
+			logErr(batch.Set(kv.QueueCursorKey(queue), appendKey, f.writeOpts))
 		} else {
 			pendingKey := kv.PendingKey(queue, uint8(job.Priority), createdNs, jobID)
-			batch.Delete(pendingKey, f.writeOpts)
+			_ = batch.Delete(pendingKey, f.writeOpts)
 		}
 
-		batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+		logErr(batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts))
 		f.incrActive(queue)
 		if qs.rateLimit > 0 {
-			batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+			logErr(batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts))
 			rateSeq++
 			qs.rateCount++
 		}
@@ -900,38 +878,6 @@ func (f *FSM) applyFetchBatchPreresolved(op store.FetchBatchOp) *store.OpResult 
 	return &store.OpResult{Data: results}
 }
 
-func (f *FSM) fetchQueueAllowed(queue string, nowNs uint64) bool {
-	qcKey := kv.QueueConfigKey(queue)
-	qcVal, closer, err := f.pebble.Get(qcKey)
-	if err != nil {
-		return true
-	}
-	defer closer.Close()
-
-	var qc store.Queue
-	if err := json.Unmarshal(qcVal, &qc); err != nil {
-		return false
-	}
-	if qc.Paused {
-		return false
-	}
-	if qc.MaxConcurrency != nil && *qc.MaxConcurrency > 0 {
-		activeCount := f.getActiveCount(queue)
-		if activeCount >= *qc.MaxConcurrency {
-			return false
-		}
-	}
-	if qc.RateLimit != nil && qc.RateWindowMs != nil && *qc.RateLimit > 0 {
-		windowNs := uint64(*qc.RateWindowMs) * 1_000_000
-		windowStart := nowNs - windowNs
-		count := countPrefixFrom(f.pebble, kv.RateLimitPrefix(queue), kv.RateLimitWindowStart(queue, windowStart))
-		if count >= *qc.RateLimit {
-			return false
-		}
-	}
-	return true
-}
-
 func (f *FSM) findPendingJobForQueue(queue string, claimed map[string]struct{}) (jobID string, pendingKey []byte, job store.Job, ok bool) {
 	prefix := kv.PendingPrefix(queue)
 	iter, err := f.pebble.NewIter(&pebble.IterOptions{
@@ -941,7 +887,7 @@ func (f *FSM) findPendingJobForQueue(queue string, claimed map[string]struct{}) 
 	if err != nil {
 		return "", nil, store.Job{}, false
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	for valid := iter.First(); valid; valid = iter.Next() {
 		key := iter.Key()
@@ -963,13 +909,13 @@ func (f *FSM) findPendingJobForQueue(queue string, claimed map[string]struct{}) 
 		}
 		var doc store.Job
 		if err := decodeJobDoc(val, &doc); err != nil {
-			closer.Close()
+			_ = closer.Close()
 			k := make([]byte, len(key))
 			copy(k, key)
 			_ = f.pebble.Delete(k, pebble.NoSync)
 			continue
 		}
-		closer.Close()
+		_ = closer.Close()
 		if doc.State != store.StatePending {
 			// Job is no longer pending (completed/cancelled) — auto-clean orphan.
 			k := make([]byte, len(key))
@@ -993,7 +939,7 @@ func (f *FSM) findAppendJobForQueue(queue string, claimed map[string]struct{}) (
 	var lower []byte
 	if cursor, closer, err := f.pebble.Get(kv.QueueCursorKey(queue)); err == nil {
 		lower = append([]byte(nil), cursor...)
-		closer.Close()
+		_ = closer.Close()
 	}
 
 	iter, err := f.pebble.NewIter(&pebble.IterOptions{
@@ -1003,7 +949,7 @@ func (f *FSM) findAppendJobForQueue(queue string, claimed map[string]struct{}) (
 	if err != nil {
 		return "", nil, store.Job{}, false
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	var valid bool
 	hasCursor := len(lower) > 0
@@ -1036,13 +982,13 @@ func (f *FSM) findAppendJobForQueue(queue string, claimed map[string]struct{}) (
 		}
 		var doc store.Job
 		if err := decodeJobDoc(val, &doc); err != nil {
-			closer.Close()
+			_ = closer.Close()
 			k := make([]byte, len(key))
 			copy(k, key)
 			_ = f.pebble.Delete(k, pebble.NoSync)
 			continue
 		}
-		closer.Close()
+		_ = closer.Close()
 		if doc.State != store.StatePending {
 			k := make([]byte, len(key))
 			copy(k, key)
@@ -1068,7 +1014,7 @@ func (f *FSM) findAppendJobForQueue(queue string, claimed map[string]struct{}) (
 		if err != nil {
 			return "", nil, store.Job{}, false
 		}
-		defer iter2.Close()
+		defer func() { _ = iter2.Close() }()
 
 		for valid := iter2.First(); valid; valid = iter2.Next() {
 			key := iter2.Key()
@@ -1089,13 +1035,13 @@ func (f *FSM) findAppendJobForQueue(queue string, claimed map[string]struct{}) (
 			}
 			var doc store.Job
 			if err := decodeJobDoc(val, &doc); err != nil {
-				closer.Close()
+				_ = closer.Close()
 				k := make([]byte, len(key))
 				copy(k, key)
 				_ = f.pebble.Delete(k, pebble.NoSync)
 				continue
 			}
-			closer.Close()
+			_ = closer.Close()
 			if doc.State != store.StatePending {
 				k := make([]byte, len(key))
 				copy(k, key)
@@ -1134,10 +1080,10 @@ func (f *FSM) dependenciesSatisfied(job store.Job) bool {
 		}
 		var dep store.Job
 		if err := decodeJobDoc(val, &dep); err != nil {
-			closer.Close()
+			_ = closer.Close()
 			return false
 		}
-		closer.Close()
+		_ = closer.Close()
 		if dep.State != store.StateCompleted {
 			return false
 		}
@@ -1183,14 +1129,6 @@ func chainDependsOn(chainCfg json.RawMessage) []string {
 
 // --- Ack ---
 
-func (f *FSM) applyAck(data json.RawMessage) *store.OpResult {
-	var op store.AckOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyAckOp(op)
-}
-
 func (f *FSM) applyAckOp(op store.AckOp) *store.OpResult {
 	jobVal, closer, err := f.pebble.Get(kv.JobKey(op.JobID))
 	if err != nil {
@@ -1200,7 +1138,7 @@ func (f *FSM) applyAckOp(op store.AckOp) *store.OpResult {
 	if err := decodeJobDoc(jobVal, &job); err != nil {
 		return &store.OpResult{Err: fmt.Errorf("decode job %s: %w", op.JobID, err)}
 	}
-	closer.Close()
+	_ = closer.Close()
 
 	if job.State != store.StateActive {
 		return &store.OpResult{Err: fmt.Errorf("job %s is not active", op.JobID)}
@@ -1211,7 +1149,7 @@ func (f *FSM) applyAckOp(op store.AckOp) *store.OpResult {
 	}
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	now := time.Unix(0, int64(op.NowNs))
 	nextState := store.StateCompleted
@@ -1281,22 +1219,22 @@ func (f *FSM) applyAckOp(op store.AckOp) *store.OpResult {
 	job.LeaseExpiresAt = nil
 
 	jobData, _ := encodeJobDoc(job)
-	batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts)
-	batch.Delete(kv.ActiveKey(job.Queue, op.JobID), f.writeOpts)
+	logErr(batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts))
+	_ = batch.Delete(kv.ActiveKey(job.Queue, op.JobID), f.writeOpts)
 	f.decrActive(job.Queue)
 
 	if nextState == store.StatePending {
 		createdNs := uint64(now.UnixNano())
 		if job.Priority == store.PriorityNormal {
-			batch.Set(kv.QueueAppendKey(job.Queue, createdNs, op.JobID), nil, f.writeOpts)
+			logErr(batch.Set(kv.QueueAppendKey(job.Queue, createdNs, op.JobID), nil, f.writeOpts))
 		} else {
-			batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, op.JobID), nil, f.writeOpts)
+			logErr(batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, op.JobID), nil, f.writeOpts))
 		}
 	}
 
 	// Clean unique lock only on terminal completion.
 	if nextState == store.StateCompleted && job.UniqueKey != nil {
-		batch.Delete(kv.UniqueKey(job.Queue, *job.UniqueKey), f.writeOpts)
+		logErr(batch.Delete(kv.UniqueKey(job.Queue, *job.UniqueKey), f.writeOpts))
 	}
 
 	// Chain progression: advance to next step on completion.
@@ -1340,7 +1278,7 @@ func (f *FSM) applyAckOp(op store.AckOp) *store.OpResult {
 			return err
 		}
 		if nextState == store.StateCompleted && job.UniqueKey != nil {
-			db.Exec("DELETE FROM unique_locks WHERE job_id = ?", op.JobID)
+			_, _ = db.Exec("DELETE FROM unique_locks WHERE job_id = ?", op.JobID)
 		}
 		if nextState == store.StateCompleted && job.BatchID != nil {
 			sqliteUpdateBatch(db, *job.BatchID, "success", callbackJobID)
@@ -1362,21 +1300,13 @@ func (f *FSM) applyAckOp(op store.AckOp) *store.OpResult {
 	return &store.OpResult{Data: nil}
 }
 
-func (f *FSM) applyAckBatch(data json.RawMessage) *store.OpResult {
-	var op store.AckBatchOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyAckBatchOp(op)
-}
-
 func (f *FSM) applyAckBatchOp(op store.AckBatchOp) *store.OpResult {
 	if len(op.Acks) == 0 {
 		return &store.OpResult{Data: 0}
 	}
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	now := time.Unix(0, int64(op.NowNs))
 	type sqliteAck struct {
@@ -1397,10 +1327,10 @@ func (f *FSM) applyAckBatchOp(op store.AckBatchOp) *store.OpResult {
 		}
 		var job store.Job
 		if err := decodeJobDoc(jobVal, &job); err != nil {
-			closer.Close()
+			_ = closer.Close()
 			continue
 		}
-		closer.Close()
+		_ = closer.Close()
 		if job.State != store.StateActive {
 			continue
 		}
@@ -1416,11 +1346,11 @@ func (f *FSM) applyAckBatchOp(op store.AckBatchOp) *store.OpResult {
 		job.LeaseExpiresAt = nil
 
 		jobData, _ := encodeJobDoc(job)
-		batch.Set(kv.JobKey(ack.JobID), jobData, f.writeOpts)
-		batch.Delete(kv.ActiveKey(job.Queue, ack.JobID), f.writeOpts)
+		logErr(batch.Set(kv.JobKey(ack.JobID), jobData, f.writeOpts))
+		logErr(batch.Delete(kv.ActiveKey(job.Queue, ack.JobID), f.writeOpts))
 		f.decrActive(job.Queue)
 		if job.UniqueKey != nil {
-			batch.Delete(kv.UniqueKey(job.Queue, *job.UniqueKey), f.writeOpts)
+			logErr(batch.Delete(kv.UniqueKey(job.Queue, *job.UniqueKey), f.writeOpts))
 		}
 
 		callbackJobID := ""
@@ -1485,7 +1415,7 @@ func (f *FSM) applyMultiAckBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 	}
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	type sqliteAck struct {
 		job           store.Job
@@ -1514,10 +1444,10 @@ func (f *FSM) applyMultiAckBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 			}
 			var job store.Job
 			if err := decodeJobDoc(jobVal, &job); err != nil {
-				closer.Close()
+				_ = closer.Close()
 				continue
 			}
-			closer.Close()
+			_ = closer.Close()
 			if job.State != store.StateActive {
 				continue
 			}
@@ -1533,11 +1463,11 @@ func (f *FSM) applyMultiAckBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 			job.LeaseExpiresAt = nil
 
 			jobData, _ := encodeJobDoc(job)
-			batch.Set(kv.JobKey(ack.JobID), jobData, f.writeOpts)
-			batch.Delete(kv.ActiveKey(job.Queue, ack.JobID), f.writeOpts)
+			logErr(batch.Set(kv.JobKey(ack.JobID), jobData, f.writeOpts))
+			logErr(batch.Delete(kv.ActiveKey(job.Queue, ack.JobID), f.writeOpts))
 			f.decrActive(job.Queue)
 			if job.UniqueKey != nil {
-				batch.Delete(kv.UniqueKey(job.Queue, *job.UniqueKey), f.writeOpts)
+				logErr(batch.Delete(kv.UniqueKey(job.Queue, *job.UniqueKey), f.writeOpts))
 			}
 
 			callbackJobID := ""
@@ -1620,7 +1550,7 @@ func (f *FSM) applyMultiFetchBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 	}
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	type sqliteFetch struct {
 		jobs []store.Job
@@ -1658,7 +1588,7 @@ func (f *FSM) applyMultiFetchBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 			worker.Hostname = &op.Hostname
 		}
 		workerData, _ := json.Marshal(worker)
-		batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts)
+		logErr(batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts))
 
 		type queueState struct {
 			name        string
@@ -1675,10 +1605,10 @@ func (f *FSM) applyMultiFetchBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 			if qcVal, closer, err := f.pebble.Get(qcKey); err == nil {
 				var qc store.Queue
 				if err := json.Unmarshal(qcVal, &qc); err != nil {
-					closer.Close()
+					_ = closer.Close()
 					continue
 				}
-				closer.Close()
+				_ = closer.Close()
 				if qc.Paused {
 					continue
 				}
@@ -1730,10 +1660,10 @@ func (f *FSM) applyMultiFetchBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 				}
 				var job store.Job
 				if err := decodeJobDoc(val, &job); err != nil {
-					closer.Close()
+					_ = closer.Close()
 					continue
 				}
-				closer.Close()
+				_ = closer.Close()
 				if job.State != store.StatePending {
 					continue
 				}
@@ -1748,20 +1678,20 @@ func (f *FSM) applyMultiFetchBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 				job.StartedAt = &startedAt
 				job.LeaseExpiresAt = &leaseExp
 				jobData, _ := encodeJobDoc(job)
-				batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+				logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 				createdNs := uint64(job.CreatedAt.UnixNano())
 				if job.Priority == store.PriorityNormal {
 					appendKey := kv.QueueAppendKey(queue, createdNs, jobID)
-					batch.Delete(appendKey, f.writeOpts)
-					batch.Set(kv.QueueCursorKey(queue), appendKey, f.writeOpts)
+					_ = batch.Delete(appendKey, f.writeOpts)
+					logErr(batch.Set(kv.QueueCursorKey(queue), appendKey, f.writeOpts))
 				} else {
 					pendingKey := kv.PendingKey(queue, uint8(job.Priority), createdNs, jobID)
-					batch.Delete(pendingKey, f.writeOpts)
+					_ = batch.Delete(pendingKey, f.writeOpts)
 				}
-				batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+				logErr(batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts))
 				f.incrActive(queue)
 				if qs.rateLimit > 0 {
-					batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+					logErr(batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts))
 					rateSeq++
 					qs.rateCount++
 				}
@@ -1813,18 +1743,18 @@ func (f *FSM) applyMultiFetchBatch(ops []*store.DecodedRaftOp) *store.OpResult {
 				job.LeaseExpiresAt = &leaseExp
 
 				jobData, _ := encodeJobDoc(job)
-				batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+				logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 				if len(pendingKey) > 0 {
-					batch.Delete(pendingKey, f.writeOpts)
+					_ = batch.Delete(pendingKey, f.writeOpts)
 				}
 				if len(appendKey) > 0 {
-					batch.Delete(appendKey, f.writeOpts)
-					batch.Set(kv.QueueCursorKey(qs.name), appendKey, f.writeOpts)
+					_ = batch.Delete(appendKey, f.writeOpts)
+					logErr(batch.Set(kv.QueueCursorKey(qs.name), appendKey, f.writeOpts))
 				}
-				batch.Set(kv.ActiveKey(qs.name, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+				logErr(batch.Set(kv.ActiveKey(qs.name, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts))
 				f.incrActive(qs.name)
 				if qs.rateLimit > 0 {
-					batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+					logErr(batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts))
 					rateSeq++
 					qs.rateCount++
 				}
@@ -1941,10 +1871,10 @@ func (f *FSM) applyAckBatchIntoBatch(batch *pebble.Batch, op store.AckBatchOp, s
 		}
 		var job store.Job
 		if err := decodeJobDoc(jobVal, &job); err != nil {
-			closer.Close()
+			_ = closer.Close()
 			continue
 		}
-		closer.Close()
+		_ = closer.Close()
 		if job.State != store.StateActive {
 			continue
 		}
@@ -1960,11 +1890,11 @@ func (f *FSM) applyAckBatchIntoBatch(batch *pebble.Batch, op store.AckBatchOp, s
 		job.LeaseExpiresAt = nil
 
 		jobData, _ := encodeJobDoc(job)
-		batch.Set(kv.JobKey(ack.JobID), jobData, f.writeOpts)
-		batch.Delete(kv.ActiveKey(job.Queue, ack.JobID), f.writeOpts)
+		logErr(batch.Set(kv.JobKey(ack.JobID), jobData, f.writeOpts))
+		logErr(batch.Delete(kv.ActiveKey(job.Queue, ack.JobID), f.writeOpts))
 		f.decrActive(job.Queue)
 		if job.UniqueKey != nil {
-			batch.Delete(kv.UniqueKey(job.Queue, *job.UniqueKey), f.writeOpts)
+			logErr(batch.Delete(kv.UniqueKey(job.Queue, *job.UniqueKey), f.writeOpts))
 		}
 		callbackJobID := ""
 		if job.BatchID != nil {
@@ -2021,7 +1951,7 @@ func (f *FSM) applyFetchBatchIntoBatch(batch *pebble.Batch, op store.FetchBatchO
 	// Skip redundant worker writes within the same indexed batch.
 	if _, already := seenWorkers[op.WorkerID]; !already {
 		workerData, _ := json.Marshal(worker)
-		batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts)
+		logErr(batch.Set(kv.WorkerKey(op.WorkerID), workerData, f.writeOpts))
 		seenWorkers[op.WorkerID] = struct{}{}
 	}
 
@@ -2041,10 +1971,10 @@ func (f *FSM) applyFetchBatchIntoBatch(batch *pebble.Batch, op store.FetchBatchO
 		if qcVal, closer, err := batch.Get(qcKey); err == nil {
 			var qc store.Queue
 			if err := json.Unmarshal(qcVal, &qc); err != nil {
-				closer.Close()
+				_ = closer.Close()
 				continue
 			}
-			closer.Close()
+			_ = closer.Close()
 			if qc.Paused {
 				continue
 			}
@@ -2096,10 +2026,10 @@ func (f *FSM) applyFetchBatchIntoBatch(batch *pebble.Batch, op store.FetchBatchO
 			}
 			var job store.Job
 			if err := decodeJobDoc(val, &job); err != nil {
-				closer.Close()
+				_ = closer.Close()
 				continue
 			}
-			closer.Close()
+			_ = closer.Close()
 			if job.State != store.StatePending {
 				continue
 			}
@@ -2114,20 +2044,20 @@ func (f *FSM) applyFetchBatchIntoBatch(batch *pebble.Batch, op store.FetchBatchO
 			job.StartedAt = &startedAt
 			job.LeaseExpiresAt = &leaseExp
 			jobData, _ := encodeJobDoc(job)
-			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 			createdNs := uint64(job.CreatedAt.UnixNano())
 			if job.Priority == store.PriorityNormal {
 				appendKey := kv.QueueAppendKey(queue, createdNs, jobID)
-				batch.Delete(appendKey, f.writeOpts)
-				batch.Set(kv.QueueCursorKey(queue), appendKey, f.writeOpts)
+				_ = batch.Delete(appendKey, f.writeOpts)
+				logErr(batch.Set(kv.QueueCursorKey(queue), appendKey, f.writeOpts))
 			} else {
 				pendingKey := kv.PendingKey(queue, uint8(job.Priority), createdNs, jobID)
-				batch.Delete(pendingKey, f.writeOpts)
+				_ = batch.Delete(pendingKey, f.writeOpts)
 			}
-			batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+			logErr(batch.Set(kv.ActiveKey(queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts))
 			f.incrActive(queue)
 			if qs.rateLimit > 0 {
-				batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+				logErr(batch.Set(kv.RateLimitKey(queue, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts))
 				rateSeq++
 				qs.rateCount++
 			}
@@ -2180,18 +2110,18 @@ func (f *FSM) applyFetchBatchIntoBatch(batch *pebble.Batch, op store.FetchBatchO
 			job.LeaseExpiresAt = &leaseExp
 
 			jobData, _ := encodeJobDoc(job)
-			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 			if len(pendingKey) > 0 {
-				batch.Delete(pendingKey, f.writeOpts)
+				_ = batch.Delete(pendingKey, f.writeOpts)
 			}
 			if len(appendKey) > 0 {
-				batch.Delete(appendKey, f.writeOpts)
-				batch.Set(kv.QueueCursorKey(qs.name), appendKey, f.writeOpts)
+				_ = batch.Delete(appendKey, f.writeOpts)
+				logErr(batch.Set(kv.QueueCursorKey(qs.name), appendKey, f.writeOpts))
 			}
-			batch.Set(kv.ActiveKey(qs.name, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+			logErr(batch.Set(kv.ActiveKey(qs.name, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts))
 			f.incrActive(qs.name)
 			if qs.rateLimit > 0 {
-				batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts)
+				logErr(batch.Set(kv.RateLimitKey(qs.name, nowNs, op.RandomSeed+rateSeq), nil, f.writeOpts))
 				rateSeq++
 				qs.rateCount++
 			}
@@ -2264,7 +2194,7 @@ func findPendingJobFromReader(r pebble.Reader, queue string, claimed map[string]
 	if err != nil {
 		return "", nil, store.Job{}, false
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	for valid := iter.First(); valid; valid = iter.Next() {
 		key := iter.Key()
@@ -2282,10 +2212,10 @@ func findPendingJobFromReader(r pebble.Reader, queue string, claimed map[string]
 		}
 		var doc store.Job
 		if err := decodeJobDoc(val, &doc); err != nil {
-			closer.Close()
+			_ = closer.Close()
 			continue
 		}
-		closer.Close()
+		_ = closer.Close()
 		if doc.State != store.StatePending {
 			continue
 		}
@@ -2301,7 +2231,7 @@ func findAppendJobFromReader(r pebble.Reader, queue string, claimed map[string]s
 	var lower []byte
 	if cursor, closer, err := r.Get(kv.QueueCursorKey(queue)); err == nil {
 		lower = append([]byte(nil), cursor...)
-		closer.Close()
+		_ = closer.Close()
 	}
 
 	iter, err := r.NewIter(&pebble.IterOptions{
@@ -2311,7 +2241,7 @@ func findAppendJobFromReader(r pebble.Reader, queue string, claimed map[string]s
 	if err != nil {
 		return "", nil, store.Job{}, false
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	var valid bool
 	hasCursor := len(lower) > 0
@@ -2340,10 +2270,10 @@ func findAppendJobFromReader(r pebble.Reader, queue string, claimed map[string]s
 		}
 		var doc store.Job
 		if err := decodeJobDoc(val, &doc); err != nil {
-			closer.Close()
+			_ = closer.Close()
 			continue
 		}
-		closer.Close()
+		_ = closer.Close()
 		if doc.State != store.StatePending {
 			continue
 		}
@@ -2366,7 +2296,7 @@ func findAppendJobFromReader(r pebble.Reader, queue string, claimed map[string]s
 		if err != nil {
 			return "", nil, store.Job{}, false
 		}
-		defer iter2.Close()
+		defer func() { _ = iter2.Close() }()
 
 		for valid := iter2.First(); valid; valid = iter2.Next() {
 			key := iter2.Key()
@@ -2384,10 +2314,10 @@ func findAppendJobFromReader(r pebble.Reader, queue string, claimed map[string]s
 			}
 			var doc store.Job
 			if err := decodeJobDoc(val, &doc); err != nil {
-				closer.Close()
+				_ = closer.Close()
 				continue
 			}
-			closer.Close()
+			_ = closer.Close()
 			if doc.State != store.StatePending {
 				continue
 			}
@@ -2409,7 +2339,7 @@ func countPrefixFromReader(r pebble.Reader, prefix, startKey []byte) int {
 	if err != nil {
 		return 0
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 	count := 0
 	for iter.First(); iter.Valid(); iter.Next() {
 		count++
@@ -2418,14 +2348,6 @@ func countPrefixFromReader(r pebble.Reader, prefix, startKey []byte) int {
 }
 
 // --- Fail ---
-
-func (f *FSM) applyFail(data json.RawMessage) *store.OpResult {
-	var op store.FailOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyFailOp(op)
-}
 
 func (f *FSM) applyFailOp(op store.FailOp) *store.OpResult {
 
@@ -2437,7 +2359,7 @@ func (f *FSM) applyFailOp(op store.FailOp) *store.OpResult {
 	if err := decodeJobDoc(jobVal, &job); err != nil {
 		return &store.OpResult{Err: fmt.Errorf("decode job %s: %w", op.JobID, err)}
 	}
-	closer.Close()
+	_ = closer.Close()
 
 	if job.State != store.StateActive {
 		return &store.OpResult{Err: fmt.Errorf("job %s is not active (state=%s)", op.JobID, job.State)}
@@ -2445,7 +2367,7 @@ func (f *FSM) applyFailOp(op store.FailOp) *store.OpResult {
 
 	now := time.Unix(0, int64(op.NowNs))
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	// Write error record
 	errDoc := store.JobError{
@@ -2458,10 +2380,10 @@ func (f *FSM) applyFailOp(op store.FailOp) *store.OpResult {
 		errDoc.Backtrace = &op.Backtrace
 	}
 	errData, _ := json.Marshal(errDoc)
-	batch.Set(kv.JobErrorKey(op.JobID, uint32(job.Attempt)), errData, f.writeOpts)
+	logErr(batch.Set(kv.JobErrorKey(op.JobID, uint32(job.Attempt)), errData, f.writeOpts))
 
 	// Remove from active set
-	batch.Delete(kv.ActiveKey(job.Queue, op.JobID), f.writeOpts)
+	logErr(batch.Delete(kv.ActiveKey(job.Queue, op.JobID), f.writeOpts))
 	f.decrActive(job.Queue)
 	if err := f.appendLifecycleEvent(batch, "failed", op.JobID, job.Queue, op.NowNs); err != nil {
 		return &store.OpResult{Err: err}
@@ -2492,8 +2414,8 @@ func (f *FSM) applyFailOp(op store.FailOp) *store.OpResult {
 		job.LeaseExpiresAt = nil
 
 		jobData, _ := encodeJobDoc(job)
-		batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts)
-		batch.Set(kv.RetryingKey(job.Queue, retryNs, op.JobID), nil, f.writeOpts)
+		logErr(batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts))
+		logErr(batch.Set(kv.RetryingKey(job.Queue, retryNs, op.JobID), nil, f.writeOpts))
 
 		result.Status = store.StateRetrying
 		result.NextAttemptAt = &nextAttempt
@@ -2507,7 +2429,7 @@ func (f *FSM) applyFailOp(op store.FailOp) *store.OpResult {
 		job.LeaseExpiresAt = nil
 
 		jobData, _ := encodeJobDoc(job)
-		batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts)
+		logErr(batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts))
 
 		result.Status = store.StateDead
 		result.AttemptsRemaining = 0
@@ -2660,17 +2582,17 @@ func (f *FSM) enqueueChainStep(batch *pebble.Batch, prevJob store.Job, step *sto
 func (f *FSM) createChainJob(batch *pebble.Batch, prevJob store.Job, queue string, payload json.RawMessage, stepIndex int, now time.Time) store.Job {
 	jobID := store.NewJobID()
 	newJob := store.Job{
-		ID:           jobID,
-		Queue:        queue,
-		State:        store.StatePending,
-		Payload:      payload,
-		Priority:     store.PriorityNormal,
-		MaxRetries:   3,
-		RetryBackoff: store.BackoffExponential,
+		ID:             jobID,
+		Queue:          queue,
+		State:          store.StatePending,
+		Payload:        payload,
+		Priority:       store.PriorityNormal,
+		MaxRetries:     3,
+		RetryBackoff:   store.BackoffExponential,
 		RetryBaseDelay: 5000,
 		RetryMaxDelay:  600000,
-		CreatedAt:    now.UTC(),
-		ChainConfig:  prevJob.ChainConfig,
+		CreatedAt:      now.UTC(),
+		ChainConfig:    prevJob.ChainConfig,
 	}
 	if prevJob.ChainID != nil {
 		newJob.ChainID = prevJob.ChainID
@@ -2678,23 +2600,15 @@ func (f *FSM) createChainJob(batch *pebble.Batch, prevJob store.Job, queue strin
 	newJob.ChainStep = &stepIndex
 
 	jobData, _ := encodeJobDoc(newJob)
-	batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
-	batch.Set(kv.QueueNameKey(queue), nil, f.writeOpts)
+	logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
+	logErr(batch.Set(kv.QueueNameKey(queue), nil, f.writeOpts))
 	createdNs := uint64(now.UnixNano())
-	batch.Set(kv.QueueAppendKey(queue, createdNs, jobID), nil, f.writeOpts)
+	logErr(batch.Set(kv.QueueAppendKey(queue, createdNs, jobID), nil, f.writeOpts))
 
 	return newJob
 }
 
 // --- Heartbeat ---
-
-func (f *FSM) applyHeartbeat(data json.RawMessage) *store.OpResult {
-	var op store.HeartbeatOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyHeartbeatOp(op)
-}
 
 func (f *FSM) applyHeartbeatOp(op store.HeartbeatOp) *store.OpResult {
 	now := time.Unix(0, int64(op.NowNs))
@@ -2706,7 +2620,7 @@ func (f *FSM) applyHeartbeatOp(op store.HeartbeatOp) *store.OpResult {
 	}
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	var firstWorkerID string
 	for jobID, update := range op.Jobs {
@@ -2717,11 +2631,11 @@ func (f *FSM) applyHeartbeatOp(op store.HeartbeatOp) *store.OpResult {
 		}
 		var job store.Job
 		if err := decodeJobDoc(jobVal, &job); err != nil {
-			closer.Close()
+			_ = closer.Close()
 			resp.Jobs[jobID] = store.HeartbeatJobResponse{Status: "cancel"}
 			continue
 		}
-		closer.Close()
+		_ = closer.Close()
 
 		if job.State != store.StateActive {
 			resp.Jobs[jobID] = store.HeartbeatJobResponse{Status: "cancel"}
@@ -2741,9 +2655,9 @@ func (f *FSM) applyHeartbeatOp(op store.HeartbeatOp) *store.OpResult {
 		}
 
 		jobData, _ := encodeJobDoc(job)
-		batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+		logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 		// Update active key with new lease
-		batch.Set(kv.ActiveKey(job.Queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts)
+		logErr(batch.Set(kv.ActiveKey(job.Queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts))
 
 		resp.Jobs[jobID] = store.HeartbeatJobResponse{Status: "ok"}
 	}
@@ -2753,12 +2667,12 @@ func (f *FSM) applyHeartbeatOp(op store.HeartbeatOp) *store.OpResult {
 		if wVal, wCloser, err := f.pebble.Get(kv.WorkerKey(firstWorkerID)); err == nil {
 			var w store.Worker
 			if err := json.Unmarshal(wVal, &w); err != nil {
-				wCloser.Close()
+				_ = wCloser.Close()
 			} else {
-				wCloser.Close()
+				_ = wCloser.Close()
 				w.LastHeartbeat = now
 				wData, _ := json.Marshal(w)
-				batch.Set(kv.WorkerKey(firstWorkerID), wData, f.writeOpts)
+				logErr(batch.Set(kv.WorkerKey(firstWorkerID), wData, f.writeOpts))
 			}
 		}
 	}
@@ -2776,14 +2690,6 @@ func (f *FSM) applyHeartbeatOp(op store.HeartbeatOp) *store.OpResult {
 
 // --- RetryJob ---
 
-func (f *FSM) applyRetryJob(data json.RawMessage) *store.OpResult {
-	var op store.RetryJobOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyRetryJobOp(op)
-}
-
 func (f *FSM) applyRetryJobOp(op store.RetryJobOp) *store.OpResult {
 	jobVal, closer, err := f.pebble.Get(kv.JobKey(op.JobID))
 	if err != nil {
@@ -2793,14 +2699,14 @@ func (f *FSM) applyRetryJobOp(op store.RetryJobOp) *store.OpResult {
 	if err := decodeJobDoc(jobVal, &job); err != nil {
 		return &store.OpResult{Err: fmt.Errorf("decode job %q: %w", op.JobID, err)}
 	}
-	closer.Close()
+	_ = closer.Close()
 
 	if job.State != store.StateDead && job.State != store.StateCancelled && job.State != store.StateCompleted && job.State != store.StateScheduled {
 		return &store.OpResult{Err: fmt.Errorf("job %q cannot be retried from state %q", op.JobID, job.State)}
 	}
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	// Remove from previous sorted set (e.g. scheduled key).
 	f.removeFromSortedSet(batch, job)
@@ -2819,11 +2725,11 @@ func (f *FSM) applyRetryJobOp(op store.RetryJobOp) *store.OpResult {
 	job.ScheduledAt = nil
 
 	jobData, _ := encodeJobDoc(job)
-	batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts)
+	logErr(batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts))
 	if job.Priority == store.PriorityNormal {
-		batch.Set(kv.QueueAppendKey(job.Queue, createdNs, op.JobID), nil, f.writeOpts)
+		logErr(batch.Set(kv.QueueAppendKey(job.Queue, createdNs, op.JobID), nil, f.writeOpts))
 	} else {
-		batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, op.JobID), nil, f.writeOpts)
+		logErr(batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, op.JobID), nil, f.writeOpts))
 	}
 
 	if err := batch.Commit(f.writeOpts); err != nil {
@@ -2839,14 +2745,6 @@ func (f *FSM) applyRetryJobOp(op store.RetryJobOp) *store.OpResult {
 
 // --- CancelJob ---
 
-func (f *FSM) applyCancelJob(data json.RawMessage) *store.OpResult {
-	var op store.CancelJobOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyCancelJobOp(op)
-}
-
 func (f *FSM) applyCancelJobOp(op store.CancelJobOp) *store.OpResult {
 	jobVal, closer, err := f.pebble.Get(kv.JobKey(op.JobID))
 	if err != nil {
@@ -2856,10 +2754,10 @@ func (f *FSM) applyCancelJobOp(op store.CancelJobOp) *store.OpResult {
 	if err := decodeJobDoc(jobVal, &job); err != nil {
 		return &store.OpResult{Err: fmt.Errorf("decode job %q: %w", op.JobID, err)}
 	}
-	closer.Close()
+	_ = closer.Close()
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	var resultStatus string
 	switch job.State {
@@ -2873,7 +2771,7 @@ func (f *FSM) applyCancelJobOp(op store.CancelJobOp) *store.OpResult {
 		deleteRetryingKey(batch, f.pebble, job.Queue, op.JobID, f.writeOpts)
 		resultStatus = store.StateCancelled
 	case store.StateActive:
-		batch.Delete(kv.ActiveKey(job.Queue, op.JobID), f.writeOpts)
+		logErr(batch.Delete(kv.ActiveKey(job.Queue, op.JobID), f.writeOpts))
 		f.decrActive(job.Queue)
 		resultStatus = "cancelling"
 	default:
@@ -2882,7 +2780,7 @@ func (f *FSM) applyCancelJobOp(op store.CancelJobOp) *store.OpResult {
 
 	job.State = store.StateCancelled
 	jobData, _ := encodeJobDoc(job)
-	batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts)
+	logErr(batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts))
 
 	if err := batch.Commit(f.writeOpts); err != nil {
 		return &store.OpResult{Err: fmt.Errorf("pebble commit cancel: %w", err)}
@@ -2897,14 +2795,6 @@ func (f *FSM) applyCancelJobOp(op store.CancelJobOp) *store.OpResult {
 
 // --- MoveJob ---
 
-func (f *FSM) applyMoveJob(data json.RawMessage) *store.OpResult {
-	var op store.MoveJobOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyMoveJobOp(op)
-}
-
 func (f *FSM) applyMoveJobOp(op store.MoveJobOp) *store.OpResult {
 	jobVal, closer, err := f.pebble.Get(kv.JobKey(op.JobID))
 	if err != nil {
@@ -2914,10 +2804,10 @@ func (f *FSM) applyMoveJobOp(op store.MoveJobOp) *store.OpResult {
 	if err := decodeJobDoc(jobVal, &job); err != nil {
 		return &store.OpResult{Err: fmt.Errorf("decode job %q: %w", op.JobID, err)}
 	}
-	closer.Close()
+	_ = closer.Close()
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	oldQueue := job.Queue
 
@@ -2926,7 +2816,7 @@ func (f *FSM) applyMoveJobOp(op store.MoveJobOp) *store.OpResult {
 	case store.StatePending:
 		deletePendingOrAppendKey(batch, f.pebble, oldQueue, op.JobID, f.writeOpts)
 	case store.StateActive:
-		batch.Delete(kv.ActiveKey(oldQueue, op.JobID), f.writeOpts)
+		logErr(batch.Delete(kv.ActiveKey(oldQueue, op.JobID), f.writeOpts))
 		f.decrActive(oldQueue)
 	case store.StateScheduled:
 		deleteScheduledKey(batch, f.pebble, oldQueue, op.JobID, f.writeOpts)
@@ -2936,34 +2826,34 @@ func (f *FSM) applyMoveJobOp(op store.MoveJobOp) *store.OpResult {
 
 	job.Queue = op.TargetQueue
 	jobData, _ := encodeJobDoc(job)
-	batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts)
-	batch.Set(kv.QueueNameKey(op.TargetQueue), nil, f.writeOpts)
+	logErr(batch.Set(kv.JobKey(op.JobID), jobData, f.writeOpts))
+	logErr(batch.Set(kv.QueueNameKey(op.TargetQueue), nil, f.writeOpts))
 
 	// Add to new queue's sorted set
 	switch job.State {
 	case store.StatePending:
 		createdNs := op.NowNs
 		if job.Priority == store.PriorityNormal {
-			batch.Set(kv.QueueAppendKey(op.TargetQueue, createdNs, op.JobID), nil, f.writeOpts)
+			logErr(batch.Set(kv.QueueAppendKey(op.TargetQueue, createdNs, op.JobID), nil, f.writeOpts))
 		} else {
-			batch.Set(kv.PendingKey(op.TargetQueue, uint8(job.Priority), createdNs, op.JobID), nil, f.writeOpts)
+			logErr(batch.Set(kv.PendingKey(op.TargetQueue, uint8(job.Priority), createdNs, op.JobID), nil, f.writeOpts))
 		}
 	case store.StateActive:
 		var leaseNs uint64
 		if job.LeaseExpiresAt != nil {
 			leaseNs = uint64(job.LeaseExpiresAt.UnixNano())
 		}
-		batch.Set(kv.ActiveKey(op.TargetQueue, op.JobID), kv.PutUint64BE(nil, leaseNs), f.writeOpts)
+		logErr(batch.Set(kv.ActiveKey(op.TargetQueue, op.JobID), kv.PutUint64BE(nil, leaseNs), f.writeOpts))
 		f.incrActive(op.TargetQueue)
 	case store.StateScheduled:
 		if job.ScheduledAt != nil {
 			schedNs := uint64(job.ScheduledAt.UnixNano())
-			batch.Set(kv.ScheduledKey(op.TargetQueue, schedNs, op.JobID), nil, f.writeOpts)
+			logErr(batch.Set(kv.ScheduledKey(op.TargetQueue, schedNs, op.JobID), nil, f.writeOpts))
 		}
 	case store.StateRetrying:
 		if job.ScheduledAt != nil {
 			retryNs := uint64(job.ScheduledAt.UnixNano())
-			batch.Set(kv.RetryingKey(op.TargetQueue, retryNs, op.JobID), nil, f.writeOpts)
+			logErr(batch.Set(kv.RetryingKey(op.TargetQueue, retryNs, op.JobID), nil, f.writeOpts))
 		}
 	}
 
@@ -2980,24 +2870,8 @@ func (f *FSM) applyMoveJobOp(op store.MoveJobOp) *store.OpResult {
 
 // --- Budgets ---
 
-func (f *FSM) applySetBudget(data json.RawMessage) *store.OpResult {
-	var op store.SetBudgetOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applySetBudgetOp(op)
-}
-
 func (f *FSM) applySetBudgetOp(op store.SetBudgetOp) *store.OpResult {
-	doc := store.Budget{
-		ID:        op.ID,
-		Scope:     op.Scope,
-		Target:    op.Target,
-		DailyUSD:  op.DailyUSD,
-		PerJobUSD: op.PerJobUSD,
-		OnExceed:  op.OnExceed,
-		CreatedAt: op.CreatedAt,
-	}
+	doc := store.Budget(op)
 	b, err := json.Marshal(doc)
 	if err != nil {
 		return &store.OpResult{Err: err}
@@ -3009,14 +2883,6 @@ func (f *FSM) applySetBudgetOp(op store.SetBudgetOp) *store.OpResult {
 		return sqliteUpsertBudget(db, doc)
 	})
 	return &store.OpResult{Data: nil}
-}
-
-func (f *FSM) applyDeleteBudget(data json.RawMessage) *store.OpResult {
-	var op store.DeleteBudgetOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyDeleteBudgetOp(op)
 }
 
 func (f *FSM) applyDeleteBudgetOp(op store.DeleteBudgetOp) *store.OpResult {
@@ -3031,14 +2897,6 @@ func (f *FSM) applyDeleteBudgetOp(op store.DeleteBudgetOp) *store.OpResult {
 
 // --- DeleteJob ---
 
-func (f *FSM) applyDeleteJob(data json.RawMessage) *store.OpResult {
-	var op store.DeleteJobOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyDeleteJobOp(op)
-}
-
 func (f *FSM) applyDeleteJobOp(op store.DeleteJobOp) *store.OpResult {
 	jobVal, closer, err := f.pebble.Get(kv.JobKey(op.JobID))
 	if err != nil {
@@ -3048,19 +2906,19 @@ func (f *FSM) applyDeleteJobOp(op store.DeleteJobOp) *store.OpResult {
 	if err := decodeJobDoc(jobVal, &job); err != nil {
 		return &store.OpResult{Err: fmt.Errorf("decode job %q: %w", op.JobID, err)}
 	}
-	closer.Close()
+	_ = closer.Close()
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
-	batch.Delete(kv.JobKey(op.JobID), f.writeOpts)
+	logErr(batch.Delete(kv.JobKey(op.JobID), f.writeOpts))
 
 	// Remove from queue sorted set
 	switch job.State {
 	case store.StatePending:
 		deletePendingOrAppendKey(batch, f.pebble, job.Queue, op.JobID, f.writeOpts)
 	case store.StateActive:
-		batch.Delete(kv.ActiveKey(job.Queue, op.JobID), f.writeOpts)
+		logErr(batch.Delete(kv.ActiveKey(job.Queue, op.JobID), f.writeOpts))
 		f.decrActive(job.Queue)
 	case store.StateScheduled:
 		deleteScheduledKey(batch, f.pebble, job.Queue, op.JobID, f.writeOpts)
@@ -3084,24 +2942,8 @@ func (f *FSM) applyDeleteJobOp(op store.DeleteJobOp) *store.OpResult {
 
 // --- Queue operations ---
 
-func (f *FSM) applyPauseQueue(data json.RawMessage) *store.OpResult {
-	var op store.QueueOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyPauseQueueOp(op)
-}
-
 func (f *FSM) applyPauseQueueOp(op store.QueueOp) *store.OpResult {
 	return f.setQueuePaused(op.Queue, true)
-}
-
-func (f *FSM) applyResumeQueue(data json.RawMessage) *store.OpResult {
-	var op store.QueueOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyResumeQueueOp(op)
 }
 
 func (f *FSM) applyResumeQueueOp(op store.QueueOp) *store.OpResult {
@@ -3114,9 +2956,9 @@ func (f *FSM) setQueuePaused(queue string, paused bool) *store.OpResult {
 	qcData, _ := json.Marshal(qc)
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
-	batch.Set(kv.QueueConfigKey(queue), qcData, f.writeOpts)
-	batch.Set(kv.QueueNameKey(queue), nil, f.writeOpts)
+	defer func() { _ = batch.Close() }()
+	logErr(batch.Set(kv.QueueConfigKey(queue), qcData, f.writeOpts))
+	logErr(batch.Set(kv.QueueNameKey(queue), nil, f.writeOpts))
 	if err := batch.Commit(f.writeOpts); err != nil {
 		return &store.OpResult{Err: err}
 	}
@@ -3132,17 +2974,9 @@ func (f *FSM) setQueuePaused(queue string, paused bool) *store.OpResult {
 	return &store.OpResult{Data: nil}
 }
 
-func (f *FSM) applyClearQueue(data json.RawMessage) *store.OpResult {
-	var op store.QueueOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyClearQueueOp(op)
-}
-
 func (f *FSM) applyClearQueueOp(op store.QueueOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	// Delete pending jobs
 	f.deleteJobsByPrefix(batch, kv.PendingPrefix(op.Queue))
@@ -3161,17 +2995,9 @@ func (f *FSM) applyClearQueueOp(op store.QueueOp) *store.OpResult {
 	return &store.OpResult{Data: nil}
 }
 
-func (f *FSM) applyDeleteQueue(data json.RawMessage) *store.OpResult {
-	var op store.QueueOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyDeleteQueueOp(op)
-}
-
 func (f *FSM) applyDeleteQueueOp(op store.QueueOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	// Delete all jobs in all states
 	f.deleteJobsByPrefix(batch, kv.PendingPrefix(op.Queue))
@@ -3181,8 +3007,8 @@ func (f *FSM) applyDeleteQueueOp(op store.QueueOp) *store.OpResult {
 	f.deleteJobsByPrefix(batch, kv.RetryingScanPrefix(op.Queue))
 
 	// Delete queue config, name, rate limits, unique locks
-	batch.Delete(kv.QueueConfigKey(op.Queue), f.writeOpts)
-	batch.Delete(kv.QueueNameKey(op.Queue), f.writeOpts)
+	logErr(batch.Delete(kv.QueueConfigKey(op.Queue), f.writeOpts))
+	logErr(batch.Delete(kv.QueueNameKey(op.Queue), f.writeOpts))
 	deletePrefix(batch, f.pebble, kv.RateLimitPrefix(op.Queue), f.writeOpts)
 	deletePrefix(batch, f.pebble, kv.UniquePrefix(op.Queue), f.writeOpts)
 
@@ -3197,14 +3023,6 @@ func (f *FSM) applyDeleteQueueOp(op store.QueueOp) *store.OpResult {
 	return &store.OpResult{Data: nil}
 }
 
-func (f *FSM) applySetConcurrency(data json.RawMessage) *store.OpResult {
-	var op store.SetConcurrencyOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applySetConcurrencyOp(op)
-}
-
 func (f *FSM) applySetConcurrencyOp(op store.SetConcurrencyOp) *store.OpResult {
 	qc := f.getOrCreateQueueConfig(op.Queue)
 	if op.Max <= 0 {
@@ -3215,9 +3033,9 @@ func (f *FSM) applySetConcurrencyOp(op store.SetConcurrencyOp) *store.OpResult {
 	qcData, _ := json.Marshal(qc)
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
-	batch.Set(kv.QueueConfigKey(op.Queue), qcData, f.writeOpts)
-	batch.Set(kv.QueueNameKey(op.Queue), nil, f.writeOpts)
+	defer func() { _ = batch.Close() }()
+	logErr(batch.Set(kv.QueueConfigKey(op.Queue), qcData, f.writeOpts))
+	logErr(batch.Set(kv.QueueNameKey(op.Queue), nil, f.writeOpts))
 	if err := batch.Commit(f.writeOpts); err != nil {
 		return &store.OpResult{Err: err}
 	}
@@ -3233,14 +3051,6 @@ func (f *FSM) applySetConcurrencyOp(op store.SetConcurrencyOp) *store.OpResult {
 	return &store.OpResult{Data: nil}
 }
 
-func (f *FSM) applySetThrottle(data json.RawMessage) *store.OpResult {
-	var op store.SetThrottleOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applySetThrottleOp(op)
-}
-
 func (f *FSM) applySetThrottleOp(op store.SetThrottleOp) *store.OpResult {
 	qc := f.getOrCreateQueueConfig(op.Queue)
 	qc.RateLimit = &op.Rate
@@ -3248,29 +3058,21 @@ func (f *FSM) applySetThrottleOp(op store.SetThrottleOp) *store.OpResult {
 	qcData, _ := json.Marshal(qc)
 
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
-	batch.Set(kv.QueueConfigKey(op.Queue), qcData, f.writeOpts)
-	batch.Set(kv.QueueNameKey(op.Queue), nil, f.writeOpts)
+	defer func() { _ = batch.Close() }()
+	logErr(batch.Set(kv.QueueConfigKey(op.Queue), qcData, f.writeOpts))
+	logErr(batch.Set(kv.QueueNameKey(op.Queue), nil, f.writeOpts))
 	if err := batch.Commit(f.writeOpts); err != nil {
 		return &store.OpResult{Err: err}
 	}
 
 	f.syncSQLite(func(db sqlExecer) error {
-		db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", op.Queue)
+		_, _ = db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", op.Queue)
 		_, err := db.Exec("UPDATE queues SET rate_limit = ?, rate_window_ms = ? WHERE name = ?",
 			op.Rate, op.WindowMs, op.Queue)
 		return err
 	})
 
 	return &store.OpResult{Data: nil}
-}
-
-func (f *FSM) applyRemoveThrottle(data json.RawMessage) *store.OpResult {
-	var op store.QueueOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyRemoveThrottleOp(op)
 }
 
 func (f *FSM) applyRemoveThrottleOp(op store.QueueOp) *store.OpResult {
@@ -3293,17 +3095,9 @@ func (f *FSM) applyRemoveThrottleOp(op store.QueueOp) *store.OpResult {
 
 // --- Promote ---
 
-func (f *FSM) applyPromote(data json.RawMessage) *store.OpResult {
-	var op store.PromoteOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyPromoteOp(op)
-}
-
 func (f *FSM) applyPromoteOp(op store.PromoteOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	var promoted int
 
@@ -3315,7 +3109,7 @@ func (f *FSM) applyPromoteOp(op store.PromoteOp) *store.OpResult {
 	if err != nil {
 		return &store.OpResult{Err: err}
 	}
-	defer qnIter.Close()
+	defer func() { _ = qnIter.Close() }()
 
 	var queues []string
 	for qnIter.First(); qnIter.Valid(); qnIter.Next() {
@@ -3356,7 +3150,7 @@ func (f *FSM) promotePrefix(batch *pebble.Batch, prefix []byte, queue string, no
 	if err != nil {
 		return 0
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	var promoted int
 	for iter.First(); iter.Valid(); iter.Next() {
@@ -3380,27 +3174,27 @@ func (f *FSM) promotePrefix(batch *pebble.Batch, prefix []byte, queue string, no
 		}
 		var job store.Job
 		if err := decodeJobDoc(jobVal, &job); err != nil {
-			closer.Close()
+			_ = closer.Close()
 			continue
 		}
-		closer.Close()
+		_ = closer.Close()
 
 		// Update to pending
 		job.State = store.StatePending
 		job.ScheduledAt = nil
 		jobData, _ := encodeJobDoc(job)
-		batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+		logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 
 		// Delete from scheduled/retrying set
 		k := make([]byte, len(key))
 		copy(k, key)
-		batch.Delete(k, f.writeOpts)
+		logErr(batch.Delete(k, f.writeOpts))
 
 		createdNs := nowNs
 		if job.Priority == store.PriorityNormal {
-			batch.Set(kv.QueueAppendKey(queue, createdNs, jobID), nil, f.writeOpts)
+			logErr(batch.Set(kv.QueueAppendKey(queue, createdNs, jobID), nil, f.writeOpts))
 		} else {
-			batch.Set(kv.PendingKey(queue, uint8(job.Priority), createdNs, jobID), nil, f.writeOpts)
+			logErr(batch.Set(kv.PendingKey(queue, uint8(job.Priority), createdNs, jobID), nil, f.writeOpts))
 		}
 
 		promoted++
@@ -3410,17 +3204,9 @@ func (f *FSM) promotePrefix(batch *pebble.Batch, prefix []byte, queue string, no
 
 // --- Reclaim ---
 
-func (f *FSM) applyReclaim(data json.RawMessage) *store.OpResult {
-	var op store.ReclaimOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyReclaimOp(op)
-}
-
 func (f *FSM) applyReclaimOp(op store.ReclaimOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	var reclaimed int
 
@@ -3432,7 +3218,7 @@ func (f *FSM) applyReclaimOp(op store.ReclaimOp) *store.OpResult {
 	if err != nil {
 		return &store.OpResult{Err: err}
 	}
-	defer qnIter.Close()
+	defer func() { _ = qnIter.Close() }()
 
 	var queues []string
 	for qnIter.First(); qnIter.Valid(); qnIter.Next() {
@@ -3473,7 +3259,7 @@ func (f *FSM) applyReclaimOp(op store.ReclaimOp) *store.OpResult {
 			copy(k, iter.Key())
 			toReclaim = append(toReclaim, reclaimEntry{key: k, jobID: jobID})
 		}
-		iter.Close()
+		_ = iter.Close()
 
 		for _, entry := range toReclaim {
 			jobVal, closer, err := f.pebble.Get(kv.JobKey(entry.jobID))
@@ -3482,10 +3268,10 @@ func (f *FSM) applyReclaimOp(op store.ReclaimOp) *store.OpResult {
 			}
 			var job store.Job
 			if err := decodeJobDoc(jobVal, &job); err != nil {
-				closer.Close()
+				_ = closer.Close()
 				continue
 			}
-			closer.Close()
+			_ = closer.Close()
 
 			job.State = store.StatePending
 			job.WorkerID = nil
@@ -3493,14 +3279,14 @@ func (f *FSM) applyReclaimOp(op store.ReclaimOp) *store.OpResult {
 			job.LeaseExpiresAt = nil
 			jobData, _ := encodeJobDoc(job)
 
-			batch.Set(kv.JobKey(entry.jobID), jobData, f.writeOpts)
-			batch.Delete(entry.key, f.writeOpts) // active key
+			logErr(batch.Set(kv.JobKey(entry.jobID), jobData, f.writeOpts))
+			logErr(batch.Delete(entry.key, f.writeOpts)) // active key
 			f.decrActive(queue)
 			createdNs := op.NowNs
 			if job.Priority == store.PriorityNormal {
-				batch.Set(kv.QueueAppendKey(queue, createdNs, entry.jobID), nil, f.writeOpts)
+				logErr(batch.Set(kv.QueueAppendKey(queue, createdNs, entry.jobID), nil, f.writeOpts))
 			} else {
-				batch.Set(kv.PendingKey(queue, uint8(job.Priority), createdNs, entry.jobID), nil, f.writeOpts)
+				logErr(batch.Set(kv.PendingKey(queue, uint8(job.Priority), createdNs, entry.jobID), nil, f.writeOpts))
 			}
 			reclaimed++
 		}
@@ -3526,17 +3312,9 @@ func (f *FSM) applyReclaimOp(op store.ReclaimOp) *store.OpResult {
 
 // --- BulkAction ---
 
-func (f *FSM) applyBulkAction(data json.RawMessage) *store.OpResult {
-	var op store.BulkActionOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyBulkActionOp(op)
-}
-
 func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	var affected int
 	lifecycleChanged := false
@@ -3548,10 +3326,10 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 		}
 		var job store.Job
 		if err := decodeJobDoc(jobVal, &job); err != nil {
-			closer.Close()
+			_ = closer.Close()
 			continue
 		}
-		closer.Close()
+		_ = closer.Close()
 
 		switch op.Action {
 		case "retry":
@@ -3570,17 +3348,17 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 			job.LeaseExpiresAt = nil
 			job.ScheduledAt = nil
 			jobData, _ := encodeJobDoc(job)
-			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 			if job.Priority == store.PriorityNormal {
-				batch.Set(kv.QueueAppendKey(job.Queue, createdNs, jobID), nil, f.writeOpts)
+				logErr(batch.Set(kv.QueueAppendKey(job.Queue, createdNs, jobID), nil, f.writeOpts))
 			} else {
-				batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, jobID), nil, f.writeOpts)
+				logErr(batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, jobID), nil, f.writeOpts))
 			}
 			affected++
 
 		case "delete":
 			f.removeFromSortedSet(batch, job)
-			batch.Delete(kv.JobKey(jobID), f.writeOpts)
+			logErr(batch.Delete(kv.JobKey(jobID), f.writeOpts))
 			deletePrefix(batch, f.pebble, kv.JobErrorPrefix(jobID), f.writeOpts)
 			affected++
 
@@ -3592,7 +3370,7 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 			f.removeFromSortedSet(batch, job)
 			job.State = store.StateCancelled
 			jobData, _ := encodeJobDoc(job)
-			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 			affected++
 
 		case "move":
@@ -3601,14 +3379,14 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 			_ = oldQueue
 			job.Queue = op.MoveToQueue
 			jobData, _ := encodeJobDoc(job)
-			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
-			batch.Set(kv.QueueNameKey(op.MoveToQueue), nil, f.writeOpts)
+			logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
+			logErr(batch.Set(kv.QueueNameKey(op.MoveToQueue), nil, f.writeOpts))
 			if job.State == store.StatePending {
 				createdNs := op.NowNs
 				if job.Priority == store.PriorityNormal {
-					batch.Set(kv.QueueAppendKey(op.MoveToQueue, createdNs, jobID), nil, f.writeOpts)
+					logErr(batch.Set(kv.QueueAppendKey(op.MoveToQueue, createdNs, jobID), nil, f.writeOpts))
 				} else {
-					batch.Set(kv.PendingKey(op.MoveToQueue, uint8(job.Priority), createdNs, jobID), nil, f.writeOpts)
+					logErr(batch.Set(kv.PendingKey(op.MoveToQueue, uint8(job.Priority), createdNs, jobID), nil, f.writeOpts))
 				}
 			}
 			affected++
@@ -3626,11 +3404,11 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 			job.LeaseExpiresAt = nil
 			job.ScheduledAt = nil
 			jobData, _ := encodeJobDoc(job)
-			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 			if job.Priority == store.PriorityNormal {
-				batch.Set(kv.QueueAppendKey(job.Queue, createdNs, jobID), nil, f.writeOpts)
+				logErr(batch.Set(kv.QueueAppendKey(job.Queue, createdNs, jobID), nil, f.writeOpts))
 			} else {
-				batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, jobID), nil, f.writeOpts)
+				logErr(batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, jobID), nil, f.writeOpts))
 			}
 			affected++
 
@@ -3643,15 +3421,15 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 				job.Priority = op.Priority
 				createdNs := op.NowNs
 				if job.Priority == store.PriorityNormal {
-					batch.Set(kv.QueueAppendKey(job.Queue, createdNs, jobID), nil, f.writeOpts)
+					logErr(batch.Set(kv.QueueAppendKey(job.Queue, createdNs, jobID), nil, f.writeOpts))
 				} else {
-					batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, jobID), nil, f.writeOpts)
+					logErr(batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, jobID), nil, f.writeOpts))
 				}
 			} else {
 				job.Priority = op.Priority
 			}
 			jobData, _ := encodeJobDoc(job)
-			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 			affected++
 
 		case "hold":
@@ -3666,7 +3444,7 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 			job.LeaseExpiresAt = nil
 			job.ScheduledAt = nil
 			jobData, _ := encodeJobDoc(job)
-			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 			if err := f.appendLifecycleEvent(batch, "held", jobID, job.Queue, op.NowNs); err != nil {
 				return &store.OpResult{Err: err}
 			}
@@ -3683,12 +3461,12 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 			job.LeaseExpiresAt = nil
 			job.ScheduledAt = nil
 			jobData, _ := encodeJobDoc(job)
-			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 			createdNs := op.NowNs
 			if job.Priority == store.PriorityNormal {
-				batch.Set(kv.QueueAppendKey(job.Queue, createdNs, jobID), nil, f.writeOpts)
+				logErr(batch.Set(kv.QueueAppendKey(job.Queue, createdNs, jobID), nil, f.writeOpts))
 			} else {
-				batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, jobID), nil, f.writeOpts)
+				logErr(batch.Set(kv.PendingKey(job.Queue, uint8(job.Priority), createdNs, jobID), nil, f.writeOpts))
 			}
 			if err := f.appendLifecycleEvent(batch, "approved", jobID, job.Queue, op.NowNs); err != nil {
 				return &store.OpResult{Err: err}
@@ -3708,7 +3486,7 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 			job.LeaseExpiresAt = nil
 			job.ScheduledAt = nil
 			jobData, _ := encodeJobDoc(job)
-			batch.Set(kv.JobKey(jobID), jobData, f.writeOpts)
+			logErr(batch.Set(kv.JobKey(jobID), jobData, f.writeOpts))
 			if err := f.appendLifecycleEvent(batch, "rejected", jobID, job.Queue, op.NowNs); err != nil {
 				return &store.OpResult{Err: err}
 			}
@@ -3738,17 +3516,9 @@ func (f *FSM) applyBulkActionOp(op store.BulkActionOp) *store.OpResult {
 
 // --- CleanUnique ---
 
-func (f *FSM) applyCleanUnique(data json.RawMessage) *store.OpResult {
-	var op store.CleanUniqueOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyCleanUniqueOp(op)
-}
-
 func (f *FSM) applyCleanUniqueOp(op store.CleanUniqueOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	var cleaned int
 
@@ -3761,7 +3531,7 @@ func (f *FSM) applyCleanUniqueOp(op store.CleanUniqueOp) *store.OpResult {
 	if err != nil {
 		return &store.OpResult{Err: err}
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		val := iter.Value()
@@ -3769,7 +3539,7 @@ func (f *FSM) applyCleanUniqueOp(op store.CleanUniqueOp) *store.OpResult {
 		if expiresNs < op.NowNs {
 			k := make([]byte, len(iter.Key()))
 			copy(k, iter.Key())
-			batch.Delete(k, f.writeOpts)
+			logErr(batch.Delete(k, f.writeOpts))
 			cleaned++
 		}
 	}
@@ -3791,17 +3561,9 @@ func (f *FSM) applyCleanUniqueOp(op store.CleanUniqueOp) *store.OpResult {
 
 // --- CleanRateLimit ---
 
-func (f *FSM) applyCleanRateLimit(data json.RawMessage) *store.OpResult {
-	var op store.CleanRateLimitOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyCleanRateLimitOp(op)
-}
-
 func (f *FSM) applyCleanRateLimitOp(op store.CleanRateLimitOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	var cleaned int
 
@@ -3813,7 +3575,7 @@ func (f *FSM) applyCleanRateLimitOp(op store.CleanRateLimitOp) *store.OpResult {
 	if err != nil {
 		return &store.OpResult{Err: err}
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		// Key: l|{queue}\x00{fetched_ns:8BE}{random:8BE}
@@ -3834,7 +3596,7 @@ func (f *FSM) applyCleanRateLimitOp(op store.CleanRateLimitOp) *store.OpResult {
 		if fetchedNs < op.CutoffNs {
 			k := make([]byte, len(key))
 			copy(k, key)
-			batch.Delete(k, f.writeOpts)
+			logErr(batch.Delete(k, f.writeOpts))
 			cleaned++
 		}
 	}
@@ -3859,7 +3621,7 @@ func (f *FSM) applyCleanRateLimitOp(op store.CleanRateLimitOp) *store.OpResult {
 func (f *FSM) getOrCreateQueueConfig(queue string) store.Queue {
 	val, closer, err := f.pebble.Get(kv.QueueConfigKey(queue))
 	if err == nil {
-		defer closer.Close()
+		defer func() { _ = closer.Close() }()
 		var qc store.Queue
 		if err := json.Unmarshal(val, &qc); err != nil {
 			return store.Queue{Name: queue}
@@ -3876,10 +3638,10 @@ func (f *FSM) updateBatchPebble(batch *pebble.Batch, batchID, outcome string, no
 	}
 	var b store.Batch
 	if err := json.Unmarshal(bVal, &b); err != nil {
-		closer.Close()
+		_ = closer.Close()
 		return ""
 	}
-	closer.Close()
+	_ = closer.Close()
 
 	b.Pending--
 	if outcome == "success" {
@@ -3889,7 +3651,7 @@ func (f *FSM) updateBatchPebble(batch *pebble.Batch, batchID, outcome string, no
 	}
 
 	bData, _ := json.Marshal(b)
-	batch.Set(kv.BatchKey(batchID), bData, f.writeOpts)
+	logErr(batch.Set(kv.BatchKey(batchID), bData, f.writeOpts))
 
 	// If all done, enqueue callback
 	if b.Pending <= 0 && b.CallbackQueue != nil {
@@ -3908,9 +3670,9 @@ func (f *FSM) updateBatchPebble(batch *pebble.Batch, batchID, outcome string, no
 			CreatedAt: now,
 		}
 		jobData, _ := json.Marshal(callbackJob)
-		batch.Set(kv.JobKey(callbackJobID), jobData, f.writeOpts)
+		logErr(batch.Set(kv.JobKey(callbackJobID), jobData, f.writeOpts))
 		createdNs := uint64(now.UnixNano())
-		batch.Set(kv.PendingKey(*b.CallbackQueue, uint8(store.PriorityNormal), createdNs, callbackJobID), nil, f.writeOpts)
+		logErr(batch.Set(kv.PendingKey(*b.CallbackQueue, uint8(store.PriorityNormal), createdNs, callbackJobID), nil, f.writeOpts))
 		return callbackJobID
 	}
 	return ""
@@ -3924,7 +3686,7 @@ func (f *FSM) deleteJobsByPrefix(batch *pebble.Batch, prefix []byte) {
 	if err != nil {
 		return
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		key := iter.Key()
@@ -3942,26 +3704,26 @@ func (f *FSM) deleteJobsByPrefix(batch *pebble.Batch, prefix []byte) {
 
 		// Determine format based on prefix
 		if len(key) > prefixLen {
-			switch {
-			case key[0] == 'p': // pending: prefix + 1 + 8 + jobID
+			switch key[0] {
+			case 'p': // pending: prefix + 1 + 8 + jobID
 				if len(key) > prefixLen+9 {
 					jobID = string(key[prefixLen+9:])
 				}
-			case key[0] == 's' || key[0] == 'r': // scheduled/retrying: prefix + 8 + jobID
+			case 's', 'r': // scheduled/retrying: prefix + 8 + jobID
 				if len(key) > prefixLen+8 {
 					jobID = string(key[prefixLen+8:])
 				}
-			case key[0] == 'a': // active: prefix + jobID
+			case 'a': // active: prefix + jobID
 				jobID = string(key[prefixLen:])
 			}
 		}
 
 		k := make([]byte, len(key))
 		copy(k, key)
-		batch.Delete(k, f.writeOpts)
+		logErr(batch.Delete(k, f.writeOpts))
 
 		if jobID != "" {
-			batch.Delete(kv.JobKey(jobID), f.writeOpts)
+			logErr(batch.Delete(kv.JobKey(jobID), f.writeOpts))
 			deletePrefix(batch, f.pebble, kv.JobErrorPrefix(jobID), f.writeOpts)
 		}
 	}
@@ -4016,23 +3778,6 @@ func marshalStringSlice(ss []string) json.RawMessage {
 	return b
 }
 
-// countPrefix counts keys with the given prefix.
-func countPrefix(db *pebble.DB, prefix []byte) int {
-	iter, err := db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return 0
-	}
-	defer iter.Close()
-	count := 0
-	for iter.First(); iter.Valid(); iter.Next() {
-		count++
-	}
-	return count
-}
-
 // countPrefixFrom counts keys from startKey to the upper bound of prefix.
 func countPrefixFrom(db *pebble.DB, prefix, startKey []byte) int {
 	iter, err := db.NewIter(&pebble.IterOptions{
@@ -4042,7 +3787,7 @@ func countPrefixFrom(db *pebble.DB, prefix, startKey []byte) int {
 	if err != nil {
 		return 0
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 	count := 0
 	for iter.First(); iter.Valid(); iter.Next() {
 		count++
@@ -4072,11 +3817,11 @@ func deletePrefix(batch *pebble.Batch, db *pebble.DB, prefix []byte, writeOpts *
 	if err != nil {
 		return
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 	for iter.First(); iter.Valid(); iter.Next() {
 		k := make([]byte, len(iter.Key()))
 		copy(k, iter.Key())
-		batch.Delete(k, writeOpts)
+		logErr(batch.Delete(k, writeOpts))
 	}
 }
 
@@ -4090,14 +3835,14 @@ func deletePendingKey(batch *pebble.Batch, db *pebble.DB, queue, jobID string, w
 	if err != nil {
 		return
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 	suffix := []byte(jobID)
 	for iter.First(); iter.Valid(); iter.Next() {
 		key := iter.Key()
 		if len(key) >= len(suffix) && string(key[len(key)-len(suffix):]) == jobID {
 			k := make([]byte, len(key))
 			copy(k, key)
-			batch.Delete(k, writeOpts)
+			logErr(batch.Delete(k, writeOpts))
 			return
 		}
 	}
@@ -4112,13 +3857,13 @@ func deleteAppendKey(batch *pebble.Batch, db *pebble.DB, queue, jobID string, wr
 	if err != nil {
 		return
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 	for iter.First(); iter.Valid(); iter.Next() {
 		key := iter.Key()
 		if len(key) >= len(jobID) && string(key[len(key)-len(jobID):]) == jobID {
 			k := make([]byte, len(key))
 			copy(k, key)
-			batch.Delete(k, writeOpts)
+			logErr(batch.Delete(k, writeOpts))
 			return
 		}
 	}
@@ -4139,13 +3884,13 @@ func deleteScheduledKey(batch *pebble.Batch, db *pebble.DB, queue, jobID string,
 	if err != nil {
 		return
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 	for iter.First(); iter.Valid(); iter.Next() {
 		key := iter.Key()
 		if len(key) >= len(jobID) && string(key[len(key)-len(jobID):]) == jobID {
 			k := make([]byte, len(key))
 			copy(k, key)
-			batch.Delete(k, writeOpts)
+			logErr(batch.Delete(k, writeOpts))
 			return
 		}
 	}
@@ -4161,13 +3906,13 @@ func deleteRetryingKey(batch *pebble.Batch, db *pebble.DB, queue, jobID string, 
 	if err != nil {
 		return
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 	for iter.First(); iter.Valid(); iter.Next() {
 		key := iter.Key()
 		if len(key) >= len(jobID) && string(key[len(key)-len(jobID):]) == jobID {
 			k := make([]byte, len(key))
 			copy(k, key)
-			batch.Delete(k, writeOpts)
+			logErr(batch.Delete(k, writeOpts))
 			return
 		}
 	}
@@ -4179,7 +3924,7 @@ func (f *FSM) removeFromSortedSet(batch *pebble.Batch, job store.Job) {
 	case store.StatePending:
 		deletePendingOrAppendKey(batch, f.pebble, job.Queue, job.ID, f.writeOpts)
 	case store.StateActive:
-		batch.Delete(kv.ActiveKey(job.Queue, job.ID), f.writeOpts)
+		logErr(batch.Delete(kv.ActiveKey(job.Queue, job.ID), f.writeOpts))
 		f.decrActive(job.Queue)
 	case store.StateScheduled:
 		deleteScheduledKey(batch, f.pebble, job.Queue, job.ID, f.writeOpts)
@@ -4190,17 +3935,9 @@ func (f *FSM) removeFromSortedSet(batch *pebble.Batch, job store.Job) {
 
 // --- ExpireJobs ---
 
-func (f *FSM) applyExpireJobs(data json.RawMessage) *store.OpResult {
-	var op store.ExpireJobsOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyExpireJobsOp(op)
-}
-
 func (f *FSM) applyExpireJobsOp(op store.ExpireJobsOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	now := time.Unix(0, int64(op.NowNs))
 	var expired int
@@ -4214,7 +3951,7 @@ func (f *FSM) applyExpireJobsOp(op store.ExpireJobsOp) *store.OpResult {
 	if err != nil {
 		return &store.OpResult{Err: err}
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		var job store.Job
@@ -4249,13 +3986,13 @@ func (f *FSM) applyExpireJobsOp(op store.ExpireJobsOp) *store.OpResult {
 			CreatedAt: now,
 		}
 		errData, _ := json.Marshal(errDoc)
-		batch.Set(kv.JobErrorKey(job.ID, uint32(job.Attempt)), errData, f.writeOpts)
+		logErr(batch.Set(kv.JobErrorKey(job.ID, uint32(job.Attempt)), errData, f.writeOpts))
 
 		// Update job state
 		job.State = store.StateDead
 		job.FailedAt = &now
 		jobData, _ := encodeJobDoc(job)
-		batch.Set(kv.JobKey(job.ID), jobData, f.writeOpts)
+		logErr(batch.Set(kv.JobKey(job.ID), jobData, f.writeOpts))
 
 		sqliteUpdates = append(sqliteUpdates, job.ID)
 		expired++
@@ -4271,8 +4008,8 @@ func (f *FSM) applyExpireJobsOp(op store.ExpireJobsOp) *store.OpResult {
 		nowStr := now.UTC().Format(time.RFC3339Nano)
 		f.syncSQLite(func(db sqlExecer) error {
 			for _, jobID := range sqliteUpdates {
-				db.Exec("UPDATE jobs SET state = 'dead', failed_at = ? WHERE id = ?", nowStr, jobID)
-				db.Exec("INSERT INTO job_errors (job_id, attempt, error, created_at) VALUES (?, 0, 'job expired', ?)", jobID, nowStr)
+				_, _ = db.Exec("UPDATE jobs SET state = 'dead', failed_at = ? WHERE id = ?", nowStr, jobID)
+				_, _ = db.Exec("INSERT INTO job_errors (job_id, attempt, error, created_at) VALUES (?, 0, 'job expired', ?)", jobID, nowStr)
 			}
 			return nil
 		})
@@ -4283,17 +4020,9 @@ func (f *FSM) applyExpireJobsOp(op store.ExpireJobsOp) *store.OpResult {
 
 // --- PurgeJobs ---
 
-func (f *FSM) applyPurgeJobs(data json.RawMessage) *store.OpResult {
-	var op store.PurgeJobsOp
-	if err := json.Unmarshal(data, &op); err != nil {
-		return &store.OpResult{Err: err}
-	}
-	return f.applyPurgeJobsOp(op)
-}
-
 func (f *FSM) applyPurgeJobsOp(op store.PurgeJobsOp) *store.OpResult {
 	batch := f.pebble.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	cutoff := time.Unix(0, int64(op.CutoffNs))
 	var purged int
@@ -4307,7 +4036,7 @@ func (f *FSM) applyPurgeJobsOp(op store.PurgeJobsOp) *store.OpResult {
 	if err != nil {
 		return &store.OpResult{Err: err}
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		var job store.Job
@@ -4345,7 +4074,7 @@ func (f *FSM) applyPurgeJobsOp(op store.PurgeJobsOp) *store.OpResult {
 		// Delete job key
 		k := make([]byte, len(iter.Key()))
 		copy(k, iter.Key())
-		batch.Delete(k, f.writeOpts)
+		logErr(batch.Delete(k, f.writeOpts))
 
 		// Delete error records
 		deletePrefix(batch, f.pebble, kv.JobErrorPrefix(job.ID), f.writeOpts)
@@ -4363,7 +4092,7 @@ func (f *FSM) applyPurgeJobsOp(op store.PurgeJobsOp) *store.OpResult {
 	if len(sqliteDeletes) > 0 {
 		f.syncSQLite(func(db sqlExecer) error {
 			for _, jobID := range sqliteDeletes {
-				sqliteDeleteJob(db, jobID)
+				_ = sqliteDeleteJob(db, jobID)
 			}
 			return nil
 		})

@@ -15,8 +15,8 @@ func TestBulkRetryByIDs(t *testing.T) {
 	var deadIDs []string
 	for range 3 {
 		r, _ := s.Enqueue(store.EnqueueRequest{Queue: "bulk.retry", Payload: json.RawMessage(`{}`), MaxRetries: &maxRetries})
-		s.Fetch(store.FetchRequest{Queues: []string{"bulk.retry"}, WorkerID: "w", Hostname: "h"})
-		s.Fail(r.JobID, "err", "", false)
+		_, _ = s.Fetch(store.FetchRequest{Queues: []string{"bulk.retry"}, WorkerID: "w", Hostname: "h"})
+		_, _ = s.Fail(r.JobID, "err", "", false)
 		deadIDs = append(deadIDs, r.JobID)
 	}
 
@@ -133,8 +133,8 @@ func TestBulkByFilter(t *testing.T) {
 	maxRetries := 1
 	for range 3 {
 		r, _ := s.Enqueue(store.EnqueueRequest{Queue: "bulk.filter", Payload: json.RawMessage(`{}`), MaxRetries: &maxRetries})
-		s.Fetch(store.FetchRequest{Queues: []string{"bulk.filter"}, WorkerID: "w", Hostname: "h"})
-		s.Fail(r.JobID, "err", "", false)
+		_, _ = s.Fetch(store.FetchRequest{Queues: []string{"bulk.filter"}, WorkerID: "w", Hostname: "h"})
+		_, _ = s.Fail(r.JobID, "err", "", false)
 	}
 
 	filter := search.Filter{Queue: "bulk.filter", State: []string{"dead"}}

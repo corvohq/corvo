@@ -70,7 +70,7 @@ func (s *Server) handleListMembers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	members := []map[string]string{}
 	for rows.Next() {
@@ -142,7 +142,7 @@ func (s *Server) handleListOrgAPIKeys(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	keys := []map[string]string{}
 	for rows.Next() {

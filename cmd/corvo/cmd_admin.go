@@ -36,11 +36,11 @@ var statusCmd = &cobra.Command{
 		}
 
 		var cluster map[string]interface{}
-		json.Unmarshal(clusterData, &cluster)
+		_ = json.Unmarshal(clusterData, &cluster)
 		fmt.Printf("Mode: %s  Status: %s\n\n", cluster["mode"], cluster["status"])
 
 		var queues []map[string]interface{}
-		json.Unmarshal(queueData, &queues)
+		_ = json.Unmarshal(queueData, &queues)
 
 		if len(queues) == 0 {
 			fmt.Println("No queues")
@@ -48,12 +48,12 @@ var statusCmd = &cobra.Command{
 		}
 
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "QUEUE\tPENDING\tACTIVE\tHELD\tCOMPLETED\tDEAD")
+		_, _ = fmt.Fprintln(w, "QUEUE\tPENDING\tACTIVE\tHELD\tCOMPLETED\tDEAD")
 		for _, q := range queues {
-			fmt.Fprintf(w, "%s\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\n",
+			_, _ = fmt.Fprintf(w, "%s\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\n",
 				q["name"], q["pending"], q["active"], q["held"], q["completed"], q["dead"])
 		}
-		w.Flush()
+		_ = w.Flush()
 		return nil
 	},
 }
@@ -74,7 +74,7 @@ var workersCmd = &cobra.Command{
 		}
 
 		var workers []map[string]interface{}
-		json.Unmarshal(data, &workers)
+		_ = json.Unmarshal(data, &workers)
 
 		if len(workers) == 0 {
 			fmt.Println("No workers connected")
@@ -82,16 +82,16 @@ var workersCmd = &cobra.Command{
 		}
 
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tHOSTNAME\tLAST HEARTBEAT")
+		_, _ = fmt.Fprintln(w, "ID\tHOSTNAME\tLAST HEARTBEAT")
 		for _, worker := range workers {
 			hostname := ""
 			if h, ok := worker["hostname"].(string); ok {
 				hostname = h
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\n",
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\n",
 				worker["id"], hostname, worker["last_heartbeat"])
 		}
-		w.Flush()
+		_ = w.Flush()
 		return nil
 	},
 }

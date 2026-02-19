@@ -115,10 +115,10 @@ func testServer(t *testing.T) (*Server, *store.Store) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	t.Cleanup(func() { da.Close() })
+	t.Cleanup(func() { _ = da.Close() })
 
 	s := store.NewStore(da, da.SQLiteDB())
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	srv := New(s, nil, ":0", nil)
 	return srv, s
 }
@@ -1174,7 +1174,7 @@ func TestClusterEventsEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	t.Cleanup(func() { da.Close() })
+	t.Cleanup(func() { _ = da.Close() })
 	s := store.NewStore(da, da.SQLiteDB())
 	srv := New(s, mockCluster{isLeader: true}, ":0", nil)
 	rr := doRequest(srv, "GET", "/api/v1/cluster/events?limit=10", nil)
@@ -1310,9 +1310,9 @@ func TestWriteProxyToLeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	defer da.Close()
+	defer func() { _ = da.Close() }()
 	followerStore := store.NewStore(da, da.SQLiteDB())
-	defer followerStore.Close()
+	defer func() { _ = followerStore.Close() }()
 
 	followerSrv := New(followerStore, mockCluster{
 		isLeader:   false,
@@ -1329,7 +1329,7 @@ func TestWriteProxyToLeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST enqueue via follower: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusCreated {
 		data, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d body=%s", resp.StatusCode, string(data))
@@ -1352,9 +1352,9 @@ func TestWriteRejectsMixedShardLeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	defer da.Close()
+	defer func() { _ = da.Close() }()
 	s := store.NewStore(da, da.SQLiteDB())
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	cl := &mockShardCluster{
 		mockCluster: mockCluster{isLeader: false},
@@ -1385,9 +1385,9 @@ func TestWriteRejectsMixedLocalRemoteShardLeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	defer da.Close()
+	defer func() { _ = da.Close() }()
 	s := store.NewStore(da, da.SQLiteDB())
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	cl := &mockShardCluster{
 		mockCluster: mockCluster{isLeader: false},
@@ -1492,7 +1492,7 @@ func TestConnectWorkerLifecycleStream(t *testing.T) {
 	}
 
 	stream := client.StreamLifecycle(context.Background())
-	defer stream.CloseRequest()
+	defer func() { _ = stream.CloseRequest() }()
 
 	if err := stream.Send(&corvov1.LifecycleStreamRequest{
 		RequestId:     1,

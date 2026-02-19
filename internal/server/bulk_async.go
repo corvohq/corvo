@@ -50,11 +50,10 @@ type bulkTask struct {
 }
 
 type asyncBulkManager struct {
-	mu       sync.RWMutex
-	tasks    map[string]*bulkTask
-	events   map[string]chan bulkTaskEvent
-	store    *store.Store
-	stopOnce sync.Once
+	mu     sync.RWMutex
+	tasks  map[string]*bulkTask
+	events map[string]chan bulkTaskEvent
+	store  *store.Store
 }
 
 var bulkTaskSeq atomic.Uint64
@@ -297,7 +296,7 @@ func (m *asyncBulkManager) resolveFilterToIDs(filter search.Filter) ([]string, e
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var ids []string
 	for rows.Next() {
 		var id string

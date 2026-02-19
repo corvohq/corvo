@@ -74,7 +74,7 @@ var enqueueCmd = &cobra.Command{
 			printJSON(data)
 		} else {
 			var result map[string]interface{}
-			json.Unmarshal(data, &result)
+			_ = json.Unmarshal(data, &result)
 			fmt.Printf("Job enqueued: %s (status: %s)\n", result["job_id"], result["status"])
 		}
 		return nil
@@ -122,7 +122,7 @@ var cancelCmd = &cobra.Command{
 		}
 		exitOnError(data, status)
 		var result map[string]string
-		json.Unmarshal(data, &result)
+		_ = json.Unmarshal(data, &result)
 		fmt.Printf("Job %s: %s\n", args[0], result["status"])
 		return nil
 	},
@@ -193,7 +193,7 @@ var replayCmd = &cobra.Command{
 			return nil
 		}
 		var result map[string]interface{}
-		json.Unmarshal(data, &result)
+		_ = json.Unmarshal(data, &result)
 		fmt.Printf("Replay enqueued: %s (status: %s)\n", result["job_id"], result["status"])
 		return nil
 	},

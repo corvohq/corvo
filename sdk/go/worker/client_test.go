@@ -40,10 +40,10 @@ func testWorkerClient(t *testing.T, opts ...Option) (*Client, *store.Store) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	t.Cleanup(func() { da.Close() })
+	t.Cleanup(func() { _ = da.Close() })
 
 	s := store.NewStore(da, da.SQLiteDB())
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 
 	srv := server.New(s, nil, ":0", nil)
 	ts := httptest.NewServer(srv.Handler())

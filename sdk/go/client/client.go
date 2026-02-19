@@ -497,7 +497,7 @@ func (c *Client) doRequestWithContext(ctx context.Context, method, path string, 
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	c.parseServerTiming(resp)
 
 	data, err := io.ReadAll(resp.Body)
@@ -510,7 +510,7 @@ func (c *Client) doRequestWithContext(ctx context.Context, method, path string, 
 			Error string `json:"error"`
 			Code  string `json:"code"`
 		}
-		json.Unmarshal(data, &apiErr)
+		_ = json.Unmarshal(data, &apiErr)
 		if apiErr.Code == "PAYLOAD_TOO_LARGE" {
 			return &PayloadTooLargeError{Message: apiErr.Error}
 		}

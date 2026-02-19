@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"math"
 
-	oldproto "github.com/golang/protobuf/proto"
+	oldproto "github.com/golang/protobuf/proto" //nolint:staticcheck // hand-written proto structs use v1 API
 )
 
 var raftBinaryPrefix = []byte{0x43, 0x42, 0x31} // "CB1"

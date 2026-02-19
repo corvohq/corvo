@@ -131,7 +131,7 @@ func (r *rateLimiter) loadNamespaceConfigs() {
 		slog.Debug("rate limiter: failed to load namespace configs", "error", err)
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var name string
 		var readRPS, readBurst, writeRPS, writeBurst sql.NullFloat64
@@ -176,7 +176,7 @@ func (r *rateLimiter) loadNamespaceConfigs() {
 		r.nsConfigs.Store(&nsMap)
 		return
 	}
-	defer keyRows.Close()
+	defer func() { _ = keyRows.Close() }()
 	for keyRows.Next() {
 		var keyHash, ns string
 		if err := keyRows.Scan(&keyHash, &ns); err != nil {
@@ -220,10 +220,6 @@ func (r *rateLimiter) close() {
 	}
 }
 
-func (r *rateLimiter) allow(key string, isWrite bool, now time.Time) bool {
-	return r.allowN(key, isWrite, 1, now)
-}
-
 func (r *rateLimiter) allowN(key string, isWrite bool, n int, now time.Time) bool {
 	if !r.cfg.Enabled {
 		return true
@@ -254,10 +250,6 @@ func (r *rateLimiter) allowN(key string, isWrite bool, n int, now time.Time) boo
 		return takeTokenN(&c.wr, cfg.WriteRPS, cfg.WriteBurst, now, n)
 	}
 	return takeTokenN(&c.read, cfg.ReadRPS, cfg.ReadBurst, now, n)
-}
-
-func takeToken(b *tokenBucket, rps, burst float64, now time.Time) bool {
-	return takeTokenN(b, rps, burst, now, 1)
 }
 
 func takeTokenN(b *tokenBucket, rps, burst float64, now time.Time, n int) bool {

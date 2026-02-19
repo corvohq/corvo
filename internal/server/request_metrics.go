@@ -181,16 +181,16 @@ func (m *requestMetrics) renderPrometheus() string {
 		v := snap[k]
 		method := promLabelEscape(k.Method)
 		route := promLabelEscape(k.Route)
-		b.WriteString(fmt.Sprintf("corvo_http_requests_total{method=\"%s\",route=\"%s\"} %d\n", method, route, v.Total))
-		b.WriteString(fmt.Sprintf("corvo_http_request_errors_total{method=\"%s\",route=\"%s\"} %d\n", method, route, v.Errors))
+		fmt.Fprintf(&b, "corvo_http_requests_total{method=\"%s\",route=\"%s\"} %d\n", method, route, v.Total)
+		fmt.Fprintf(&b, "corvo_http_request_errors_total{method=\"%s\",route=\"%s\"} %d\n", method, route, v.Errors)
 		var cumulative uint64
 		for i, bucket := range requestDurationBuckets {
 			cumulative = v.Buckets[i]
-			b.WriteString(fmt.Sprintf("corvo_http_request_duration_seconds_bucket{method=\"%s\",route=\"%s\",le=\"%g\"} %d\n", method, route, bucket, cumulative))
+			fmt.Fprintf(&b, "corvo_http_request_duration_seconds_bucket{method=\"%s\",route=\"%s\",le=\"%g\"} %d\n", method, route, bucket, cumulative)
 		}
-		b.WriteString(fmt.Sprintf("corvo_http_request_duration_seconds_bucket{method=\"%s\",route=\"%s\",le=\"+Inf\"} %d\n", method, route, v.Total))
-		b.WriteString(fmt.Sprintf("corvo_http_request_duration_seconds_sum{method=\"%s\",route=\"%s\"} %.9f\n", method, route, v.SumSeconds))
-		b.WriteString(fmt.Sprintf("corvo_http_request_duration_seconds_count{method=\"%s\",route=\"%s\"} %d\n", method, route, v.Total))
+		fmt.Fprintf(&b, "corvo_http_request_duration_seconds_bucket{method=\"%s\",route=\"%s\",le=\"+Inf\"} %d\n", method, route, v.Total)
+		fmt.Fprintf(&b, "corvo_http_request_duration_seconds_sum{method=\"%s\",route=\"%s\"} %.9f\n", method, route, v.SumSeconds)
+		fmt.Fprintf(&b, "corvo_http_request_duration_seconds_count{method=\"%s\",route=\"%s\"} %d\n", method, route, v.Total)
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -198,7 +198,7 @@ func (m *requestMetrics) renderPrometheus() string {
 	for _, c := range m.byKey {
 		inflight += c.inFlight.Load()
 	}
-	b.WriteString(fmt.Sprintf("corvo_http_requests_in_flight %d\n", inflight))
+	fmt.Fprintf(&b, "corvo_http_requests_in_flight %d\n", inflight)
 	for _, k := range keys {
 		c := m.byKey[k]
 		if c == nil {
@@ -210,7 +210,7 @@ func (m *requestMetrics) renderPrometheus() string {
 		}
 		method := promLabelEscape(k.Method)
 		route := promLabelEscape(k.Route)
-		b.WriteString(fmt.Sprintf("corvo_rate_limit_throttled_total{method=\"%s\",route=\"%s\"} %d\n", method, route, th))
+		fmt.Fprintf(&b, "corvo_rate_limit_throttled_total{method=\"%s\",route=\"%s\"} %d\n", method, route, th)
 	}
 	return b.String()
 }

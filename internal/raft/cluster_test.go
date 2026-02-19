@@ -100,7 +100,7 @@ func waitForJobCount(t *testing.T, db *sql.DB, want int, timeout time.Duration) 
 
 func TestClusterSingleNodeBootstrap(t *testing.T) {
 	c1 := testCluster(t, "node-1", testRaftAddr(t), true)
-	defer c1.Shutdown()
+	defer func() { _ = c1.Shutdown() }()
 
 	if err := c1.WaitForLeader(5 * time.Second); err != nil {
 		t.Fatalf("WaitForLeader: %v", err)
@@ -135,7 +135,7 @@ func TestClusterThreeNodeFailover(t *testing.T) {
 	c1 := testCluster(t, "node-1", addr1, true)
 	defer func() {
 		if c1 != nil {
-			c1.Shutdown()
+			_ = c1.Shutdown()
 		}
 	}()
 	if err := c1.WaitForLeader(5 * time.Second); err != nil {
@@ -143,9 +143,9 @@ func TestClusterThreeNodeFailover(t *testing.T) {
 	}
 
 	c2 := testCluster(t, "node-2", addr2, false)
-	defer c2.Shutdown()
+	defer func() { _ = c2.Shutdown() }()
 	c3 := testCluster(t, "node-3", addr3, false)
-	defer c3.Shutdown()
+	defer func() { _ = c3.Shutdown() }()
 
 	addVoterWithRetry(t, c1, "node-2", addr2)
 	addVoterWithRetry(t, c1, "node-3", addr3)
@@ -174,7 +174,7 @@ func TestClusterThreeNodeFailover(t *testing.T) {
 	waitForJob(t, s2, r1.JobID, 5*time.Second)
 	waitForJob(t, s3, r1.JobID, 5*time.Second)
 
-	leader.Shutdown()
+	_ = leader.Shutdown()
 	if leader == c1 {
 		c1 = nil
 	}
@@ -217,13 +217,13 @@ func TestClusterLateJoinAfterSnapshot(t *testing.T) {
 	addr3 := testRaftAddr(t)
 
 	c1 := testCluster(t, "node-1", addr1, true)
-	defer c1.Shutdown()
+	defer func() { _ = c1.Shutdown() }()
 	if err := c1.WaitForLeader(5 * time.Second); err != nil {
 		t.Fatalf("node-1 WaitForLeader: %v", err)
 	}
 
 	c2 := testCluster(t, "node-2", addr2, false)
-	defer c2.Shutdown()
+	defer func() { _ = c2.Shutdown() }()
 	addVoterWithRetry(t, c1, "node-2", addr2)
 
 	s1 := store.NewStore(c1, c1.SQLiteReadDB())
@@ -244,7 +244,7 @@ func TestClusterLateJoinAfterSnapshot(t *testing.T) {
 	}
 
 	c3 := testCluster(t, "node-3", addr3, false)
-	defer c3.Shutdown()
+	defer func() { _ = c3.Shutdown() }()
 	addVoterWithRetry(t, c1, "node-3", addr3)
 
 	waitForJobCount(t, c3.SQLiteReadDB(), jobs, 12*time.Second)
@@ -258,7 +258,7 @@ func TestClusterLateJoinAfterSnapshotThenFailoverReplication(t *testing.T) {
 	c1 := testCluster(t, "node-1", addr1, true)
 	defer func() {
 		if c1 != nil {
-			c1.Shutdown()
+			_ = c1.Shutdown()
 		}
 	}()
 	if err := c1.WaitForLeader(5 * time.Second); err != nil {
@@ -266,7 +266,7 @@ func TestClusterLateJoinAfterSnapshotThenFailoverReplication(t *testing.T) {
 	}
 
 	c2 := testCluster(t, "node-2", addr2, false)
-	defer c2.Shutdown()
+	defer func() { _ = c2.Shutdown() }()
 	addVoterWithRetry(t, c1, "node-2", addr2)
 
 	s1 := store.NewStore(c1, c1.SQLiteReadDB())
@@ -286,12 +286,12 @@ func TestClusterLateJoinAfterSnapshotThenFailoverReplication(t *testing.T) {
 	}
 
 	c3 := testCluster(t, "node-3", addr3, false)
-	defer c3.Shutdown()
+	defer func() { _ = c3.Shutdown() }()
 	addVoterWithRetry(t, c1, "node-3", addr3)
 	waitForJobCount(t, c3.SQLiteReadDB(), jobs, 12*time.Second)
 
 	// Fail leader and ensure replication still works across remaining nodes.
-	c1.Shutdown()
+	_ = c1.Shutdown()
 	c1 = nil
 	remaining := []*Cluster{c2, c3}
 	newLeader := waitForLeaderFrom(t, remaining, 10*time.Second)
@@ -318,7 +318,7 @@ func TestPrepareFSMForRecoveryClearsPebbleWhenNoSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open pebble: %v", err)
 	}
-	defer pdb.Close()
+	defer func() { _ = pdb.Close() }()
 
 	if err := pdb.Set([]byte("j|job-1"), []byte(`{"id":"job-1"}`), pebble.Sync); err != nil {
 		t.Fatalf("seed pebble: %v", err)
@@ -341,7 +341,7 @@ func TestPrepareFSMForRecoveryClearsPebbleWhenNoSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("iter: %v", err)
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 	if iter.First() {
 		t.Fatalf("expected empty pebble after recovery prep with no snapshots")
 	}
@@ -363,7 +363,7 @@ func TestClusterOverloadPressureReturnsRetryHint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCluster: %v", err)
 	}
-	defer c.Shutdown()
+	defer func() { _ = c.Shutdown() }()
 	if err := c.WaitForLeader(5 * time.Second); err != nil {
 		t.Fatalf("WaitForLeader: %v", err)
 	}
@@ -445,13 +445,13 @@ func TestClusterRestartRecoveryWithoutSnapshot(t *testing.T) {
 		}
 	}
 	waitForJobCount(t, c1.SQLiteReadDB(), jobs, 5*time.Second)
-	c1.Shutdown()
+	_ = c1.Shutdown()
 
 	c2, err := NewCluster(cfg)
 	if err != nil {
 		t.Fatalf("NewCluster(restart): %v", err)
 	}
-	defer c2.Shutdown()
+	defer func() { _ = c2.Shutdown() }()
 	if err := c2.WaitForLeader(5 * time.Second); err != nil {
 		t.Fatalf("WaitForLeader(restart): %v", err)
 	}
@@ -502,13 +502,13 @@ func TestClusterRestartRecoveryAfterSnapshot(t *testing.T) {
 	if err := c1.Raft().Snapshot().Error(); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
-	c1.Shutdown()
+	_ = c1.Shutdown()
 
 	c2, err := NewCluster(cfg)
 	if err != nil {
 		t.Fatalf("NewCluster(restart): %v", err)
 	}
-	defer c2.Shutdown()
+	defer func() { _ = c2.Shutdown() }()
 	if err := c2.WaitForLeader(5 * time.Second); err != nil {
 		t.Fatalf("WaitForLeader(restart): %v", err)
 	}

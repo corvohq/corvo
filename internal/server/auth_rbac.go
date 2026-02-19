@@ -70,7 +70,7 @@ func (s *Server) listAssignedRoles(keyHash string) []string {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := []string{}
 	for rows.Next() {
 		var role string
@@ -113,7 +113,7 @@ func (s *Server) handleListAuthRoles(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error(), "AUTH_ERROR")
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := []map[string]any{}
 	for rows.Next() {
 		var name, raw, createdAt string
@@ -227,7 +227,7 @@ func (s *Server) handleListAPIKeyRoles(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error(), "AUTH_ERROR")
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := []string{}
 	for rows.Next() {
 		var role string

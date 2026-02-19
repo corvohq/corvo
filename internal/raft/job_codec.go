@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	oldproto "github.com/golang/protobuf/proto"
+	oldproto "github.com/golang/protobuf/proto" //nolint:staticcheck // hand-written proto structs use v1 API
 	"github.com/corvohq/corvo/internal/store"
 )
 

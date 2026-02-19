@@ -21,7 +21,7 @@ func (s *Server) handleListWorkers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type workerRow struct {
 		ID            string  `json:"id"`

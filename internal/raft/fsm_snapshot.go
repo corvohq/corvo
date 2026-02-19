@@ -22,7 +22,7 @@ type fsmSnapshot struct {
 }
 
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
-	defer sink.Close()
+	defer func() { _ = sink.Close() }()
 
 	gzw := gzip.NewWriter(sink)
 	tw := tar.NewWriter(gzw)
@@ -30,14 +30,14 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 	// 1. Pebble checkpoint
 	tmpDir, err := os.MkdirTemp("", "corvo-snapshot-*")
 	if err != nil {
-		sink.Cancel()
+		_ = sink.Cancel()
 		return fmt.Errorf("create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	checkpointDir := filepath.Join(tmpDir, "pebble-checkpoint")
 	if err := s.pebble.Checkpoint(checkpointDir); err != nil {
-		sink.Cancel()
+		_ = sink.Cancel()
 		return fmt.Errorf("pebble checkpoint: %w", err)
 	}
 
@@ -62,25 +62,25 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		_, err = io.Copy(tw, f)
 		return err
 	})
 	if err != nil {
-		sink.Cancel()
+		_ = sink.Cancel()
 		return fmt.Errorf("tar pebble checkpoint: %w", err)
 	}
 
 	// 2. SQLite backup via VACUUM INTO
 	sqliteBackup := filepath.Join(tmpDir, "sqlite-backup.db")
 	if _, err := s.sqlite.Exec("VACUUM INTO ?", sqliteBackup); err != nil {
-		sink.Cancel()
+		_ = sink.Cancel()
 		return fmt.Errorf("sqlite vacuum into: %w", err)
 	}
 
 	info, err := os.Stat(sqliteBackup)
 	if err != nil {
-		sink.Cancel()
+		_ = sink.Cancel()
 		return fmt.Errorf("stat sqlite backup: %w", err)
 	}
 	header := &tar.Header{
@@ -89,23 +89,23 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		Mode: 0644,
 	}
 	if err := tw.WriteHeader(header); err != nil {
-		sink.Cancel()
+		_ = sink.Cancel()
 		return err
 	}
 	f, err := os.Open(sqliteBackup)
 	if err != nil {
-		sink.Cancel()
+		_ = sink.Cancel()
 		return err
 	}
 	if _, err := io.Copy(tw, f); err != nil {
-		f.Close()
-		sink.Cancel()
+		_ = f.Close()
+		_ = sink.Cancel()
 		return err
 	}
-	f.Close()
+	_ = f.Close()
 
 	if err := tw.Close(); err != nil {
-		sink.Cancel()
+		_ = sink.Cancel()
 		return err
 	}
 	return gzw.Close()
@@ -119,13 +119,13 @@ func restoreFromSnapshot(pdb *pebble.DB, sqliteDB *sql.DB, rc io.Reader) error {
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	gzr, err := gzip.NewReader(rc)
 	if err != nil {
 		return fmt.Errorf("gzip reader: %w", err)
 	}
-	defer gzr.Close()
+	defer func() { _ = gzr.Close() }()
 
 	tr := tar.NewReader(gzr)
 	for {
@@ -146,10 +146,10 @@ func restoreFromSnapshot(pdb *pebble.DB, sqliteDB *sql.DB, rc io.Reader) error {
 			return err
 		}
 		if _, err := io.Copy(f, tr); err != nil {
-			f.Close()
+			_ = f.Close()
 			return err
 		}
-		f.Close()
+		_ = f.Close()
 	}
 
 	// Restore Pebble: iterate snapshot and ingest
@@ -164,22 +164,22 @@ func restoreFromSnapshot(pdb *pebble.DB, sqliteDB *sql.DB, rc io.Reader) error {
 		// Clear existing data using a single range tombstone (O(1) memory).
 		clearBatch := pdb.NewBatch()
 		if err := clearBatch.DeleteRange([]byte{0x00}, []byte{0xff}, pebble.Sync); err != nil {
-			clearBatch.Close()
-			snapDB.Close()
+			_ = clearBatch.Close()
+			_ = snapDB.Close()
 			return fmt.Errorf("clear pebble: %w", err)
 		}
 		if err := clearBatch.Commit(pebble.Sync); err != nil {
-			clearBatch.Close()
-			snapDB.Close()
+			_ = clearBatch.Close()
+			_ = snapDB.Close()
 			return fmt.Errorf("clear pebble: %w", err)
 		}
-		clearBatch.Close()
+		_ = clearBatch.Close()
 
 		// Copy from snapshot in chunks of 10 000 keys to bound memory usage.
 		const chunkSize = 10_000
 		snapIter, err := snapDB.NewIter(nil)
 		if err != nil {
-			snapDB.Close()
+			_ = snapDB.Close()
 			return fmt.Errorf("create snapshot iter: %w", err)
 		}
 		batch := pdb.NewBatch()
@@ -189,28 +189,28 @@ func restoreFromSnapshot(pdb *pebble.DB, sqliteDB *sql.DB, rc io.Reader) error {
 			copy(k, snapIter.Key())
 			v := make([]byte, len(snapIter.Value()))
 			copy(v, snapIter.Value())
-			batch.Set(k, v, pebble.Sync)
+			logErr(batch.Set(k, v, pebble.Sync))
 			count++
 			if count >= chunkSize {
 				if err := batch.Commit(pebble.Sync); err != nil {
-					batch.Close()
-					snapIter.Close()
-					snapDB.Close()
+					_ = batch.Close()
+					_ = snapIter.Close()
+					_ = snapDB.Close()
 					return fmt.Errorf("restore pebble chunk: %w", err)
 				}
-				batch.Close()
+				_ = batch.Close()
 				batch = pdb.NewBatch()
 				count = 0
 			}
 		}
-		snapIter.Close()
-		snapDB.Close()
+		_ = snapIter.Close()
+		_ = snapDB.Close()
 
 		if err := batch.Commit(pebble.Sync); err != nil {
-			batch.Close()
+			_ = batch.Close()
 			return fmt.Errorf("restore pebble: %w", err)
 		}
-		batch.Close()
+		_ = batch.Close()
 	}
 
 	// Restore SQLite: exec from backup
@@ -221,7 +221,7 @@ func restoreFromSnapshot(pdb *pebble.DB, sqliteDB *sql.DB, rc io.Reader) error {
 		if err != nil {
 			return fmt.Errorf("open backup sqlite: %w", err)
 		}
-		defer backupDB.Close()
+		defer func() { _ = backupDB.Close() }()
 
 		// Get all table names from backup
 		rows, err := backupDB.Query(`
@@ -237,10 +237,10 @@ func restoreFromSnapshot(pdb *pebble.DB, sqliteDB *sql.DB, rc io.Reader) error {
 		var tables []string
 		for rows.Next() {
 			var name string
-			rows.Scan(&name)
+			_ = rows.Scan(&name)
 			tables = append(tables, name)
 		}
-		rows.Close()
+		_ = rows.Close()
 
 		// Disable foreign key enforcement during restore — SQLite is a
 		// rebuildable materialized view, not the source of truth, so it is safe
@@ -289,7 +289,7 @@ func copyTable(src *sql.DB, dst sqlExecer, table string) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {

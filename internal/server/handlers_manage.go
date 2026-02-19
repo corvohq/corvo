@@ -526,7 +526,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
 		return
 	}
-	if req.BulkRequest.Action == "" {
+	if req.Action == "" {
 		writeError(w, http.StatusBadRequest, "action is required", "VALIDATION_ERROR")
 		return
 	}
@@ -534,10 +534,10 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 	const asyncThreshold = 10000
 	useAsync := req.Async != nil && *req.Async
 	if !useAsync {
-		if len(req.BulkRequest.JobIDs) > asyncThreshold {
+		if len(req.JobIDs) > asyncThreshold {
 			useAsync = true
-		} else if len(req.BulkRequest.JobIDs) == 0 && req.BulkRequest.Filter != nil {
-			count, err := s.bulkAsync.countFilter(*req.BulkRequest.Filter)
+		} else if len(req.JobIDs) == 0 && req.Filter != nil {
+			count, err := s.bulkAsync.countFilter(*req.Filter)
 			if err != nil {
 				writeError(w, http.StatusBadRequest, err.Error(), "BULK_ERROR")
 				return
@@ -548,11 +548,11 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if req.BulkRequest.Filter != nil && req.BulkRequest.Filter.Queue != "" {
-		req.BulkRequest.Filter.Queue = namespaceQueue(principal.Namespace, req.BulkRequest.Filter.Queue)
+	if req.Filter != nil && req.Filter.Queue != "" {
+		req.Filter.Queue = namespaceQueue(principal.Namespace, req.Filter.Queue)
 	}
-	if req.BulkRequest.MoveToQueue != "" {
-		req.BulkRequest.MoveToQueue = namespaceQueue(principal.Namespace, req.BulkRequest.MoveToQueue)
+	if req.MoveToQueue != "" {
+		req.MoveToQueue = namespaceQueue(principal.Namespace, req.MoveToQueue)
 	}
 	if useAsync {
 		task, err := s.bulkAsync.start(req.BulkRequest)

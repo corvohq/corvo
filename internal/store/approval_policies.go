@@ -115,7 +115,7 @@ func (s *Store) ListApprovalPolicies() ([]ApprovalPolicy, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]ApprovalPolicy, 0)
 	for rows.Next() {
 		var p ApprovalPolicy

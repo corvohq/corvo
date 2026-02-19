@@ -140,7 +140,7 @@ func (s *Store) ListBudgets() ([]Budget, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]Budget, 0)
 	for rows.Next() {
 		var b Budget
@@ -268,7 +268,7 @@ func (s *Store) fetchQueueBudgets(queue string) ([]Budget, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]Budget, 0)
 	for rows.Next() {
 		var b Budget
@@ -320,7 +320,7 @@ func (s *Store) evaluatePerJobBudget(jobID string, incomingCost float64) (bool, 
 	if err != nil {
 		return false, "", err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var matched []Budget
 	for rows.Next() {

@@ -50,7 +50,7 @@ func (s *Server) handleDebugRuntime(w http.ResponseWriter, r *http.Request) {
 
 	// CPU times via getrusage.
 	var rusage syscall.Rusage
-	syscall.Getrusage(syscall.RUSAGE_SELF, &rusage)
+	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &rusage)
 	userNs := int64(rusage.Utime.Sec)*1e9 + int64(rusage.Utime.Usec)*1e3
 	sysNs := int64(rusage.Stime.Sec)*1e9 + int64(rusage.Stime.Usec)*1e3
 

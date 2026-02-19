@@ -30,10 +30,10 @@ func setup(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatalf("raft.NewDirectApplier: %v", err)
 	}
-	t.Cleanup(func() { da.Close() })
+	t.Cleanup(func() { _ = da.Close() })
 
 	s := store.NewStore(da, da.SQLiteDB())
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	sched := scheduler.New(s, nil, scheduler.DefaultConfig(), nil)
 	srv := server.New(s, nil, ":0", nil)
 	ts := httptest.NewServer(srv.Handler())
@@ -79,7 +79,7 @@ func (e *testEnv) fetch(t *testing.T, queues []string) *fetchResult {
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNoContent {
 		return nil
 	}
@@ -88,7 +88,7 @@ func (e *testEnv) fetch(t *testing.T, queues []string) *fetchResult {
 		t.Fatalf("fetch: status %d: %s", resp.StatusCode, data)
 	}
 	var result fetchResult
-	json.NewDecoder(resp.Body).Decode(&result)
+	_ = json.NewDecoder(resp.Body).Decode(&result)
 	return &result
 }
 
@@ -99,7 +99,7 @@ func (e *testEnv) ack(t *testing.T, jobID string) {
 	if err != nil {
 		t.Fatalf("ack: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(resp.Body)
 		t.Fatalf("ack: status %d: %s", resp.StatusCode, data)
@@ -118,13 +118,13 @@ func (e *testEnv) fail(t *testing.T, jobID string, errMsg string) *failResponse 
 	if err != nil {
 		t.Fatalf("fail: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(resp.Body)
 		t.Fatalf("fail: status %d: %s", resp.StatusCode, data)
 	}
 	var result failResponse
-	json.NewDecoder(resp.Body).Decode(&result)
+	_ = json.NewDecoder(resp.Body).Decode(&result)
 	return &result
 }
 
@@ -141,13 +141,13 @@ func (e *testEnv) heartbeat(t *testing.T, jobs map[string]interface{}) *heartbea
 	if err != nil {
 		t.Fatalf("heartbeat: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(resp.Body)
 		t.Fatalf("heartbeat: status %d: %s", resp.StatusCode, data)
 	}
 	var result heartbeatResponse
-	json.NewDecoder(resp.Body).Decode(&result)
+	_ = json.NewDecoder(resp.Body).Decode(&result)
 	return &result
 }
 
@@ -165,13 +165,13 @@ func (e *testEnv) bulk(t *testing.T, action string, jobIDs []string) *bulkRespon
 	if err != nil {
 		t.Fatalf("bulk: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(resp.Body)
 		t.Fatalf("bulk: status %d: %s", resp.StatusCode, data)
 	}
 	var result bulkResponse
-	json.NewDecoder(resp.Body).Decode(&result)
+	_ = json.NewDecoder(resp.Body).Decode(&result)
 	return &result
 }
 
@@ -386,9 +386,9 @@ func TestSearch(t *testing.T) {
 	e := setup(t)
 
 	// Enqueue on two different queues
-	e.client.Enqueue("search.alpha", map[string]string{"x": "1"})
-	e.client.Enqueue("search.alpha", map[string]string{"x": "2"})
-	e.client.Enqueue("search.beta", map[string]string{"x": "3"})
+	_, _ = e.client.Enqueue("search.alpha", map[string]string{"x": "1"})
+	_, _ = e.client.Enqueue("search.alpha", map[string]string{"x": "2"})
+	_, _ = e.client.Enqueue("search.beta", map[string]string{"x": "3"})
 
 	// Search for alpha queue only
 	result, err := e.client.Search(client.SearchFilter{Queue: "search.alpha"})

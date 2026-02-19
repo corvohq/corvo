@@ -31,7 +31,7 @@ func NewDirectApplier(dataDir string) (*DirectApplier, error) {
 	sqlitePath := filepath.Join(dataDir, "corvo.db")
 	sqliteDB, err := openMaterializedView(sqlitePath)
 	if err != nil {
-		pdb.Close()
+		_ = pdb.Close()
 		return nil, err
 	}
 
@@ -90,7 +90,7 @@ func (d *DirectApplier) SQLiteDB() *sql.DB {
 // Close closes both Pebble and SQLite.
 func (d *DirectApplier) Close() error {
 	d.fsm.Close()
-	d.pdb.Close()
-	d.sqlite.Close()
+	_ = d.pdb.Close()
+	_ = d.sqlite.Close()
 	return nil
 }

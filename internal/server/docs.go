@@ -13,13 +13,13 @@ var openapiSpec []byte
 func (s *Server) handleOpenAPISpec(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "public, max-age=300")
-	w.Write(openapiSpec)
+	_, _ = w.Write(openapiSpec)
 }
 
 func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Write([]byte(scalarHTML))
+	_, _ = w.Write([]byte(scalarHTML))
 }
 
 const scalarHTML = `<!doctype html>

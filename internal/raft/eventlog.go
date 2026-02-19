@@ -21,7 +21,7 @@ func loadEventCursor(db *pebble.DB) uint64 {
 	if err != nil {
 		return 0
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 	if len(val) < 8 {
 		return 0
 	}

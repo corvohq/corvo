@@ -17,10 +17,10 @@ func setupTest(t *testing.T) (*Server, *store.Store) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	t.Cleanup(func() { da.Close() })
+	t.Cleanup(func() { _ = da.Close() })
 
 	s := store.NewStore(da, da.SQLiteDB())
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 
 	srv := New(s, "127.0.0.1:0")
 	errCh := make(chan error, 1)
@@ -30,7 +30,7 @@ func setupTest(t *testing.T) (*Server, *store.Store) {
 	for srv.Addr() == nil {
 	}
 
-	t.Cleanup(func() { srv.Shutdown() })
+	t.Cleanup(func() { _ = srv.Shutdown() })
 	return srv, s
 }
 
@@ -40,13 +40,13 @@ func dial(t *testing.T, srv *Server) net.Conn {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	t.Cleanup(func() { conn.Close() })
+	t.Cleanup(func() { _ = conn.Close() })
 	return conn
 }
 
 func sendRecv(t *testing.T, conn net.Conn, cmd string) string {
 	t.Helper()
-	fmt.Fprintf(conn, "%s\n", cmd)
+	_, _ = fmt.Fprintf(conn, "%s\n", cmd)
 	scanner := bufio.NewScanner(conn)
 	if !scanner.Scan() {
 		t.Fatalf("no response for %q: %v", cmd, scanner.Err())
@@ -115,11 +115,11 @@ func TestConcurrent(t *testing.T) {
 				t.Errorf("dial: %v", err)
 				return
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			scanner := bufio.NewScanner(conn)
 			for i := range perWorker {
-				fmt.Fprintf(conn, "ENQUEUE conc.q {\"i\":%d}\n", i)
+				_, _ = fmt.Fprintf(conn, "ENQUEUE conc.q {\"i\":%d}\n", i)
 				if !scanner.Scan() {
 					t.Errorf("no response: %v", scanner.Err())
 					return

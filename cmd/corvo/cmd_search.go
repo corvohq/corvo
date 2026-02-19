@@ -84,7 +84,7 @@ var searchCmd = &cobra.Command{
 					ID string `json:"id"`
 				} `json:"jobs"`
 			}
-			json.Unmarshal(data, &result)
+			_ = json.Unmarshal(data, &result)
 			for _, j := range result.Jobs {
 				fmt.Println(j.ID)
 			}
@@ -96,7 +96,6 @@ var searchCmd = &cobra.Command{
 	},
 }
 
-var bulkAction string
 var bulkFilter string
 
 var bulkCmd = &cobra.Command{
@@ -141,7 +140,7 @@ var bulkCmd = &cobra.Command{
 			printJSON(data)
 		} else {
 			var result map[string]interface{}
-			json.Unmarshal(data, &result)
+			_ = json.Unmarshal(data, &result)
 			fmt.Printf("Affected: %.0f jobs (%.0fms)\n", result["affected"], result["duration_ms"])
 		}
 		return nil

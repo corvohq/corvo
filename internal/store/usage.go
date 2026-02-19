@@ -164,7 +164,7 @@ func (s *Store) UsageSummary(req UsageSummaryRequest) (*UsageSummaryResponse, er
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var g UsageSummaryGroup
 		if err := rows.Scan(

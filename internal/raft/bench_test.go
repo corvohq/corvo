@@ -26,7 +26,7 @@ func benchCluster(b *testing.B) (*Cluster, *store.Store) {
 	if err != nil {
 		b.Fatalf("NewCluster: %v", err)
 	}
-	b.Cleanup(func() { c.Shutdown() })
+	b.Cleanup(func() { _ = c.Shutdown() })
 
 	if err := c.WaitForLeader(5 * time.Second); err != nil {
 		b.Fatalf("WaitForLeader: %v", err)
@@ -49,7 +49,7 @@ func benchMultiCluster(b *testing.B, shards int) (*MultiCluster, *store.Store) {
 	if err != nil {
 		b.Fatalf("NewMultiCluster: %v", err)
 	}
-	b.Cleanup(func() { mc.Shutdown() })
+	b.Cleanup(func() { _ = mc.Shutdown() })
 
 	if err := mc.WaitForLeader(5 * time.Second); err != nil {
 		b.Fatalf("WaitForLeader: %v", err)
@@ -74,7 +74,7 @@ func BenchmarkEnqueueDirect(b *testing.B) {
 	if err != nil {
 		b.Fatalf("NewDirectApplier: %v", err)
 	}
-	b.Cleanup(func() { da.Close() })
+	b.Cleanup(func() { _ = da.Close() })
 
 	s := store.NewStore(da, da.SQLiteDB())
 	payload := json.RawMessage(`{"bench":true}`)

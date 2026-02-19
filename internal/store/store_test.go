@@ -16,8 +16,10 @@ func testStore(t *testing.T) *store.Store {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	t.Cleanup(func() { da.Close() })
-	return store.NewStore(da, da.SQLiteDB())
+	t.Cleanup(func() { _ = da.Close() })
+	s := store.NewStore(da, da.SQLiteDB())
+	t.Cleanup(func() { _ = s.Close() })
+	return s
 }
 
 // testStoreAsync creates a Store with async SQLite mirror enabled,
@@ -29,7 +31,7 @@ func testStoreAsync(t *testing.T) *store.Store {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
 	da.SetSQLiteMirrorAsync(true)
-	t.Cleanup(func() { da.Close() })
+	t.Cleanup(func() { _ = da.Close() })
 	return store.NewStore(da, da.SQLiteDB())
 }
 
@@ -212,8 +214,8 @@ func TestFetchReturnsNilWhenEmpty(t *testing.T) {
 func TestFetchPriorityOrder(t *testing.T) {
 	s := testStore(t)
 
-	s.Enqueue(store.EnqueueRequest{Queue: "prio.queue", Payload: json.RawMessage(`{"p":"normal"}`), Priority: "normal"})
-	s.Enqueue(store.EnqueueRequest{Queue: "prio.queue", Payload: json.RawMessage(`{"p":"critical"}`), Priority: "critical"})
+	_, _ = s.Enqueue(store.EnqueueRequest{Queue: "prio.queue", Payload: json.RawMessage(`{"p":"normal"}`), Priority: "normal"})
+	_, _ = s.Enqueue(store.EnqueueRequest{Queue: "prio.queue", Payload: json.RawMessage(`{"p":"critical"}`), Priority: "critical"})
 
 	r, _ := s.Fetch(store.FetchRequest{Queues: []string{"prio.queue"}, WorkerID: "w", Hostname: "h"})
 	if r == nil {
@@ -227,8 +229,8 @@ func TestFetchPriorityOrder(t *testing.T) {
 func TestFetchSkipsPausedQueue(t *testing.T) {
 	s := testStore(t)
 
-	s.Enqueue(store.EnqueueRequest{Queue: "paused.queue", Payload: json.RawMessage(`{}`)})
-	s.PauseQueue("paused.queue")
+	_, _ = s.Enqueue(store.EnqueueRequest{Queue: "paused.queue", Payload: json.RawMessage(`{}`)})
+	_ = s.PauseQueue("paused.queue")
 
 	r, err := s.Fetch(store.FetchRequest{Queues: []string{"paused.queue"}, WorkerID: "w", Hostname: "h"})
 	if err != nil {
@@ -243,7 +245,7 @@ func TestAck(t *testing.T) {
 	s := testStore(t)
 
 	enqResult, _ := s.Enqueue(store.EnqueueRequest{Queue: "ack.queue", Payload: json.RawMessage(`{}`)})
-	s.Fetch(store.FetchRequest{Queues: []string{"ack.queue"}, WorkerID: "w", Hostname: "h"})
+	_, _ = s.Fetch(store.FetchRequest{Queues: []string{"ack.queue"}, WorkerID: "w", Hostname: "h"})
 
 	err := s.Ack(enqResult.JobID, json.RawMessage(`{"done":true}`))
 	if err != nil {
@@ -264,8 +266,8 @@ func TestAckCleansUniqueLock(t *testing.T) {
 		Payload:   json.RawMessage(`{}`),
 		UniqueKey: "key-1",
 	})
-	s.Fetch(store.FetchRequest{Queues: []string{"unique.queue"}, WorkerID: "w", Hostname: "h"})
-	s.Ack(enqResult.JobID, nil)
+	_, _ = s.Fetch(store.FetchRequest{Queues: []string{"unique.queue"}, WorkerID: "w", Hostname: "h"})
+	_ = s.Ack(enqResult.JobID, nil)
 
 	// Should be able to enqueue same unique key again
 	r2, _ := s.Enqueue(store.EnqueueRequest{
@@ -442,7 +444,7 @@ func TestFailWithRetry(t *testing.T) {
 		Payload:    json.RawMessage(`{}`),
 		MaxRetries: &maxRetries,
 	})
-	s.Fetch(store.FetchRequest{Queues: []string{"fail.queue"}, WorkerID: "w", Hostname: "h"})
+	_, _ = s.Fetch(store.FetchRequest{Queues: []string{"fail.queue"}, WorkerID: "w", Hostname: "h"})
 
 	result, err := s.Fail(enqResult.JobID, "something broke", "stack trace here", false)
 	if err != nil {
@@ -474,7 +476,7 @@ func TestFailDead(t *testing.T) {
 		Payload:    json.RawMessage(`{}`),
 		MaxRetries: &maxRetries,
 	})
-	s.Fetch(store.FetchRequest{Queues: []string{"dead.queue"}, WorkerID: "w", Hostname: "h"})
+	_, _ = s.Fetch(store.FetchRequest{Queues: []string{"dead.queue"}, WorkerID: "w", Hostname: "h"})
 
 	result, err := s.Fail(enqResult.JobID, "fatal error", "", false)
 	if err != nil {
@@ -493,7 +495,7 @@ func TestHeartbeatExtendsLease(t *testing.T) {
 	s := testStore(t)
 
 	enqResult, _ := s.Enqueue(store.EnqueueRequest{Queue: "hb.queue", Payload: json.RawMessage(`{}`)})
-	s.Fetch(store.FetchRequest{Queues: []string{"hb.queue"}, WorkerID: "w", Hostname: "h"})
+	_, _ = s.Fetch(store.FetchRequest{Queues: []string{"hb.queue"}, WorkerID: "w", Hostname: "h"})
 
 	// Get current lease
 	job1, _ := s.GetJob(enqResult.JobID)
@@ -524,7 +526,7 @@ func TestHeartbeatWithProgress(t *testing.T) {
 	s := testStore(t)
 
 	enqResult, _ := s.Enqueue(store.EnqueueRequest{Queue: "prog.queue", Payload: json.RawMessage(`{}`)})
-	s.Fetch(store.FetchRequest{Queues: []string{"prog.queue"}, WorkerID: "w", Hostname: "h"})
+	_, _ = s.Fetch(store.FetchRequest{Queues: []string{"prog.queue"}, WorkerID: "w", Hostname: "h"})
 
 	_, err := s.Heartbeat(store.HeartbeatRequest{
 		Jobs: map[string]store.HeartbeatJobUpdate{
@@ -551,7 +553,7 @@ func TestHeartbeatWithCheckpoint(t *testing.T) {
 	s := testStore(t)
 
 	enqResult, _ := s.Enqueue(store.EnqueueRequest{Queue: "cp.queue", Payload: json.RawMessage(`{}`)})
-	s.Fetch(store.FetchRequest{Queues: []string{"cp.queue"}, WorkerID: "w", Hostname: "h"})
+	_, _ = s.Fetch(store.FetchRequest{Queues: []string{"cp.queue"}, WorkerID: "w", Hostname: "h"})
 
 	_, err := s.Heartbeat(store.HeartbeatRequest{
 		Jobs: map[string]store.HeartbeatJobUpdate{
@@ -576,10 +578,10 @@ func TestHeartbeatCancelledJob(t *testing.T) {
 	s := testStore(t)
 
 	enqResult, _ := s.Enqueue(store.EnqueueRequest{Queue: "cancel.queue", Payload: json.RawMessage(`{}`)})
-	s.Fetch(store.FetchRequest{Queues: []string{"cancel.queue"}, WorkerID: "w", Hostname: "h"})
+	_, _ = s.Fetch(store.FetchRequest{Queues: []string{"cancel.queue"}, WorkerID: "w", Hostname: "h"})
 
 	// Cancel the job via the proper API
-	s.CancelJob(enqResult.JobID)
+	_, _ = s.CancelJob(enqResult.JobID)
 
 	resp, err := s.Heartbeat(store.HeartbeatRequest{
 		Jobs: map[string]store.HeartbeatJobUpdate{
@@ -648,7 +650,7 @@ func TestEnqueueBatch(t *testing.T) {
 
 	// Verify batch row via SQLite
 	var total, pending int
-	s.ReadDB().QueryRow("SELECT total, pending FROM batches WHERE id = ?", result.BatchID).Scan(&total, &pending)
+	_ = s.ReadDB().QueryRow("SELECT total, pending FROM batches WHERE id = ?", result.BatchID).Scan(&total, &pending)
 	if total != 3 || pending != 3 {
 		t.Errorf("batch total=%d pending=%d, want 3/3", total, pending)
 	}
@@ -674,12 +676,12 @@ func TestBatchCompletionCallback(t *testing.T) {
 		if r == nil {
 			t.Fatal("Fetch() returned nil")
 		}
-		s.Ack(r.JobID, nil)
+		_ = s.Ack(r.JobID, nil)
 	}
 
 	// Verify callback job was enqueued
 	var count int
-	s.ReadDB().QueryRow("SELECT COUNT(*) FROM jobs WHERE queue = 'batch.done'").Scan(&count)
+	_ = s.ReadDB().QueryRow("SELECT COUNT(*) FROM jobs WHERE queue = 'batch.done'").Scan(&count)
 	if count != 1 {
 		t.Errorf("callback job count = %d, want 1", count)
 	}

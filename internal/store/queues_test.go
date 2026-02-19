@@ -10,8 +10,8 @@ import (
 func TestListQueues(t *testing.T) {
 	s := testStore(t)
 
-	s.Enqueue(store.EnqueueRequest{Queue: "q1", Payload: json.RawMessage(`{}`)})
-	s.Enqueue(store.EnqueueRequest{Queue: "q2", Payload: json.RawMessage(`{}`)})
+	_, _ = s.Enqueue(store.EnqueueRequest{Queue: "q1", Payload: json.RawMessage(`{}`)})
+	_, _ = s.Enqueue(store.EnqueueRequest{Queue: "q2", Payload: json.RawMessage(`{}`)})
 
 	queues, err := s.ListQueues()
 	if err != nil {
@@ -25,7 +25,7 @@ func TestListQueues(t *testing.T) {
 func TestPauseResumeQueue(t *testing.T) {
 	s := testStore(t)
 
-	s.Enqueue(store.EnqueueRequest{Queue: "pr.queue", Payload: json.RawMessage(`{}`)})
+	_, _ = s.Enqueue(store.EnqueueRequest{Queue: "pr.queue", Payload: json.RawMessage(`{}`)})
 
 	// Pause
 	if err := s.PauseQueue("pr.queue"); err != nil {
@@ -53,15 +53,15 @@ func TestPauseResumeQueue(t *testing.T) {
 func TestClearQueue(t *testing.T) {
 	s := testStore(t)
 
-	s.Enqueue(store.EnqueueRequest{Queue: "clear.queue", Payload: json.RawMessage(`{}`)})
-	s.Enqueue(store.EnqueueRequest{Queue: "clear.queue", Payload: json.RawMessage(`{}`)})
+	_, _ = s.Enqueue(store.EnqueueRequest{Queue: "clear.queue", Payload: json.RawMessage(`{}`)})
+	_, _ = s.Enqueue(store.EnqueueRequest{Queue: "clear.queue", Payload: json.RawMessage(`{}`)})
 
 	if err := s.ClearQueue("clear.queue"); err != nil {
 		t.Fatalf("ClearQueue: %v", err)
 	}
 
 	var count int
-	s.ReadDB().QueryRow("SELECT COUNT(*) FROM jobs WHERE queue = 'clear.queue'").Scan(&count)
+	_ = s.ReadDB().QueryRow("SELECT COUNT(*) FROM jobs WHERE queue = 'clear.queue'").Scan(&count)
 	if count != 0 {
 		t.Errorf("jobs count after clear = %d, want 0", count)
 	}
@@ -70,18 +70,18 @@ func TestClearQueue(t *testing.T) {
 func TestDeleteQueue(t *testing.T) {
 	s := testStore(t)
 
-	s.Enqueue(store.EnqueueRequest{Queue: "del.queue", Payload: json.RawMessage(`{}`)})
+	_, _ = s.Enqueue(store.EnqueueRequest{Queue: "del.queue", Payload: json.RawMessage(`{}`)})
 
 	if err := s.DeleteQueue("del.queue"); err != nil {
 		t.Fatalf("DeleteQueue: %v", err)
 	}
 
 	var count int
-	s.ReadDB().QueryRow("SELECT COUNT(*) FROM queues WHERE name = 'del.queue'").Scan(&count)
+	_ = s.ReadDB().QueryRow("SELECT COUNT(*) FROM queues WHERE name = 'del.queue'").Scan(&count)
 	if count != 0 {
 		t.Error("queue should be deleted")
 	}
-	s.ReadDB().QueryRow("SELECT COUNT(*) FROM jobs WHERE queue = 'del.queue'").Scan(&count)
+	_ = s.ReadDB().QueryRow("SELECT COUNT(*) FROM jobs WHERE queue = 'del.queue'").Scan(&count)
 	if count != 0 {
 		t.Error("jobs should be deleted")
 	}
@@ -90,8 +90,8 @@ func TestDeleteQueue(t *testing.T) {
 func TestSetConcurrency(t *testing.T) {
 	s := testStore(t)
 
-	s.Enqueue(store.EnqueueRequest{Queue: "conc.queue", Payload: json.RawMessage(`{}`)})
-	s.Enqueue(store.EnqueueRequest{Queue: "conc.queue", Payload: json.RawMessage(`{}`)})
+	_, _ = s.Enqueue(store.EnqueueRequest{Queue: "conc.queue", Payload: json.RawMessage(`{}`)})
+	_, _ = s.Enqueue(store.EnqueueRequest{Queue: "conc.queue", Payload: json.RawMessage(`{}`)})
 
 	// Set concurrency to 1
 	if err := s.SetConcurrency("conc.queue", 1); err != nil {
@@ -114,14 +114,14 @@ func TestSetConcurrency(t *testing.T) {
 func TestSetAndRemoveThrottle(t *testing.T) {
 	s := testStore(t)
 
-	s.Enqueue(store.EnqueueRequest{Queue: "throttle.queue", Payload: json.RawMessage(`{}`)})
+	_, _ = s.Enqueue(store.EnqueueRequest{Queue: "throttle.queue", Payload: json.RawMessage(`{}`)})
 
 	if err := s.SetThrottle("throttle.queue", 100, 60000); err != nil {
 		t.Fatalf("SetThrottle: %v", err)
 	}
 
 	var rateLimit, rateWindow int
-	s.ReadDB().QueryRow("SELECT rate_limit, rate_window_ms FROM queues WHERE name = 'throttle.queue'").
+	_ = s.ReadDB().QueryRow("SELECT rate_limit, rate_window_ms FROM queues WHERE name = 'throttle.queue'").
 		Scan(&rateLimit, &rateWindow)
 	if rateLimit != 100 || rateWindow != 60000 {
 		t.Errorf("rate_limit=%d window=%d, want 100/60000", rateLimit, rateWindow)
@@ -132,7 +132,7 @@ func TestSetAndRemoveThrottle(t *testing.T) {
 	}
 
 	var rl, rw *int
-	s.ReadDB().QueryRow("SELECT rate_limit, rate_window_ms FROM queues WHERE name = 'throttle.queue'").
+	_ = s.ReadDB().QueryRow("SELECT rate_limit, rate_window_ms FROM queues WHERE name = 'throttle.queue'").
 		Scan(&rl, &rw)
 	if rl != nil || rw != nil {
 		t.Error("rate limit should be NULL after removal")
@@ -148,7 +148,7 @@ func TestPauseCreatesQueueRow(t *testing.T) {
 	}
 
 	var paused int
-	s.ReadDB().QueryRow("SELECT paused FROM queues WHERE name = 'new.queue'").Scan(&paused)
+	_ = s.ReadDB().QueryRow("SELECT paused FROM queues WHERE name = 'new.queue'").Scan(&paused)
 	if paused != 1 {
 		t.Errorf("paused = %d, want 1", paused)
 	}

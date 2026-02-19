@@ -218,7 +218,9 @@ func (w *Worker) fetchLoop(fetchCtx context.Context) {
 		handler, ok := w.handlers[job.Queue]
 		if !ok {
 			slog.Warn("no handler for queue", "queue", job.Queue)
-			w.client.ack(job.JobID, nil)
+			if err := w.client.ack(job.JobID, nil); err != nil {
+				slog.Error("failed to ack job", "job_id", job.JobID, "error", err)
+			}
 			continue
 		}
 
@@ -236,9 +238,13 @@ func (w *Worker) fetchLoop(fetchCtx context.Context) {
 		w.mu.Unlock()
 
 		if err != nil {
-			w.client.fail(job.JobID, err.Error(), "")
+			if ferr := w.client.fail(job.JobID, err.Error(), ""); ferr != nil {
+				slog.Error("failed to fail job", "job_id", job.JobID, "error", ferr)
+			}
 		} else {
-			w.client.ack(job.JobID, nil)
+			if aerr := w.client.ack(job.JobID, nil); aerr != nil {
+				slog.Error("failed to ack job", "job_id", job.JobID, "error", aerr)
+			}
 		}
 	}
 }
@@ -325,8 +331,12 @@ func (w *Worker) failActiveJobs() {
 
 	for jobID := range remaining {
 		// Best-effort: heartbeat to preserve checkpoint, then fail.
-		w.client.heartbeat(jobID, nil, nil)
-		w.client.fail(jobID, "worker_shutdown", "")
+		if _, err := w.client.heartbeat(jobID, nil, nil); err != nil {
+			slog.Error("failed to heartbeat job", "job_id", jobID, "error", err)
+		}
+		if err := w.client.fail(jobID, "worker_shutdown", ""); err != nil {
+			slog.Error("failed to fail job", "job_id", jobID, "error", err)
+		}
 	}
 }
 

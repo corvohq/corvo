@@ -77,7 +77,7 @@ func (s *Server) handleBulkProgress(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-keepalive.C:
-			fmt.Fprint(w, ":keepalive\n\n")
+			_, _ = fmt.Fprint(w, ":keepalive\n\n")
 			flusher.Flush()
 		case ev, ok := <-ch:
 			if !ok {
@@ -91,7 +91,7 @@ func (s *Server) handleBulkProgress(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, body)
+			_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, body)
 			flusher.Flush()
 		}
 	}
@@ -113,5 +113,5 @@ func (s *Server) writeBulkTerminalEvent(w http.ResponseWriter, task *bulkTask) {
 		CreatedAtNs: time.Now().UnixNano(),
 	}
 	body, _ := json.Marshal(ev)
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, body)
+	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, body)
 }

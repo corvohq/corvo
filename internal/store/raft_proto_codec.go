@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	oldproto "github.com/golang/protobuf/proto"
+	oldproto "github.com/golang/protobuf/proto" //nolint:staticcheck // hand-written proto structs use v1 API
 )
 
 var raftProtoPrefix = []byte{0x50, 0x42, 0x31} // "PB1"

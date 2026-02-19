@@ -17,10 +17,10 @@ func testSetup(t *testing.T) (*store.Store, *Scheduler, *sql.DB) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	t.Cleanup(func() { da.Close() })
+	t.Cleanup(func() { _ = da.Close() })
 
 	s := store.NewStore(da, da.SQLiteDB())
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	sched := New(s, nil, DefaultConfig(), nil)
 	return s, sched, da.SQLiteDB()
 }
@@ -41,7 +41,7 @@ func TestPromoteScheduledJobs(t *testing.T) {
 
 	// Verify it's scheduled
 	var state string
-	db.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
+	_ = db.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
 	if state != "scheduled" {
 		t.Fatalf("job state = %q, want 'scheduled'", state)
 	}
@@ -50,7 +50,7 @@ func TestPromoteScheduledJobs(t *testing.T) {
 	sched.RunOnce()
 
 	// Verify it's now pending
-	db.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
+	_ = db.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
 	if state != "pending" {
 		t.Errorf("job state after promote = %q, want 'pending'", state)
 	}
@@ -66,15 +66,15 @@ func TestPromoteRetryingJobs(t *testing.T) {
 		MaxRetries:   &maxRetries,
 		RetryBackoff: "none",
 	})
-	s.Fetch(store.FetchRequest{Queues: []string{"retry.queue"}, WorkerID: "w", Hostname: "h"})
-	s.Fail(result.JobID, "err", "", false)
+	_, _ = s.Fetch(store.FetchRequest{Queues: []string{"retry.queue"}, WorkerID: "w", Hostname: "h"})
+	_, _ = s.Fail(result.JobID, "err", "", false)
 
 	// With backoff=none, scheduled_at should be ~now
 	// Run scheduler to promote
 	sched.RunOnce()
 
 	var state string
-	db.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
+	_ = db.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
 	if state != "pending" {
 		t.Errorf("job state after promote = %q, want 'pending'", state)
 	}
@@ -87,7 +87,7 @@ func TestReclaimExpiredLeases(t *testing.T) {
 		Queue:   "lease.queue",
 		Payload: json.RawMessage(`{}`),
 	})
-	s.Fetch(store.FetchRequest{
+	_, _ = s.Fetch(store.FetchRequest{
 		Queues:        []string{"lease.queue"},
 		WorkerID:      "w",
 		Hostname:      "h",
@@ -100,7 +100,7 @@ func TestReclaimExpiredLeases(t *testing.T) {
 	sched.RunOnce()
 
 	var state string
-	db.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
+	_ = db.QueryRow("SELECT state FROM jobs WHERE id = ?", result.JobID).Scan(&state)
 	if state != "pending" {
 		t.Errorf("job state after reclaim = %q, want 'pending'", state)
 	}
@@ -110,20 +110,20 @@ func TestCleanExpiredUniqueLocks(t *testing.T) {
 	_, sched, db := testSetup(t)
 
 	// Insert an expired unique lock
-	db.Exec(
+	_, _ = db.Exec(
 		"INSERT INTO unique_locks (queue, unique_key, job_id, expires_at) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%f', 'now', '-10 seconds'))",
 		"q", "k", "j",
 	)
 
 	var count int
-	db.QueryRow("SELECT COUNT(*) FROM unique_locks").Scan(&count)
+	_ = db.QueryRow("SELECT COUNT(*) FROM unique_locks").Scan(&count)
 	if count != 1 {
 		t.Fatalf("unique_locks count = %d, want 1", count)
 	}
 
 	sched.RunOnce()
 
-	db.QueryRow("SELECT COUNT(*) FROM unique_locks").Scan(&count)
+	_ = db.QueryRow("SELECT COUNT(*) FROM unique_locks").Scan(&count)
 	if count != 0 {
 		t.Errorf("unique_locks count after cleanup = %d, want 0", count)
 	}

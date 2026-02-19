@@ -46,7 +46,7 @@ func Open(dataDir string) (*DB, error) {
 
 	readDB, err := openConn(dbPath)
 	if err != nil {
-		writeDB.Close()
+		_ = writeDB.Close()
 		return nil, fmt.Errorf("open read connection: %w", err)
 	}
 	// Keep read-side CGo/pure-sqlite pressure bounded under high stream load.
@@ -56,8 +56,8 @@ func Open(dataDir string) (*DB, error) {
 
 	eventsDB, err := openConn(eventsPath)
 	if err != nil {
-		writeDB.Close()
-		readDB.Close()
+		_ = writeDB.Close()
+		_ = readDB.Close()
 		return nil, fmt.Errorf("open events connection: %w", err)
 	}
 	eventsDB.SetMaxOpenConns(1)
@@ -66,18 +66,18 @@ func Open(dataDir string) (*DB, error) {
 	db := &DB{Write: writeDB, Read: readDB, EventsWrite: eventsDB}
 
 	if err := db.migrate(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("run migrations: %w", err)
 	}
 
 	if err := db.migrateEvents(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("migrate events db: %w", err)
 	}
 
 	// ATTACH events DB to read connection for cross-database JOINs.
 	if _, err := readDB.Exec("ATTACH DATABASE ? AS edb", eventsPath); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("attach events db: %w", err)
 	}
 
@@ -97,12 +97,12 @@ func openConn(path string) (*sql.DB, error) {
 		"PRAGMA busy_timeout=5000",
 	} {
 		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
+			_ = db.Close()
 			return nil, fmt.Errorf("apply sqlite pragma %q: %w", pragma, err)
 		}
 	}
 	if err := db.Ping(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	return db, nil

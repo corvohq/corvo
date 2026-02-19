@@ -16,10 +16,10 @@ func testClient(t *testing.T) *Client {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	t.Cleanup(func() { da.Close() })
+	t.Cleanup(func() { _ = da.Close() })
 
 	s := store.NewStore(da, da.SQLiteDB())
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	srv := server.New(s, nil, ":0", nil)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
@@ -102,8 +102,8 @@ func TestClientGetJob(t *testing.T) {
 func TestClientSearch(t *testing.T) {
 	c := testClient(t)
 
-	c.Enqueue("search.q", map[string]string{})
-	c.Enqueue("search.q", map[string]string{})
+	_, _ = c.Enqueue("search.q", map[string]string{})
+	_, _ = c.Enqueue("search.q", map[string]string{})
 
 	result, err := c.Search(SearchFilter{Queue: "search.q"})
 	if err != nil {
@@ -117,7 +117,7 @@ func TestClientSearch(t *testing.T) {
 func TestClientListQueues(t *testing.T) {
 	c := testClient(t)
 
-	c.Enqueue("q1", map[string]string{})
+	_, _ = c.Enqueue("q1", map[string]string{})
 
 	data, err := c.ListQueues()
 	if err != nil {
@@ -125,7 +125,7 @@ func TestClientListQueues(t *testing.T) {
 	}
 
 	var queues []map[string]interface{}
-	json.Unmarshal(data, &queues)
+	_ = json.Unmarshal(data, &queues)
 	if len(queues) != 1 {
 		t.Errorf("queues count = %d, want 1", len(queues))
 	}

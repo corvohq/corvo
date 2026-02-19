@@ -2,9 +2,7 @@ package server
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -42,7 +40,7 @@ func (s *Server) handleTenantBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error(), "BACKUP_ERROR")
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var j store.Job
 		var payload, tags, checkpoint, result, chainCfg string
@@ -137,7 +135,7 @@ func (s *Server) handleBillingSummary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error(), "BILLING_ERROR")
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	type agg struct {
 		Rows                int64   `json:"rows"`
 		InputTokens         int64   `json:"input_tokens"`
@@ -189,28 +187,3 @@ func extractNamespaceFromQueue(queue string) string {
 	return queue[:idx]
 }
 
-func intQueryParam(raw string, def int) int {
-	if strings.TrimSpace(raw) == "" {
-		return def
-	}
-	v, err := strconv.Atoi(raw)
-	if err != nil {
-		return def
-	}
-	return v
-}
-
-func namespaceFromRequestOrPrincipal(reqNs string, principal authPrincipal) string {
-	ns := strings.TrimSpace(reqNs)
-	if ns == "" {
-		ns = principal.Namespace
-	}
-	if ns == "" {
-		ns = "default"
-	}
-	return ns
-}
-
-func fmtErrf(format string, args ...any) error {
-	return fmt.Errorf(format, args...)
-}

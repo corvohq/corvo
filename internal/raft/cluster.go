@@ -167,7 +167,7 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 	}
 	sqliteDB, err := openMaterializedView(sqlitePath)
 	if err != nil {
-		pdb.Close()
+		_ = pdb.Close()
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 
@@ -187,44 +187,44 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 	// Transport
 	transport, err := newTCPTransport(cfg.RaftBind, cfg.RaftAdvertise)
 	if err != nil {
-		pdb.Close()
-		sqliteDB.Close()
+		_ = pdb.Close()
+		_ = sqliteDB.Close()
 		return nil, fmt.Errorf("create transport: %w", err)
 	}
 
 	// Log store + stable store
 	logStore, err := openRaftStore(raftDir, cfg)
 	if err != nil {
-		pdb.Close()
-		sqliteDB.Close()
-		transport.Close()
+		_ = pdb.Close()
+		_ = sqliteDB.Close()
+		_ = transport.Close()
 		return nil, err
 	}
 
 	// Snapshot store
 	snapshotStore, err := raft.NewFileSnapshotStore(raftDir, 2, os.Stderr)
 	if err != nil {
-		pdb.Close()
-		sqliteDB.Close()
-		transport.Close()
-		logStore.Close()
+		_ = pdb.Close()
+		_ = sqliteDB.Close()
+		_ = transport.Close()
+		_ = logStore.Close()
 		return nil, fmt.Errorf("create snapshot store: %w", err)
 	}
 	if err := prepareFSMForRecovery(pdb, snapshotStore); err != nil {
-		pdb.Close()
-		sqliteDB.Close()
-		transport.Close()
-		logStore.Close()
+		_ = pdb.Close()
+		_ = sqliteDB.Close()
+		_ = transport.Close()
+		_ = logStore.Close()
 		return nil, fmt.Errorf("prepare fsm recovery: %w", err)
 	}
 
 	// Create Raft instance
 	r, err := raft.NewRaft(raftConfig, fsm, logStore, logStore, snapshotStore, transport)
 	if err != nil {
-		pdb.Close()
-		sqliteDB.Close()
-		transport.Close()
-		logStore.Close()
+		_ = pdb.Close()
+		_ = sqliteDB.Close()
+		_ = transport.Close()
+		_ = logStore.Close()
 		return nil, fmt.Errorf("create raft: %w", err)
 	}
 
@@ -308,7 +308,7 @@ func clearPebbleAll(pdb *pebble.DB) error {
 	// regardless of DB size. All Corvo keys use ASCII prefixes (0x61–0x77),
 	// so [0x00, 0xff) covers the entire practical keyspace.
 	batch := pdb.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 	if err := batch.DeleteRange([]byte{0x00}, []byte{0xff}, pebble.Sync); err != nil {
 		return fmt.Errorf("delete range pebble: %w", err)
 	}
@@ -405,7 +405,7 @@ func (c *Cluster) preResolveFetch(op store.FetchBatchOp) (store.FetchBatchOp, []
 					candidateQueues = append(candidateQueues, queue)
 				}
 			}
-			iter.Close()
+			_ = iter.Close()
 		}
 
 		if len(candidateIDs) >= op.Count {
@@ -418,7 +418,7 @@ func (c *Cluster) preResolveFetch(op store.FetchBatchOp) (store.FetchBatchOp, []
 		var cursor []byte
 		if c, closer, err := pdb.Get(kv.QueueCursorKey(queue)); err == nil {
 			cursor = append([]byte(nil), c...)
-			closer.Close()
+			_ = closer.Close()
 		}
 		iter, err = pdb.NewIter(&pebble.IterOptions{
 			LowerBound: appendPrefix,
@@ -465,7 +465,7 @@ func (c *Cluster) preResolveFetch(op store.FetchBatchOp) (store.FetchBatchOp, []
 					}
 				}
 			}
-			iter.Close()
+			_ = iter.Close()
 		}
 	}
 
@@ -921,18 +921,6 @@ func (c *Cluster) MarkQueueEmpty(queue string) {
 	})
 }
 
-// prefixHasKey returns true if there is at least one key with the given prefix.
-func prefixHasKey(pdb *pebble.DB, prefix []byte) bool {
-	iter, err := pdb.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return false
-	}
-	defer iter.Close()
-	return iter.First()
-}
 
 // Stats returns Raft cluster statistics.
 func (c *Cluster) Stats() map[string]string {
@@ -1004,12 +992,12 @@ func openMaterializedView(path string) (*sql.DB, error) {
 		"PRAGMA busy_timeout=5000",
 	} {
 		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
+			_ = db.Close()
 			return nil, fmt.Errorf("apply sqlite pragma %q: %w", pragma, err)
 		}
 	}
 	if err := db.Ping(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 
@@ -1017,15 +1005,15 @@ func openMaterializedView(path string) (*sql.DB, error) {
 	// These mirror the main schema but without events tables (no longer needed).
 	_, err = db.Exec(materializedViewSchema)
 	if err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("create materialized view schema: %w", err)
 	}
 	if err := ensureMaterializedViewSchema(db); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("migrate materialized view schema: %w", err)
 	}
 	if err := ensureTextSearchSchema(db); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("ensure text search schema: %w", err)
 	}
 
@@ -1111,7 +1099,7 @@ func sqliteHasColumn(db *sql.DB, table, column string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var cid int
 		var name string
@@ -1531,7 +1519,7 @@ func (c *Cluster) JoinCluster(leaderAddr string) error {
 	if err != nil {
 		return fmt.Errorf("join request: %w", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode/100 != 2 {
 		var m map[string]any
 		_ = json.NewDecoder(res.Body).Decode(&m)
@@ -1818,7 +1806,7 @@ func (c *Cluster) EventLog(afterSeq uint64, limit int) ([]map[string]any, error)
 	if err != nil {
 		return nil, err
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	prefix := kv.EventLogPrefix()
 	events := make([]map[string]any, 0, limit)

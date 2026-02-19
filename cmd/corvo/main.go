@@ -261,7 +261,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		}
 		cluster = multi
 	}
-	defer cluster.Shutdown()
+	defer func() { _ = cluster.Shutdown() }()
 
 	joinTargets := []string{}
 	if joinAddr != "" {
@@ -440,7 +440,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	schedCancel()
 
 	slog.Info("stopping store")
-	s.Close()
+	_ = s.Close()
 
 	slog.Info("corvo server stopped")
 	return nil

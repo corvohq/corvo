@@ -46,8 +46,8 @@ func TestGetJobWithErrors(t *testing.T) {
 		Payload:    json.RawMessage(`{}`),
 		MaxRetries: &maxRetries,
 	})
-	s.Fetch(store.FetchRequest{Queues: []string{"err.queue"}, WorkerID: "w", Hostname: "h"})
-	s.Fail(enqResult.JobID, "first error", "trace1", false)
+	_, _ = s.Fetch(store.FetchRequest{Queues: []string{"err.queue"}, WorkerID: "w", Hostname: "h"})
+	_, _ = s.Fail(enqResult.JobID, "first error", "trace1", false)
 
 	job, err := s.GetJob(enqResult.JobID)
 	if err != nil {
@@ -78,8 +78,8 @@ func TestRetryJob(t *testing.T) {
 		Payload:    json.RawMessage(`{}`),
 		MaxRetries: &maxRetries,
 	})
-	s.Fetch(store.FetchRequest{Queues: []string{"retry.queue"}, WorkerID: "w", Hostname: "h"})
-	s.Fail(enqResult.JobID, "error", "", false)
+	_, _ = s.Fetch(store.FetchRequest{Queues: []string{"retry.queue"}, WorkerID: "w", Hostname: "h"})
+	_, _ = s.Fail(enqResult.JobID, "error", "", false)
 
 	// Job should be dead
 	job, _ := s.GetJob(enqResult.JobID)
@@ -130,7 +130,7 @@ func TestCancelActiveJob(t *testing.T) {
 		Queue:   "cancel.active",
 		Payload: json.RawMessage(`{}`),
 	})
-	s.Fetch(store.FetchRequest{Queues: []string{"cancel.active"}, WorkerID: "w", Hostname: "h"})
+	_, _ = s.Fetch(store.FetchRequest{Queues: []string{"cancel.active"}, WorkerID: "w", Hostname: "h"})
 
 	status, err := s.CancelJob(enqResult.JobID)
 	if err != nil {

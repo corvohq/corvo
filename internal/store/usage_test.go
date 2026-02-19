@@ -11,7 +11,7 @@ func TestUsageSummaryTotalsAndGroupBy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	now := time.Date(2026, 2, 13, 12, 0, 0, 0, time.UTC)
 	rows := []struct {
@@ -74,7 +74,7 @@ func TestUsageSummaryValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	s = &Store{sqliteR: db.Read}
 	if _, err := s.UsageSummary(UsageSummaryRequest{Period: "1h", GroupBy: "bad"}); err == nil {
 		t.Fatalf("expected unsupported group_by error")

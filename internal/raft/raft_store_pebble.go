@@ -51,7 +51,7 @@ func (s *pebbleRaftStore) FirstIndex() (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 	if !iter.First() {
 		return 0, iter.Error()
 	}
@@ -65,7 +65,7 @@ func (s *pebbleRaftStore) LastIndex() (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 	if !iter.Last() {
 		return 0, iter.Error()
 	}
@@ -80,7 +80,7 @@ func (s *pebbleRaftStore) GetLog(index uint64, out *raft.Log) error {
 		}
 		return err
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 	l, err := decodeRaftLog(v)
 	if err != nil {
 		return err
@@ -98,7 +98,7 @@ func (s *pebbleRaftStore) StoreLogs(logs []*raft.Log) error {
 		return nil
 	}
 	batch := s.db.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 	for _, l := range logs {
 		enc, err := encodeRaftLog(l)
 		if err != nil {
@@ -116,7 +116,7 @@ func (s *pebbleRaftStore) DeleteRange(min, max uint64) error {
 		return nil
 	}
 	batch := s.db.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 	for i := min; i <= max; i++ {
 		if err := batch.Delete(pebbleRaftLogKey(i), pebble.NoSync); err != nil && err != pebble.ErrNotFound {
 			return err
@@ -140,7 +140,7 @@ func (s *pebbleRaftStore) Get(key []byte) ([]byte, error) {
 		}
 		return nil, err
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 	out := append([]byte(nil), v...)
 	return out, nil
 }

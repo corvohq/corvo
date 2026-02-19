@@ -42,14 +42,12 @@ func (s *badgerRaftStore) FirstIndex() (uint64, error) {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
 		prefix := []byte(badgerLogPrefix)
-		for it.Seek(prefix); it.Valid(); it.Next() {
-			item := it.Item()
-			k := item.Key()
-			if !bytes.HasPrefix(k, prefix) {
-				break
+		it.Seek(prefix)
+		if it.Valid() {
+			k := it.Item().Key()
+			if bytes.HasPrefix(k, prefix) {
+				first = decodeIndexFromLogKey(k)
 			}
-			first = decodeIndexFromLogKey(k)
-			return nil
 		}
 		return nil
 	})

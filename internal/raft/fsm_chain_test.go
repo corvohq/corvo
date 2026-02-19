@@ -61,10 +61,10 @@ func fetchAndAckChainJob(t *testing.T, da *DirectApplier, queue string, stepStat
 	}
 	var job store.Job
 	if err := decodeJobDoc(jobVal, &job); err != nil {
-		closer.Close()
+		_ = closer.Close()
 		t.Fatalf("decode job %s: %v", fr.JobID, err)
 	}
-	closer.Close()
+	_ = closer.Close()
 	return job
 }
 
@@ -90,7 +90,7 @@ func TestChainBasicProgression(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	defer da.Close()
+	defer func() { _ = da.Close() }()
 
 	chain := &store.ChainDefinition{
 		Steps: []store.ChainStep{
@@ -155,7 +155,7 @@ func TestChainEarlyExit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	defer da.Close()
+	defer func() { _ = da.Close() }()
 
 	chain := &store.ChainDefinition{
 		Steps: []store.ChainStep{
@@ -195,7 +195,7 @@ func TestChainLastStepRunsOnExit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	defer da.Close()
+	defer func() { _ = da.Close() }()
 
 	chain := &store.ChainDefinition{
 		Steps: []store.ChainStep{
@@ -223,7 +223,7 @@ func TestChainFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	defer da.Close()
+	defer func() { _ = da.Close() }()
 
 	chain := &store.ChainDefinition{
 		Steps: []store.ChainStep{
@@ -293,7 +293,7 @@ func TestChainNoHandler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	defer da.Close()
+	defer func() { _ = da.Close() }()
 
 	// Chain with no on_exit
 	chain := &store.ChainDefinition{
@@ -321,7 +321,7 @@ func TestChainPayloadMerge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	defer da.Close()
+	defer func() { _ = da.Close() }()
 
 	chain := &store.ChainDefinition{
 		Steps: []store.ChainStep{
@@ -367,7 +367,7 @@ func TestNonChainJobIgnoresStepStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	defer da.Close()
+	defer func() { _ = da.Close() }()
 
 	now := time.Now()
 	op := makeEnqueueOp(store.NewJobID(), "plain.q", now)
@@ -400,7 +400,7 @@ func TestChainFailureHandlerDoesNotRecurse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirectApplier: %v", err)
 	}
-	defer da.Close()
+	defer func() { _ = da.Close() }()
 
 	chain := &store.ChainDefinition{
 		Steps: []store.ChainStep{

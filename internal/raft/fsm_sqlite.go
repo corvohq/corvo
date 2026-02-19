@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -86,7 +87,7 @@ func sqliteInsertJob(db sqlExecer, op store.EnqueueOp) error {
 	}
 
 	// Ensure queue exists
-	db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", op.Queue)
+	_, _ = db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", op.Queue)
 
 	// Insert unique lock if needed
 	if op.UniqueKey != "" {
@@ -95,7 +96,7 @@ func sqliteInsertJob(db sqlExecer, op store.EnqueueOp) error {
 			period = 3600
 		}
 		expiresAt := time.Unix(0, int64(op.NowNs)).Add(time.Duration(period) * time.Second).UTC().Format(time.RFC3339Nano)
-		db.Exec("INSERT OR REPLACE INTO unique_locks (queue, unique_key, job_id, expires_at) VALUES (?, ?, ?, ?)",
+		_, _ = db.Exec("INSERT OR REPLACE INTO unique_locks (queue, unique_key, job_id, expires_at) VALUES (?, ?, ?, ?)",
 			op.Queue, op.UniqueKey, op.JobID, expiresAt)
 	}
 
@@ -110,7 +111,7 @@ func sqliteInsertBatch(db sqlExecer, op store.EnqueueBatchOp) error {
 			s := string(op.Batch.CallbackPayload)
 			callbackPayload = &s
 		}
-		db.Exec(`INSERT OR REPLACE INTO batches (id, total, pending, callback_queue, callback_payload) VALUES (?, ?, ?, ?, ?)`,
+		_, _ = db.Exec(`INSERT OR REPLACE INTO batches (id, total, pending, callback_queue, callback_payload) VALUES (?, ?, ?, ?, ?)`,
 			op.BatchID, len(op.Jobs), len(op.Jobs), op.Batch.CallbackQueue, callbackPayload)
 	}
 
@@ -155,7 +156,7 @@ func sqliteInsertBatch(db sqlExecer, op store.EnqueueBatchOp) error {
 			batchIDPtr = &op.BatchID
 		}
 		createdAt := j.CreatedAt.UTC().Format(time.RFC3339Nano)
-		db.Exec(`INSERT OR REPLACE INTO jobs (id, queue, state, payload, priority, max_retries,
+		_, _ = db.Exec(`INSERT OR REPLACE INTO jobs (id, queue, state, payload, priority, max_retries,
 			retry_backoff, retry_base_delay_ms, retry_max_delay_ms, tags, checkpoint,
 			agent_max_iterations, agent_max_cost_usd, agent_iteration_timeout, agent_iteration, agent_total_cost_usd,
 			parent_id, chain_id, chain_step, chain_config, provider_error,
@@ -168,7 +169,7 @@ func sqliteInsertBatch(db sqlExecer, op store.EnqueueBatchOp) error {
 			parentID, chainID, chainStep, chainConfig, 0,
 			batchIDPtr, createdAt,
 		)
-		db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", j.Queue)
+		_, _ = db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", j.Queue)
 	}
 	return nil
 }
@@ -190,14 +191,16 @@ func sqliteFetchJob(db sqlExecer, job store.Job, op store.FetchOp) error {
 	}
 
 	// Record rate limit entry
-	db.Exec("INSERT INTO rate_limit_window (queue, fetched_at) VALUES (?, ?)", job.Queue, startedAt)
+	_, _ = db.Exec("INSERT INTO rate_limit_window (queue, fetched_at) VALUES (?, ?)", job.Queue, startedAt)
 
 	// Upsert worker
 	queuesJSON, _ := json.Marshal(op.Queues)
-	db.Exec(`INSERT INTO workers (id, hostname, queues, last_heartbeat, started_at)
+	if _, err := db.Exec(`INSERT INTO workers (id, hostname, queues, last_heartbeat, started_at)
 		VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET
 		hostname = excluded.hostname, queues = excluded.queues, last_heartbeat = excluded.last_heartbeat`,
-		op.WorkerID, op.Hostname, string(queuesJSON), startedAt, startedAt)
+		op.WorkerID, op.Hostname, string(queuesJSON), startedAt, startedAt); err != nil {
+		slog.Debug("sqlite mirror write failed", "op", "upsert worker", "error", err)
+	}
 
 	return nil
 }
@@ -219,7 +222,9 @@ func sqliteAckJob(db sqlExecer, job store.Job, op store.AckOp, callbackJobID str
 
 	// Clean unique lock
 	if job.UniqueKey != nil {
-		db.Exec("DELETE FROM unique_locks WHERE job_id = ?", op.JobID)
+		if _, err := db.Exec("DELETE FROM unique_locks WHERE job_id = ?", op.JobID); err != nil {
+			slog.Debug("sqlite mirror write failed", "op", "delete unique lock", "error", err)
+		}
 	}
 
 	// Update batch
@@ -240,13 +245,17 @@ func sqliteUpdateBatch(db sqlExecer, batchID, outcome, callbackJobID string) {
 	} else {
 		updateCol = "failed = failed + 1"
 	}
-	db.Exec(fmt.Sprintf("UPDATE batches SET pending = pending - 1, %s WHERE id = ?", updateCol), batchID)
+	if _, err := db.Exec(fmt.Sprintf("UPDATE batches SET pending = pending - 1, %s WHERE id = ?", updateCol), batchID); err != nil {
+		slog.Debug("sqlite mirror write failed", "op", "update batch", "error", err)
+	}
 
 	if callbackJobID != "" {
 		// The callback job was already inserted by the Pebble side, just insert into SQLite
-		db.Exec(`INSERT OR IGNORE INTO jobs (id, queue, state, payload, priority)
+		if _, err := db.Exec(`INSERT OR IGNORE INTO jobs (id, queue, state, payload, priority)
 			SELECT ?, callback_queue, 'pending', COALESCE(callback_payload, '{}'), 2
-			FROM batches WHERE id = ?`, callbackJobID, batchID)
+			FROM batches WHERE id = ?`, callbackJobID, batchID); err != nil {
+			slog.Debug("sqlite mirror write failed", "op", "insert job", "error", err)
+		}
 	}
 }
 
@@ -258,8 +267,10 @@ func sqliteFailJob(db sqlExecer, job store.Job, op store.FailOp, errDoc store.Jo
 	if op.Backtrace != "" {
 		backtrace = &op.Backtrace
 	}
-	db.Exec("INSERT INTO job_errors (job_id, attempt, error, backtrace, created_at) VALUES (?, ?, ?, ?, ?)",
-		op.JobID, errDoc.Attempt, op.Error, backtrace, now)
+	if _, err := db.Exec("INSERT INTO job_errors (job_id, attempt, error, backtrace, created_at) VALUES (?, ?, ?, ?, ?)",
+		op.JobID, errDoc.Attempt, op.Error, backtrace, now); err != nil {
+		slog.Debug("sqlite mirror write failed", "op", "insert job error", "error", err)
+	}
 
 	if job.State == store.StateRetrying {
 		var scheduledAt *string
@@ -303,17 +314,25 @@ func sqliteHeartbeat(db sqlExecer, op store.HeartbeatOp, leaseExp time.Time, wor
 		}
 
 		if progressStr != nil && checkpointStr != nil {
-			db.Exec("UPDATE jobs SET progress = ?, checkpoint = ?, lease_expires_at = ? WHERE id = ? AND state = 'active'",
-				*progressStr, *checkpointStr, leaseStr, jobID)
+			if _, err := db.Exec("UPDATE jobs SET progress = ?, checkpoint = ?, lease_expires_at = ? WHERE id = ? AND state = 'active'",
+				*progressStr, *checkpointStr, leaseStr, jobID); err != nil {
+				slog.Debug("sqlite mirror write failed", "op", "update job heartbeat", "error", err)
+			}
 		} else if progressStr != nil {
-			db.Exec("UPDATE jobs SET progress = ?, lease_expires_at = ? WHERE id = ? AND state = 'active'",
-				*progressStr, leaseStr, jobID)
+			if _, err := db.Exec("UPDATE jobs SET progress = ?, lease_expires_at = ? WHERE id = ? AND state = 'active'",
+				*progressStr, leaseStr, jobID); err != nil {
+				slog.Debug("sqlite mirror write failed", "op", "update job heartbeat", "error", err)
+			}
 		} else if checkpointStr != nil {
-			db.Exec("UPDATE jobs SET checkpoint = ?, lease_expires_at = ? WHERE id = ? AND state = 'active'",
-				*checkpointStr, leaseStr, jobID)
+			if _, err := db.Exec("UPDATE jobs SET checkpoint = ?, lease_expires_at = ? WHERE id = ? AND state = 'active'",
+				*checkpointStr, leaseStr, jobID); err != nil {
+				slog.Debug("sqlite mirror write failed", "op", "update job heartbeat", "error", err)
+			}
 		} else {
-			db.Exec("UPDATE jobs SET lease_expires_at = ? WHERE id = ? AND state = 'active'",
-				leaseStr, jobID)
+			if _, err := db.Exec("UPDATE jobs SET lease_expires_at = ? WHERE id = ? AND state = 'active'",
+				leaseStr, jobID); err != nil {
+				slog.Debug("sqlite mirror write failed", "op", "update job heartbeat", "error", err)
+			}
 		}
 		if update.Usage != nil {
 			var queue string
@@ -328,7 +347,9 @@ func sqliteHeartbeat(db sqlExecer, op store.HeartbeatOp, leaseExp time.Time, wor
 
 	if workerID != "" {
 		nowStr := now.UTC().Format(time.RFC3339Nano)
-		db.Exec("UPDATE workers SET last_heartbeat = ? WHERE id = ?", nowStr, workerID)
+		if _, err := db.Exec("UPDATE workers SET last_heartbeat = ? WHERE id = ?", nowStr, workerID); err != nil {
+			slog.Debug("sqlite mirror write failed", "op", "update worker heartbeat", "error", err)
+		}
 	}
 
 	return nil
@@ -420,7 +441,9 @@ func sqliteCancelJob(db sqlExecer, jobID string) error {
 }
 
 func sqliteMoveJob(db sqlExecer, jobID, targetQueue string) error {
-	db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", targetQueue)
+	if _, err := db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", targetQueue); err != nil {
+		slog.Debug("sqlite mirror write failed", "op", "insert queue", "error", err)
+	}
 	_, err := db.Exec("UPDATE jobs SET queue = ? WHERE id = ?", targetQueue, jobID)
 	return err
 }
@@ -447,22 +470,32 @@ func sqliteDeleteBudget(db sqlExecer, scope, target string) error {
 
 
 func sqliteDeleteJob(db sqlExecer, jobID string) error {
-	db.Exec("DELETE FROM job_errors WHERE job_id = ?", jobID)
+	if _, err := db.Exec("DELETE FROM job_errors WHERE job_id = ?", jobID); err != nil {
+		slog.Debug("sqlite mirror write failed", "op", "delete job errors", "error", err)
+	}
 	_, err := db.Exec("DELETE FROM jobs WHERE id = ?", jobID)
 	return err
 }
 
 func sqliteUpdateQueueField(db sqlExecer, queue, field string, value any) error {
-	db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", queue)
+	if _, err := db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", queue); err != nil {
+		slog.Debug("sqlite mirror write failed", "op", "insert queue", "error", err)
+	}
 	query := fmt.Sprintf("UPDATE queues SET %s = ? WHERE name = ?", field)
 	_, err := db.Exec(query, value, queue)
 	return err
 }
 
 func sqliteDeleteQueue(db sqlExecer, queue string) error {
-	db.Exec("DELETE FROM jobs WHERE queue = ?", queue)
-	db.Exec("DELETE FROM rate_limit_window WHERE queue = ?", queue)
-	db.Exec("DELETE FROM unique_locks WHERE queue = ?", queue)
+	if _, err := db.Exec("DELETE FROM jobs WHERE queue = ?", queue); err != nil {
+		slog.Debug("sqlite mirror write failed", "op", "delete queue jobs", "error", err)
+	}
+	if _, err := db.Exec("DELETE FROM rate_limit_window WHERE queue = ?", queue); err != nil {
+		slog.Debug("sqlite mirror write failed", "op", "delete queue rate limits", "error", err)
+	}
+	if _, err := db.Exec("DELETE FROM unique_locks WHERE queue = ?", queue); err != nil {
+		slog.Debug("sqlite mirror write failed", "op", "delete queue unique locks", "error", err)
+	}
 	_, err := db.Exec("DELETE FROM queues WHERE name = ?", queue)
 	return err
 }
@@ -483,43 +516,65 @@ func sqliteBulkAction(db sqlExecer, op store.BulkActionOp) error {
 
 	switch op.Action {
 	case "retry":
-		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'pending', attempt = 0, failed_at = NULL, completed_at = NULL,
+		if _, err := db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'pending', attempt = 0, failed_at = NULL, completed_at = NULL,
 			worker_id = NULL, hostname = NULL, lease_expires_at = NULL, scheduled_at = NULL
-			WHERE id IN (%s) AND state IN ('dead', 'cancelled', 'completed', 'scheduled')`, inClause), args...)
+			WHERE id IN (%s) AND state IN ('dead', 'cancelled', 'completed', 'scheduled')`, inClause), args...); err != nil {
+			slog.Debug("sqlite mirror write failed", "op", "bulk retry", "error", err)
+		}
 	case "delete":
-		db.Exec(fmt.Sprintf("DELETE FROM job_errors WHERE job_id IN (%s)", inClause), args...)
-		db.Exec(fmt.Sprintf("DELETE FROM jobs WHERE id IN (%s)", inClause), args...)
+		if _, err := db.Exec(fmt.Sprintf("DELETE FROM job_errors WHERE job_id IN (%s)", inClause), args...); err != nil {
+			slog.Debug("sqlite mirror write failed", "op", "bulk delete errors", "error", err)
+		}
+		if _, err := db.Exec(fmt.Sprintf("DELETE FROM jobs WHERE id IN (%s)", inClause), args...); err != nil {
+			slog.Debug("sqlite mirror write failed", "op", "bulk delete jobs", "error", err)
+		}
 	case "cancel":
-		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'cancelled'
-			WHERE id IN (%s) AND state IN ('pending', 'active', 'scheduled', 'retrying')`, inClause), args...)
+		if _, err := db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'cancelled'
+			WHERE id IN (%s) AND state IN ('pending', 'active', 'scheduled', 'retrying')`, inClause), args...); err != nil {
+			slog.Debug("sqlite mirror write failed", "op", "bulk cancel", "error", err)
+		}
 	case "move":
-		db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", op.MoveToQueue)
+		if _, err := db.Exec("INSERT OR IGNORE INTO queues (name) VALUES (?)", op.MoveToQueue); err != nil {
+			slog.Debug("sqlite mirror write failed", "op", "bulk move create queue", "error", err)
+		}
 		moveArgs := []any{op.MoveToQueue}
 		moveArgs = append(moveArgs, args...)
-		db.Exec(fmt.Sprintf("UPDATE jobs SET queue = ? WHERE id IN (%s)", inClause), moveArgs...)
+		if _, err := db.Exec(fmt.Sprintf("UPDATE jobs SET queue = ? WHERE id IN (%s)", inClause), moveArgs...); err != nil {
+			slog.Debug("sqlite mirror write failed", "op", "bulk move jobs", "error", err)
+		}
 	case "requeue":
-		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'pending', failed_at = NULL, worker_id = NULL,
+		if _, err := db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'pending', failed_at = NULL, worker_id = NULL,
 			hostname = NULL, lease_expires_at = NULL, scheduled_at = NULL
-			WHERE id IN (%s) AND state = 'dead'`, inClause), args...)
+			WHERE id IN (%s) AND state = 'dead'`, inClause), args...); err != nil {
+			slog.Debug("sqlite mirror write failed", "op", "bulk requeue", "error", err)
+		}
 	case "change_priority":
 		priArgs := []any{op.Priority}
 		priArgs = append(priArgs, args...)
-		db.Exec(fmt.Sprintf(`UPDATE jobs SET priority = ?
-			WHERE id IN (%s) AND state IN ('pending', 'scheduled')`, inClause), priArgs...)
+		if _, err := db.Exec(fmt.Sprintf(`UPDATE jobs SET priority = ?
+			WHERE id IN (%s) AND state IN ('pending', 'scheduled')`, inClause), priArgs...); err != nil {
+			slog.Debug("sqlite mirror write failed", "op", "bulk change priority", "error", err)
+		}
 	case "hold":
-		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'held', worker_id = NULL, hostname = NULL,
+		if _, err := db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'held', worker_id = NULL, hostname = NULL,
 			lease_expires_at = NULL, scheduled_at = NULL
-			WHERE id IN (%s) AND state IN ('pending', 'active', 'scheduled', 'retrying')`, inClause), args...)
+			WHERE id IN (%s) AND state IN ('pending', 'active', 'scheduled', 'retrying')`, inClause), args...); err != nil {
+			slog.Debug("sqlite mirror write failed", "op", "bulk hold", "error", err)
+		}
 	case "approve":
-		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'pending', worker_id = NULL, hostname = NULL,
+		if _, err := db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'pending', worker_id = NULL, hostname = NULL,
 			lease_expires_at = NULL, scheduled_at = NULL, hold_reason = NULL
-			WHERE id IN (%s) AND state = 'held'`, inClause), args...)
+			WHERE id IN (%s) AND state = 'held'`, inClause), args...); err != nil {
+			slog.Debug("sqlite mirror write failed", "op", "bulk approve", "error", err)
+		}
 	case "reject":
 		rejArgs := []any{nowStr}
 		rejArgs = append(rejArgs, args...)
-		db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'dead', failed_at = ?, worker_id = NULL, hostname = NULL,
+		if _, err := db.Exec(fmt.Sprintf(`UPDATE jobs SET state = 'dead', failed_at = ?, worker_id = NULL, hostname = NULL,
 			lease_expires_at = NULL, scheduled_at = NULL, hold_reason = NULL
-			WHERE id IN (%s) AND state = 'held'`, inClause), rejArgs...)
+			WHERE id IN (%s) AND state = 'held'`, inClause), rejArgs...); err != nil {
+			slog.Debug("sqlite mirror write failed", "op", "bulk reject", "error", err)
+		}
 	}
 	return nil
 }
@@ -540,7 +595,7 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 		retErr = fmt.Errorf("begin sqlite rebuild tx: %w", err)
 		return retErr
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	for _, stmt := range []string{
 		"DELETE FROM budgets",
@@ -568,7 +623,7 @@ func (f *FSM) RebuildSQLiteFromPebble() error {
 		retErr = fmt.Errorf("create pebble iter: %w", err)
 		return retErr
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		key := iter.Key()

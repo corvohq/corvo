@@ -124,7 +124,7 @@ func (s *Store) GetJob(id string) (*Job, error) {
 	if err != nil {
 		return nil, fmt.Errorf("query job errors: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var je JobError
@@ -213,7 +213,7 @@ func (s *Store) ListJobIterations(id string) ([]JobIteration, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list iterations for %q: %w", id, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]JobIteration, 0, 16)
 	for rows.Next() {

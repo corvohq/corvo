@@ -55,7 +55,7 @@ func apiRequest(method, path string, body interface{}) ([]byte, int, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -66,14 +66,14 @@ func apiRequest(method, path string, body interface{}) ([]byte, int, error) {
 
 func printJSON(data []byte) {
 	var buf bytes.Buffer
-	json.Indent(&buf, data, "", "  ")
-	fmt.Fprintln(os.Stdout, buf.String())
+	_ = json.Indent(&buf, data, "", "  ")
+	_, _ = fmt.Fprintln(os.Stdout, buf.String())
 }
 
 func exitOnError(data []byte, status int) {
 	if status >= 400 {
 		var errResp map[string]string
-		json.Unmarshal(data, &errResp)
+		_ = json.Unmarshal(data, &errResp)
 		if msg, ok := errResp["error"]; ok {
 			fmt.Fprintf(os.Stderr, "Error: %s\n", msg)
 		} else {

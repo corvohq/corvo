@@ -49,7 +49,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-keepalive.C:
-			fmt.Fprintf(w, ":keepalive\n\n")
+			_, _ = fmt.Fprintf(w, ":keepalive\n\n")
 			flusher.Flush()
 		case <-ticker.C:
 			if s.cluster == nil {
@@ -64,13 +64,13 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 				if err != nil {
 					continue
 				}
-				seq, _ := ev["seq"]
+				seq := ev["seq"]
 				seqStr := fmt.Sprintf("%v", seq)
 				evType, _ := ev["type"].(string)
 				if evType == "" {
 					evType = "message"
 				}
-				fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", seqStr, evType, data)
+				_, _ = fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", seqStr, evType, data)
 
 				// Update lastSeq from the event.
 				if seqF, ok := seq.(float64); ok {

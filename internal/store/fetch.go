@@ -109,7 +109,3 @@ func (s *Store) FetchBatch(req FetchRequest, count int) ([]FetchResult, error) {
 	return jobs, nil
 }
 
-func marshalQueues(queues []string) string {
-	b, _ := json.Marshal(queues)
-	return string(b)
-}

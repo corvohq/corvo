@@ -45,15 +45,15 @@ var approvalPolicyListCmd = &cobra.Command{
 			return nil
 		}
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tNAME\tMODE\tENABLED\tQUEUE\tTAG")
+		_, _ = fmt.Fprintln(w, "ID\tNAME\tMODE\tENABLED\tQUEUE\tTAG")
 		for _, p := range out {
 			tag := ""
 			if p.TagKey != "" {
 				tag = p.TagKey + "=" + p.TagValue
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%t\t%s\t%s\n", p.ID, p.Name, p.Mode, p.Enabled, p.Queue, tag)
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%t\t%s\t%s\n", p.ID, p.Name, p.Mode, p.Enabled, p.Queue, tag)
 		}
-		w.Flush()
+		_ = w.Flush()
 		return nil
 	},
 }

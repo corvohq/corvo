@@ -20,7 +20,7 @@ func (s *Server) handleListNamespaces(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error(), "STORE_ERROR")
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := []map[string]any{}
 	for rows.Next() {

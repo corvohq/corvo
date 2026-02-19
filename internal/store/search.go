@@ -61,7 +61,7 @@ func (s *Store) SearchJobs(filter search.Filter) (*SearchResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("search jobs: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var jobs []JobSummary
 	for rows.Next() {

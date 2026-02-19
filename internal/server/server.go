@@ -386,7 +386,7 @@ func (s *Server) mountUI(r chi.Router) {
 		// Try to open the file. If it exists, serve it directly.
 		f, err := s.uiFS.Open(uiPath)
 		if err == nil {
-			defer f.Close()
+			defer func() { _ = f.Close() }()
 			stat, _ := f.Stat()
 			if stat != nil && !stat.IsDir() {
 				if strings.HasPrefix(uiPath, "assets/") {
@@ -406,7 +406,7 @@ func (s *Server) mountUI(r chi.Router) {
 		}
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(indexHTML)
+		_, _ = w.Write(indexHTML)
 	})
 
 	// Redirect bare /ui to /ui/
@@ -468,7 +468,7 @@ func (s *Server) Handler() http.Handler {
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func writeError(w http.ResponseWriter, status int, msg string, code string) {
@@ -498,7 +498,7 @@ func writeStoreError(w http.ResponseWriter, err error, fallbackStatus int, fallb
 }
 
 func decodeJSON(r *http.Request, v interface{}) error {
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 	return json.NewDecoder(r.Body).Decode(v)
 }
 
@@ -609,12 +609,6 @@ func (s *Server) requestMetricsMiddleware(next http.Handler) http.Handler {
 		stw := &serverTimingWriter{ResponseWriter: w, start: start}
 		ww := middleware.NewWrapResponseWriter(stw, r.ProtoMajor)
 		next.ServeHTTP(ww, r)
-		route = r.URL.Path
-		if rctx := chi.RouteContext(r.Context()); rctx != nil {
-			if pat := strings.TrimSpace(rctx.RoutePattern()); pat != "" {
-				route = pat
-			}
-		}
 		s.reqMetrics.finish(counter, ww.Status(), time.Since(start))
 	})
 }

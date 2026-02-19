@@ -76,7 +76,7 @@ func (s *Server) Shutdown() error {
 	ln := s.listener
 	s.mu.RUnlock()
 	if ln != nil {
-		ln.Close()
+		_ = ln.Close()
 	}
 	s.wg.Wait()
 	return nil
@@ -84,7 +84,7 @@ func (s *Server) Shutdown() error {
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	scanner := bufio.NewScanner(conn)
 	// Allow up to 1MB lines for large payloads.
@@ -99,12 +99,12 @@ func (s *Server) handleConn(conn net.Conn) {
 		cmd, rest := splitFirst(line)
 		switch strings.ToUpper(cmd) {
 		case "PING":
-			fmt.Fprintf(conn, "+PONG\r\n")
+			_, _ = fmt.Fprintf(conn, "+PONG\r\n")
 
 		case "ENQUEUE":
 			queue, payload := splitFirst(rest)
 			if queue == "" || payload == "" {
-				fmt.Fprintf(conn, "-ERR usage: ENQUEUE <queue> <json_payload>\r\n")
+				_, _ = fmt.Fprintf(conn, "-ERR usage: ENQUEUE <queue> <json_payload>\r\n")
 				continue
 			}
 			result, err := s.store.Enqueue(store.EnqueueRequest{
@@ -112,13 +112,13 @@ func (s *Server) handleConn(conn net.Conn) {
 				Payload: json.RawMessage(payload),
 			})
 			if err != nil {
-				fmt.Fprintf(conn, "-ERR %s\r\n", err.Error())
+				_, _ = fmt.Fprintf(conn, "-ERR %s\r\n", err.Error())
 				continue
 			}
-			fmt.Fprintf(conn, "+%s\r\n", result.JobID)
+			_, _ = fmt.Fprintf(conn, "+%s\r\n", result.JobID)
 
 		default:
-			fmt.Fprintf(conn, "-ERR unknown command '%s'\r\n", cmd)
+			_, _ = fmt.Fprintf(conn, "-ERR unknown command '%s'\r\n", cmd)
 		}
 	}
 }
