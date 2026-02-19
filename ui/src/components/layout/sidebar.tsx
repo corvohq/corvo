@@ -3,7 +3,6 @@ import { cn } from "@/lib/utils";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import {
   LayoutDashboard,
-  Layers,
   ListOrdered,
   Skull,
   HandMetal,
@@ -76,8 +75,7 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
     <>
       <div className="flex h-14 items-center border-b px-4">
         <NavLink to="/ui" className="flex items-center gap-2" onClick={onNavigate}>
-          <Layers className="h-5 w-5" />
-          <span className="text-lg font-bold tracking-tight">Corvo</span>
+          <img src="/ui/logo-full.svg" alt="Corvo" className="h-6" />
         </NavLink>
       </div>
       <nav className="flex-1 space-y-1 p-3">
