@@ -12,11 +12,11 @@ async function expectToast(page: Page, text: string | RegExp) {
 
 // Enqueue a job via the UI and wait for the success toast.
 async function enqueueViaUI(page: Page, queue: string) {
-  await page.goto("/ui");
+  await page.goto("/ui/");
   await waitForLoad(page);
   await page.getByRole("button", { name: /enqueue job/i }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
-  await page.getByLabel(/queue name/i).fill(queue);
+  await page.getByPlaceholder("e.g. emails").fill(queue);
   await page.getByRole("button", { name: "Enqueue" }).click();
   await expectToast(page, "Job enqueued");
   await expect(page.getByRole("dialog")).not.toBeVisible();
@@ -26,14 +26,17 @@ async function enqueueViaUI(page: Page, queue: string) {
 
 test.describe("Enqueue Job dialog", () => {
   test("opens from dashboard and enqueues a job", async ({ page }) => {
-    await page.goto("/ui");
+    await page.goto("/ui/");
     await waitForLoad(page);
 
     await page.getByRole("button", { name: /enqueue job/i }).click();
     await expect(page.getByRole("dialog")).toBeVisible();
-    await expect(page.getByText("Enqueue Job")).toBeVisible();
+    // Scope to dialog to avoid matching the "Enqueue Job" button on the dashboard.
+    await expect(page.getByRole("dialog").getByText("Enqueue Job")).toBeVisible();
 
-    await page.getByLabel(/queue name \*/i).fill("test.enqueue");
+    await page.getByPlaceholder("e.g. emails").fill("test.enqueue");
+    // Wait for React state to enable the submit button before clicking.
+    await expect(page.getByRole("button", { name: "Enqueue" })).toBeEnabled();
     // Payload defaults to {}, leave it as-is.
     await page.getByRole("button", { name: "Enqueue" }).click();
 
@@ -42,7 +45,7 @@ test.describe("Enqueue Job dialog", () => {
   });
 
   test("submit is disabled until a queue name is entered", async ({ page }) => {
-    await page.goto("/ui");
+    await page.goto("/ui/");
     await waitForLoad(page);
     await page.getByRole("button", { name: /enqueue job/i }).click();
     await expect(page.getByRole("dialog")).toBeVisible();
@@ -50,21 +53,21 @@ test.describe("Enqueue Job dialog", () => {
     const submitBtn = page.getByRole("button", { name: "Enqueue" });
     await expect(submitBtn).toBeDisabled();
 
-    await page.getByLabel(/queue name \*/i).fill("some.queue");
+    await page.getByPlaceholder("e.g. emails").fill("some.queue");
     await expect(submitBtn).toBeEnabled();
   });
 
   test("closing the dialog resets the form", async ({ page }) => {
-    await page.goto("/ui");
+    await page.goto("/ui/");
     await waitForLoad(page);
     await page.getByRole("button", { name: /enqueue job/i }).click();
-    await page.getByLabel(/queue name \*/i).fill("some.queue");
+    await page.getByPlaceholder("e.g. emails").fill("some.queue");
     await page.getByRole("button", { name: "Cancel" }).click();
     await expect(page.getByRole("dialog")).not.toBeVisible();
 
     // Reopen — queue should be empty again.
     await page.getByRole("button", { name: /enqueue job/i }).click();
-    await expect(page.getByLabel(/queue name \*/i)).toHaveValue("");
+    await expect(page.getByPlaceholder("e.g. emails")).toHaveValue("");
   });
 });
 
@@ -87,7 +90,13 @@ test.describe("Queue: Pause / Resume", () => {
   });
 
   test("resuming a paused queue shows Active badge and toast", async ({ page }) => {
-    // Pause first.
+    // Use a separate queue so this test isn't affected by the paused state
+    // left by the previous test.
+    const RESUME_QUEUE = "test.resume-only";
+    await enqueueViaUI(page, RESUME_QUEUE);
+    await page.goto(`/ui/queues/${RESUME_QUEUE}`);
+    await waitForLoad(page);
+
     await page.getByRole("button", { name: /^pause$/i }).click();
     await expectToast(page, "Queue paused");
 
@@ -197,7 +206,7 @@ test.describe("Job: Clone", () => {
     await expect(page.getByText("Clone Job")).toBeVisible();
 
     // Queue field should be pre-filled from the original job.
-    const queueInput = page.getByLabel(/queue name \*/i);
+    const queueInput = page.getByPlaceholder("e.g. emails");
     await expect(queueInput).not.toHaveValue("");
 
     // Can submit the clone.
@@ -239,6 +248,27 @@ test.describe("Job: Delete", () => {
 });
 
 // ─── Bulk actions ─────────────────────────────────────────────────────────────
+// NOTE: Bulk: Move and Bulk: Retry both consume dead jobs from the dead-letter
+// queue, so Move runs first while dead jobs are still available.
+
+test.describe("Bulk: Move", () => {
+  test("bulk move opens destination input and moves jobs", async ({ page }) => {
+    await page.goto("/ui/dead-letter");
+    await waitForLoad(page);
+
+    // Select just the first job (nth(1) to skip the select-all header checkbox).
+    await page.getByRole("checkbox").nth(1).check();
+    await expect(page.getByText(/\d+ selected/)).toBeVisible();
+
+    await page.getByRole("button", { name: /^move$/i }).click();
+    await expect(page.getByRole("dialog")).toBeVisible();
+
+    // Destination queue input should appear.
+    await page.getByPlaceholder(/queue name/i).fill("test.bulk-moved");
+    await page.getByRole("button", { name: /move \d+ jobs?/i }).click();
+    await expectToast(page, /bulk action/i);
+  });
+});
 
 test.describe("Bulk: Retry", () => {
   test("bulk retrying dead jobs shows success toast", async ({ page }) => {
@@ -281,25 +311,6 @@ test.describe("Bulk: Cancel", () => {
   });
 });
 
-test.describe("Bulk: Move", () => {
-  test("bulk move opens destination input and moves jobs", async ({ page }) => {
-    await page.goto("/ui/dead-letter");
-    await waitForLoad(page);
-
-    // Select just the first job.
-    await page.getByRole("checkbox").nth(1).check();
-    await expect(page.getByText(/\d+ selected/)).toBeVisible();
-
-    await page.getByRole("button", { name: /^move$/i }).click();
-    await expect(page.getByRole("dialog")).toBeVisible();
-
-    // Destination queue input should appear.
-    await page.getByPlaceholder(/queue name/i).fill("test.bulk-moved");
-    await page.getByRole("button", { name: /move \d+ jobs?/i }).click();
-    await expectToast(page, /bulk action/i);
-  });
-});
-
 test.describe("Bulk: Delete", () => {
   test("bulk deleting jobs shows success toast", async ({ page }) => {
     for (let i = 0; i < 2; i++) {
@@ -336,8 +347,6 @@ test.describe("Held Jobs: Approve", () => {
 
 test.describe("Held Jobs: Reject", () => {
   test("rejecting a held job shows toast", async ({ page }) => {
-    // Put something fresh in the held state so the previous test doesn't
-    // deplete the list — the seed creates multiple held jobs.
     await page.goto("/ui/held");
     await waitForLoad(page);
 
@@ -384,14 +393,17 @@ test.describe("Scheduled Jobs: Run Now", () => {
 });
 
 // ─── API Keys ────────────────────────────────────────────────────────────────
+// NOTE: These tests run last because creating an API key puts the server into
+// auth-required mode. The test is self-contained: it creates a key, verifies
+// the one-time reveal banner, then deletes the key so the server returns to
+// open mode for subsequent runs.
 
-test.describe("API Keys: Create", () => {
-  test("creates a new API key and shows it once", async ({ page }) => {
+test.describe("API Keys", () => {
+  test("creates a key and deletes it", async ({ page }) => {
     await page.goto("/ui/api-keys");
     await waitForLoad(page);
 
     await page.getByText("Create API Key").click();
-    // The form expands inline.
     await expect(page.getByPlaceholder("e.g. production-worker")).toBeVisible();
 
     await page.getByPlaceholder("e.g. production-worker").fill("e2e-test-key");
@@ -400,30 +412,17 @@ test.describe("API Keys: Create", () => {
     await expectToast(page, "API key created");
     // The raw key is shown once after creation.
     await expect(page.getByText("Copy this key now")).toBeVisible();
-  });
-});
 
-test.describe("API Keys: Delete", () => {
-  test("deletes an API key and removes it from the list", async ({ page }) => {
-    await page.goto("/ui/api-keys");
-    await waitForLoad(page);
-
-    // Create a key to delete.
-    await page.getByText("Create API Key").click();
-    await page.getByPlaceholder("e.g. production-worker").fill("e2e-to-delete");
-    await page.getByText("Create Key").click();
-    await expectToast(page, "API key created");
-
-    // Dismiss the "copy this key" banner, wait for table to update.
+    // Dismiss the one-time reveal banner.
     await page.getByText("Dismiss").click();
     await waitForLoad(page);
 
-    // Find the row and click its delete (X) button.
-    const row = page.locator("tr", { hasText: "e2e-to-delete" });
+    // The key should appear in the table — delete it to restore open mode.
+    const row = page.locator("tr", { hasText: "e2e-test-key" });
     await expect(row).toBeVisible();
     await row.getByRole("button", { name: /delete/i }).click();
 
     await expectToast(page, "API key deleted");
-    await expect(page.getByText("e2e-to-delete")).not.toBeVisible({ timeout: 6_000 });
+    await expect(page.getByText("e2e-test-key")).not.toBeVisible({ timeout: 6_000 });
   });
 });

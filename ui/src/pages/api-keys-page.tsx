@@ -11,7 +11,6 @@ import {
   assignAuthKeyRole,
   unassignAuthKeyRole,
   setStoredApiKey,
-  getStoredApiKey,
 } from "@/lib/api";
 import type { AuthKey, Namespace } from "@/lib/api";
 import { Copy, ChevronDown, ChevronRight, X, AlertTriangle } from "lucide-react";
@@ -58,27 +57,45 @@ export default function ApiKeysPage() {
         expires_at: expiresAt ? new Date(expiresAt).toISOString() : undefined,
       }),
     onSuccess: (data) => {
-      // Store key in localStorage BEFORE invalidating queries so subsequent
-      // requests include it and don't trigger the auth gate.
-      if (!getStoredApiKey()) {
-        setStoredApiKey(data.api_key);
-      }
-      qc.invalidateQueries({ queryKey: ["auth-keys"] });
+      // Always store the new key so subsequent requests authenticate.
+      // A stale key from a previously-deleted key must be replaced.
+      setStoredApiKey(data.api_key);
       setCreatedKey(data.api_key);
       setName("");
-      setQueueScope("");
-      setExpiresAt("");
       setShowCreate(false);
       toast.success("API key created");
+      // Optimistically add the key to the cache. The Raft write may not
+      // have propagated to the SQLite read view yet, so a refetch could
+      // return stale data. This makes the table update instantly.
+      qc.setQueryData<AuthKey[]>(["auth-keys"], (old = []) => [
+        ...old,
+        {
+          key_hash: data.api_key.slice(0, 16), // placeholder until refetch
+          name: name.trim(),
+          namespace,
+          role,
+          queue_scope: queueScope.trim() || undefined,
+          enabled: true,
+          created_at: new Date().toISOString(),
+        } as AuthKey,
+      ]);
+      setQueueScope("");
+      setExpiresAt("");
+      qc.invalidateQueries({ queryKey: ["auth-keys"] });
     },
     onError: (err) => toast.error(String(err)),
   });
 
   const deleteMut = useMutation({
     mutationFn: (keyHash: string) => deleteAuthKey(keyHash),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["auth-keys"] });
+    onSuccess: (_data, keyHash) => {
+      // Optimistically remove the key from the cache so the table
+      // updates instantly, regardless of Raft→SQLite propagation delay.
+      qc.setQueryData<AuthKey[]>(["auth-keys"], (old = []) =>
+        old.filter((k) => k.key_hash !== keyHash),
+      );
       toast.success("API key deleted");
+      qc.invalidateQueries({ queryKey: ["auth-keys"] });
     },
     onError: (err) => toast.error(String(err)),
   });

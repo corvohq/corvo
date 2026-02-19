@@ -2,7 +2,9 @@ import { spawn, execSync } from "child_process";
 import { rm } from "fs/promises";
 import * as path from "path";
 import * as net from "net";
+import { fileURLToPath } from "url";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CORVO_BIN = path.resolve(__dirname, "../../../corvo");
 const DATA_DIR = "/tmp/corvo-e2e-data";
 const SERVER_PORT = 8080;
@@ -31,43 +33,39 @@ function waitForPort(port: number, timeout = 15_000): Promise<void> {
 }
 
 export default async function globalSetup() {
-  // Check if a server is already running on port 8080.
-  // If so, assume the developer is managing it and just seed against it.
-  const alreadyRunning = await new Promise<boolean>((resolve) => {
-    const socket = net.connect(SERVER_PORT, "127.0.0.1");
-    socket.on("connect", () => { socket.destroy(); resolve(true); });
-    socket.on("error", () => { socket.destroy(); resolve(false); });
+  // Always start from a clean slate: kill anything on the port, wipe data.
+  // This avoids stale state (e.g. leftover API keys) from previous test runs.
+  console.log(`[e2e] Killing any process on :${SERVER_PORT}...`);
+  try {
+    execSync(`lsof -ti:${SERVER_PORT} | xargs kill -9`, { stdio: "ignore" });
+    // Give the old process a moment to release the port.
+    await new Promise((r) => setTimeout(r, 500));
+  } catch {
+    // Nothing was running — that's fine.
+  }
+
+  await rm(DATA_DIR, { recursive: true, force: true });
+
+  const server = spawn(CORVO_BIN, [
+    "server",
+    "--data-dir", DATA_DIR,
+    "--bind", `:${SERVER_PORT}`,
+    "--log-level", "warn",
+  ], { detached: false, stdio: "ignore" });
+
+  server.on("error", (err) => {
+    console.error("[e2e] Failed to start corvo server:", err.message);
+    process.exit(1);
   });
 
-  if (alreadyRunning) {
-    console.log(`[e2e] Using existing server on :${SERVER_PORT}`);
-    // Store sentinel so teardown knows not to kill anything.
-    process.env._CORVO_E2E_EXTERNAL_SERVER = "1";
-  } else {
-    // Start a fresh server with a clean data directory.
-    await rm(DATA_DIR, { recursive: true, force: true });
+  // Store PID so teardown can kill it.
+  process.env._CORVO_E2E_SERVER_PID = String(server.pid);
+  // Keep a reference so Node doesn't GC it.
+  (globalThis as any).__corvoE2EServer = server;
 
-    const server = spawn(CORVO_BIN, [
-      "server",
-      "--data-dir", DATA_DIR,
-      "--bind", `:${SERVER_PORT}`,
-      "--log-level", "warn",
-    ], { detached: false, stdio: "ignore" });
-
-    server.on("error", (err) => {
-      console.error("[e2e] Failed to start corvo server:", err.message);
-      process.exit(1);
-    });
-
-    // Store PID so teardown can kill it.
-    process.env._CORVO_E2E_SERVER_PID = String(server.pid);
-    // Keep a reference so Node doesn't GC it.
-    (globalThis as any).__corvoE2EServer = server;
-
-    console.log(`[e2e] Started corvo server (pid ${server.pid}), waiting for :${SERVER_PORT}...`);
-    await waitForPort(SERVER_PORT);
-    console.log(`[e2e] Server ready`);
-  }
+  console.log(`[e2e] Started corvo server (pid ${server.pid}), waiting for :${SERVER_PORT}...`);
+  await waitForPort(SERVER_PORT);
+  console.log(`[e2e] Server ready`);
 
   // Seed demo data.
   console.log("[e2e] Seeding demo data...");
