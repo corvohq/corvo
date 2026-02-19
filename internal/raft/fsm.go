@@ -27,7 +27,6 @@ type FSM struct {
 	pebble       *pebble.DB
 	sqlite       *sql.DB
 	writeOpts    *pebble.WriteOptions
-	sqliteMirror bool
 	lifecycleOn  bool
 	eventSeq     uint64
 	sqliteAsync  bool
@@ -63,7 +62,6 @@ func NewFSM(pdb *pebble.DB, sqliteDB *sql.DB) *FSM {
 		pebble:       pdb,
 		sqlite:       sqliteDB,
 		writeOpts:    pebble.Sync,
-		sqliteMirror: true,
 		lifecycleOn:  false,
 		eventSeq:     loadEventCursor(pdb),
 	}
@@ -745,9 +743,6 @@ func (f *FSM) SQLiteDB() *sql.DB {
 // syncSQLite runs a function against SQLite. If it fails, we log the error
 // but don't fail the Raft apply — SQLite is a rebuildable materialized view.
 func (f *FSM) syncSQLite(fn func(db sqlExecer) error) {
-	if !f.sqliteMirror {
-		return
-	}
 	if f.sqliteAsync {
 		select {
 		case f.sqliteQueue <- fn:
@@ -769,11 +764,6 @@ func (f *FSM) syncSQLite(fn func(db sqlExecer) error) {
 	f.sqliteDoneN.Add(1)
 }
 
-// SetSQLiteMirrorEnabled toggles synchronous SQLite materialized-view writes.
-func (f *FSM) SetSQLiteMirrorEnabled(enabled bool) {
-	f.sqliteMirror = enabled
-}
-
 // SetLifecycleEventsEnabled toggles lifecycle event persistence.
 func (f *FSM) SetLifecycleEventsEnabled(enabled bool) {
 	f.lifecycleOn = enabled
@@ -783,7 +773,7 @@ func (f *FSM) SetLifecycleEventsEnabled(enabled bool) {
 // been flushed and committed to SQLite. In synchronous mode this is a no-op.
 // Call this after a Raft apply to ensure the SQLite read view is consistent.
 func (f *FSM) FlushSQLiteMirror() {
-	if !f.sqliteMirror || !f.sqliteAsync {
+	if !f.sqliteAsync {
 		return
 	}
 	// Snapshot the queued count. We spin-wait until the committed counter
@@ -853,7 +843,6 @@ func (f *FSM) SQLiteMirrorStatus() map[string]any {
 		pending = queued - done - dropped
 	}
 	out := map[string]any{
-		"enabled": f.sqliteMirror,
 		"async":   f.sqliteAsync,
 		"dropped": dropped,
 		"queued":  queued,

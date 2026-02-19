@@ -64,8 +64,7 @@ var (
 	raftStore           = "badger"
 	schedulerEnabled    = true
 	schedulerInterval   = time.Second
-	sqliteMirrorEnabled = true
-	sqliteMirrorAsync   = true
+	sqliteMirrorAsync = true
 	applyTimeout        = 10 * time.Second
 	shutdownTimeout     = 500 * time.Millisecond
 	discoverMode        string
@@ -142,7 +141,6 @@ func init() {
 	serverCmd.Flags().IntVar(&raftMaxFetchInflight, "raft-max-fetch-inflight", 64, "Max concurrent fetch/fetch-batch applies per queue")
 	serverCmd.Flags().StringVar(&applyMultiMode, "apply-multi-mode", "grouped", "Multi-apply batch mode: grouped (2-3 commits), indexed (1 commit), individual (N commits)")
 	serverCmd.Flags().BoolVar(&noCompression, "no-compression", true, "Disable gzip compression on ConnectRPC responses (enabled by default; set --no-compression=false to enable gzip)")
-	serverCmd.Flags().BoolVar(&sqliteMirrorEnabled, "sqlite-mirror", true, "Enable SQLite materialized view for UI queries (disable for max throughput)")
 	serverCmd.Flags().IntVar(&snapshotThreshold, "snapshot-threshold", 0, "Raft log entries between snapshots (0 = default 4096)")
 	serverCmd.Flags().IntVar(&maxPayloadSize, "max-payload-size", 256*1024, "Maximum job payload size in bytes (default 256KB; 0 to disable)")
 	serverCmd.Flags().BoolVar(&docsEnabled, "docs-enabled", true, "Serve API docs at /docs and /openapi.json")
@@ -192,7 +190,6 @@ func runServer(cmd *cobra.Command, args []string) error {
 		"raft_store", raftStore,
 		"scheduler_enabled", schedulerEnabled,
 		"scheduler_interval", schedulerInterval,
-		"sqlite_mirror_enabled", sqliteMirrorEnabled,
 		"sqlite_mirror_async", sqliteMirrorAsync,
 		"clustered_mode", clusteredMode,
 		"durable_mode", durableMode,
@@ -225,7 +222,6 @@ func runServer(cmd *cobra.Command, args []string) error {
 	clusterCfg.RaftStore = raftStore
 	clusterCfg.RaftNoSync = raftNoSync
 	clusterCfg.PebbleNoSync = pebbleNoSync
-	clusterCfg.SQLiteMirror = sqliteMirrorEnabled
 	clusterCfg.SQLiteMirrorAsync = sqliteMirrorAsync
 	clusterCfg.ApplyTimeout = applyTimeout
 	clusterCfg.ApplyMaxPending = raftMaxPending

@@ -179,7 +179,6 @@ w.Start(context.Background()) // blocks, handles SIGTERM
 | `--raft-store` | `badger` | Log backend: `bolt`, `badger`, `pebble` |
 | `--raft-shards` | `1` | In-process Raft shard groups |
 | `--durable` | `false` | Raft fsync per write (power-loss safe) |
-| `--sqlite-mirror` | `true` | SQLite materialized view for reads |
 | `--apply-multi-mode` | `grouped` | Batch mode: `grouped`, `indexed`, `individual` |
 | `--stream-max-inflight` | `2048` | Max concurrent stream frames |
 | `--stream-max-open` | `4096` | Max open streams |

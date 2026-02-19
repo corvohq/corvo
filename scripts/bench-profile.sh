@@ -75,7 +75,6 @@ mkdir -p "$DATA_DIR"
 $BINARY server \
     --bind "$BIND" \
     --data-dir "$DATA_DIR" \
-    --sqlite-mirror=false \
     --apply-multi-mode "$MULTI_MODE" \
     --raft-store "$RAFT_STORE" \
     --stream-max-inflight 16000 \

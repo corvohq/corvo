@@ -11,7 +11,6 @@ type ClusterConfig struct {
 	RaftStore               string        // Raft log/stable backend: bolt or badger
 	RaftNoSync              bool          // Disable Raft log fsync (unsafe; benchmark only)
 	PebbleNoSync            bool          // Disable Pebble fsync (unsafe; benchmark only)
-	SQLiteMirror            bool          // Synchronously mirror Pebble mutations into SQLite
 	SQLiteMirrorAsync       bool          // Apply SQLite mirror writes asynchronously in background batches
 	Bootstrap               bool          // Bootstrap as single-node cluster
 	JoinAddr                string        // Address of existing leader to join
@@ -38,7 +37,6 @@ func DefaultClusterConfig() ClusterConfig {
 		DataDir:                 "data",
 		RaftBind:                ":9000",
 		RaftStore:               "bolt",
-		SQLiteMirror:            true,
 		Bootstrap:               true,
 		SnapshotThreshold:       4096,
 		SnapshotInterval:        1 * time.Minute,

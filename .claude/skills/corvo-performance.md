@@ -48,7 +48,7 @@ The bench worker assumes acks are processed in FIFO order. When the server proce
 Commit `b1967ba` parallelized ack and fetch Apply calls in the stream handler. Both fire concurrently via goroutines and may land in the same Raft batch window. `applyMultiIndexed` sorts acks before fetches so freed slots are visible. This is correct but can interact with the HasPendingJobs cache — an ack may free a slot that a concurrent fetch doesn't see because the cache still says "empty".
 
 ### SQLite Mirror Under Load
-At very high throughput (>100k ops/sec), the synchronous SQLite mirror adds significant FSM latency. Disabling it (`--sqlite-mirror=false`) in benchmarks removes this bottleneck. In production, use async mode or accept the latency cost for query capability.
+At very high throughput (>100k ops/sec), the synchronous SQLite mirror adds significant FSM latency. Use async mode (`SQLiteMirrorAsync=true`, the default) to keep the mirror off the write critical path.
 
 ### Tombstone Accumulation
 Deleted Pebble keys (append log entries after fetch) leave tombstones until compaction. Under sustained high-throughput workloads, scanning through tombstones is expensive. The cursor mechanism avoids this, but the fallback scan (before cursor) traverses them.
@@ -60,7 +60,6 @@ Deleted Pebble keys (append log entries after fetch) leave tombstones until comp
 bin/corvo server \
   --raft-store badger \           # usually fastest for Raft log
   --raft-shards 4 \               # parallelize writes across shards
-  --sqlite-mirror=false \          # remove SQLite overhead (no search/dashboard)
   --durable=false \                # no fsync (default, use Raft for durability)
   --stream-max-fps 0 \             # remove per-stream rate limit
   --idle-fetch-sleep 10ms \        # faster job pickup
@@ -122,5 +121,5 @@ curl http://localhost:8080/api/v1/debug/runtime
 
 - **HasPendingJobs with Pebble scans:** We tried this and it was a bottleneck. The pure in-memory cache with TTLs is the right approach.
 - **Removing the cursor entirely:** Scanning from `iter.First()` every time traverses tombstones and drops throughput significantly.
-- **Synchronous SQLite for benchmarks:** Disable it (`--sqlite-mirror=false`) when measuring pure throughput.
+- **Synchronous SQLite for benchmarks:** Async mode is the default and keeps SQLite off the write critical path.
 - **Individual Raft applies:** Always use batched mode (`grouped` or `indexed`). The `individual` mode exists only for debugging.

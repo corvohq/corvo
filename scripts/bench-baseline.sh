@@ -196,7 +196,6 @@ start_server() {
         --raft-store "$STORE"
         --raft-shards "$shards"
         --log-level error
-        --sqlite-mirror=false
         --snapshot-threshold 1000000
         --idle-fetch-sleep 10ms
     )

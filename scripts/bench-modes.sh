@@ -41,7 +41,6 @@ WORKER_QUEUES="${WORKER_QUEUES:-}"
 FETCH_POLL_INTERVAL="${FETCH_POLL_INTERVAL:-}"
 IDLE_FETCH_SLEEP="${IDLE_FETCH_SLEEP:-}"
 STREAM_MAX_FPS="${STREAM_MAX_FPS:-}"
-SQLITE_MIRROR="${SQLITE_MIRROR:-false}"
 APPLY_MULTI_MODE="${APPLY_MULTI_MODE:-}"
 COMBINED="${COMBINED:-}"
 
@@ -140,9 +139,6 @@ run_one() {
     fi
     if [ -n "$STREAM_MAX_FPS" ]; then
         common_args+=(--stream-max-fps "$STREAM_MAX_FPS")
-    fi
-    if [ "$SQLITE_MIRROR" = "false" ]; then
-        common_args+=(--sqlite-mirror=false)
     fi
     if [ -n "$APPLY_MULTI_MODE" ]; then
         common_args+=(--apply-multi-mode "$APPLY_MULTI_MODE")

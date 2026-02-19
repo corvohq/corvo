@@ -176,8 +176,8 @@ Response frame: {request_id, acked, jobs[], enqueued_job_ids[], error, leader_ad
 Materialized view rebuilt from Pebble. All source of truth is in Pebble.
 
 ### Write modes
-- **Synchronous** (default): `syncSQLite(fn)` blocks FSM until SQLite updated
-- **Async** (`SQLiteMirrorAsync=true`): enqueue callback → background goroutine batches up to 1024 per transaction
+- **Synchronous**: `syncSQLite(fn)` blocks FSM until SQLite updated
+- **Async** (`SQLiteMirrorAsync=true`, the default): enqueue callback → background goroutine batches up to 1024 per transaction
 
 ### Key tables
 `jobs`, `job_errors`, `job_usage`, `job_iterations`, `queues`, `workers`, `batches`, `unique_locks`, `schedules`, `api_keys`, `audit_logs`, `namespaces`

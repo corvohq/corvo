@@ -174,7 +174,6 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 	// Create FSM
 	fsm := NewFSM(pdb, sqliteDB)
 	fsm.SetPebbleNoSync(cfg.PebbleNoSync)
-	fsm.SetSQLiteMirrorEnabled(cfg.SQLiteMirror)
 	fsm.SetSQLiteMirrorAsync(cfg.SQLiteMirrorAsync)
 	fsm.SetLifecycleEventsEnabled(cfg.LifecycleEvents)
 	fsm.SetApplyMultiMode(cfg.ApplyMultiMode)
@@ -270,7 +269,6 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 		"raft_store", cfg.RaftStore,
 		"raft_no_sync", cfg.RaftNoSync,
 		"pebble_no_sync", cfg.PebbleNoSync,
-		"sqlite_mirror", cfg.SQLiteMirror,
 		"sqlite_mirror_async", cfg.SQLiteMirrorAsync,
 		"lifecycle_events", cfg.LifecycleEvents,
 		"snapshot_threshold", cfg.SnapshotThreshold,
@@ -1755,7 +1753,6 @@ func (c *Cluster) ClusterStatus() map[string]any {
 		"raft_nosync":                    c.config.RaftNoSync,
 		"raft_store":                     c.config.RaftStore,
 		"pebble_nosync":                  c.config.PebbleNoSync,
-		"sqlite_mirror_enabled":          c.config.SQLiteMirror,
 		"sqlite_mirror_async":            c.config.SQLiteMirrorAsync,
 		"lifecycle_events":               c.config.LifecycleEvents,
 		"snapshot_threshold":             c.config.SnapshotThreshold,
