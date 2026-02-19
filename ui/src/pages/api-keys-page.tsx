@@ -65,8 +65,9 @@ export default function ApiKeysPage() {
       setShowCreate(false);
       toast.success("API key created");
       // Optimistically add the key to the cache. The Raft write may not
-      // have propagated to the SQLite read view yet, so a refetch could
-      // return stale data. This makes the table update instantly.
+      // have propagated to the SQLite read view yet, so an immediate
+      // refetch would return stale data and overwrite this.
+      // React Query will naturally sync on window focus or staleTime expiry.
       qc.setQueryData<AuthKey[]>(["auth-keys"], (old = []) => [
         ...old,
         {
@@ -81,7 +82,6 @@ export default function ApiKeysPage() {
       ]);
       setQueueScope("");
       setExpiresAt("");
-      qc.invalidateQueries({ queryKey: ["auth-keys"] });
     },
     onError: (err) => toast.error(String(err)),
   });
@@ -95,7 +95,6 @@ export default function ApiKeysPage() {
         old.filter((k) => k.key_hash !== keyHash),
       );
       toast.success("API key deleted");
-      qc.invalidateQueries({ queryKey: ["auth-keys"] });
     },
     onError: (err) => toast.error(String(err)),
   });
