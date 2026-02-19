@@ -1,4 +1,6 @@
-# Corvo
+<p align="center">
+  <img src=".github/logo.png" alt="Corvo" width="300" />
+</p>
 
 **Corvo is an open-source distributed job system with automatic clustering.**
 
