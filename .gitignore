@@ -6,6 +6,8 @@ bin/
 node_modules/
 ui/node_modules/
 ui/dist/
+ui/playwright-report/
+ui/test-results/
 *.tsbuildinfo
 *.log
 
