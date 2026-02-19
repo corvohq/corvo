@@ -1,16 +1,16 @@
 <p align="center">
-  <img src=".github/logo.png" alt="Corvo" width="300" />
+  <img src=".github/og-image.png" alt="Corvo" width="500" />
 </p>
 
-**Corvo is an open-source distributed job system with automatic clustering.**
+**Corvo is a source-available distributed job system with automatic clustering.**
 
 Single binary. No external dependencies. Production-ready.
 
 ---
 
-## Quickstart (30 seconds)
+## Quickstart
 
-Run a single node:
+Start the server:
 
 ```bash
 corvo server
@@ -19,16 +19,31 @@ corvo server
 Enqueue a job:
 
 ```bash
-corvo enqueue emails.send '{"to":"user@example.com"}'
+corvo enqueue emails.send ‘{"to":"user@example.com"}’
 ```
 
-Start a worker:
+Connect a worker:
 
-```bash
-corvo worker emails.send
+```ts
+import { CorvoClient } from "@corvo/client";
+import { CorvoWorker } from "@corvo/worker";
+
+const client = new CorvoClient("http://localhost:8080", fetch);
+const worker = new CorvoWorker(client, {
+  queues: ["emails.send"],
+  concurrency: 8,
+});
+
+worker.register("emails.send", async (job) => {
+  // handle job.payload
+});
+
+await worker.start();
 ```
 
-That’s it. No Redis. No Postgres. No coordinator.
+Workers pull jobs over HTTP. Use any language — SDKs available for TypeScript, Python, Go, Rust, and Haskell.
+
+No Redis. No Postgres. No coordinator.
 
 ---
 
@@ -262,7 +277,7 @@ Graceful shutdown is supported via SIGTERM.
 
 ## Enterprise Features (Optional)
 
-Corvo is fully open-source and production-ready.
+Corvo is fully source-available and production-ready.
 
 Optional enterprise features provide:
 
@@ -285,8 +300,7 @@ Feature priorities are based on production feedback.
 
 ## License
 
-MIT (core)
-Enterprise extensions available separately.
+FSL (Functional Source License). See [LICENSE.md](LICENSE.md) for details.
 
 ---
 

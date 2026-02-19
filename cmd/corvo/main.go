@@ -40,7 +40,7 @@ func main() {
 var rootCmd = &cobra.Command{
 	Use:   "corvo",
 	Short: "Corvo — language-agnostic job processing system",
-	Long:  "An open-source, language-agnostic job processing system with embedded SQLite.",
+	Long:  "A source-available, language-agnostic job processing system with embedded SQLite.",
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		setupLogging()
 	},
