@@ -2,20 +2,20 @@ version: "3.9"
 
 services:
   corvo-0:
-    image: corvo/corvo
+    image: corvohq/corvo
     command: ["server", "--bind", ":8080", "--raft-bind", ":9400", "--node-id", "corvo-0", "--bootstrap=true"]
     ports: ["8080:8080", "9400:9400"]
     volumes: ["corvo-0-data:/data"]
 
   corvo-1:
-    image: corvo/corvo
+    image: corvohq/corvo
     command: ["server", "--bind", ":8080", "--raft-bind", ":9400", "--node-id", "corvo-1", "--bootstrap=false", "--join", "corvo-0:8080"]
     ports: ["8081:8080", "9401:9400"]
     depends_on: [corvo-0]
     volumes: ["corvo-1-data:/data"]
 
   corvo-2:
-    image: corvo/corvo
+    image: corvohq/corvo
     command: ["server", "--bind", ":8080", "--raft-bind", ":9400", "--node-id", "corvo-2", "--bootstrap=false", "--join", "corvo-0:8080"]
     ports: ["8082:8080", "9402:9400"]
     depends_on: [corvo-0]

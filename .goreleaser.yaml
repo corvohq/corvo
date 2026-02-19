@@ -34,6 +34,38 @@ archives:
       - goos: windows
         formats: [zip]
 
+dockers:
+  - id: corvo-amd64
+    ids: [corvo]
+    goos: linux
+    goarch: amd64
+    dockerfile: deploy/Dockerfile.goreleaser
+    image_templates:
+      - "corvohq/corvo:{{ .Version }}-amd64"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+
+  - id: corvo-arm64
+    ids: [corvo]
+    goos: linux
+    goarch: arm64
+    dockerfile: deploy/Dockerfile.goreleaser
+    image_templates:
+      - "corvohq/corvo:{{ .Version }}-arm64"
+    build_flag_templates:
+      - "--platform=linux/arm64"
+
+docker_manifests:
+  - name_template: "corvohq/corvo:{{ .Version }}"
+    image_templates:
+      - "corvohq/corvo:{{ .Version }}-amd64"
+      - "corvohq/corvo:{{ .Version }}-arm64"
+
+  - name_template: "corvohq/corvo:latest"
+    image_templates:
+      - "corvohq/corvo:{{ .Version }}-amd64"
+      - "corvohq/corvo:{{ .Version }}-arm64"
+
 checksum:
   name_template: "checksums.txt"
 
