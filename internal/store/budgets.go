@@ -87,7 +87,7 @@ func (s *Store) SetBudget(req SetBudgetRequest) (*Budget, error) {
 		OnExceed:  onExceed,
 		CreatedAt: now,
 	}
-	if err := s.applyOp(OpSetBudget, op).Err; err != nil {
+	if err := s.applyOpConsistent(OpSetBudget, op).Err; err != nil {
 		return nil, err
 	}
 	s.budgetConfigState.Store(1)
@@ -107,7 +107,7 @@ func (s *Store) DeleteBudget(scope, target string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.applyOp(OpDeleteBudget, DeleteBudgetOp{Scope: scope, Target: target}).Err; err != nil {
+	if err := s.applyOpConsistent(OpDeleteBudget, DeleteBudgetOp{Scope: scope, Target: target}).Err; err != nil {
 		return err
 	}
 	s.refreshBudgetConfigState()

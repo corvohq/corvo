@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,9 +35,10 @@ type FSM struct {
 	sqliteStop   chan struct{}
 	sqliteDone   chan struct{}
 	sqliteMu     sync.Mutex
-	sqliteDrops  atomic.Uint64
-	sqliteQueued atomic.Uint64
-	sqliteDoneN  atomic.Uint64
+	sqliteDrops     atomic.Uint64
+	sqliteQueued    atomic.Uint64
+	sqliteDoneN     atomic.Uint64
+	sqliteCommitted atomic.Uint64 // items flushed AND tx.Commit()'d
 
 	rebuildMu       sync.Mutex
 	lastRebuildAt   time.Time
@@ -777,6 +779,22 @@ func (f *FSM) SetLifecycleEventsEnabled(enabled bool) {
 	f.lifecycleOn = enabled
 }
 
+// FlushSQLiteMirror blocks until all queued async SQLite mirror writes have
+// been flushed and committed to SQLite. In synchronous mode this is a no-op.
+// Call this after a Raft apply to ensure the SQLite read view is consistent.
+func (f *FSM) FlushSQLiteMirror() {
+	if !f.sqliteMirror || !f.sqliteAsync {
+		return
+	}
+	// Snapshot the queued count. We spin-wait until the committed counter
+	// reaches this value, meaning all items up to this point have been
+	// flushed and tx.Commit()'d.
+	target := f.sqliteQueued.Load()
+	for f.sqliteCommitted.Load() < target {
+		runtime.Gosched()
+	}
+}
+
 // SetSQLiteMirrorAsync toggles async SQLite materialized-view writes.
 func (f *FSM) SetSQLiteMirrorAsync(async bool) {
 	if async == f.sqliteAsync {
@@ -940,6 +958,9 @@ func tryFlush(f *FSM, batch []func(db sqlExecer) error) bool {
 		}
 		slog.Error("sqlite mirror commit failed", "error", err)
 	}
+	// Signal committed count after tx.Commit() so FlushSQLiteMirror waiters
+	// only unblock once the data is visible to other SQLite readers.
+	f.sqliteCommitted.Add(uint64(len(batch)))
 	return true
 }
 

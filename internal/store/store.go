@@ -60,6 +60,19 @@ func (s *Store) applyOp(opType OpType, data any) *OpResult {
 	return res
 }
 
+// applyOpConsistent is like applyOp but additionally flushes the async SQLite
+// mirror after a successful write. Use this for low-frequency admin/config
+// operations where the caller (e.g. the UI) immediately reads back from SQLite.
+// High-frequency job/queue operations should use applyOp instead — they rely on
+// SSE events or Pebble reads, not immediate SQLite consistency.
+func (s *Store) applyOpConsistent(opType OpType, data any) *OpResult {
+	res := s.applyOp(opType, data)
+	if res == nil || res.Err == nil {
+		s.applier.FlushSQLiteMirror()
+	}
+	return res
+}
+
 // applyOpResult submits an operation and extracts a typed result.
 func applyOpResult[T any](s *Store, opType OpType, data any) (*T, error) {
 	result := s.applyOp(opType, data)

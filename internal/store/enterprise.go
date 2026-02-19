@@ -4,55 +4,55 @@ package store
 
 // CreateNamespace creates a namespace via Raft.
 func (s *Store) CreateNamespace(name string) error {
-	res := s.applyOp(OpCreateNamespace, CreateNamespaceOp{Name: name})
+	res := s.applyOpConsistent(OpCreateNamespace, CreateNamespaceOp{Name: name})
 	return res.Err
 }
 
 // DeleteNamespace deletes a namespace via Raft.
 func (s *Store) DeleteNamespace(name string) error {
-	res := s.applyOp(OpDeleteNamespace, DeleteNamespaceOp{Name: name})
+	res := s.applyOpConsistent(OpDeleteNamespace, DeleteNamespaceOp{Name: name})
 	return res.Err
 }
 
 // SetAuthRole creates or updates an RBAC role via Raft.
 func (s *Store) SetAuthRole(op SetAuthRoleOp) error {
-	res := s.applyOp(OpSetAuthRole, op)
+	res := s.applyOpConsistent(OpSetAuthRole, op)
 	return res.Err
 }
 
 // DeleteAuthRole deletes an RBAC role via Raft.
 func (s *Store) DeleteAuthRole(name string) error {
-	res := s.applyOp(OpDeleteAuthRole, DeleteAuthRoleOp{Name: name})
+	res := s.applyOpConsistent(OpDeleteAuthRole, DeleteAuthRoleOp{Name: name})
 	return res.Err
 }
 
 // AssignAPIKeyRole assigns a role to an API key via Raft.
 func (s *Store) AssignAPIKeyRole(op AssignAPIKeyRoleOp) error {
-	res := s.applyOp(OpAssignAPIKeyRole, op)
+	res := s.applyOpConsistent(OpAssignAPIKeyRole, op)
 	return res.Err
 }
 
 // UnassignAPIKeyRole removes a role assignment from an API key via Raft.
 func (s *Store) UnassignAPIKeyRole(keyHash, role string) error {
-	res := s.applyOp(OpUnassignAPIKeyRole, UnassignAPIKeyRoleOp{KeyHash: keyHash, Role: role})
+	res := s.applyOpConsistent(OpUnassignAPIKeyRole, UnassignAPIKeyRoleOp{KeyHash: keyHash, Role: role})
 	return res.Err
 }
 
 // SetSSOSettings updates SSO configuration via Raft.
 func (s *Store) SetSSOSettings(op SetSSOSettingsOp) error {
-	res := s.applyOp(OpSetSSOSettings, op)
+	res := s.applyOpConsistent(OpSetSSOSettings, op)
 	return res.Err
 }
 
 // UpsertAPIKey creates or updates an API key via Raft.
 func (s *Store) UpsertAPIKey(op UpsertAPIKeyOp) error {
-	res := s.applyOp(OpUpsertAPIKey, op)
+	res := s.applyOpConsistent(OpUpsertAPIKey, op)
 	return res.Err
 }
 
 // DeleteAPIKey deletes an API key via Raft.
 func (s *Store) DeleteAPIKey(keyHash string) error {
-	res := s.applyOp(OpDeleteAPIKey, DeleteAPIKeyOp{KeyHash: keyHash})
+	res := s.applyOpConsistent(OpDeleteAPIKey, DeleteAPIKeyOp{KeyHash: keyHash})
 	return res.Err
 }
 
@@ -68,19 +68,19 @@ func (s *Store) UpdateAPIKeyLastUsed(op UpdateAPIKeyUsedOp) {
 
 // SetNamespaceRateLimit sets per-namespace rate limit overrides via Raft.
 func (s *Store) SetNamespaceRateLimit(op SetNamespaceRateLimitOp) error {
-	res := s.applyOp(OpSetNamespaceRateLimit, op)
+	res := s.applyOpConsistent(OpSetNamespaceRateLimit, op)
 	return res.Err
 }
 
 // UpsertWebhook creates or updates a webhook via Raft.
 func (s *Store) UpsertWebhook(op UpsertWebhookOp) error {
-	res := s.applyOp(OpUpsertWebhook, op)
+	res := s.applyOpConsistent(OpUpsertWebhook, op)
 	return res.Err
 }
 
 // DeleteWebhook deletes a webhook via Raft.
 func (s *Store) DeleteWebhook(id string) error {
-	res := s.applyOp(OpDeleteWebhook, DeleteWebhookOp{ID: id})
+	res := s.applyOpConsistent(OpDeleteWebhook, DeleteWebhookOp{ID: id})
 	return res.Err
 }
 

@@ -20,6 +20,19 @@ func testStore(t *testing.T) *store.Store {
 	return store.NewStore(da, da.SQLiteDB())
 }
 
+// testStoreAsync creates a Store with async SQLite mirror enabled,
+// matching the production default where SQLite writes are batched.
+func testStoreAsync(t *testing.T) *store.Store {
+	t.Helper()
+	da, err := raft.NewDirectApplier(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewDirectApplier: %v", err)
+	}
+	da.SetSQLiteMirrorAsync(true)
+	t.Cleanup(func() { da.Close() })
+	return store.NewStore(da, da.SQLiteDB())
+}
+
 func TestEnqueue(t *testing.T) {
 	s := testStore(t)
 
@@ -705,6 +718,53 @@ func TestFullJobLifecycle(t *testing.T) {
 	job, _ := s.GetJob(enqResult.JobID)
 	if job.State != store.StateCompleted {
 		t.Errorf("final state = %q, want %q", job.State, store.StateCompleted)
+	}
+}
+
+// TestAsyncSQLiteMirrorConsistency verifies that admin write operations
+// (which use applyOpConsistent) provide read-after-write consistency even
+// when the SQLite mirror runs in async mode (the production default).
+func TestAsyncSQLiteMirrorConsistency(t *testing.T) {
+	s := testStoreAsync(t)
+
+	// Create an API key and immediately read it back from SQLite.
+	// Without the flush barrier, this read would return 0 rows because
+	// the async mirror hasn't processed the write yet.
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	err := s.UpsertAPIKey(store.UpsertAPIKeyOp{
+		KeyHash:   "testhash123",
+		Name:      "test-key",
+		Namespace: "default",
+		Role:      "admin",
+		Enabled:   1,
+		CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("UpsertAPIKey: %v", err)
+	}
+
+	// Immediately query SQLite — this must see the key.
+	var count int
+	if err := s.ReadDB().QueryRow(
+		"SELECT COUNT(*) FROM api_keys WHERE key_hash = ?", "testhash123",
+	).Scan(&count); err != nil {
+		t.Fatalf("query api_keys: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("api_keys count = %d after UpsertAPIKey, want 1 (async mirror not flushed?)", count)
+	}
+
+	// Delete the key and verify it's gone immediately.
+	if err := s.DeleteAPIKey("testhash123"); err != nil {
+		t.Fatalf("DeleteAPIKey: %v", err)
+	}
+	if err := s.ReadDB().QueryRow(
+		"SELECT COUNT(*) FROM api_keys WHERE key_hash = ?", "testhash123",
+	).Scan(&count); err != nil {
+		t.Fatalf("query api_keys after delete: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("api_keys count = %d after DeleteAPIKey, want 0 (async mirror not flushed?)", count)
 	}
 }
 

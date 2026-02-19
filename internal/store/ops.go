@@ -85,6 +85,9 @@ type Applier interface {
 	// append-log jobs. Used as a cheap pre-check to avoid submitting empty
 	// fetches through Raft consensus.
 	HasPendingJobs(queues []string) bool
+	// FlushSQLiteMirror blocks until all queued async SQLite mirror writes
+	// have been flushed. Ensures read-after-write consistency.
+	FlushSQLiteMirror()
 }
 
 // MarshalOp creates a serialized Op from type and data.

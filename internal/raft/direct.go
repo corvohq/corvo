@@ -52,6 +52,12 @@ func (d *DirectApplier) Apply(opType store.OpType, data any) *store.OpResult {
 	return result.(*store.OpResult)
 }
 
+// FlushSQLiteMirror blocks until all queued async SQLite mirror writes have
+// been flushed. Implements store.Applier.
+func (d *DirectApplier) FlushSQLiteMirror() {
+	d.fsm.FlushSQLiteMirror()
+}
+
 // HasPendingJobs checks the in-memory cache for pending jobs.
 // Returns true on cache miss (assumes pending) to avoid expensive Pebble scans.
 func (d *DirectApplier) HasPendingJobs(queues []string) bool {
@@ -69,6 +75,11 @@ func (d *DirectApplier) HasPendingJobs(queues []string) bool {
 		return true // cache miss → assume pending
 	}
 	return false
+}
+
+// SetSQLiteMirrorAsync toggles async SQLite mirror mode on the underlying FSM.
+func (d *DirectApplier) SetSQLiteMirrorAsync(async bool) {
+	d.fsm.SetSQLiteMirrorAsync(async)
 }
 
 // SQLiteDB returns the SQLite database for read access.

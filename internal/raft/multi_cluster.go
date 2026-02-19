@@ -187,6 +187,13 @@ func (m *MultiCluster) HasPendingJobs(queues []string) bool {
 	return false
 }
 
+// FlushSQLiteMirror flushes all shards' SQLite mirrors. Implements store.Applier.
+func (m *MultiCluster) FlushSQLiteMirror() {
+	for _, shard := range m.shards {
+		shard.FlushSQLiteMirror()
+	}
+}
+
 // Apply routes mutating operations to the owning shard.
 func (m *MultiCluster) Apply(opType store.OpType, data any) *store.OpResult {
 	if len(m.shards) == 0 {

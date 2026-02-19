@@ -365,6 +365,12 @@ func (c *Cluster) Apply(opType store.OpType, data any) *store.OpResult {
 	}
 }
 
+// FlushSQLiteMirror blocks until all queued async SQLite mirror writes have
+// been flushed. Implements store.Applier.
+func (c *Cluster) FlushSQLiteMirror() {
+	c.fsm.FlushSQLiteMirror()
+}
+
 // preResolveFetch scans Pebble for candidate pending/append jobs outside the
 // serial FSM goroutine. This moves the expensive iterator work to the calling
 // stream goroutine (which runs on any CPU), leaving only cheap O(1) point

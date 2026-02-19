@@ -58,28 +58,12 @@ export default function ApiKeysPage() {
       }),
     onSuccess: (data) => {
       // Always store the new key so subsequent requests authenticate.
-      // A stale key from a previously-deleted key must be replaced.
       setStoredApiKey(data.api_key);
       setCreatedKey(data.api_key);
       setName("");
       setShowCreate(false);
       toast.success("API key created");
-      // Optimistically add the key to the cache. The Raft write may not
-      // have propagated to the SQLite read view yet, so an immediate
-      // refetch would return stale data and overwrite this.
-      // React Query will naturally sync on window focus or staleTime expiry.
-      qc.setQueryData<AuthKey[]>(["auth-keys"], (old = []) => [
-        ...old,
-        {
-          key_hash: data.api_key.slice(0, 16), // placeholder until refetch
-          name: name.trim(),
-          namespace,
-          role,
-          queue_scope: queueScope.trim() || undefined,
-          enabled: true,
-          created_at: new Date().toISOString(),
-        } as AuthKey,
-      ]);
+      qc.invalidateQueries({ queryKey: ["auth-keys"] });
       setQueueScope("");
       setExpiresAt("");
     },
@@ -88,12 +72,8 @@ export default function ApiKeysPage() {
 
   const deleteMut = useMutation({
     mutationFn: (keyHash: string) => deleteAuthKey(keyHash),
-    onSuccess: (_data, keyHash) => {
-      // Optimistically remove the key from the cache so the table
-      // updates instantly, regardless of Raft→SQLite propagation delay.
-      qc.setQueryData<AuthKey[]>(["auth-keys"], (old = []) =>
-        old.filter((k) => k.key_hash !== keyHash),
-      );
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["auth-keys"] });
       toast.success("API key deleted");
     },
     onError: (err) => toast.error(String(err)),
