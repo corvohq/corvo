@@ -20,8 +20,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/corvohq/corvo/sdk/go/client"
-	"github.com/corvohq/corvo/sdk/go/worker"
+	"github.com/corvohq/go-sdk/client"
+	"github.com/corvohq/go-sdk/rpc"
 )
 
 const benchStreamsPerRPCClient = 200
@@ -478,7 +478,7 @@ func benchDoEnqueue(protocol, serverURL string, total, concurrency, workers int,
 	var queueRR atomic.Int64
 	var overloads atomic.Int64
 	var wg sync.WaitGroup
-	var rpcClients []*worker.Client
+	var rpcClients []*rpc.Client
 	if protocol != "http" {
 		rpcClients = benchNewRPCClientPool(serverURL, concurrency)
 	}
@@ -582,19 +582,19 @@ func benchDoEnqueue(protocol, serverURL string, total, concurrency, workers int,
 				if n > remaining {
 					n = remaining
 				}
-				enqueues := make([]worker.LifecycleEnqueueItem, 0, n)
+				enqueues := make([]rpc.LifecycleEnqueueItem, 0, n)
 				for range n {
 					targetQueue := queue
 					if workerQueues {
 						targetQueue = benchWorkerQueueName(queue, workers, int(queueRR.Add(1)-1)%max(workers, 1))
 					}
-					enqueues = append(enqueues, worker.LifecycleEnqueueItem{
+					enqueues = append(enqueues, rpc.LifecycleEnqueueItem{
 						Queue:   targetQueue,
 						Payload: json.RawMessage(`{}`),
 					})
 				}
 				opStart := time.Now()
-				resp, err := stream.Exchange(worker.LifecycleRequest{
+				resp, err := stream.Exchange(rpc.LifecycleRequest{
 					RequestID: reqID,
 					Enqueues:  enqueues,
 				})
@@ -685,7 +685,7 @@ func benchDoLifecycle(protocol string, httpC *http.Client, serverURL string, tot
 	var wg sync.WaitGroup
 	var completedMu sync.Mutex
 	completedIDs := make(map[string]struct{}, total)
-	var rpcClients []*worker.Client
+	var rpcClients []*rpc.Client
 	if protocol != "http" {
 		rpcClients = benchNewRPCClientPool(serverURL, workers*concurrency)
 	}
@@ -814,9 +814,9 @@ func benchDoLifecycle(protocol string, httpC *http.Client, serverURL string, tot
 					ackN = len(pendingOrder)
 				}
 				ackIDs := pendingOrder[:ackN]
-				acks := make([]worker.AckBatchItem, 0, ackN)
+				acks := make([]rpc.AckBatchItem, 0, ackN)
 				for _, id := range ackIDs {
-					acks = append(acks, worker.AckBatchItem{
+					acks = append(acks, rpc.AckBatchItem{
 						JobID:  id,
 						Result: json.RawMessage(`{}`),
 					})
@@ -832,7 +832,7 @@ func benchDoLifecycle(protocol string, httpC *http.Client, serverURL string, tot
 				}
 
 				frameStart := time.Now()
-				resp, err := stream.Exchange(worker.LifecycleRequest{
+				resp, err := stream.Exchange(rpc.LifecycleRequest{
 					RequestID:    requestID,
 					Queues:       []string{wq},
 					WorkerID:     wid,
@@ -1019,7 +1019,7 @@ func benchDoCombined(protocol string, httpC *http.Client, serverURL string, tota
 		return int(completedN.Load())
 	}
 
-	var producerClients, workerClients []*worker.Client
+	var producerClients, workerClients []*rpc.Client
 	if protocol != "http" {
 		// Separate pools for producers and workers — matching real-world usage
 		// where client SDK and worker SDK use different connections. This avoids
@@ -1094,19 +1094,19 @@ func benchDoCombined(protocol string, httpC *http.Client, serverURL string, tota
 				if batchN > remaining {
 					batchN = remaining
 				}
-				enqueues := make([]worker.LifecycleEnqueueItem, 0, batchN)
+				enqueues := make([]rpc.LifecycleEnqueueItem, 0, batchN)
 				for range batchN {
 					targetQueue := queue
 					if workerQueues {
 						targetQueue = benchWorkerQueueName(queue, workers, int(queueRR.Add(1)-1)%max(workers, 1))
 					}
-					enqueues = append(enqueues, worker.LifecycleEnqueueItem{
+					enqueues = append(enqueues, rpc.LifecycleEnqueueItem{
 						Queue:   targetQueue,
 						Payload: json.RawMessage(`{}`),
 					})
 				}
 				opStart := time.Now()
-				resp, err := stream.Exchange(worker.LifecycleRequest{
+				resp, err := stream.Exchange(rpc.LifecycleRequest{
 					RequestID: reqID,
 					Enqueues:  enqueues,
 				})
@@ -1301,9 +1301,9 @@ func benchDoCombined(protocol string, httpC *http.Client, serverURL string, tota
 					ackN = len(pendingOrder)
 				}
 				ackIDs := pendingOrder[:ackN]
-				acks := make([]worker.AckBatchItem, 0, ackN)
+				acks := make([]rpc.AckBatchItem, 0, ackN)
 				for _, id := range ackIDs {
-					acks = append(acks, worker.AckBatchItem{
+					acks = append(acks, rpc.AckBatchItem{
 						JobID:  id,
 						Result: json.RawMessage(`{}`),
 					})
@@ -1318,7 +1318,7 @@ func benchDoCombined(protocol string, httpC *http.Client, serverURL string, tota
 					fetchN = 0
 				}
 
-				resp, err := stream.Exchange(worker.LifecycleRequest{
+				resp, err := stream.Exchange(rpc.LifecycleRequest{
 					RequestID:    requestID,
 					Queues:       []string{wq},
 					WorkerID:     wid,
@@ -1551,7 +1551,7 @@ func benchClearQueues(httpC *http.Client, serverURL, baseQueue string, workers i
 
 // ── RPC client pool ─────────────────────────────────────────────────────────
 
-func benchNewRPCClientPool(serverURL string, totalStreams int) []*worker.Client {
+func benchNewRPCClientPool(serverURL string, totalStreams int) []*rpc.Client {
 	if totalStreams <= 0 {
 		totalStreams = 1
 	}
@@ -1559,9 +1559,9 @@ func benchNewRPCClientPool(serverURL string, totalStreams int) []*worker.Client 
 	if n < 1 {
 		n = 1
 	}
-	clients := make([]*worker.Client, 0, n)
+	clients := make([]*rpc.Client, 0, n)
 	for range n {
-		clients = append(clients, worker.New(serverURL))
+		clients = append(clients, rpc.New(serverURL))
 	}
 	return clients
 }

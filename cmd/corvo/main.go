@@ -27,6 +27,9 @@ import (
 )
 
 var (
+	version  = "0.2.0" // overridden by goreleaser ldflags
+	commit   = "dev"
+	date     = "unknown"
 	logLevel string
 )
 
@@ -179,6 +182,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	pebbleNoSync := true
 
 	slog.Info("starting corvo server",
+		"version", version,
 		"bind", bindAddr,
 		"raft_bind", raftBind,
 		"raft_advertise", raftAdvertise,
@@ -409,6 +413,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if !docsEnabled {
 		opts = append(opts, server.WithDocsDisabled())
 	}
+	opts = append(opts, server.WithVersion(version))
 	srv := server.New(s, cluster, bindAddr, uiFS, opts...)
 	go func() {
 		if err := srv.Start(); err != nil && err != http.ErrServerClosed {

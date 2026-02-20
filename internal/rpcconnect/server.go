@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -86,6 +87,7 @@ type StreamStats struct {
 // Server implements the Connect WorkerService API.
 type Server struct {
 	store         *store.Store
+	version       string
 	streamCfg     StreamConfig
 	frameSem      chan struct{}
 	openCount     atomic.Int64
@@ -153,6 +155,7 @@ func NewHandler(s *store.Store, opts ...func(*Server)) (string, http.Handler, *S
 	if srv.streamCfg.DisableCompression {
 		handlerOpts = append(handlerOpts, connect.WithCompression("gzip", nil, nil))
 	}
+	handlerOpts = append(handlerOpts, connect.WithInterceptors(sdkHeaderInterceptor()))
 	path, handler := corvov1connect.NewWorkerServiceHandler(srv, handlerOpts...)
 	return path, handler, srv
 }
@@ -160,6 +163,11 @@ func NewHandler(s *store.Store, opts ...func(*Server)) (string, http.Handler, *S
 // WithStreamConfig sets the per-stream rate limit / circuit-break config.
 func WithStreamConfig(cfg StreamConfig) func(*Server) {
 	return func(s *Server) { s.streamCfg = cfg }
+}
+
+// WithVersion sets the server version returned by GetServerInfo.
+func WithVersion(v string) func(*Server) {
+	return func(s *Server) { s.version = v }
 }
 
 // WithLeaderCheck enables per-stream leadership verification.
@@ -655,6 +663,47 @@ func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[corvov1.Hea
 		resp.Jobs[jobID] = &corvov1.HeartbeatJobResponse{Status: status.Status}
 	}
 	return connect.NewResponse(resp), nil
+}
+
+func (s *Server) GetServerInfo(ctx context.Context, req *connect.Request[corvov1.GetServerInfoRequest]) (*connect.Response[corvov1.GetServerInfoResponse], error) {
+	return connect.NewResponse(&corvov1.GetServerInfoResponse{
+		ServerVersion: s.version,
+		ApiVersion:    s.version,
+	}), nil
+}
+
+type sdkHeaderLogger struct{}
+
+func sdkHeaderInterceptor() *sdkHeaderLogger { return &sdkHeaderLogger{} }
+
+func logSDKHeaders(headers http.Header, procedure string) {
+	clientName := headers.Get("X-Corvo-Client-Name")
+	clientVersion := headers.Get("X-Corvo-Client-Version")
+	if clientName != "" || clientVersion != "" {
+		slog.Debug("sdk client request",
+			"client_name", clientName,
+			"client_version", clientVersion,
+			"procedure", procedure,
+		)
+	}
+}
+
+func (i *sdkHeaderLogger) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
+	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		logSDKHeaders(req.Header(), req.Spec().Procedure)
+		return next(ctx, req)
+	}
+}
+
+func (i *sdkHeaderLogger) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
+	return next
+}
+
+func (i *sdkHeaderLogger) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
+	return func(ctx context.Context, conn connect.StreamingHandlerConn) error {
+		logSDKHeaders(conn.RequestHeader(), conn.Spec().Procedure)
+		return next(ctx, conn)
+	}
 }
 
 func usageFromPB(in *corvov1.UsageReport) *store.UsageReport {

@@ -62,6 +62,7 @@ type Server struct {
 	h2cTransport     http.RoundTripper
 	maxPayloadBytes  int // 0 means no limit
 	docsDisabled     bool
+	version          string
 }
 
 // Option mutates server behavior.
@@ -136,6 +137,14 @@ func WithMaxPayloadSize(bytes int) Option {
 func WithDocsDisabled() Option {
 	return func(s *Server) error {
 		s.docsDisabled = true
+		return nil
+	}
+}
+
+// WithVersion sets the server version reported by the GetServerInfo RPC.
+func WithVersion(v string) Option {
+	return func(s *Server) error {
+		s.version = v
 		return nil
 	}
 }
@@ -333,6 +342,9 @@ func (s *Server) buildRouter() chi.Router {
 
 	// Worker lifecycle RPC (Connect: protobuf and JSON fallback).
 	var rpcOpts []func(*rpcconnect.Server)
+	if s.version != "" {
+		rpcOpts = append(rpcOpts, rpcconnect.WithVersion(s.version))
+	}
 	if s.streamCfg != nil {
 		rpcOpts = append(rpcOpts, rpcconnect.WithStreamConfig(*s.streamCfg))
 	}

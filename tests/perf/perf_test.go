@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/corvohq/corvo/sdk/go/client"
-	"github.com/corvohq/corvo/sdk/go/worker"
+	"github.com/corvohq/go-sdk/client"
+	"github.com/corvohq/go-sdk/rpc"
 )
 
 func TestPerfE2EEnqueueHTTP(t *testing.T) {
@@ -65,7 +65,7 @@ func TestPerfE2EEnqueueHTTP(t *testing.T) {
 func TestPerfE2ELifecycleRPC(t *testing.T) {
 	baseURL := startRealServer(t, false)
 	c := client.New(baseURL)
-	wc := worker.New(baseURL)
+	wc := rpc.New(baseURL)
 
 	total := envInt("CORVO_PERF_E2E_LC_TOTAL", 3000)
 	concurrency := envInt("CORVO_PERF_E2E_LC_CONCURRENCY", 10)
@@ -89,7 +89,7 @@ func TestPerfE2ELifecycleRPC(t *testing.T) {
 		go func(workerID string) {
 			defer wg.Done()
 			ctx := context.Background()
-			pending := make([]worker.AckBatchItem, 0, ackBatch*2)
+			pending := make([]rpc.AckBatchItem, 0, ackBatch*2)
 			for {
 				if int(done.Load()) >= total {
 					return
@@ -120,7 +120,7 @@ func TestPerfE2ELifecycleRPC(t *testing.T) {
 				if n > remaining {
 					n = remaining
 				}
-				jobs, err := wc.FetchBatch(ctx, worker.FetchRequest{
+				jobs, err := wc.FetchBatch(ctx, rpc.FetchRequest{
 					Queues:        []string{"perf.e2e.rpc"},
 					WorkerID:      workerID,
 					Hostname:      "perf-host",
@@ -136,7 +136,7 @@ func TestPerfE2ELifecycleRPC(t *testing.T) {
 					continue
 				}
 				for _, j := range jobs {
-					pending = append(pending, worker.AckBatchItem{
+					pending = append(pending, rpc.AckBatchItem{
 						JobID:  j.JobID,
 						Result: json.RawMessage(`{}`),
 					})
@@ -163,7 +163,7 @@ func TestPerfE2ELifecycleRPC(t *testing.T) {
 func TestPerfE2ELifecycleStream(t *testing.T) {
 	baseURL := startRealServer(t, false)
 	c := client.New(baseURL)
-	wc := worker.New(baseURL)
+	wc := rpc.New(baseURL)
 
 	total := envInt("CORVO_PERF_E2E_STREAM_TOTAL", 3000)
 	concurrency := envInt("CORVO_PERF_E2E_STREAM_CONCURRENCY", 10)
@@ -201,7 +201,7 @@ func TestPerfE2ELifecycleStream(t *testing.T) {
 			defer stream.Close()
 			var reqID uint64 = 1
 
-			pending := make([]worker.AckBatchItem, 0, ackBatch*2)
+			pending := make([]rpc.AckBatchItem, 0, ackBatch*2)
 			for {
 				if int(done.Load()) >= total && len(pending) == 0 {
 					return
@@ -224,7 +224,7 @@ func TestPerfE2ELifecycleStream(t *testing.T) {
 					}
 				}
 
-				resp, err := stream.Exchange(worker.LifecycleRequest{
+				resp, err := stream.Exchange(rpc.LifecycleRequest{
 					RequestID:    reqID,
 					Queues:       []string{"perf.e2e.stream"},
 					WorkerID:     workerID,
@@ -259,7 +259,7 @@ func TestPerfE2ELifecycleStream(t *testing.T) {
 
 				// Append newly fetched jobs.
 				for _, j := range resp.Jobs {
-					pending = append(pending, worker.AckBatchItem{
+					pending = append(pending, rpc.AckBatchItem{
 						JobID:  j.JobID,
 						Result: json.RawMessage(`{}`),
 					})

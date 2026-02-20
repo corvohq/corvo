@@ -18,12 +18,6 @@ data/
 bench-results/
 bench-*.json
 
-# SDK build artifacts
-sdk/typescript/dist/
-sdk/typescript/node_modules/
-sdk/typescript/package-lock.json
-sdk/typescript-worker/dist/
-sdk/python/**/__pycache__/
-*.pyc
-sdk/rust/target/
-sdk/rust/Cargo.lock
+# Go workspace (local dev only — not committed)
+go.work
+go.work.sum
