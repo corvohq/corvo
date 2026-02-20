@@ -182,7 +182,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	pebbleNoSync := true
 
 	slog.Info("starting corvo server",
-		"version", version,
+		"version", version, "commit", commit, "date", date,
 		"bind", bindAddr,
 		"raft_bind", raftBind,
 		"raft_advertise", raftAdvertise,
