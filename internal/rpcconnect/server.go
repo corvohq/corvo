@@ -673,7 +673,7 @@ func (s *Server) ServerInfoHandler() http.HandlerFunc {
 			"server_version": s.version,
 			"api_version":    s.version,
 		})
-		w.Write(resp)
+		_, _ = w.Write(resp)
 	}
 }
 
