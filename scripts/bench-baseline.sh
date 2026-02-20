@@ -272,7 +272,7 @@ echo ""
 
 # Build once.
 echo "==> Building corvo..."
-go build -o "$BINARY" ./cmd/corvo
+GOWORK=off go build -o "$BINARY" ./cmd/corvo
 
 mkdir -p "$RESULTS_DIR"
 

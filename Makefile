@@ -7,7 +7,7 @@ ui:
 	cd ui && npm install && npm run build
 
 build: ui
-	go build -o $(BUILD_DIR)/$(BINARY) ./cmd/corvo
+	GOWORK=off go build -o $(BUILD_DIR)/$(BINARY) ./cmd/corvo
 
 bench: build
 	./$(BUILD_DIR)/$(BINARY) bench

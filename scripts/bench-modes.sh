@@ -84,7 +84,7 @@ trap cleanup EXIT INT TERM
 
 # Build once.
 echo "==> Building corvo..."
-go build -o "$BINARY" ./cmd/corvo
+GOWORK=off go build -o "$BINARY" ./cmd/corvo
 
 wait_healthy() {
     local url="$1"
