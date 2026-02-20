@@ -22,8 +22,6 @@ require (
 	modernc.org/sqlite v1.45.0
 )
 
-require google.golang.org/genproto v0.0.0-20250115164207-1a7da9e5054f // indirect
-
 require (
 	github.com/DataDog/zstd v1.5.2 // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
