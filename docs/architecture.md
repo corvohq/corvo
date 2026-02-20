@@ -81,6 +81,23 @@ Responsible for:
 
 Scheduler ticks every second.
 
+### Scheduling Latency
+
+Scheduled and retrying jobs are promoted to pending by polling, not event-driven timers.
+
+| Parameter | Default |
+|-----------|---------|
+| Promote interval | 1s |
+| Max defer under load | 10s |
+
+This means:
+
+- A scheduled job becomes eligible up to **~1s** after its `scheduled_at` time
+- Under heavy load, promotion may be deferred up to **~10s** to avoid competing with the enqueue/fetch hot path
+- Timestamps are stored with nanosecond precision internally (for key ordering), but the effective resolution is 1 second
+
+If your workload requires sub-second scheduling precision, Corvo is not the right fit today.
+
 ---
 
 ## Storage Model
