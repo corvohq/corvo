@@ -5,6 +5,9 @@ on:
     branches: [master]
   pull_request:
 
+env:
+  GOPRIVATE: github.com/corvohq/*
+
 jobs:
   lint:
     runs-on: ubuntu-latest

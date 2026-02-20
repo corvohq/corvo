@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	corvov1 "github.com/corvohq/corvo/internal/rpcconnect/gen/corvo/v1"
-	"github.com/corvohq/corvo/internal/rpcconnect/gen/corvo/v1/corvov1connect"
+	corvov1 "github.com/corvohq/proto/gen/corvo/v1"
+	"github.com/corvohq/proto/gen/corvo/v1/corvov1connect"
 	"github.com/corvohq/corvo/internal/store"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -665,11 +665,16 @@ func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[corvov1.Hea
 	return connect.NewResponse(resp), nil
 }
 
-func (s *Server) GetServerInfo(ctx context.Context, req *connect.Request[corvov1.GetServerInfoRequest]) (*connect.Response[corvov1.GetServerInfoResponse], error) {
-	return connect.NewResponse(&corvov1.GetServerInfoResponse{
-		ServerVersion: s.version,
-		ApiVersion:    s.version,
-	}), nil
+// ServerInfoHandler returns a plain HTTP handler for the server info endpoint.
+func (s *Server) ServerInfoHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		resp, _ := json.Marshal(map[string]string{
+			"server_version": s.version,
+			"api_version":    s.version,
+		})
+		w.Write(resp)
+	}
 }
 
 type sdkHeaderLogger struct{}

@@ -21,3 +21,7 @@ bench-*.json
 # Go workspace (local dev only — not committed)
 go.work
 go.work.sum
+
+sdk/python/**/__pycache__/
+sdk/rust/target/
+sdk/rust/Cargo.lock

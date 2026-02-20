@@ -18,8 +18,8 @@ import (
 	"connectrpc.com/connect"
 	"github.com/corvohq/corvo/internal/enterprise"
 	"github.com/corvohq/corvo/internal/raft"
-	corvov1 "github.com/corvohq/corvo/internal/rpcconnect/gen/corvo/v1"
-	"github.com/corvohq/corvo/internal/rpcconnect/gen/corvo/v1/corvov1connect"
+	corvov1 "github.com/corvohq/proto/gen/corvo/v1"
+	"github.com/corvohq/proto/gen/corvo/v1/corvov1connect"
 	"github.com/corvohq/corvo/internal/store"
 	"golang.org/x/net/http2"
 )
