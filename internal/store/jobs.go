@@ -8,7 +8,9 @@ import (
 )
 
 // GetJob returns a job with its error history from local SQLite.
+// Flushes the async SQLite mirror first to ensure read-after-write consistency.
 func (s *Store) GetJob(id string) (*Job, error) {
+	s.applier.FlushSQLiteMirror()
 	var j Job
 	var payload, tags, progress, checkpoint, result, resultSchema, chainConfig, routing, routingTarget sql.NullString // resultSchema/routing/routingTarget kept for SQL compat
 	var agentIterTimeout, holdReason sql.NullString
@@ -202,6 +204,7 @@ func (s *Store) ReplayFromIteration(id string, from int) (*EnqueueResult, error)
 }
 
 func (s *Store) ListJobIterations(id string) ([]JobIteration, error) {
+	s.applier.FlushSQLiteMirror()
 	rows, err := s.sqliteR.Query(`
 		SELECT id, job_id, iteration, status, checkpoint, trace, hold_reason, result,
 			input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,

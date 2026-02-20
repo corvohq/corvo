@@ -42,7 +42,9 @@ type JobSummary struct {
 }
 
 // SearchJobs executes a search query against local SQLite.
+// Flushes the async SQLite mirror first to ensure read-after-write consistency.
 func (s *Store) SearchJobs(filter search.Filter) (*SearchResult, error) {
+	s.applier.FlushSQLiteMirror()
 	start := time.Now()
 
 	query, countQuery, args, countArgs, err := search.BuildQuery(filter)
