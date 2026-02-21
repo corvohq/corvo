@@ -40,10 +40,10 @@ github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06 h1:zuQyyAK
 github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06/go.mod h1:7nc4anLGjupUW/PeY5qiNYsdNXj7zopG+eqsS7To5IQ=
 github.com/coreos/go-oidc/v3 v3.17.0 h1:hWBGaQfbi0iVviX4ibC7bk8OKT5qNr4klBaCHVNvehc=
 github.com/coreos/go-oidc/v3 v3.17.0/go.mod h1:wqPbKFrVnE90vty060SB40FCJ8fTHTxSwyXJqZH+sI8=
-github.com/corvohq/go-sdk v0.2.1 h1:TpBTJGlHSqafg4M1ECXEPmLrurxAkQ20t+7G0BCh1z0=
-github.com/corvohq/go-sdk v0.2.1/go.mod h1:D2Re6yil009eWdKe3DKj4qhg2UxusNor3T7PPzLV4og=
-github.com/corvohq/proto v0.2.0 h1:RjU8NQ9uLL6a5qpsmp3CD6Un+B8ipI6f+RAu0emoutM=
-github.com/corvohq/proto v0.2.0/go.mod h1:wRu5MHs3ZYne2P2pdOcJUiI4Ip0eqOwKEksYpwDWlqE=
+github.com/corvohq/go-sdk v0.3.0 h1:FLX2Q5dSkXvT/mca/6mgeGo2BIm8/cgSRUAYUbc/skQ=
+github.com/corvohq/go-sdk v0.3.0/go.mod h1:A4be2pVe3vejt+/8kPo1yVa3bS5lGjIzqubURpVN6Mo=
+github.com/corvohq/proto v0.3.0 h1:M00mt59zZUm/4QaGZwNO/5vyu5Yb4Qanoye8/OmyW9g=
+github.com/corvohq/proto v0.3.0/go.mod h1:wRu5MHs3ZYne2P2pdOcJUiI4Ip0eqOwKEksYpwDWlqE=
 github.com/cpuguy83/go-md2man/v2 v2.0.6/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6NIQQ7OS05n1F4g=
 github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ33E=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

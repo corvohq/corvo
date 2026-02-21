@@ -27,7 +27,7 @@ import (
 )
 
 var (
-	version  = "0.2.0" // overridden by goreleaser ldflags
+	version  = "0.3.0" // overridden by goreleaser ldflags
 	commit   = "dev"
 	date     = "unknown"
 	logLevel string
