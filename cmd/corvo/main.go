@@ -149,6 +149,13 @@ func init() {
 	serverCmd.Flags().BoolVar(&docsEnabled, "docs-enabled", true, "Serve API docs at /docs and /openapi.json")
 
 	rootCmd.AddCommand(serverCmd)
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "version",
+		Short: "Print the Corvo version",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Printf("corvo %s (commit: %s, built: %s)\n", version, commit, date)
+		},
+	})
 }
 
 func setupLogging() {
