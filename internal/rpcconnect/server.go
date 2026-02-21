@@ -777,6 +777,13 @@ func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[corvov1.Hea
 	return connect.NewResponse(resp), nil
 }
 
+func (s *Server) GetServerInfo(ctx context.Context, req *connect.Request[corvov1.GetServerInfoRequest]) (*connect.Response[corvov1.GetServerInfoResponse], error) {
+	return connect.NewResponse(&corvov1.GetServerInfoResponse{
+		ServerVersion: s.version,
+		ApiVersion:    s.version,
+	}), nil
+}
+
 // ServerInfoHandler returns a plain HTTP handler for the server info endpoint.
 func (s *Server) ServerInfoHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

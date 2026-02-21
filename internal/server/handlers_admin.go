@@ -72,6 +72,13 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 // @Success 200 {object} object
 // @Failure 503 {object} ErrorResponse
 // @Router /healthz [get]
+func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{
+		"server_version": s.version,
+		"api_version":    s.version,
+	})
+}
+
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	// Check DB is accessible
 	if err := s.store.ReadDB().Ping(); err != nil {

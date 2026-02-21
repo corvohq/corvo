@@ -367,6 +367,7 @@ func (s *Server) buildRouter() chi.Router {
 	}
 
 	r.Get("/healthz", s.handleHealthz)
+	r.Get("/api/v1/info", s.handleServerInfo)
 	r.Route("/debug/pprof", func(r chi.Router) {
 		r.Get("/", netpprof.Index)
 		r.Get("/cmdline", netpprof.Cmdline)

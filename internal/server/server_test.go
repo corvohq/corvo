@@ -161,6 +161,23 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
+func TestServerInfoEndpoint(t *testing.T) {
+	_, s := testServer(t)
+	srv := New(s, nil, ":0", nil, WithVersion("1.2.3"))
+	rr := doRequest(srv, "GET", "/api/v1/info", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var info map[string]string
+	decodeResponse(t, rr, &info)
+	if info["server_version"] != "1.2.3" {
+		t.Fatalf("server_version = %q, want %q", info["server_version"], "1.2.3")
+	}
+	if info["api_version"] != "1.2.3" {
+		t.Fatalf("api_version = %q, want %q", info["api_version"], "1.2.3")
+	}
+}
+
 func TestRateLimitMiddlewareDeniesBurst(t *testing.T) {
 	_, s := testServer(t)
 	srv := New(s, nil, ":0", nil, WithRateLimit(RateLimitConfig{
