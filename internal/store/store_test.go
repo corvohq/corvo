@@ -893,3 +893,141 @@ func TestBulkGetJobsEmpty(t *testing.T) {
 		t.Fatalf("got %d jobs, want 0", len(jobs))
 	}
 }
+
+// testStoreWithEvents creates a Store with lifecycle events enabled and returns
+// both the store and DirectApplier so the caller can read the event log.
+func testStoreWithEvents(t *testing.T) (*store.Store, *raft.DirectApplier) {
+	t.Helper()
+	da, err := raft.NewDirectApplier(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewDirectApplier: %v", err)
+	}
+	da.SetLifecycleEventsEnabled(true)
+	t.Cleanup(func() { _ = da.Close() })
+	s := store.NewStore(da, da.SQLiteDB())
+	t.Cleanup(func() { _ = s.Close() })
+	return s, da
+}
+
+func TestHeartbeatProgressEmitsLifecycleEvent(t *testing.T) {
+	s, da := testStoreWithEvents(t)
+
+	// Enqueue and fetch a job (transitions: enqueued → started)
+	enqResult, err := s.Enqueue(store.EnqueueRequest{
+		Queue:   "progress.queue",
+		Payload: json.RawMessage(`{"task":"build"}`),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	_, err = s.Fetch(store.FetchRequest{
+		Queues:   []string{"progress.queue"},
+		WorkerID: "w1",
+		Hostname: "h1",
+	})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	// Send heartbeat with progress data
+	progressData := map[string]interface{}{
+		"current": 3,
+		"total":   9,
+		"message": "Building environment",
+	}
+	_, err = s.Heartbeat(store.HeartbeatRequest{
+		Jobs: map[string]store.HeartbeatJobUpdate{
+			enqResult.JobID: {
+				Progress: progressData,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+
+	// Read all lifecycle events
+	events, err := da.EventLog(0, 100)
+	if err != nil {
+		t.Fatalf("EventLog: %v", err)
+	}
+
+	// Find the "progress" event
+	var progressEvent map[string]any
+	for _, ev := range events {
+		if ev["type"] == "progress" {
+			progressEvent = ev
+			break
+		}
+	}
+	if progressEvent == nil {
+		t.Fatalf("no progress event found in %d lifecycle events: %v", len(events), events)
+	}
+
+	// Verify event fields
+	if progressEvent["job_id"] != enqResult.JobID {
+		t.Errorf("progress event job_id = %v, want %v", progressEvent["job_id"], enqResult.JobID)
+	}
+	if progressEvent["queue"] != "progress.queue" {
+		t.Errorf("progress event queue = %v, want %q", progressEvent["queue"], "progress.queue")
+	}
+
+	// Verify the data payload contains our progress JSON
+	dataRaw, ok := progressEvent["data"]
+	if !ok {
+		t.Fatal("progress event missing data field")
+	}
+	dataBytes, ok := dataRaw.(json.RawMessage)
+	if !ok {
+		t.Fatalf("progress event data is %T, want json.RawMessage", dataRaw)
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(dataBytes, &data); err != nil {
+		t.Fatalf("unmarshal progress data: %v", err)
+	}
+	if data["message"] != "Building environment" {
+		t.Errorf("progress data message = %v, want %q", data["message"], "Building environment")
+	}
+	if data["current"] != float64(3) {
+		t.Errorf("progress data current = %v, want 3", data["current"])
+	}
+	if data["total"] != float64(9) {
+		t.Errorf("progress data total = %v, want 9", data["total"])
+	}
+}
+
+func TestHeartbeatWithoutProgressNoEvent(t *testing.T) {
+	s, da := testStoreWithEvents(t)
+
+	enqResult, _ := s.Enqueue(store.EnqueueRequest{
+		Queue:   "noprog.queue",
+		Payload: json.RawMessage(`{}`),
+	})
+	_, _ = s.Fetch(store.FetchRequest{
+		Queues:   []string{"noprog.queue"},
+		WorkerID: "w1",
+		Hostname: "h1",
+	})
+
+	// Heartbeat without progress
+	_, err := s.Heartbeat(store.HeartbeatRequest{
+		Jobs: map[string]store.HeartbeatJobUpdate{
+			enqResult.JobID: {},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+
+	events, err := da.EventLog(0, 100)
+	if err != nil {
+		t.Fatalf("EventLog: %v", err)
+	}
+
+	// Should have enqueued + started events, but NO progress event
+	for _, ev := range events {
+		if ev["type"] == "progress" {
+			t.Errorf("unexpected progress event: %v", ev)
+		}
+	}
+}

@@ -1,13 +1,16 @@
 package raft
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/cockroachdb/pebble"
 	hashraft "github.com/hashicorp/raft"
+	"github.com/corvohq/corvo/internal/kv"
 	"github.com/corvohq/corvo/internal/store"
 )
 
@@ -85,6 +88,61 @@ func (d *DirectApplier) SetSQLiteMirrorAsync(async bool) {
 // SQLiteDB returns the SQLite database for read access.
 func (d *DirectApplier) SQLiteDB() *sql.DB {
 	return d.sqlite
+}
+
+// SetLifecycleEventsEnabled toggles lifecycle event persistence on the underlying FSM.
+func (d *DirectApplier) SetLifecycleEventsEnabled(enabled bool) {
+	d.fsm.SetLifecycleEventsEnabled(enabled)
+}
+
+// EventLog reads lifecycle events from Pebble with sequence > afterSeq.
+func (d *DirectApplier) EventLog(afterSeq uint64, limit int) ([]map[string]any, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	start := afterSeq + 1
+	iter, err := d.pdb.NewIter(&pebble.IterOptions{
+		LowerBound: kv.EventLogKey(start),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	prefix := kv.EventLogPrefix()
+	events := make([]map[string]any, 0, limit)
+	for iter.First(); iter.Valid() && len(events) < limit; iter.Next() {
+		if !bytes.HasPrefix(iter.Key(), prefix) {
+			break
+		}
+		var ev lifecycleEvent
+		if err := json.Unmarshal(iter.Value(), &ev); err != nil {
+			continue
+		}
+		item := map[string]any{
+			"seq":   ev.Seq,
+			"type":  ev.Type,
+			"at_ns": ev.AtNs,
+		}
+		if ev.JobID != "" {
+			item["job_id"] = ev.JobID
+		}
+		if ev.Queue != "" {
+			item["queue"] = ev.Queue
+		}
+		if len(ev.Data) > 0 {
+			item["data"] = ev.Data
+		}
+		events = append(events, item)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return events, nil
 }
 
 // Close closes both Pebble and SQLite.
