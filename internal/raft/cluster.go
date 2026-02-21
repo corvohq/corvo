@@ -1829,6 +1829,9 @@ func (c *Cluster) EventLog(afterSeq uint64, limit int) ([]map[string]any, error)
 		if ev.Queue != "" {
 			item["queue"] = ev.Queue
 		}
+		if len(ev.Data) > 0 {
+			item["data"] = ev.Data
+		}
 		events = append(events, item)
 	}
 	if err := iter.Error(); err != nil {

@@ -233,6 +233,45 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
+// @Summary Bulk get jobs
+// @Description Returns multiple jobs by ID in a single request. Missing jobs are silently skipped.
+// @Tags Jobs
+// @Accept json
+// @Produce json
+// @Param body body object true "Request body with job_ids array"
+// @Success 200 {object} object
+// @Failure 400 {object} ErrorResponse
+// @Security ApiKeyAuth
+// @Router /jobs/bulk-get [post]
+func (s *Server) handleBulkGetJobs(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
+	var body struct {
+		JobIDs []string `json:"job_ids"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON", "PARSE_ERROR")
+		return
+	}
+	if len(body.JobIDs) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"jobs": []any{}})
+		return
+	}
+	jobs, err := s.store.BulkGetJobs(body.JobIDs)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "VALIDATION_ERROR")
+		return
+	}
+	filtered := make([]*store.Job, 0, len(jobs))
+	for _, j := range jobs {
+		if !enforceNamespaceJob(principal.Namespace, j.Queue) {
+			continue
+		}
+		j.Queue = visibleQueue(principal.Namespace, j.Queue)
+		filtered = append(filtered, j)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": filtered})
+}
+
 // @Summary List agent iterations
 // @Description Returns the iteration history for an agent job (AI loop tracking).
 // @Tags Jobs

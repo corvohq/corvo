@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"encoding/json"
+	"strconv"
 	"testing"
 	"time"
 
@@ -810,5 +811,85 @@ func TestFetchRespectsDependsOn(t *testing.T) {
 	}
 	if second == nil || second.JobID != child.JobID {
 		t.Fatalf("expected dependent child, got %#v", second)
+	}
+}
+
+func TestBulkGetJobs(t *testing.T) {
+	s := testStore(t)
+
+	// Enqueue three jobs.
+	ids := make([]string, 3)
+	for i := 0; i < 3; i++ {
+		r, err := s.Enqueue(store.EnqueueRequest{
+			Queue:   "bulk.queue",
+			Payload: json.RawMessage(`{"i":` + strconv.Itoa(i) + `}`),
+		})
+		if err != nil {
+			t.Fatalf("Enqueue %d: %v", i, err)
+		}
+		ids[i] = r.JobID
+	}
+
+	// Fetch all three.
+	jobs, err := s.BulkGetJobs(ids)
+	if err != nil {
+		t.Fatalf("BulkGetJobs: %v", err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("got %d jobs, want 3", len(jobs))
+	}
+
+	// Verify correct jobs returned.
+	got := map[string]bool{}
+	for _, j := range jobs {
+		got[j.ID] = true
+	}
+	for _, id := range ids {
+		if !got[id] {
+			t.Errorf("missing job %s", id)
+		}
+	}
+}
+
+func TestBulkGetJobsMissing(t *testing.T) {
+	s := testStore(t)
+
+	r, _ := s.Enqueue(store.EnqueueRequest{Queue: "bulk.queue", Payload: json.RawMessage(`{}`)})
+
+	// Mix existing and non-existing IDs.
+	jobs, err := s.BulkGetJobs([]string{r.JobID, "nonexistent-id-123"})
+	if err != nil {
+		t.Fatalf("BulkGetJobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1", len(jobs))
+	}
+	if jobs[0].ID != r.JobID {
+		t.Errorf("got job %s, want %s", jobs[0].ID, r.JobID)
+	}
+}
+
+func TestBulkGetJobsLimit(t *testing.T) {
+	s := testStore(t)
+
+	ids := make([]string, 1001)
+	for i := range ids {
+		ids[i] = "fake-id"
+	}
+	_, err := s.BulkGetJobs(ids)
+	if err == nil {
+		t.Fatal("expected error for >1000 IDs")
+	}
+}
+
+func TestBulkGetJobsEmpty(t *testing.T) {
+	s := testStore(t)
+
+	jobs, err := s.BulkGetJobs([]string{})
+	if err != nil {
+		t.Fatalf("BulkGetJobs: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("got %d jobs, want 0", len(jobs))
 	}
 }

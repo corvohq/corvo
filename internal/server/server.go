@@ -248,6 +248,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/jobs/{id}", s.handleGetJob)
 		r.Get("/jobs/{id}/iterations", s.handleListJobIterations)
 		r.Post("/jobs/search", s.handleSearch)
+		r.Post("/jobs/bulk-get", s.handleBulkGetJobs)
 		r.Get("/search/fulltext", s.handleFullTextSearch)
 		r.Get("/workers", s.handleListWorkers)
 		r.Get("/cluster/status", s.handleClusterStatus)
@@ -350,6 +351,7 @@ func (s *Server) buildRouter() chi.Router {
 	}
 	if s.cluster != nil {
 		rpcOpts = append(rpcOpts, rpcconnect.WithLeaderCheck(&leaderCheckAdapter{server: s}))
+		rpcOpts = append(rpcOpts, rpcconnect.WithEventLogReader(s.cluster))
 	}
 	rpcPath, rpcHandler, rpcSrv := rpcconnect.NewHandler(s.store, rpcOpts...)
 	s.rpcServer = rpcSrv

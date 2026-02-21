@@ -2660,6 +2660,10 @@ func (f *FSM) applyHeartbeatOp(op store.HeartbeatOp) *store.OpResult {
 		logErr(batch.Set(kv.ActiveKey(job.Queue, jobID), kv.PutUint64BE(nil, leaseExpiresNs), f.writeOpts))
 
 		resp.Jobs[jobID] = store.HeartbeatJobResponse{Status: "ok"}
+
+		if len(update.Progress) > 0 {
+			_ = f.appendLifecycleEventWithData(batch, "progress", jobID, job.Queue, op.NowNs, update.Progress)
+		}
 	}
 
 	// Update worker heartbeat
@@ -2676,6 +2680,8 @@ func (f *FSM) applyHeartbeatOp(op store.HeartbeatOp) *store.OpResult {
 			}
 		}
 	}
+
+	logErr(f.appendLifecycleCursor(batch))
 
 	if err := batch.Commit(f.writeOpts); err != nil {
 		return &store.OpResult{Err: fmt.Errorf("pebble commit heartbeat: %w", err)}

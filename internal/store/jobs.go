@@ -145,6 +145,23 @@ func (s *Store) GetJob(id string) (*Job, error) {
 	return &j, rows.Err()
 }
 
+// BulkGetJobs returns jobs for the given IDs. Missing jobs are silently skipped.
+// At most 1000 IDs are accepted.
+func (s *Store) BulkGetJobs(ids []string) ([]*Job, error) {
+	if len(ids) > 1000 {
+		return nil, fmt.Errorf("bulk-get limited to 1000 IDs, got %d", len(ids))
+	}
+	jobs := make([]*Job, 0, len(ids))
+	for _, id := range ids {
+		j, err := s.GetJob(id)
+		if err != nil {
+			continue // skip missing
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, nil
+}
+
 func (s *Store) ReplayFromIteration(id string, from int) (*EnqueueResult, error) {
 	if from <= 0 {
 		return nil, fmt.Errorf("from iteration must be > 0")

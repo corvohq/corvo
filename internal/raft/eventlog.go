@@ -9,11 +9,12 @@ import (
 )
 
 type lifecycleEvent struct {
-	Seq   uint64 `json:"seq"`
-	Type  string `json:"type"`
-	JobID string `json:"job_id,omitempty"`
-	Queue string `json:"queue,omitempty"`
-	AtNs  uint64 `json:"at_ns"`
+	Seq   uint64          `json:"seq"`
+	Type  string          `json:"type"`
+	JobID string          `json:"job_id,omitempty"`
+	Queue string          `json:"queue,omitempty"`
+	AtNs  uint64          `json:"at_ns"`
+	Data  json.RawMessage `json:"data,omitempty"`
 }
 
 func loadEventCursor(db *pebble.DB) uint64 {
@@ -39,6 +40,22 @@ func (f *FSM) appendLifecycleEvent(batch *pebble.Batch, typ, jobID, queue string
 		JobID: jobID,
 		Queue: queue,
 		AtNs:  atNs,
+	}
+	return f.appendEventDoc(batch, ev)
+}
+
+func (f *FSM) appendLifecycleEventWithData(batch *pebble.Batch, typ, jobID, queue string, atNs uint64, data json.RawMessage) error {
+	if !f.lifecycleOn {
+		return nil
+	}
+	f.eventSeq++
+	ev := lifecycleEvent{
+		Seq:   f.eventSeq,
+		Type:  typ,
+		JobID: jobID,
+		Queue: queue,
+		AtNs:  atNs,
+		Data:  data,
 	}
 	return f.appendEventDoc(batch, ev)
 }

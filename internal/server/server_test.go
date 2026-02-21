@@ -43,7 +43,10 @@ func (m mockCluster) ClusterStatus() map[string]any {
 func (m mockCluster) State() string                  { return "follower" }
 func (m mockCluster) RebuildSQLiteFromPebble() error { return nil }
 func (m mockCluster) EventLog(afterSeq uint64, limit int) ([]map[string]any, error) {
-	return []map[string]any{{"seq": 1, "type": "enqueued"}}, nil
+	if afterSeq >= 1 {
+		return nil, nil // no more events after seq 1
+	}
+	return []map[string]any{{"seq": float64(1), "type": "enqueued", "queue": "test.q", "job_id": "j1"}}, nil
 }
 
 type mockClusterWithVoter struct {
@@ -1538,5 +1541,247 @@ func TestConnectWorkerLifecycleStream(t *testing.T) {
 		if got.State != store.StateCompleted {
 			t.Fatalf("job %s state = %s want completed", job.GetJobId(), got.State)
 		}
+	}
+}
+
+// --- BulkGetJobs endpoint tests ---
+
+func TestBulkGetJobsEndpoint(t *testing.T) {
+	srv, _ := testServer(t)
+
+	// Enqueue two jobs.
+	var ids []string
+	for i := 0; i < 2; i++ {
+		rr := doRequest(srv, "POST", "/api/v1/enqueue", map[string]any{
+			"queue":   "bulk.q",
+			"payload": map[string]int{"i": i},
+		})
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("enqueue %d: status %d", i, rr.Code)
+		}
+		var result store.EnqueueResult
+		decodeResponse(t, rr, &result)
+		ids = append(ids, result.JobID)
+	}
+
+	// Bulk get both.
+	rr := doRequest(srv, "POST", "/api/v1/jobs/bulk-get", map[string]any{
+		"job_ids": ids,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("bulk-get status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Jobs []map[string]any `json:"jobs"`
+	}
+	decodeResponse(t, rr, &out)
+	if len(out.Jobs) != 2 {
+		t.Fatalf("got %d jobs, want 2", len(out.Jobs))
+	}
+}
+
+func TestBulkGetJobsEndpointMissing(t *testing.T) {
+	srv, _ := testServer(t)
+
+	rr := doRequest(srv, "POST", "/api/v1/jobs/bulk-get", map[string]any{
+		"job_ids": []string{"nonexistent-1", "nonexistent-2"},
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("bulk-get status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Jobs []map[string]any `json:"jobs"`
+	}
+	decodeResponse(t, rr, &out)
+	if len(out.Jobs) != 0 {
+		t.Fatalf("got %d jobs, want 0", len(out.Jobs))
+	}
+}
+
+func TestBulkGetJobsEndpointEmpty(t *testing.T) {
+	srv, _ := testServer(t)
+
+	rr := doRequest(srv, "POST", "/api/v1/jobs/bulk-get", map[string]any{
+		"job_ids": []string{},
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("bulk-get status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// --- SSE filter helper tests ---
+
+func TestParseCSVSet(t *testing.T) {
+	tests := []struct {
+		input string
+		want  int // expected set size, 0 means nil
+	}{
+		{"", 0},
+		{"  ", 0},
+		{"a,b,c", 3},
+		{" a , b ", 2},
+		{"single", 1},
+		{",,,", 0}, // all empty after trim
+	}
+	for _, tc := range tests {
+		got := parseCSVSet(tc.input)
+		if tc.want == 0 {
+			if got != nil {
+				t.Errorf("parseCSVSet(%q) = %v, want nil", tc.input, got)
+			}
+		} else if len(got) != tc.want {
+			t.Errorf("parseCSVSet(%q) len = %d, want %d", tc.input, len(got), tc.want)
+		}
+	}
+}
+
+func TestMatchSSEFilter(t *testing.T) {
+	ev := map[string]any{
+		"type":   "completed",
+		"queue":  "build",
+		"job_id": "j1",
+	}
+
+	// No filters — matches all.
+	if !matchSSEFilter(ev, nil, nil, nil) {
+		t.Error("nil filters should match all")
+	}
+
+	// Queue filter match.
+	if !matchSSEFilter(ev, map[string]struct{}{"build": {}}, nil, nil) {
+		t.Error("queue filter should match")
+	}
+
+	// Queue filter mismatch.
+	if matchSSEFilter(ev, map[string]struct{}{"deploy": {}}, nil, nil) {
+		t.Error("queue filter should not match")
+	}
+
+	// Type filter match.
+	if !matchSSEFilter(ev, nil, nil, map[string]struct{}{"completed": {}}) {
+		t.Error("type filter should match")
+	}
+
+	// Type filter mismatch.
+	if matchSSEFilter(ev, nil, nil, map[string]struct{}{"progress": {}}) {
+		t.Error("type filter should not match")
+	}
+
+	// Job ID filter match.
+	if !matchSSEFilter(ev, nil, map[string]struct{}{"j1": {}}, nil) {
+		t.Error("job_id filter should match")
+	}
+
+	// Job ID filter mismatch.
+	if matchSSEFilter(ev, nil, map[string]struct{}{"j2": {}}, nil) {
+		t.Error("job_id filter should not match")
+	}
+
+	// Combined filters — all must match.
+	if !matchSSEFilter(ev, map[string]struct{}{"build": {}}, map[string]struct{}{"j1": {}}, map[string]struct{}{"completed": {}}) {
+		t.Error("combined filters should match")
+	}
+	if matchSSEFilter(ev, map[string]struct{}{"build": {}}, map[string]struct{}{"j1": {}}, map[string]struct{}{"progress": {}}) {
+		t.Error("combined filters: type mismatch should fail")
+	}
+}
+
+// --- Subscribe RPC test ---
+
+func TestConnectSubscribeRPC(t *testing.T) {
+	da, err := raft.NewDirectApplier(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewDirectApplier: %v", err)
+	}
+	t.Cleanup(func() { _ = da.Close() })
+	s := store.NewStore(da, da.SQLiteDB())
+	t.Cleanup(func() { _ = s.Close() })
+
+	mc := mockCluster{isLeader: true}
+	srv := New(s, mc, ":0", nil)
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	tr := &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+	httpClient := &http.Client{Transport: tr}
+	client := corvov1connect.NewWorkerServiceClient(httpClient, ts.URL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	stream, err := client.Subscribe(ctx, connect.NewRequest(&corvov1.SubscribeRequest{
+		Types: []string{"enqueued"},
+	}))
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// The mock cluster returns one event at seq 1 with type "enqueued".
+	ok := stream.Receive()
+	if !ok {
+		t.Fatalf("expected to receive an event, err: %v", stream.Err())
+	}
+	ev := stream.Msg()
+	if ev.GetType() != "enqueued" {
+		t.Fatalf("event type = %q, want %q", ev.GetType(), "enqueued")
+	}
+	if ev.GetSeq() != 1 {
+		t.Fatalf("event seq = %d, want 1", ev.GetSeq())
+	}
+	if ev.GetJobId() != "j1" {
+		t.Fatalf("event job_id = %q, want %q", ev.GetJobId(), "j1")
+	}
+}
+
+func TestConnectSubscribeRPCFiltersByQueue(t *testing.T) {
+	da, err := raft.NewDirectApplier(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewDirectApplier: %v", err)
+	}
+	t.Cleanup(func() { _ = da.Close() })
+	s := store.NewStore(da, da.SQLiteDB())
+	t.Cleanup(func() { _ = s.Close() })
+
+	mc := mockCluster{isLeader: true}
+	srv := New(s, mc, ":0", nil)
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	tr := &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+	httpClient := &http.Client{Transport: tr}
+	client := corvov1connect.NewWorkerServiceClient(httpClient, ts.URL)
+
+	// Subscribe filtering by queue "test.q" — the mock event has queue "test.q", so it should match.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	stream, err := client.Subscribe(ctx, connect.NewRequest(&corvov1.SubscribeRequest{
+		Queues: []string{"test.q"},
+	}))
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	ok := stream.Receive()
+	if !ok {
+		t.Fatalf("expected event, err: %v", stream.Err())
+	}
+	ev := stream.Msg()
+	if ev.GetQueue() != "test.q" {
+		t.Fatalf("queue = %q, want %q", ev.GetQueue(), "test.q")
 	}
 }

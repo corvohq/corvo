@@ -72,6 +72,11 @@ type LeaderCheck interface {
 	LeaderHTTPURL() string // e.g. "http://10.0.0.2:8080", or "" if unknown
 }
 
+// EventLogReader provides access to the lifecycle event log.
+type EventLogReader interface {
+	EventLog(afterSeq uint64, limit int) ([]map[string]any, error)
+}
+
 // StreamStats exposes lifecycle stream metrics for Prometheus scraping.
 type StreamStats struct {
 	OpenStreams     int64
@@ -86,12 +91,13 @@ type StreamStats struct {
 
 // Server implements the Connect WorkerService API.
 type Server struct {
-	store         *store.Store
-	version       string
-	streamCfg     StreamConfig
-	frameSem      chan struct{}
-	openCount     atomic.Int64
-	leaderCheck   LeaderCheck
+	store          *store.Store
+	version        string
+	streamCfg      StreamConfig
+	frameSem       chan struct{}
+	openCount      atomic.Int64
+	leaderCheck    LeaderCheck
+	eventLogReader EventLogReader
 	framesTotal    atomic.Uint64
 	streamsTotal   atomic.Uint64
 	overloadTotal  atomic.Uint64
@@ -173,6 +179,11 @@ func WithVersion(v string) func(*Server) {
 // WithLeaderCheck enables per-stream leadership verification.
 func WithLeaderCheck(lc LeaderCheck) func(*Server) {
 	return func(s *Server) { s.leaderCheck = lc }
+}
+
+// WithEventLogReader sets the event log reader for the Subscribe RPC.
+func WithEventLogReader(r EventLogReader) func(*Server) {
+	return func(s *Server) { s.eventLogReader = r }
 }
 
 // checkLeader returns a NOT_LEADER response if this node is not the leader,
@@ -609,6 +620,107 @@ func (s *Server) StreamLifecycle(ctx context.Context, stream *connect.BidiStream
 			return err
 		}
 	}
+}
+
+func (s *Server) Subscribe(ctx context.Context, req *connect.Request[corvov1.SubscribeRequest], stream *connect.ServerStream[corvov1.SubscribeEvent]) error {
+	if s.eventLogReader == nil {
+		return connect.NewError(connect.CodeUnimplemented, fmt.Errorf("event log not available"))
+	}
+
+	// Build filter sets from request.
+	filterQueues := toStringSet(req.Msg.GetQueues())
+	filterJobIDs := toStringSet(req.Msg.GetJobIds())
+	filterTypes := toStringSet(req.Msg.GetTypes())
+	lastSeq := req.Msg.GetLastEventId()
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	keepalive := time.NewTicker(15 * time.Second)
+	defer keepalive.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-keepalive.C:
+			// Send empty keepalive event.
+			if err := stream.Send(&corvov1.SubscribeEvent{}); err != nil {
+				return err
+			}
+		case <-ticker.C:
+			events, err := s.eventLogReader.EventLog(lastSeq, 50)
+			if err != nil || len(events) == 0 {
+				continue
+			}
+			for _, ev := range events {
+				seq, _ := ev["seq"].(float64)
+				lastSeq = uint64(seq)
+
+				if !matchSubscribeFilter(ev, filterQueues, filterJobIDs, filterTypes) {
+					continue
+				}
+
+				evType, _ := ev["type"].(string)
+				jobID, _ := ev["job_id"].(string)
+				queue, _ := ev["queue"].(string)
+				atNs, _ := ev["at_ns"].(float64)
+
+				pbEv := &corvov1.SubscribeEvent{
+					Seq:   uint64(seq),
+					Type:  evType,
+					JobId: jobID,
+					Queue: queue,
+					AtNs:  uint64(atNs),
+				}
+				if data, ok := ev["data"]; ok {
+					if raw, err := json.Marshal(data); err == nil {
+						pbEv.DataJson = string(raw)
+					}
+				}
+				if err := stream.Send(pbEv); err != nil {
+					return err
+				}
+			}
+		}
+	}
+}
+
+func toStringSet(ss []string) map[string]struct{} {
+	if len(ss) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(ss))
+	for _, s := range ss {
+		if s != "" {
+			set[s] = struct{}{}
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return set
+}
+
+func matchSubscribeFilter(ev map[string]any, queues, jobIDs, types map[string]struct{}) bool {
+	if queues != nil {
+		q, _ := ev["queue"].(string)
+		if _, ok := queues[q]; !ok {
+			return false
+		}
+	}
+	if jobIDs != nil {
+		j, _ := ev["job_id"].(string)
+		if _, ok := jobIDs[j]; !ok {
+			return false
+		}
+	}
+	if types != nil {
+		t, _ := ev["type"].(string)
+		if _, ok := types[t]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) Fail(ctx context.Context, req *connect.Request[corvov1.FailRequest]) (*connect.Response[corvov1.FailResponse], error) {
