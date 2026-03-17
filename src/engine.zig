@@ -41,8 +41,8 @@ pub const Config = struct {
     apply_max_pending: u32 = 16384,
     /// Max requests per sub-batch execution (matches batch_max for single commit).
     apply_sub_batch_max: u32 = 1024,
-    /// Replication durability mode for cluster writes.
-    durability: pipeline_mod.Durability = .strong_pipelined,
+    /// true = wait for follower ack. false = replicate in background.
+    sync_replication: bool = false,
     /// Talon fsync disabled (replication is the durability mechanism).
     talon_sync: bool = false,
     /// Clock function for timestamps. Null = use default.
@@ -122,7 +122,7 @@ pub const Engine = struct {
                 .sub_batch_max = self.config.apply_sub_batch_max,
                 .max_pending = self.config.apply_max_pending,
                 .repl_hook = repl_hook,
-                .durability = self.config.durability,
+                .sync_replication = self.config.sync_replication,
             },
         );
         try self.pipeline.?.start();

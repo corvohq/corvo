@@ -243,7 +243,7 @@ pub const Server = struct {
         const num_workers: usize = if (self.config.worker_count > 0)
             self.config.worker_count
         else
-            std.Thread.getCpuCount() catch 4;
+            16;
 
         // Spawn worker threads.
         const workers = try self.allocator.alloc(std.Thread, num_workers);

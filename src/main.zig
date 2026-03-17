@@ -114,7 +114,7 @@ pub fn main() !void {
     var worker_count: u16 = 0;
     var rate_limit_enabled = false;
     var rate_limit_rps: f64 = 1000;
-    var durability: []const u8 = "strong-pipelined";
+    var cluster_replication: []const u8 = "async";
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--bind")) {
@@ -188,9 +188,9 @@ pub fn main() !void {
                 log.err("invalid threads: {s}", .{w_str});
                 return;
             };
-        } else if (std.mem.eql(u8, arg, "--durability")) {
-            durability = args.next() orelse {
-                log.err("--durability requires: eventual, strong, strong-pipelined", .{});
+        } else if (std.mem.eql(u8, arg, "--cluster-replication")) {
+            cluster_replication = args.next() orelse {
+                log.err("--cluster-replication requires: async, sync", .{});
                 return;
             };
         } else if (std.mem.eql(u8, arg, "--rate-limit")) {
@@ -294,17 +294,10 @@ pub fn main() !void {
     }
     defer if (cluster_node) |*cn| cn.deinit();
 
-    const dur: pipeline_mod.Durability = if (std.mem.eql(u8, durability, "eventual"))
-        .eventual
-    else if (std.mem.eql(u8, durability, "strong"))
-        .strong
-    else
-        .strong_pipelined;
-
     var engine = engine_mod.Engine.init(allocator, &stores, .{
         .node_id = if (node_id.len > 0) node_id else "node-1",
         .oplog_path = if (use_oplog) oplog_path_z[0..oplog_path_slice.len :0] else null,
-        .durability = dur,
+        .sync_replication = std.mem.eql(u8, cluster_replication, "sync"),
     });
     defer engine.deinit();
 

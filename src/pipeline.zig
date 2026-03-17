@@ -38,18 +38,12 @@ pub const ReplHook = struct {
     }
 };
 
-pub const Durability = enum {
-    /// Ack client after local commit only. Follower replication is async.
-    /// Fastest. Data loss if leader dies before follower catches up.
-    eventual,
-    /// Ack client only after at least one follower confirms the write.
-    /// Safest. Higher latency (network round-trip per batch).
-    strong,
-    /// Ack client after local commit. Wait for previous batch's follower
-    /// ack before committing the next batch. Same durability as strong
-    /// (at most 1 batch of unacked writes) but overlaps network with local work.
-    /// Best balance of safety and throughput.
-    strong_pipelined,
+// Replication entry for async handoff to background thread.
+const ReplEntryMax = 256 * 1024;
+const ReplRingSize = 256;
+const ReplEntry = struct {
+    data: []u8,
+    len: u32 = 0,
 };
 
 pub const Config = struct {
@@ -67,8 +61,8 @@ pub const Config = struct {
     extend_at: u32 = 64,
     /// Replication hook — called after oplog append with encoded mutations.
     repl_hook: ?ReplHook = null,
-    /// Replication durability mode.
-    durability: Durability = .strong_pipelined,
+    /// true = wait for follower ack. false = replicate in background.
+    sync_replication: bool = false,
 };
 
 // ============================================================================
@@ -220,6 +214,12 @@ pub const Pipeline = struct {
     // Last acked sequence from followers (updated by ack callback).
     last_acked_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    // Async replication ring — pipeline pushes, background thread sends.
+    repl_ring: ?[]ReplEntry = null,
+    repl_write_pos: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    repl_read_pos: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    repl_thread: ?std.Thread = null,
+
     // Stats
     applied_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     overload_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -254,7 +254,18 @@ pub const Pipeline = struct {
     pub fn start(self: *Pipeline) !void {
         if (self.running.load(.monotonic)) return;
         self.running.store(true, .monotonic);
+        // Allocate async repl ring if needed.
+        if (self.config.repl_hook != null and !self.config.sync_replication) {
+            self.repl_ring = try self.allocator.alloc(ReplEntry, ReplRingSize);
+            for (self.repl_ring.?) |*e| {
+                e.data = try self.allocator.alloc(u8, ReplEntryMax);
+                e.len = 0;
+            }
+        }
         self.thread = try std.Thread.spawn(.{}, applyLoop, .{self});
+        if (self.repl_ring != null) {
+            self.repl_thread = try std.Thread.spawn(.{}, replLoop, .{self});
+        }
     }
 
     pub fn stop(self: *Pipeline) void {
@@ -264,6 +275,10 @@ pub const Pipeline = struct {
         if (self.thread) |t| {
             t.join();
             self.thread = null;
+        }
+        if (self.repl_thread) |t| {
+            t.join();
+            self.repl_thread = null;
         }
         // Signal any remaining pending ack entries so callers don't block forever.
         self.ack_mu.lock();
@@ -363,14 +378,16 @@ pub const Pipeline = struct {
                     notify_mod.notifyFromOp(self.notify, req.op_type, &req.data);
                 }
 
-                // Replicate encoded overlay in one message.
+                // Replicate encoded overlay.
                 if (total_mutations > 0) {
-                    const seq = self.oplog.append(0, repl_buf[0..repl_pos]);
-                    self.config.repl_hook.?.replicate(0, seq, repl_buf[0..repl_pos]);
-
-                    if (self.config.durability != .eventual) {
+                    if (self.config.sync_replication) {
+                        // Sync: oplog + send on pipeline thread, defer client signal.
+                        const seq = self.oplog.append(0, repl_buf[0..repl_pos]);
+                        self.config.repl_hook.?.replicate(0, seq, repl_buf[0..repl_pos]);
                         self.pushAckPending(seq, batch_buf[0..batch_size]);
                     } else {
+                        // Async: signal clients now, hand off to background thread.
+                        self.pushReplEntry(repl_buf[0..repl_pos]);
                         for (batch_buf[0..batch_size]) |req| req.event.set();
                     }
                 } else {
@@ -611,6 +628,45 @@ pub const Pipeline = struct {
 
             self.ack_head = (self.ack_head + 1) % ack_ring_size;
             self.ack_count -= 1;
+        }
+    }
+
+    // ========================================================================
+    // Async replication — background thread for oplog + TCP send
+    // ========================================================================
+
+    fn pushReplEntry(self: *Pipeline, data: []const u8) void {
+        const ring = self.repl_ring orelse return;
+        const wp = self.repl_write_pos.load(.monotonic);
+        const rp = self.repl_read_pos.load(.acquire);
+        if (wp - rp >= ReplRingSize) return;
+        const idx = wp % ReplRingSize;
+        const len: u32 = @intCast(@min(data.len, ReplEntryMax));
+        @memcpy(ring[idx].data[0..len], data[0..len]);
+        ring[idx].len = len;
+        self.repl_write_pos.store(wp + 1, .release);
+    }
+
+    fn replLoop(self: *Pipeline) void {
+        const hook = self.config.repl_hook orelse return;
+        const ring = self.repl_ring orelse return;
+
+        while (self.running.load(.monotonic) or self.repl_write_pos.load(.acquire) != self.repl_read_pos.load(.monotonic)) {
+            const wp = self.repl_write_pos.load(.acquire);
+            const rp = self.repl_read_pos.load(.monotonic);
+            if (wp == rp) {
+                std.Thread.sleep(10_000); // 10µs idle
+                continue;
+            }
+            var pos = rp;
+            while (pos < wp) {
+                const idx = pos % ReplRingSize;
+                const entry = &ring[idx];
+                const seq = self.oplog.append(0, entry.data[0..entry.len]);
+                hook.replicate(0, seq, entry.data[0..entry.len]);
+                pos += 1;
+            }
+            self.repl_read_pos.store(pos, .release);
         }
     }
 
