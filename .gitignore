@@ -26,3 +26,9 @@ sdk/python/**/__pycache__/
 sdk/rust/target/
 sdk/rust/Cargo.lock
 sdk/
+
+# Zig
+.zig-cache/
+zig-out/
+*.o
+zig-out/
