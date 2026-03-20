@@ -18,6 +18,19 @@ const OpHandler = handler_mod.OpHandler;
 const QueueNotifier = notify_mod.QueueNotifier;
 
 // ============================================================================
+// CPU Pinning (Linux sched_setaffinity)
+// ============================================================================
+
+/// Pin the calling thread to a specific CPU core via sched_setaffinity(2).
+/// Uses tid=0 to target the current thread.
+pub fn pinCurrentThread(core: usize) void {
+    if (comptime @import("builtin").os.tag != .linux) return;
+    var mask: [16]u64 = [_]u64{0} ** 16; // cpu_set_t (1024 bits)
+    mask[core / 64] = @as(u64, 1) << @intCast(core % 64);
+    _ = std.os.linux.syscall3(.sched_setaffinity, 0, @sizeOf(@TypeOf(mask)), @intFromPtr(&mask));
+}
+
+// ============================================================================
 // Config
 // ============================================================================
 
@@ -315,6 +328,8 @@ pub const Pipeline = struct {
     // ========================================================================
 
     fn applyLoop(self: *Pipeline) void {
+        pinCurrentThread(0); // Pin apply loop to core 0 (most critical thread).
+
         const batch_max: usize = @min(self.config.batch_max, 1024);
         const sub_batch_max: usize = self.config.sub_batch_max;
 
@@ -420,9 +435,8 @@ pub const Pipeline = struct {
         var kv_batch = self.shards[0].newBatch();
         defer kv_batch.close();
 
-        for (batch, 0..) |req, i| {
+        for (batch) |req| {
             req.result = self.handler.apply(&kv_batch, req.op_type, &req.data);
-            if (i % 64 == 63) kv_batch.sortOverlay();
         }
 
         var result = EncodeResult{};
@@ -463,12 +477,8 @@ pub const Pipeline = struct {
         }
         defer if (has_oplog) kv_batch.freeMutations();
 
-        for (batch, 0..) |req, i| {
+        for (batch) |req| {
             req.result = self.handler.apply(&kv_batch, req.op_type, &req.data);
-            // Sort overlay periodically so subsequent batch reads use
-            // binary search (O(log n)) instead of linear scan through
-            // the unsorted tail.
-            if (i % 64 == 63) kv_batch.sortOverlay();
         }
 
         kv_batch.commit();
@@ -648,6 +658,8 @@ pub const Pipeline = struct {
     }
 
     fn replLoop(self: *Pipeline) void {
+        pinCurrentThread(1); // Pin replication loop to core 1.
+
         const hook = self.config.repl_hook orelse return;
         const ring = self.repl_ring orelse return;
 

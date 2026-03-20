@@ -20,6 +20,9 @@ const kv = @import("kv.zig");
 const Mutation = kv.Mutation;
 const MutOp = kv.MutOp;
 
+/// Pre-allocate 256 MB to avoid filesystem metadata updates on each append.
+const prealloc_size: u64 = 256 * 1024 * 1024;
+
 /// Entry header sizes.
 const entry_header_size: usize = 18; // seq(8) + shard(2) + timestamp(8)
 const frame_len_size: usize = 4;
@@ -80,6 +83,8 @@ pub const Log = struct {
             if (self.file) |f| {
                 // Recover existing entries.
                 self.recover(f);
+                // Pre-allocate disk space to reduce metadata updates on append.
+                preallocate(f);
             }
         }
 
@@ -210,6 +215,9 @@ pub const Log = struct {
         // Truncate file to new size (remove leftover bytes from old entries).
         const posix_fd = f.handle;
         std.posix.ftruncate(posix_fd, self.file_size) catch {};
+
+        // Re-allocate space after compaction.
+        preallocate(f);
     }
 
     /// Returns the total number of entries in the log.
@@ -222,6 +230,16 @@ pub const Log = struct {
     // ========================================================================
     // File I/O
     // ========================================================================
+
+    /// Pre-allocate disk blocks via fallocate(2) to avoid filesystem metadata
+    /// updates on each append write. This is a best-effort optimization; failures
+    /// are silently ignored (non-Linux, unsupported filesystem, etc.).
+    fn preallocate(file: std.fs.File) void {
+        if (comptime @import("builtin").os.tag != .linux) return;
+        const fd: usize = @intCast(file.handle);
+        // fallocate(fd, mode=0, offset=0, len)
+        _ = std.os.linux.syscall4(.fallocate, fd, 0, 0, prealloc_size);
+    }
 
     /// Write a single frame to the file.
     fn writeFrame(self: *Log, file: std.fs.File, seq: u64, shard_id: u16, ts: i64, data: []const u8) void {
@@ -246,6 +264,13 @@ pub const Log = struct {
     fn recover(self: *Log, file: std.fs.File) void {
         const stat = file.stat() catch return;
         if (stat.size == 0) return;
+
+        // Hint to the kernel that we'll read this file sequentially.
+        // Enables aggressive read-ahead during recovery scan.
+        if (comptime @import("builtin").os.tag == .linux) {
+            const POSIX_FADV_SEQUENTIAL: usize = 2;
+            _ = std.os.linux.syscall4(.fadvise64, @intCast(file.handle), 0, 0, POSIX_FADV_SEQUENTIAL);
+        }
 
         file.seekTo(0) catch return;
 

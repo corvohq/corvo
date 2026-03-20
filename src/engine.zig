@@ -186,9 +186,8 @@ pub const Engine = struct {
         defer kv_batch.close();
 
         var last_result: ops_mod.OpResult = .{};
-        for (batch_ops, 0..) |op, i| {
+        for (batch_ops) |op| {
             last_result = self.handler.apply(&kv_batch, op.op_type, &op.data);
-            if (i % 64 == 63) kv_batch.sortOverlay();
         }
 
         kv_batch.commit();
@@ -211,7 +210,6 @@ pub const Engine = struct {
         for (batch_ops, 0..) |op, idx| {
             results[idx] = self.handler.apply(&kv_batch, op.op_type, &op.data);
             count += 1;
-            if (idx % 64 == 63) kv_batch.sortOverlay();
         }
 
         kv_batch.commit();

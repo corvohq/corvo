@@ -54,8 +54,9 @@ pub const Store = struct {
     }
 
     /// Create a new write batch for atomic apply.
+    /// Auto-sorts every 64 writes for fast reads during batch execution.
     pub fn newBatch(self: *Store) WriteBatch {
-        return .{ .batch = self.db.newBatch(), .db = self.db };
+        return .{ .batch = self.db.newBatchWithOptions(.{ .sort_every = 64 }), .db = self.db };
     }
 
     /// Close the store. Caller owns the talon.DB lifecycle.
@@ -138,28 +139,21 @@ pub const WriteBatch = struct {
         return .{ .iter = self.batch.newIterBounded(lower, upper) };
     }
 
-    /// Encode the batch overlay directly into a buffer for replication.
-    /// Zero-copy: reads key/value slices from Talon's arena (valid until commit).
-    /// Returns (encoded_len, mutation_count). Does NOT write the count header —
-    /// caller accumulates across sub-batches and writes one header.
+    /// Encode recorded mutations into a buffer for replication.
+    /// Uses corvo's own mutation recording, not talon internals.
     /// Entry format: {op:1}{key_len:2LE}{val_len:4LE}{key}{val}
     pub fn encodeOverlay(self: *WriteBatch, buf: []u8) struct { len: usize, count: u32 } {
-        const writes = self.batch.writes.items;
-        const delete_ranges = self.batch.delete_ranges.items;
-        const total = writes.len + delete_ranges.len;
-        if (total == 0) return .{ .len = 0, .count = 0 };
+        const mutations = self.getMutations();
+        if (mutations.len == 0) return .{ .len = 0, .count = 0 };
 
         var pos: usize = 0;
-
-        for (writes) |m| {
-            const op: u8 = if (m.value != null) 0x01 else 0x02;
+        for (mutations) |m| {
             const key = m.key;
-            const val = m.value orelse "";
-
+            const val = m.value;
             const entry_size = 1 + 2 + 4 + key.len + val.len;
-            if (pos + entry_size > buf.len) return .{ .len = pos, .count = @intCast(total) };
+            if (pos + entry_size > buf.len) return .{ .len = pos, .count = @intCast(mutations.len) };
 
-            buf[pos] = op;
+            buf[pos] = @intFromEnum(m.op);
             pos += 1;
             std.mem.writeInt(u16, buf[pos..][0..2], @intCast(key.len), .little);
             pos += 2;
@@ -173,30 +167,7 @@ pub const WriteBatch = struct {
             }
         }
 
-        for (delete_ranges) |r| {
-            const entry_size = 1 + 2 + 4 + r.start.len + r.end.len;
-            if (pos + entry_size > buf.len) return .{ .len = pos, .count = @intCast(total) };
-
-            buf[pos] = 0x03;
-            pos += 1;
-            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(r.start.len), .little);
-            pos += 2;
-            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(r.end.len), .little);
-            pos += 4;
-            @memcpy(buf[pos..][0..r.start.len], r.start);
-            pos += r.start.len;
-            @memcpy(buf[pos..][0..r.end.len], r.end);
-            pos += r.end.len;
-        }
-
-        return .{ .len = pos, .count = @intCast(total) };
-    }
-
-    /// Sort the write overlay for O(log n) reads instead of O(n).
-    /// Call between handler invocations in a sub-batch to avoid
-    /// linear scan degradation as writes accumulate.
-    pub fn sortOverlay(self: *WriteBatch) void {
-        self.batch.ensureSorted();
+        return .{ .len = pos, .count = @intCast(mutations.len) };
     }
 
     /// Atomically commit all buffered writes.

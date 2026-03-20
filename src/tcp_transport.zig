@@ -15,6 +15,27 @@ const ElectionMsg = transport.ElectionMsg;
 const ReplMsg = transport.ReplMsg;
 
 // ============================================================================
+// TCP_CORK optimization for small message batching
+// ============================================================================
+
+// TCP_CORK (Linux-specific, IPPROTO_TCP level option 3) defers sending until
+// uncorked or the MSS is filled. When multiple small messages are sent in
+// quick succession (election rounds, ack bursts), this coalesces them into
+// fewer TCP segments. TCP_CORK takes precedence over TCP_NODELAY while set.
+const TCP_CORK = 3;
+
+/// Threshold below which we apply TCP_CORK. Election messages are 23 bytes
+/// (4-byte frame header + 19-byte payload), acks are 28 bytes. Anything
+/// under 128 bytes is a "small" control message worth coalescing.
+const CORK_THRESHOLD: usize = 128;
+
+fn setCork(stream: net.Stream, enabled: bool) void {
+    if (comptime @import("builtin").os.tag != .linux) return;
+    const val: c_int = if (enabled) 1 else 0;
+    std.posix.setsockopt(stream.handle, std.posix.IPPROTO.TCP, TCP_CORK, &std.mem.toBytes(val)) catch {};
+}
+
+// ============================================================================
 // Wire format for transport messages
 // ============================================================================
 
@@ -190,6 +211,18 @@ pub const TcpTransport = struct {
         defer if (need_heap) self.allocator.free(buf);
 
         const frame = encodeMsg(buf, msg);
+
+        // TCP_CORK for small messages: cork before write, uncork after.
+        // This lets the kernel coalesce multiple small sends (election
+        // heartbeats, ack bursts) into a single TCP segment. The uncork
+        // triggers an immediate flush, so latency is bounded to the time
+        // between cork and uncork (just the writeAll call). TCP_CORK
+        // overrides TCP_NODELAY while set, which is the desired behavior —
+        // we want batching for small rapid-fire messages.
+        const use_cork = frame.len <= CORK_THRESHOLD;
+        if (use_cork) setCork(stream, true);
+        defer if (use_cork) setCork(stream, false);
+
         stream.writeAll(frame) catch {
             self.peers_mu.lock();
             if (self.peers.getPtr(to)) |p| {
