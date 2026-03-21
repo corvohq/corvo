@@ -709,15 +709,6 @@ pub const IoUringRpcServer = struct {
                 resp_type = rpc.MSG_ACK_BATCH_RESP;
                 resp_payload_len = @intCast(resp.len);
             },
-            rpc.MSG_FETCH_ACK_BATCH => {
-                const resp = self.doFetchAck(payload, wb[HDR..]) catch {
-                    self.setError(conn, "fetch_ack failed");
-                    self.sendFromWorker(conn_id);
-                    return;
-                };
-                resp_type = rpc.MSG_FETCH_ACK_BATCH_RESP;
-                resp_payload_len = @intCast(resp.len);
-            },
             rpc.MSG_FAIL_BATCH => {
                 const resp = self.doFail(payload, wb[HDR..]) catch {
                     self.setError(conn, "fail failed");
@@ -807,7 +798,4 @@ pub const IoUringRpcServer = struct {
         return rpc.processHeartbeat(self.store, payload, resp_buf);
     }
 
-    fn doFetchAck(self: *IoUringRpcServer, payload: []const u8, resp_buf: []u8) ![]const u8 {
-        return rpc.processFetchAckBatch(self.store, self.allocator, payload, resp_buf);
-    }
 };

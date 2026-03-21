@@ -212,69 +212,6 @@ const RpcClient = struct {
         const acked = r.readU16() catch 0;
         return acked;
     }
-    /// Combined fetch+ack in one round-trip. Acks previous jobs, fetches new ones.
-    fn fetchAckBatch(
-        self: *RpcClient,
-        queue: []const u8,
-        count: u16,
-        acks: []const FetchedId,
-        fetched_ids: []FetchedId,
-    ) !u16 {
-        self.req_id +%= 1;
-
-        var w = rpc.BufWriter{ .buf = &self.send_buf };
-        const now_ns: u64 = @intCast(@as(i128, std.time.nanoTimestamp()));
-        w.writeU64(now_ns);
-        w.writeU16(count);
-        w.writeU32(30_000); // lease_ms
-        w.writeLenPrefixed("bench-worker"); // worker_id
-        w.writeU8(1); // queue_count
-        w.writeLenPrefixed(queue);
-
-        // Ack jobs from previous round
-        w.writeU16(@intCast(acks.len));
-        for (acks) |a| {
-            w.writeLenPrefixed(a.id_buf[0..a.id_len]);
-            w.writeLenPrefixed(a.queue_buf[0..a.queue_len]);
-            w.writeU8(0); // ack_status: done
-            w.writeU8(0); // flags: no optional fields
-        }
-
-        try rpc.writeFrame(self.stream, rpc.MSG_FETCH_ACK_BATCH, self.req_id, w.slice());
-
-        const header = try rpc.readHeader(self.stream);
-        if (header.msg_type == rpc.MSG_ERROR) {
-            if (header.length > 0) {
-                try rpc.readExact(self.stream, self.recv_buf[0..header.length]);
-            }
-            return 0;
-        }
-        if (header.length > 0) {
-            try rpc.readExact(self.stream, self.recv_buf[0..header.length]);
-        }
-
-        var r = rpc.BufReader{ .data = self.recv_buf[0..header.length] };
-        const fetched_count = r.readU16() catch 0;
-        const n = @min(fetched_count, @as(u16, @intCast(fetched_ids.len)));
-
-        for (0..n) |i| {
-            const id = r.readLenPrefixed() catch break;
-            const q = r.readLenPrefixed() catch break;
-            @memcpy(fetched_ids[i].id_buf[0..id.len], id);
-            fetched_ids[i].id_len = @intCast(id.len);
-            @memcpy(fetched_ids[i].queue_buf[0..q.len], q);
-            fetched_ids[i].queue_len = @intCast(q.len);
-            // Skip per-job metadata.
-            _ = r.readU16() catch break; // attempt
-            _ = r.readU16() catch break; // max_retries
-            _ = r.readLenPrefixed() catch break; // checkpoint
-            _ = r.readLenPrefixed() catch break; // tags
-            const pl = r.readU16() catch break;
-            r.skip(pl) catch break; // payload data
-        }
-
-        return n;
-    }
 };
 
 const FetchedId = struct {
