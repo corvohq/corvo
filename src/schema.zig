@@ -41,12 +41,6 @@ const ddl =
     \\    group_key TEXT,
     \\    hold_reason TEXT,
     \\    error_msg TEXT,
-    \\    provider_error INTEGER NOT NULL DEFAULT 0,
-    \\    agent_max_iterations INTEGER,
-    \\    agent_max_cost_usd REAL,
-    \\    agent_iteration_timeout TEXT,
-    \\    agent_iteration INTEGER NOT NULL DEFAULT 0,
-    \\    agent_total_cost_usd REAL NOT NULL DEFAULT 0,
     \\    lease_expires_at TEXT,
     \\    scheduled_at TEXT,
     \\    expire_at TEXT,
@@ -91,23 +85,6 @@ const ddl =
     \\CREATE VIRTUAL TABLE IF NOT EXISTS jobs_fts USING fts5(
     \\    job_id UNINDEXED, payload, content='', tokenize='unicode61'
     \\);
-    \\
-    \\-- ============================================================
-    \\-- Job iterations (agent job tracking)
-    \\-- ============================================================
-    \\CREATE TABLE IF NOT EXISTS job_iterations (
-    \\    job_id TEXT NOT NULL,
-    \\    iteration INTEGER NOT NULL,
-    \\    status TEXT NOT NULL DEFAULT 'completed',
-    \\    checkpoint TEXT,
-    \\    result TEXT,
-    \\    cost_usd REAL NOT NULL DEFAULT 0,
-    \\    completed_at TEXT,
-    \\    PRIMARY KEY (job_id, iteration)
-    \\);
-    \\
-    \\CREATE INDEX IF NOT EXISTS idx_job_iterations_job
-    \\    ON job_iterations (job_id);
     \\
     \\-- ============================================================
     \\-- Job errors
@@ -195,27 +172,6 @@ const ddl =
     \\
     \\CREATE UNIQUE INDEX IF NOT EXISTS idx_budgets_scope_target
     \\    ON budgets (scope, target);
-    \\
-    \\-- ============================================================
-    \\-- Job Usage (AI/agent token + cost tracking)
-    \\-- ============================================================
-    \\CREATE TABLE IF NOT EXISTS job_usage (
-    \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    \\    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    \\    queue TEXT NOT NULL,
-    \\    attempt INTEGER NOT NULL DEFAULT 0,
-    \\    input_tokens INTEGER NOT NULL DEFAULT 0,
-    \\    output_tokens INTEGER NOT NULL DEFAULT 0,
-    \\    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-    \\    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-    \\    model TEXT,
-    \\    provider TEXT,
-    \\    cost_usd REAL NOT NULL DEFAULT 0,
-    \\    created_at TEXT NOT NULL
-    \\);
-    \\
-    \\CREATE INDEX IF NOT EXISTS idx_job_usage_job ON job_usage(job_id);
-    \\CREATE INDEX IF NOT EXISTS idx_job_usage_queue ON job_usage(queue, created_at);
     \\
     \\-- ============================================================
     \\-- API Keys

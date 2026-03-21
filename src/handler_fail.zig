@@ -30,6 +30,9 @@ pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops
         var job = codec.decodeJob(job_bytes.?);
         if (job.state != .active) continue;
 
+        // Lease token check: reject stale fails from workers whose lease was reclaimed.
+        if (fail_job.lease_token != 0 and job.lease_token != 0 and fail_job.lease_token != job.lease_token) continue;
+
         // Delete active key + decrement counts
         var ak_buf: keys.KeyBuf = undefined;
         b.delete(OpHandler.jobActiveKey(&ak_buf, &job));
@@ -116,7 +119,7 @@ pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops
                 }
             }
 
-            // Batch completion tracking
+            // Batch completion tracking.
             if (job.batch_id) |bid| {
                 if (bid.len > 0) self.handleBatchJobComplete(b, bid, false, op.now_ns);
             }
@@ -166,6 +169,11 @@ pub fn fireChainOnFailure(self: *OpHandler, b: *kv.WriteBatch, job: *const types
 
     var id_buf: [64]u8 = undefined;
     const chain_job_id = std.fmt.bufPrint(&id_buf, "chain_{s}_{d}", .{ job.id, chain_step_failure }) catch return;
+
+    // Assert: chain failure job must not already exist.
+    var check_jk_buf: keys.KeyBuf = undefined;
+    assert.check(b.get(keys.jobKey(&check_jk_buf, chain_job_id)) == null,
+        "fireChainOnFailure: chain failure job already exists: parent={s}", .{job.id});
 
     const chain_job = ops.EnqueueJob{
         .job_id = chain_job_id,

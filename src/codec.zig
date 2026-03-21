@@ -15,7 +15,7 @@ const types = @import("types.zig");
 // Wire format version
 // ============================================================================
 
-const format_version: u8 = 1;
+const format_version: u8 = 3;
 
 // ============================================================================
 // Encoding helpers
@@ -93,10 +93,10 @@ fn readOptStr(data: []const u8, pos: usize) struct { val: ?[]const u8, next: usi
 }
 
 // ============================================================================
-// Job Header Codec
+// Job Header Codec (v2 — agent fields removed)
 // ============================================================================
 //
-// Fixed fields (49 bytes):
+// Fixed fields:
 //   [0]     version (u8)
 //   [1]     state (u8)
 //   [2]     priority (u8)
@@ -108,25 +108,21 @@ fn readOptStr(data: []const u8, pos: usize) struct { val: ?[]const u8, next: usi
 //   [16..19] unique_period_s (u32 LE)
 //   [20..23] expire_after_ms (u32 LE)
 //   [24..25] chain_step (u16 LE)
-//   [26..29] agent_max_iterations (u32 LE)
-//   [30..33] agent_iteration_timeout (u32 LE)
-//   [34..37] agent_iteration (u32 LE)
-//   [38..45] agent_max_cost_usd (f64 LE)
-//   [46..53] agent_total_cost_usd (f64 LE)
-//   [54..61] created_at_ns (u64 LE)
-//   [62..69] started_at_ns (u64 LE)
-//   [70..77] completed_at_ns (u64 LE)
-//   [78..85] failed_at_ns (u64 LE)
-//   [86..93] scheduled_at_ns (u64 LE)
-//   [94..101] lease_expires_at_ns (u64 LE)
-//   [102..109] expire_at_ns (u64 LE)
+//   [26..33] created_at_ns (u64 LE)
+//   [34..41] started_at_ns (u64 LE)
+//   [42..49] completed_at_ns (u64 LE)
+//   [50..57] failed_at_ns (u64 LE)
+//   [58..65] scheduled_at_ns (u64 LE)
+//   [66..73] lease_expires_at_ns (u64 LE)
+//   [74..81] expire_at_ns (u64 LE)
+//   [82]    flags (u8): reserved
 //
 // Variable fields (length-prefixed, 2-byte LE length each):
 //   id, queue, unique_key, batch_id, worker_id, hostname,
 //   parent_id, chain_id, chain_config, group, hold_reason,
 //   tags, progress, checkpoint, result
 
-const job_fixed_size: usize = 110;
+const job_fixed_size: usize = 91;
 
 /// Maximum encoded job header size. Generous upper bound.
 pub const max_job_encoded_size: usize = 4096;
@@ -151,21 +147,6 @@ pub fn encodeJob(buf: []u8, job: *const types.Job) []const u8 {
     pos = writeU32LE(buf, pos, job.expire_after_ms);
     pos = writeU16LE(buf, pos, job.chain_step);
 
-    // Agent fields (inline — always present, zeroed if no agent)
-    if (job.agent) |a| {
-        pos = writeU32LE(buf, pos, a.max_iterations);
-        pos = writeU32LE(buf, pos, a.iteration_timeout);
-        pos = writeU32LE(buf, pos, a.iteration);
-        pos = writeF64LE(buf, pos, a.max_cost_usd);
-        pos = writeF64LE(buf, pos, a.total_cost_usd);
-    } else {
-        pos = writeU32LE(buf, pos, 0);
-        pos = writeU32LE(buf, pos, 0);
-        pos = writeU32LE(buf, pos, 0);
-        pos = writeF64LE(buf, pos, 0);
-        pos = writeF64LE(buf, pos, 0);
-    }
-
     // Timestamps
     pos = writeU64LE(buf, pos, job.created_at_ns);
     pos = writeU64LE(buf, pos, job.started_at_ns);
@@ -174,6 +155,12 @@ pub fn encodeJob(buf: []u8, job: *const types.Job) []const u8 {
     pos = writeU64LE(buf, pos, job.scheduled_at_ns);
     pos = writeU64LE(buf, pos, job.lease_expires_at_ns);
     pos = writeU64LE(buf, pos, job.expire_at_ns);
+
+    // Flags (reserved)
+    pos = writeU8(buf, pos, 0);
+
+    // Lease token
+    pos = writeU64LE(buf, pos, job.lease_token);
 
     // Variable-length fields
     pos = writeStr(buf, pos, job.id);
@@ -248,28 +235,6 @@ pub fn decodeJob(data: []const u8) types.Job {
     pos = chain_step.next;
     job.chain_step = chain_step.val;
 
-    // Agent fields
-    const a_max_iter = readU32LE(data, pos);
-    pos = a_max_iter.next;
-    const a_timeout = readU32LE(data, pos);
-    pos = a_timeout.next;
-    const a_iter = readU32LE(data, pos);
-    pos = a_iter.next;
-    const a_max_cost = readF64LE(data, pos);
-    pos = a_max_cost.next;
-    const a_total_cost = readF64LE(data, pos);
-    pos = a_total_cost.next;
-
-    if (a_max_iter.val != 0 or a_timeout.val != 0 or a_iter.val != 0) {
-        job.agent = .{
-            .max_iterations = a_max_iter.val,
-            .iteration_timeout = a_timeout.val,
-            .iteration = a_iter.val,
-            .max_cost_usd = a_max_cost.val,
-            .total_cost_usd = a_total_cost.val,
-        };
-    }
-
     // Timestamps
     const created = readU64LE(data, pos);
     pos = created.next;
@@ -298,6 +263,14 @@ pub fn decodeJob(data: []const u8) types.Job {
     const expire_at = readU64LE(data, pos);
     pos = expire_at.next;
     job.expire_at_ns = expire_at.val;
+
+    // Flags
+    pos = readU8(data, pos).next; // flags (reserved)
+
+    // Lease token
+    const lease_token = readU64LE(data, pos);
+    pos = lease_token.next;
+    job.lease_token = lease_token.val;
 
     // Variable fields
     const id = readStr(data, pos);
@@ -768,151 +741,6 @@ pub fn decodeBudget(data: []const u8) types.Budget {
     return bg;
 }
 
-// ============================================================================
-// Usage Report Codec (for ju| values)
-// ============================================================================
-//
-// Fixed layout: [8B input][8B output][8B cacheCreate][8B cacheRead]
-//               [8B costUSD bits][2B queueLen][queue][2B modelLen][model]
-//               [2B providerLen][provider][8B createdAtNs]
-
-const min_usage_kv_len: usize = 8 * 5 + 2 * 3 + 8;
-
-pub fn encodeUsageKV(buf: []u8, u: *const types.UsageReport, queue: []const u8, created_at_ns: u64) []const u8 {
-    assert.check(queue.len > 0, "encodeUsageKV: empty queue", .{});
-    assert.check(created_at_ns > 0, "encodeUsageKV: zero createdAtNs", .{});
-
-    var pos: usize = 0;
-    pos = writeU64LE(buf, pos, u.input_tokens);
-    pos = writeU64LE(buf, pos, u.output_tokens);
-    pos = writeU64LE(buf, pos, u.cache_creation_tokens);
-    pos = writeU64LE(buf, pos, u.cache_read_tokens);
-    pos = writeF64LE(buf, pos, u.cost_usd);
-    pos = writeStr(buf, pos, queue);
-    pos = writeStr(buf, pos, u.model);
-    pos = writeStr(buf, pos, u.provider);
-    pos = writeU64LE(buf, pos, created_at_ns);
-
-    return buf[0..pos];
-}
-
-pub fn decodeUsageKV(data: []const u8) struct { usage: types.UsageReport, queue: []const u8, created_at_ns: u64 } {
-    assert.check(data.len >= min_usage_kv_len, "decodeUsageKV: data too short ({d})", .{data.len});
-
-    var pos: usize = 0;
-    var u: types.UsageReport = .{};
-
-    const input = readU64LE(data, pos);
-    pos = input.next;
-    u.input_tokens = input.val;
-
-    const output = readU64LE(data, pos);
-    pos = output.next;
-    u.output_tokens = output.val;
-
-    const cache_create = readU64LE(data, pos);
-    pos = cache_create.next;
-    u.cache_creation_tokens = cache_create.val;
-
-    const cache_read = readU64LE(data, pos);
-    pos = cache_read.next;
-    u.cache_read_tokens = cache_read.val;
-
-    const cost = readF64LE(data, pos);
-    pos = cost.next;
-    u.cost_usd = cost.val;
-
-    const queue = readStr(data, pos);
-    pos = queue.next;
-
-    const model = readStr(data, pos);
-    pos = model.next;
-    u.model = model.val;
-
-    const provider = readStr(data, pos);
-    pos = provider.next;
-    u.provider = provider.val;
-
-    const created = readU64LE(data, pos);
-    pos = created.next;
-
-    return .{ .usage = u, .queue = queue.val, .created_at_ns = created.val };
-}
-
-// ============================================================================
-// Iteration Codec (for ji| values)
-// ============================================================================
-//
-// Fixed fields:
-//   [0]     version (u8)
-//   [1]     status (u8)
-//   [2..5]  iteration (u32 LE)
-//   [6..13] cost_usd (f64 LE)
-//   [14..21] completed_at_ns (u64 LE)
-//
-// Variable fields:
-//   job_id, checkpoint, result
-
-const iteration_fixed_size: usize = 22;
-pub const max_iteration_encoded_size: usize = 8192;
-
-pub fn encodeIteration(buf: []u8, it: *const types.JobIteration) []const u8 {
-    assert.check(buf.len >= iteration_fixed_size, "encodeIteration: buffer too small", .{});
-
-    var pos: usize = 0;
-    pos = writeU8(buf, pos, format_version);
-    pos = writeU8(buf, pos, @intFromEnum(it.status));
-    pos = writeU32LE(buf, pos, it.iteration);
-    pos = writeF64LE(buf, pos, it.cost_usd);
-    pos = writeU64LE(buf, pos, it.completed_at_ns);
-
-    pos = writeStr(buf, pos, it.job_id);
-    pos = writeOptStr(buf, pos, it.checkpoint);
-    pos = writeOptStr(buf, pos, it.result);
-
-    return buf[0..pos];
-}
-
-pub fn decodeIteration(data: []const u8) types.JobIteration {
-    assert.check(data.len >= iteration_fixed_size, "decodeIteration: data too short ({d})", .{data.len});
-
-    var pos: usize = 0;
-    var it: types.JobIteration = .{};
-
-    const ver = readU8(data, pos);
-    pos = ver.next;
-    assert.check(ver.val == format_version, "decodeIteration: unknown version {d}", .{ver.val});
-
-    const status = readU8(data, pos);
-    pos = status.next;
-    it.status = @enumFromInt(status.val);
-
-    const iteration = readU32LE(data, pos);
-    pos = iteration.next;
-    it.iteration = iteration.val;
-
-    const cost = readF64LE(data, pos);
-    pos = cost.next;
-    it.cost_usd = cost.val;
-
-    const completed = readU64LE(data, pos);
-    pos = completed.next;
-    it.completed_at_ns = completed.val;
-
-    const job_id = readStr(data, pos);
-    pos = job_id.next;
-    it.job_id = job_id.val;
-
-    const checkpoint = readOptStr(data, pos);
-    pos = checkpoint.next;
-    it.checkpoint = checkpoint.val;
-
-    const result = readOptStr(data, pos);
-    pos = result.next;
-    it.result = result.val;
-
-    return it;
-}
 
 // ============================================================================
 // Tests
@@ -935,13 +763,6 @@ test "job encode/decode roundtrip" {
         .batch_id = "batch-1",
         .tags = "[\"urgent\"]",
         .group = "tenant-a",
-        .agent = .{
-            .max_iterations = 10,
-            .max_cost_usd = 5.0,
-            .iteration_timeout = 30000,
-            .iteration = 3,
-            .total_cost_usd = 1.5,
-        },
     };
 
     var buf: [max_job_encoded_size]u8 = undefined;
@@ -964,13 +785,6 @@ test "job encode/decode roundtrip" {
     try testing.expectEqualStrings("batch-1", decoded.batch_id.?);
     try testing.expectEqualStrings("[\"urgent\"]", decoded.tags.?);
     try testing.expectEqualStrings("tenant-a", decoded.group.?);
-
-    const a = decoded.agent.?;
-    try testing.expectEqual(@as(u32, 10), a.max_iterations);
-    try testing.expectEqual(@as(f64, 5.0), a.max_cost_usd);
-    try testing.expectEqual(@as(u32, 30000), a.iteration_timeout);
-    try testing.expectEqual(@as(u32, 3), a.iteration);
-    try testing.expectEqual(@as(f64, 1.5), a.total_cost_usd);
 }
 
 test "job encode/decode minimal" {
@@ -990,7 +804,6 @@ test "job encode/decode minimal" {
     try testing.expectEqual(types.JobState.pending, decoded.state);
     try testing.expect(decoded.unique_key == null);
     try testing.expect(decoded.batch_id == null);
-    try testing.expect(decoded.agent == null);
     try testing.expect(decoded.tags == null);
 }
 
@@ -1098,73 +911,3 @@ test "batch encode/decode roundtrip" {
     try testing.expectEqualStrings("{\"notify\":true}", decoded.callback_payload.?);
 }
 
-test "usage encode/decode roundtrip" {
-    const u = types.UsageReport{
-        .input_tokens = 1000,
-        .output_tokens = 500,
-        .cache_creation_tokens = 100,
-        .cache_read_tokens = 200,
-        .cost_usd = 0.05,
-        .model = "claude-3",
-        .provider = "anthropic",
-    };
-
-    var buf: [512]u8 = undefined;
-    const encoded = encodeUsageKV(&buf, &u, "default", 1710000000000000000);
-    const result = decodeUsageKV(encoded);
-
-    const testing = std.testing;
-    try testing.expectEqual(@as(u64, 1000), result.usage.input_tokens);
-    try testing.expectEqual(@as(u64, 500), result.usage.output_tokens);
-    try testing.expectEqual(@as(f64, 0.05), result.usage.cost_usd);
-    try testing.expectEqualStrings("claude-3", result.usage.model);
-    try testing.expectEqualStrings("anthropic", result.usage.provider);
-    try testing.expectEqualStrings("default", result.queue);
-    try testing.expectEqual(@as(u64, 1710000000000000000), result.created_at_ns);
-}
-
-test "iteration encode/decode roundtrip" {
-    const it = types.JobIteration{
-        .job_id = "agent-job-1",
-        .iteration = 3,
-        .status = .@"continue",
-        .checkpoint = "{\"step\":3}",
-        .result = null,
-        .cost_usd = 0.25,
-        .completed_at_ns = 1710000003000000000,
-    };
-
-    var buf: [max_iteration_encoded_size]u8 = undefined;
-    const encoded = encodeIteration(&buf, &it);
-    const decoded = decodeIteration(encoded);
-
-    const testing = std.testing;
-    try testing.expectEqualStrings("agent-job-1", decoded.job_id);
-    try testing.expectEqual(@as(u32, 3), decoded.iteration);
-    try testing.expectEqual(types.IterationStatus.@"continue", decoded.status);
-    try testing.expectEqualStrings("{\"step\":3}", decoded.checkpoint.?);
-    try testing.expect(decoded.result == null);
-    try testing.expectEqual(@as(f64, 0.25), decoded.cost_usd);
-    try testing.expectEqual(@as(u64, 1710000003000000000), decoded.completed_at_ns);
-}
-
-test "iteration encode/decode completed" {
-    const it = types.JobIteration{
-        .job_id = "j1",
-        .iteration = 5,
-        .status = .completed,
-        .result = "{\"output\":\"done\"}",
-        .cost_usd = 1.5,
-        .completed_at_ns = 1710000005000000000,
-    };
-
-    var buf: [max_iteration_encoded_size]u8 = undefined;
-    const encoded = encodeIteration(&buf, &it);
-    const decoded = decodeIteration(encoded);
-
-    const testing = std.testing;
-    try testing.expectEqual(types.IterationStatus.completed, decoded.status);
-    try testing.expectEqual(@as(u32, 5), decoded.iteration);
-    try testing.expectEqualStrings("{\"output\":\"done\"}", decoded.result.?);
-    try testing.expect(decoded.checkpoint == null);
-}

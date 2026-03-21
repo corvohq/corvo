@@ -65,8 +65,8 @@ pub fn applySealBatch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.SealBa
                     .payload = batch.callback_payload,
                     .state = .pending,
                     .created_at_ns = op.now_ns,
-                    .batch_id = op.batch_id,
                 };
+                assert.check(callback_job.batch_id == null, "callback job cannot have batch id", .{});
                 const jobs = [_]ops.EnqueueJob{callback_job};
                 const enqueue_op = ops.EnqueueOp{
                     .jobs = &jobs,

@@ -32,33 +32,19 @@ pub fn applyAck(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.AckOp) ops.O
         var job = codec.decodeJob(job_bytes.?);
         if (job.state != .active) continue; // not active, skip
 
-        // Agent logic
+        // Lease token check: reject stale acks from workers whose lease was reclaimed.
+        if (ack.lease_token != 0 and job.lease_token != 0 and ack.lease_token != job.lease_token) continue;
+
+        // Hold logic
         var next_state: types.JobState = .completed;
-        if (job.agent) |*agent| {
-            if (ack.usage) |usage| {
-                agent.total_cost_usd += usage.cost_usd;
-            }
-            switch (ack.agent_status) {
-                .@"continue" => {
-                    agent.iteration += 1;
-                    next_state = .pending;
-                    if (agent.max_iterations > 0 and agent.iteration > agent.max_iterations) {
-                        next_state = .held;
-                        job.hold_reason = "max_iterations exceeded";
-                    } else if (agent.max_cost_usd > 0 and agent.total_cost_usd > agent.max_cost_usd) {
-                        next_state = .held;
-                        job.hold_reason = "max_cost exceeded";
-                    }
-                },
-                .hold => {
-                    next_state = .held;
-                    job.hold_reason = ack.hold_reason;
-                },
-                .none, .done => {
-                    next_state = .completed;
-                },
-            }
-            job.agent = agent.*;
+        switch (ack.ack_status) {
+            .hold => {
+                next_state = .held;
+                job.hold_reason = ack.hold_reason;
+            },
+            .done => {
+                next_state = .completed;
+            },
         }
 
         if (ack.checkpoint) |cp| {
@@ -100,39 +86,6 @@ pub fn applyAck(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.AckOp) ops.O
                     advanceChain(self, b, &job, ack, op.now_ns);
                 }
             }
-        } else if (next_state == .pending) {
-            // Agent continue → re-enqueue as pending
-            self.pending.push(job.queue, job.priority, job.created_at_ns, ack.job_id);
-            if (job.expire_after_ms > 0) {
-                job.expire_at_ns = op.now_ns + @as(u64, job.expire_after_ms) * 1_000_000;
-                var xk_buf: keys.KeyBuf = undefined;
-                b.set(keys.expireKey(&xk_buf, job.expire_at_ns, ack.job_id), "");
-            }
-        }
-
-        // Write iteration KV entry for agent jobs.
-        if (job.agent) |agent| {
-            var iter_key_buf: keys.KeyBuf = undefined;
-            var iter_val_buf: [codec.max_iteration_encoded_size]u8 = undefined;
-            const iter_status: types.IterationStatus = switch (next_state) {
-                .completed => .completed,
-                .held => .held,
-                .pending => .@"continue",
-                else => .completed,
-            };
-            const iteration = types.JobIteration{
-                .job_id = ack.job_id,
-                .iteration = agent.iteration,
-                .status = iter_status,
-                .checkpoint = ack.checkpoint,
-                .result = ack.result,
-                .cost_usd = if (ack.usage) |u| u.cost_usd else 0,
-                .completed_at_ns = op.now_ns,
-            };
-            b.set(
-                keys.jobIterationKey(&iter_key_buf, ack.job_id, agent.iteration),
-                codec.encodeIteration(&iter_val_buf, &iteration),
-            );
         }
 
         // Clear worker fields
@@ -168,10 +121,11 @@ fn advanceChain(self: *OpHandler, b: *kv.WriteBatch, job: *const types.Job, ack:
     const cc = job.chain_config orelse return;
     if (cc.len == 0) return;
 
-    // Parse chain config JSON: {"steps":[{"queue":"q","payload":"..."}],"on_exit":{"queue":"done"}}.
+    // Parse chain config JSON: {"steps":[{"queue":"q","payload":...}],"on_exit":{"queue":"done"}}.
+    // payload is Value because SDKs may send it as a string or a JSON object.
     const ChainStep = struct {
         queue: ?[]const u8 = null,
-        payload: ?[]const u8 = null,
+        payload: ?std.json.Value = null,
     };
     const ChainDef = struct {
         steps: ?[]const ChainStep = null,
@@ -192,11 +146,10 @@ fn advanceChain(self: *OpHandler, b: *kv.WriteBatch, job: *const types.Job, ack:
     const current_step = job.chain_step;
     const next_idx = current_step + 1;
 
-    // Determine the step status from the ack (default: continue).
-    const is_exit = if (ack.agent_status == .done) true else false;
+    const is_exit = (next_idx >= steps.len);
 
     var next_queue: ?[]const u8 = null;
-    var next_payload: ?[]const u8 = null;
+    var next_payload: ?std.json.Value = null;
     var next_chain_step: u16 = 0;
 
     if (is_exit) {
@@ -236,13 +189,26 @@ fn advanceChain(self: *OpHandler, b: *kv.WriteBatch, job: *const types.Job, ack:
             w.writeAll(r) catch return;
         }
     }
-    if (next_payload) |np| {
-        if (np.len > 2 and np[0] == '{') {
-            // Merge step's own payload fields: strip leading '{', append rest.
-            w.writeByte(',') catch return;
-            w.writeAll(np[1..]) catch return;
-        } else {
-            w.writeByte('}') catch return;
+    if (next_payload) |pv| {
+        switch (pv) {
+            .string => |s| {
+                if (s.len > 2 and s[0] == '{') {
+                    w.writeByte(',') catch return;
+                    w.writeAll(s[1..]) catch return;
+                } else {
+                    w.writeByte('}') catch return;
+                }
+            },
+            .object => {
+                var obj_iter = pv.object.iterator();
+                while (obj_iter.next()) |entry| {
+                    w.writeByte(',') catch return;
+                    w.print("{f}:", .{std.json.fmt(entry.key_ptr.*, .{})}) catch return;
+                    w.print("{f}", .{std.json.fmt(entry.value_ptr.*, .{})}) catch return;
+                }
+                w.writeByte('}') catch return;
+            },
+            else => w.writeByte('}') catch return,
         }
     } else {
         w.writeByte('}') catch return;
@@ -252,6 +218,13 @@ fn advanceChain(self: *OpHandler, b: *kv.WriteBatch, job: *const types.Job, ack:
     // Generate a job ID for the next chain step.
     var id_buf: [64]u8 = undefined;
     const chain_job_id = std.fmt.bufPrint(&id_buf, "chain_{s}_{d}", .{ job.id, next_chain_step }) catch return;
+
+    // Assert: chain job must not already exist. If it does, something re-triggered
+    // advanceChain for a parent that already spawned this step (e.g. bulk retry on parent
+    // without cleaning up downstream chain state).
+    var check_jk_buf: keys.KeyBuf = undefined;
+    assert.check(b.get(keys.jobKey(&check_jk_buf, chain_job_id)) == null,
+        "advanceChain: chain job already exists: step={d} parent={s}", .{ next_chain_step, job.id });
 
     const chain_job = ops.EnqueueJob{
         .job_id = chain_job_id,
@@ -274,3 +247,4 @@ fn advanceChain(self: *OpHandler, b: *kv.WriteBatch, job: *const types.Job, ack:
     };
     _ = self.applyEnqueue(b, &enqueue_op);
 }
+

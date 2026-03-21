@@ -46,7 +46,6 @@ pub const MirrorOp = struct {
         maintenance: MaintenancePayload,
         queue_config: QueueConfigPayload,
         cron: CronFullPayload,
-        iteration: IterationPayload,
         bulk_action_job: BulkActionJobPayload,
         batch_op: BatchOpPayload,
         budget_op: BudgetOpPayload,
@@ -144,8 +143,6 @@ pub const MirrorOp = struct {
         result_len: u16 = 0,
         hold_reason: [256]u8 = undefined,
         hold_reason_len: u8 = 0,
-        agent_iteration: u32 = 0,
-        agent_total_cost_usd: f64 = 0,
 
         fn jobId(self: *const AckPayload) []const u8 {
             return self.job_id[0..self.job_id_len];
@@ -239,9 +236,11 @@ pub const MirrorOp = struct {
     pub const BulkActionJobPayload = struct {
         job_id: [128]u8 = undefined,
         job_id_len: u8 = 0,
-        action: enum { update_state, delete } = .update_state,
+        action: enum { update_state, delete, move } = .update_state,
         new_state: [16]u8 = undefined,
         new_state_len: u8 = 0,
+        new_queue: [128]u8 = undefined,
+        new_queue_len: u8 = 0,
         now_ns: u64 = 0,
 
         fn jobId(self: *const BulkActionJobPayload) []const u8 {
@@ -249,6 +248,9 @@ pub const MirrorOp = struct {
         }
         fn stateSlice(self: *const BulkActionJobPayload) []const u8 {
             return self.new_state[0..self.new_state_len];
+        }
+        fn queueSlice(self: *const BulkActionJobPayload) []const u8 {
+            return self.new_queue[0..self.new_queue_len];
         }
     };
 
@@ -319,29 +321,6 @@ pub const MirrorOp = struct {
         fn checkpointSlice(self: *const HeartbeatJobPayload) ?[]const u8 {
             if (self.checkpoint_len == 0) return null;
             return self.checkpoint[0..self.checkpoint_len];
-        }
-    };
-
-    pub const IterationPayload = struct {
-        job_id: [128]u8 = undefined,
-        job_id_len: u8 = 0,
-        iteration: u32 = 0,
-        status: types.IterationStatus = .completed,
-        cost_usd: f64 = 0,
-        completed_at_ns: u64 = 0,
-        checkpoint: [4096]u8 = undefined,
-        checkpoint_len: u16 = 0,
-        result: [4096]u8 = undefined,
-        result_len: u16 = 0,
-
-        fn jobId(self: *const IterationPayload) []const u8 {
-            return self.job_id[0..self.job_id_len];
-        }
-        fn checkpointSlice(self: *const IterationPayload) []const u8 {
-            return self.checkpoint[0..self.checkpoint_len];
-        }
-        fn resultSlice(self: *const IterationPayload) []const u8 {
-            return self.result[0..self.result_len];
         }
     };
 
@@ -529,6 +508,19 @@ pub const Mirror = struct {
             @memcpy(p.new_state[0..sl], state[0..sl]);
             p.new_state_len = @intCast(sl);
         }
+        self.enqueue(.{ .op_type = .bulk_action, .payload = .{ .bulk_action_job = p } });
+    }
+
+    pub fn enqueueBulkActionMove(self: *Mirror, job_id: []const u8, queue: []const u8) void {
+        var p = MirrorOp.BulkActionJobPayload{
+            .action = .move,
+        };
+        const il = @min(job_id.len, p.job_id.len);
+        @memcpy(p.job_id[0..il], job_id[0..il]);
+        p.job_id_len = @intCast(il);
+        const ql = @min(queue.len, p.new_queue.len);
+        @memcpy(p.new_queue[0..ql], queue[0..ql]);
+        p.new_queue_len = @intCast(ql);
         self.enqueue(.{ .op_type = .bulk_action, .payload = .{ .bulk_action_job = p } });
     }
 
@@ -851,12 +843,8 @@ pub const Mirror = struct {
                 if (p.result_len > 0) s.bindText(2, p.resultSlice()) else s.bindNull(2);
                 // 3: hold_reason
                 if (p.hold_reason_len > 0) s.bindText(3, p.holdReasonSlice()) else s.bindNull(3);
-                // 4: agent_iteration
-                s.bindInt(4, @intCast(p.agent_iteration));
-                // 5: agent_total_cost_usd
-                s.bindDouble(5, p.agent_total_cost_usd);
-                // 6: id (WHERE clause)
-                s.bindText(6, p.jobId());
+                // 4: id (WHERE clause)
+                s.bindText(4, p.jobId());
                 try s.exec();
                 s.reset();
             },
@@ -925,26 +913,6 @@ pub const Mirror = struct {
                     else => {},
                 }
             },
-            .iteration => |*p| {
-                var s = &stmts.insert_iteration;
-                s.bindText(1, p.jobId());
-                s.bindInt(2, @intCast(p.iteration));
-                s.bindText(3, p.status.toString());
-                if (p.checkpoint_len > 0) {
-                    s.bindText(4, p.checkpointSlice());
-                } else {
-                    s.bindNull(4);
-                }
-                if (p.result_len > 0) {
-                    s.bindText(5, p.resultSlice());
-                } else {
-                    s.bindNull(5);
-                }
-                s.bindDouble(6, p.cost_usd);
-                s.bindText(7, formatNs(&stmts.ts_buf, p.completed_at_ns));
-                try s.exec();
-                s.reset();
-            },
             .maintenance => |*p| {
                 switch (p.action) {
                     .promote => self.promoteScheduled(p.now_ns),
@@ -980,6 +948,7 @@ pub const Mirror = struct {
                 switch (p.action) {
                     .delete => self.deleteJob(p.jobId()),
                     .update_state => self.updateJobState(p.jobId(), p.stateSlice(), p.now_ns),
+                    .move => self.updateJobQueue(p.jobId(), p.queueSlice()),
                 }
             },
             .batch_op => |*p| {
@@ -1034,7 +1003,7 @@ pub const Mirror = struct {
     /// Runs directly on the DB (not through the ring buffer) since purge
     /// is a bulk operation that doesn't need per-job queueing.
     /// CASCADE handles job_payloads and job_errors. We manually delete
-    /// job_iterations (no CASCADE) and jobs_fts (contentless FTS5).
+    /// jobs_fts (contentless FTS5).
     pub fn purgeTerminalJobs(self: *Mirror, cutoff_ns: u64) void {
         var ts_buf: [32]u8 = undefined;
         const cutoff_str = std.fmt.bufPrint(&ts_buf, "{d}", .{cutoff_ns}) catch return;
@@ -1049,17 +1018,6 @@ pub const Mirror = struct {
         del_fts.bindText(1, cutoff_str);
         del_fts.exec() catch {};
         del_fts.reset();
-
-        // Delete iterations for jobs being purged (no CASCADE).
-        var del_iters = self.db.prepare(
-            "DELETE FROM job_iterations WHERE job_id IN " ++
-                "(SELECT id FROM jobs WHERE state IN ('completed','dead','cancelled') " ++
-                "AND completed_at IS NOT NULL AND completed_at < ?)",
-        ) catch return;
-        defer del_iters.finalize();
-        del_iters.bindText(1, cutoff_str);
-        del_iters.exec() catch {};
-        del_iters.reset();
 
         // Delete jobs (CASCADE deletes job_payloads and job_errors).
         var del_jobs = self.db.prepare(
@@ -1128,14 +1086,6 @@ pub const Mirror = struct {
         defer del_fts.finalize();
         del_fts.bindText(1, queue_name);
         del_fts.exec() catch {};
-
-        // Delete iterations (no CASCADE).
-        var del_iters = self.db.prepare(
-            "DELETE FROM job_iterations WHERE job_id IN (SELECT id FROM jobs WHERE queue = ?)",
-        ) catch return;
-        defer del_iters.finalize();
-        del_iters.bindText(1, queue_name);
-        del_iters.exec() catch {};
 
         // Delete jobs (CASCADE handles payloads + errors).
         var del_jobs = self.db.prepare("DELETE FROM jobs WHERE queue = ?") catch return;
@@ -1308,6 +1258,14 @@ pub const Mirror = struct {
         }
     }
 
+    pub fn updateJobQueue(self: *Mirror, job_id: []const u8, queue: []const u8) void {
+        var stmt = self.db.prepare("UPDATE jobs SET queue = ? WHERE id = ?") catch return;
+        defer stmt.finalize();
+        stmt.bindText(1, queue);
+        stmt.bindText(2, job_id);
+        stmt.exec() catch {};
+    }
+
     /// Update a job's progress, checkpoint, and lease in the mirror (heartbeat).
     pub fn heartbeatJob(self: *Mirror, job_id: []const u8, progress: ?[]const u8, checkpoint: ?[]const u8, lease_expires_ns: u64) void {
         var ts_buf: [32]u8 = undefined;
@@ -1352,19 +1310,13 @@ pub const Mirror = struct {
         }
     }
 
-    /// Delete a single job from the mirror (including FTS and iterations).
+    /// Delete a single job from the mirror (including FTS).
     pub fn deleteJob(self: *Mirror, job_id: []const u8) void {
         // FTS (contentless, no CASCADE).
         var del_fts = self.db.prepare("DELETE FROM jobs_fts WHERE job_id = ?") catch return;
         defer del_fts.finalize();
         del_fts.bindText(1, job_id);
         del_fts.exec() catch {};
-
-        // Iterations (no CASCADE).
-        var del_iters = self.db.prepare("DELETE FROM job_iterations WHERE job_id = ?") catch return;
-        defer del_iters.finalize();
-        del_iters.bindText(1, job_id);
-        del_iters.exec() catch {};
 
         // Job (CASCADE handles payloads + errors).
         var del_job = self.db.prepare("DELETE FROM jobs WHERE id = ?") catch return;
@@ -1398,7 +1350,6 @@ const MirrorStmts = struct {
     update_queue_throttle: sqlite.Stmt,
     insert_fts: sqlite.Stmt,
     insert_payload: sqlite.Stmt,
-    insert_iteration: sqlite.Stmt,
 
     // Shared timestamp formatting buffers.
     ts_buf: [32]u8 = undefined,
@@ -1423,7 +1374,6 @@ const MirrorStmts = struct {
             .ack_job = try db.prepare(
                 "UPDATE jobs SET state = 'completed', completed_at = ?," ++
                     " result = ?, hold_reason = ?," ++
-                    " agent_iteration = ?, agent_total_cost_usd = ?," ++
                     " worker_id = NULL, lease_expires_at = NULL WHERE id = ?",
             ),
             .fail_job = try db.prepare(
@@ -1454,10 +1404,6 @@ const MirrorStmts = struct {
             .insert_payload = try db.prepare(
                 "INSERT OR REPLACE INTO job_payloads (job_id, payload) VALUES (?, ?)",
             ),
-            .insert_iteration = try db.prepare(
-                "INSERT OR REPLACE INTO job_iterations (job_id, iteration, status, checkpoint, result, cost_usd, completed_at)" ++
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ),
         };
     }
 
@@ -1475,7 +1421,6 @@ const MirrorStmts = struct {
         self.update_queue_throttle.finalize();
         self.insert_fts.finalize();
         self.insert_payload.finalize();
-        self.insert_iteration.finalize();
     }
 };
 
@@ -2038,7 +1983,7 @@ test "mirror delete job removes all related data" {
     var mirror = try Mirror.initInMemory(std.testing.allocator);
     defer mirror.deinit();
 
-    // Insert job + payload + FTS + error + iteration.
+    // Insert job + payload + FTS + error.
     testInsertJob(&mirror, "del-1", "q1", "completed");
     {
         var stmt = try mirror.db.prepare("INSERT INTO job_payloads (job_id, payload) VALUES ('del-1', 'hello world')");
@@ -2055,19 +2000,11 @@ test "mirror delete job removes all related data" {
         defer stmt.finalize();
         try stmt.exec();
     }
-    {
-        var stmt = try mirror.db.prepare(
-            "INSERT INTO job_iterations (job_id, iteration, status, completed_at) VALUES ('del-1', 1, 'completed', '2000')",
-        );
-        defer stmt.finalize();
-        try stmt.exec();
-    }
 
     // Verify everything exists.
     try std.testing.expectEqual(@as(i64, 1), testQueryCountBind(&mirror, "SELECT COUNT(*) FROM jobs WHERE id = ?", "del-1"));
     try std.testing.expectEqual(@as(i64, 1), testQueryCountBind(&mirror, "SELECT COUNT(*) FROM job_payloads WHERE job_id = ?", "del-1"));
     try std.testing.expectEqual(@as(i64, 1), testQueryCountBind(&mirror, "SELECT COUNT(*) FROM job_errors WHERE job_id = ?", "del-1"));
-    try std.testing.expectEqual(@as(i64, 1), testQueryCountBind(&mirror, "SELECT COUNT(*) FROM job_iterations WHERE job_id = ?", "del-1"));
 
     // Delete the job.
     mirror.deleteJob("del-1");
@@ -2076,7 +2013,6 @@ test "mirror delete job removes all related data" {
     try std.testing.expectEqual(@as(i64, 0), testQueryCountBind(&mirror, "SELECT COUNT(*) FROM jobs WHERE id = ?", "del-1"));
     try std.testing.expectEqual(@as(i64, 0), testQueryCountBind(&mirror, "SELECT COUNT(*) FROM job_payloads WHERE job_id = ?", "del-1"));
     try std.testing.expectEqual(@as(i64, 0), testQueryCountBind(&mirror, "SELECT COUNT(*) FROM job_errors WHERE job_id = ?", "del-1"));
-    try std.testing.expectEqual(@as(i64, 0), testQueryCountBind(&mirror, "SELECT COUNT(*) FROM job_iterations WHERE job_id = ?", "del-1"));
 }
 
 test "mirror fail with retry vs dead state" {
@@ -2144,33 +2080,3 @@ test "mirror fail with retry vs dead state" {
     try std.testing.expectEqual(@as(i64, 2), testQueryCount(&mirror, "SELECT COUNT(*) FROM job_errors"));
 }
 
-test "mirror schema has agent columns" {
-    var mirror = try Mirror.initInMemory(std.testing.allocator);
-    defer mirror.deinit();
-
-    // Insert a job with agent fields.
-    {
-        var stmt = try mirror.db.prepare(
-            "INSERT INTO jobs (id, queue, state, agent_max_iterations, agent_max_cost_usd," ++
-                " agent_iteration, agent_total_cost_usd, provider_error, created_at)" ++
-                " VALUES ('agent-1', 'q1', 'active', 10, 5.0, 3, 1.5, 1, '1000')",
-        );
-        defer stmt.finalize();
-        try stmt.exec();
-    }
-
-    // Verify agent columns.
-    {
-        var stmt = try mirror.db.prepare(
-            "SELECT agent_max_iterations, agent_max_cost_usd, agent_iteration, agent_total_cost_usd, provider_error" ++
-                " FROM jobs WHERE id = 'agent-1'",
-        );
-        defer stmt.finalize();
-        try std.testing.expect(try stmt.step());
-        try std.testing.expectEqual(@as(i64, 10), stmt.columnInt(0));
-        try std.testing.expectEqual(@as(f64, 5.0), stmt.columnDouble(1));
-        try std.testing.expectEqual(@as(i64, 3), stmt.columnInt(2));
-        try std.testing.expectEqual(@as(f64, 1.5), stmt.columnDouble(3));
-        try std.testing.expectEqual(@as(i64, 1), stmt.columnInt(4));
-    }
-}

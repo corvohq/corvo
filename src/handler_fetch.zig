@@ -85,12 +85,14 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             if (job.state != .pending) continue; // No longer pending — stale.
 
             // Claim the job.
+            self.lease_counter += 1;
             job.state = .active;
             job.worker_id = op.worker_id;
             job.hostname = op.hostname;
             job.attempt += 1;
             job.started_at_ns = op.now_ns;
             job.lease_expires_at_ns = lease_expires_ns;
+            job.lease_token = self.lease_counter;
 
             // No p| key delete needed — PendingIndex is the source of truth.
             // p| keys are not written (enqueue uses in-memory index only).
@@ -134,6 +136,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             f.attempt = job.attempt;
             f.max_retries = job.max_retries;
             f.lease_duration_ms = lease_duration_ms;
+            f.lease_token = job.lease_token;
             result.affected += 1;
         }
     }
@@ -242,12 +245,14 @@ fn fetchWithFairness(
         assert.check(job_bytes != null, "fairness: validated job disappeared", .{});
         var job = codec.decodeJob(job_bytes.?);
 
+        self.lease_counter += 1;
         job.state = .active;
         job.worker_id = op.worker_id;
         job.hostname = op.hostname;
         job.attempt += 1;
         job.started_at_ns = op.now_ns;
         job.lease_expires_at_ns = lease_expires_ns;
+        job.lease_token = self.lease_counter;
 
         if (job.expire_after_ms > 0 and job.expire_at_ns > 0) {
             var xk_buf: keys.KeyBuf = undefined;
@@ -286,6 +291,7 @@ fn fetchWithFairness(
         f.attempt = job.attempt;
         f.max_retries = job.max_retries;
         f.lease_duration_ms = lease_duration_ms;
+        f.lease_token = job.lease_token;
         result.affected += 1;
     }
 }

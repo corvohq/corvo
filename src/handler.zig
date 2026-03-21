@@ -36,6 +36,8 @@ pub const OpHandler = struct {
     queue_configs: std.StringHashMap(types.Queue),
     /// Whether to verify index consistency after each mutation.
     verify_indexes: bool = false,
+    /// Monotonic counter for lease tokens. Unique per fetch claim.
+    lease_counter: u64 = 0,
     /// Allocator for handler-owned state (maps, etc).
     allocator: Allocator,
 
@@ -452,7 +454,6 @@ pub const OpHandler = struct {
     pub const applyModifyEntSetting = @import("handler_ent.zig").applyModifyEntSetting;
 
     /// Handle batch job completion — decrement pending, fire callback if batch is done.
-    /// Called from ack (succeeded) and fail (failed) handlers.
     pub fn handleBatchJobComplete(self: *OpHandler, b: *kv.WriteBatch, batch_id: []const u8, succeeded: bool, now_ns: u64) void {
         var bk_buf: keys.KeyBuf = undefined;
         const bkey = keys.batchKey(&bk_buf, batch_id);
@@ -467,6 +468,7 @@ pub const OpHandler = struct {
         } else {
             batch.failed += 1;
         }
+        assert.check(batch.succeeded + batch.failed <= batch.total, "handleBatchJobComplete: completed ({d}+{d}) exceeds total ({d}) for batch {s}", .{ batch.succeeded, batch.failed, batch.total, batch_id });
 
         // Check if batch is complete (sealed + no pending jobs).
         if (batch.pending == 0 and !batch.open) {

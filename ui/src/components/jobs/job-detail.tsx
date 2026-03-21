@@ -14,7 +14,6 @@ import {
   useRetryJob,
   useCancelJob,
   useDeleteJob,
-  useReplayJob,
 } from "@/hooks/use-mutations";
 import type { Job } from "@/lib/types";
 import {
@@ -27,16 +26,12 @@ import {
 import { useState } from "react";
 import { MoveDialog } from "@/components/dialogs/move-dialog";
 import { EnqueueDialog } from "@/components/dialogs/enqueue-dialog";
-import { useJobIterations } from "@/hooks/use-job-iterations";
 import { useSearch } from "@/hooks/use-search";
-import { IterationTable } from "@/components/ai/iteration-table";
 
 export function JobDetail({ job }: { job: Job }) {
   const retryJob = useRetryJob();
   const cancelJob = useCancelJob();
   const deleteJob = useDeleteJob();
-  const replayJob = useReplayJob();
-  const { data: iterations = [], isLoading: isIterationsLoading } = useJobIterations(job.id);
   const chainID = job.chain_id || "";
   const { data: chainResult, isLoading: isChainLoading } = useSearch(
     { chain_id: chainID, limit: 200, order: "asc", sort: "created_at" },
@@ -60,7 +55,6 @@ export function JobDetail({ job }: { job: Job }) {
   );
 
   const retryLabel = job.state === "scheduled" ? "Run Now" : "Retry";
-  const isAgentJob = !!job.agent;
 
   return (
     <div className="space-y-6">
@@ -224,24 +218,6 @@ export function JobDetail({ job }: { job: Job }) {
                 </dd>
               </div>
             )}
-            {job.agent && (
-              <>
-                <div>
-                  <dt className="text-muted-foreground">Agent Iteration</dt>
-                  <dd>
-                    {job.agent.iteration || 0}
-                    {job.agent.max_iterations ? ` / ${job.agent.max_iterations}` : ""}
-                  </dd>
-                </div>
-                <div>
-                  <dt className="text-muted-foreground">Agent Cost</dt>
-                  <dd>
-                    ${((job.agent.total_cost_usd || 0)).toFixed(4)}
-                    {job.agent.max_cost_usd ? ` / $${job.agent.max_cost_usd.toFixed(4)}` : ""}
-                  </dd>
-                </div>
-              </>
-            )}
           </dl>
 
           {job.tags && Object.keys(job.tags).length > 0 && (
@@ -264,25 +240,6 @@ export function JobDetail({ job }: { job: Job }) {
           )}
         </CardContent>
       </Card>
-
-      {isAgentJob && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">Agent Iterations</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {isIterationsLoading ? (
-              <p className="py-4 text-sm text-muted-foreground">Loading iterations...</p>
-            ) : (
-              <IterationTable
-                iterations={iterations}
-                replaying={replayJob.isPending}
-                onReplay={(from) => replayJob.mutate({ id: job.id, from })}
-              />
-            )}
-          </CardContent>
-        </Card>
-      )}
 
       {job.chain_id && (
         <Card>

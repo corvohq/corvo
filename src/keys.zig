@@ -36,8 +36,6 @@ pub const prefix_provider = "pv|"; // pv|{name}
 pub const prefix_queue_prov = "qp|"; // qp|{queue}
 pub const prefix_expire = "x|"; // x|{expireAtNs:8BE}{jobID}
 pub const prefix_dead = "d|"; // d|{terminalAtNs:8BE}{jobID}
-pub const prefix_job_iteration = "ji|"; // ji|{job_id}\x00{iteration:4BE}
-pub const prefix_job_usage = "ju|"; // ju|{job_id}\x00{attempt:4BE}\x00{phase}
 pub const prefix_queue_append = "qa|"; // qa|{queue}\x00{created_ns:8BE}{job_id}
 pub const prefix_queue_cursor = "qac|"; // qac|{queue}
 
@@ -399,61 +397,6 @@ pub fn deadKey(buf: *KeyBuf, terminal_at_ns: u64, job_id: []const u8) []const u8
     var pos = copyPrefix(buf, prefix_dead);
     pos = putU64BE(buf, pos, terminal_at_ns);
     pos = copyStr(buf, pos, job_id);
-    return buf[0..pos];
-}
-
-/// ji|{job_id}\x00{iteration:4BE}
-pub fn jobIterationKey(buf: *KeyBuf, job_id: []const u8, iteration: u32) []const u8 {
-    assert.check(job_id.len > 0, "jobIterationKey: empty jobID", .{});
-    var pos = copyPrefix(buf, prefix_job_iteration);
-    pos = copyStr(buf, pos, job_id);
-    pos = putU8(buf, pos, sep);
-    pos = putU32BE(buf, pos, iteration);
-    return buf[0..pos];
-}
-
-/// ji|{job_id}\x00
-pub fn jobIterationPrefix(buf: *KeyBuf, job_id: []const u8) []const u8 {
-    assert.check(job_id.len > 0, "jobIterationPrefix: empty jobID", .{});
-    var pos = copyPrefix(buf, prefix_job_iteration);
-    pos = copyStr(buf, pos, job_id);
-    pos = putU8(buf, pos, sep);
-    return buf[0..pos];
-}
-
-/// ju|{job_id}\x00{attempt:4BE}\x00{phase}
-pub fn jobUsageKey(buf: *KeyBuf, job_id: []const u8, attempt: u32, phase: []const u8) []const u8 {
-    assert.check(job_id.len > 0, "jobUsageKey: empty jobID", .{});
-    assert.check(phase.len > 0, "jobUsageKey: empty phase", .{});
-    var pos = copyPrefix(buf, prefix_job_usage);
-    pos = copyStr(buf, pos, job_id);
-    pos = putU8(buf, pos, sep);
-    pos = putU32BE(buf, pos, attempt);
-    pos = putU8(buf, pos, sep);
-    pos = copyStr(buf, pos, phase);
-    return buf[0..pos];
-}
-
-/// ju|{job_id}\x00{attempt:4BE}\x00hb{nowNs:8BE}
-pub fn jobUsageHeartbeatKey(buf: *KeyBuf, job_id: []const u8, attempt: u32, now_ns: u64) []const u8 {
-    assert.check(job_id.len > 0, "jobUsageHeartbeatKey: empty jobID", .{});
-    assert.check(now_ns > 0, "jobUsageHeartbeatKey: zero nowNs", .{});
-    var pos = copyPrefix(buf, prefix_job_usage);
-    pos = copyStr(buf, pos, job_id);
-    pos = putU8(buf, pos, sep);
-    pos = putU32BE(buf, pos, attempt);
-    pos = putU8(buf, pos, sep);
-    pos = copyStr(buf, pos, "hb");
-    pos = putU64BE(buf, pos, now_ns);
-    return buf[0..pos];
-}
-
-/// ju|{job_id}\x00
-pub fn jobUsagePrefix(buf: *KeyBuf, job_id: []const u8) []const u8 {
-    assert.check(job_id.len > 0, "jobUsagePrefix: empty jobID", .{});
-    var pos = copyPrefix(buf, prefix_job_usage);
-    pos = copyStr(buf, pos, job_id);
-    pos = putU8(buf, pos, sep);
     return buf[0..pos];
 }
 

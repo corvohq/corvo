@@ -976,7 +976,7 @@ fn runClusterSim(allocator: std.mem.Allocator, seed: u64, ticks: u32, drop_rate:
             const ci = rng.intRangeAtMost(usize, 0, completed_count - 1);
             const cid = completed_ids[ci][0..completed_lens[ci]];
             const id_ptrs = [1][]const u8{cid};
-            const actions = [_]ops_mod.BulkAction{ .retry, .cancel, .delete };
+            const actions = [_]ops_mod.BulkAction{ .requeue, .cancel, .delete };
             const action = actions[rng.intRangeAtMost(usize, 0, 2)];
             _ = leader.apply(.bulk_action, &ops_mod.OpData{
                 .bulk_action = .{ .job_ids = &id_ptrs, .action = action, .now_ns = now },

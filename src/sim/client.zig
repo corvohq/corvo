@@ -1,13 +1,10 @@
 //! SimClient — adversarial simulated worker for the VOPR simulator.
 //!
-//! Exercises the full operation space including edge cases:
-//! - Unique job lifecycle (enqueue → ack → re-enqueue same key)
-//! - Bulk retry/requeue of dead jobs (d| cleanup, unique lock re-acquire)
-//! - Batch create → enqueue into batch → ack/fail → seal (counter tracking)
-//! - Fetch from paused queues (should get nothing)
-//! - Double-ack, ack of non-existent jobs
-//! - Clear queue with active jobs
-//! - Maintenance interleaved with everything
+//! Routes all operations through Server.route() (HTTP JSON path) to exercise
+//! the full request lifecycle: JSON parsing, handler logic, KV ops, mirror
+//! sync, chain progression, and response serialization.
+//!
+//! Maintenance is the only operation that bypasses HTTP (no public endpoint).
 
 const std = @import("std");
 const corvo = @import("corvo");
@@ -17,6 +14,7 @@ const ops = corvo.ops;
 const keys = corvo.keys;
 const codec = corvo.codec;
 const engine_mod = corvo.engine;
+const server_mod = corvo.server;
 const kv = corvo.kv;
 const clock_mod = @import("clock.zig");
 const Config = @import("config.zig").Config;
@@ -24,13 +22,13 @@ const Config = @import("config.zig").Config;
 const max_active_jobs = 64;
 const max_completed_ids = 128;
 const max_batches = 16;
-const max_unique_keys = 20;
 
 pub const SimClient = struct {
     id: u32,
     prng: std.Random.DefaultPrng,
     rng: std.Random,
-    engine: *engine_mod.Engine,
+    engine: *engine_mod.Engine, // for maintenance only (no HTTP path)
+    server: *server_mod.Server,
     config: Config,
     queues: []const []const u8,
     worker_id_buf: [32]u8 = undefined,
@@ -69,6 +67,7 @@ pub const SimClient = struct {
     unique_conflicts: u32 = 0,
     double_acks: u32 = 0,
     clear_queues: u32 = 0,
+    chain_enqueued: u32 = 0,
 
     const IdBuf = struct {
         buf: [64]u8 = undefined,
@@ -84,6 +83,7 @@ pub const SimClient = struct {
         queue_buf: [64]u8 = undefined,
         queue_len: usize = 0,
         will_fail: bool = false,
+        lease_token: u64 = 0,
 
         fn jobID(self: *const JobEntry) []const u8 {
             return self.id_buf[0..self.id_len];
@@ -93,10 +93,14 @@ pub const SimClient = struct {
         }
     };
 
+    // Response buffer for server.route() calls.
+    const resp_buf_size = 65536;
+
     pub fn init(
         id: u32,
         seed: u64,
         engine: *engine_mod.Engine,
+        server: *server_mod.Server,
         config: Config,
         queues: []const []const u8,
     ) SimClient {
@@ -105,6 +109,7 @@ pub const SimClient = struct {
             .prng = std.Random.DefaultPrng.init(seed),
             .rng = undefined,
             .engine = engine,
+            .server = server,
             .config = config,
             .queues = queues,
         };
@@ -116,6 +121,11 @@ pub const SimClient = struct {
 
     fn workerID(self: *const SimClient) []const u8 {
         return self.worker_id_buf[0..self.worker_id_len];
+    }
+
+    fn route(self: *SimClient, method: []const u8, path: []const u8, body: ?[]const u8, buf: []u8) server_mod.Server.Response {
+        const req = server_mod.Request{ .method = method, .path = path, .body = body };
+        return self.server.route(req, buf);
     }
 
     pub fn act(self: *SimClient) void {
@@ -130,7 +140,7 @@ pub const SimClient = struct {
         const r = self.rng.float(f64);
         var threshold: f64 = 0;
 
-        // Maintenance — always interleaved, not just at end.
+        // Maintenance — still via engine (no HTTP endpoint).
         threshold += self.config.maintenance_rate;
         if (r < threshold) { self.doMaintenance(); return; }
 
@@ -174,74 +184,67 @@ pub const SimClient = struct {
     }
 
     // ====================================================================
-    // Enqueue — with unique keys, batch assignment, scheduling
+    // Enqueue — via POST /api/v1/enqueue
     // ====================================================================
 
     fn doEnqueue(self: *SimClient) void {
         const queue_idx = self.rng.intRangeAtMost(usize, 0, self.queues.len - 1);
         const q = self.queues[queue_idx];
-        const now_ns: u64 = @intCast(clock_mod.globalClockNow());
 
-        var id_buf: [64]u8 = undefined;
-        const id = std.fmt.bufPrint(&id_buf, "job_{d}_{d}_{d}", .{
-            self.id, self.enqueued, self.rng.int(u32),
-        }) catch unreachable;
+        var body_buf: [4096]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&body_buf);
+        const w = stream.writer();
 
-        var enqueue_job = ops.EnqueueJob{
-            .job_id = id,
-            .queue = q,
-            .priority = types.priority_default,
-            .max_retries = 3,
-            .created_at_ns = now_ns,
-        };
-
-        // Scheduled job.
-        if (self.chance(self.config.scheduled_job_rate)) {
-            enqueue_job.scheduled_at_ns = now_ns + 5_000_000_000;
-            enqueue_job.state = .scheduled;
-        }
+        w.print("{{\"queue\":\"{s}\",\"payload\":{{\"sim\":true}}", .{q}) catch return;
 
         // Priority.
         if (self.chance(self.config.priority_rate)) {
-            enqueue_job.priority = @intCast(self.rng.intRangeAtMost(u8, 1, 255));
+            const p = self.rng.intRangeAtMost(u8, 1, 255);
+            w.print(",\"priority\":{d}", .{p}) catch return;
         }
 
-        // Unique key — small pool (10 keys per queue) so conflicts are frequent.
-        var uk_buf: [32]u8 = undefined;
+        // Unique key.
         if (self.chance(self.config.unique_rate)) {
             const uk_idx = self.rng.intRangeAtMost(u32, 0, 9);
-            const uk = std.fmt.bufPrint(&uk_buf, "ukey_{d}_{d}", .{ queue_idx, uk_idx }) catch unreachable;
-            enqueue_job.unique_key = uk;
-            enqueue_job.unique_period_s = 3600;
+            w.print(",\"unique_key\":\"ukey_{d}_{d}\",\"unique_period\":3600", .{ queue_idx, uk_idx }) catch return;
         }
 
         // Batch assignment.
         if (self.batch_count > 0 and self.chance(self.config.batch_enqueue_rate)) {
             const bi = self.rng.intRangeAtMost(usize, 0, self.batch_count - 1);
-            enqueue_job.batch_id = self.batches[bi].slice();
+            w.print(",\"batch_id\":\"{s}\"", .{self.batches[bi].slice()}) catch return;
             self.batch_job_counts[bi] += 1;
         }
 
-        const jobs_arr = [1]ops.EnqueueJob{enqueue_job};
-        const data = ops.OpData{
-            .enqueue = .{ .jobs = &jobs_arr, .now_ns = now_ns },
-        };
+        // Chain config — 5% of enqueues.
+        if (self.chance(0.05)) {
+            // Simple 2-step chain with on_exit.
+            const other_q = self.queues[self.rng.intRangeAtMost(usize, 0, self.queues.len - 1)];
+            w.print(",\"chain\":{{\"steps\":[{{\"queue\":\"{s}\"}},{{\"queue\":\"{s}\"}}],\"on_exit\":{{\"queue\":\"{s}\"}}}}", .{ q, other_q, q }) catch return;
+            self.chain_enqueued += 1;
+        }
 
-        const result = self.engine.apply(.enqueue, &data);
-        if (result.err == null) {
+        // Scheduled job.
+        if (self.chance(self.config.scheduled_job_rate)) {
+            w.writeAll(",\"scheduled_at\":\"2099-01-01T00:00:00Z\"") catch return;
+        }
+
+        w.writeByte('}') catch return;
+        const body = stream.getWritten();
+
+        var resp_buf: [resp_buf_size]u8 = undefined;
+        const resp = self.route("POST", "/api/v1/enqueue", body, &resp_buf);
+
+        if (resp.status == 201) {
             self.enqueued += 1;
-            if (result.unique_job_id_len > 0) {
-                self.unique_conflicts += 1;
-            }
-        } else {
-            // Unique conflict returns an error but it's expected.
-            self.enqueued += 1;
+        } else if (resp.status == 409) {
+            // unique_existing
             self.unique_conflicts += 1;
         }
     }
 
     // ====================================================================
-    // Fetch
+    // Fetch — via POST /api/v1/fetch
     // ====================================================================
 
     fn doFetch(self: *SimClient) void {
@@ -249,39 +252,39 @@ pub const SimClient = struct {
 
         const queue_idx = self.rng.intRangeAtMost(usize, 0, self.queues.len - 1);
         const q = self.queues[queue_idx];
-        const now_ns: u64 = @intCast(clock_mod.globalClockNow());
 
-        const queues_slice = [1][]const u8{q};
-        const data = ops.OpData{
-            .fetch = .{
-                .queues = &queues_slice,
-                .worker_id = self.workerID(),
-                .count = 1,
-                .now_ns = now_ns,
-                .lease_duration_ms = 30000,
-            },
-        };
+        var body_buf: [256]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf,
+            "{{\"queues\":[\"{s}\"],\"worker_id\":\"{s}\",\"count\":1}}",
+            .{ q, self.workerID() },
+        ) catch return;
 
-        const result = self.engine.apply(.fetch, &data);
+        var resp_buf: [resp_buf_size]u8 = undefined;
+        const resp = self.route("POST", "/api/v1/fetch", body, &resp_buf);
 
-        for (0..result.affected) |i| {
-            if (self.active_count >= max_active_jobs) break;
-            if (i >= ops.OpResult.max_inline_fetch) break;
+        if (resp.status != 200) return;
 
-            const f = &result.fetched[i];
-            var entry = &self.active_jobs[self.active_count];
-            @memcpy(entry.id_buf[0..f.id_len], f.id_buf[0..f.id_len]);
-            entry.id_len = f.id_len;
-            @memcpy(entry.queue_buf[0..f.queue_len], f.queue_buf[0..f.queue_len]);
-            entry.queue_len = f.queue_len;
-            entry.will_fail = self.chance(self.config.fail_rate);
-            self.active_count += 1;
-            self.fetched += 1;
-        }
+        // Parse job_id from response: {"job_id":"...","queue":"..."}
+        const job_id = extractJsonString(resp.body, "job_id") orelse return;
+        if (job_id.len == 0) return; // empty = no job available
+
+        const resp_queue = extractJsonString(resp.body, "queue") orelse q;
+
+        var entry = &self.active_jobs[self.active_count];
+        const id_len = @min(job_id.len, entry.id_buf.len);
+        @memcpy(entry.id_buf[0..id_len], job_id[0..id_len]);
+        entry.id_len = id_len;
+        const ql = @min(resp_queue.len, entry.queue_buf.len);
+        @memcpy(entry.queue_buf[0..ql], resp_queue[0..ql]);
+        entry.queue_len = ql;
+        entry.will_fail = self.chance(self.config.fail_rate);
+        entry.lease_token = extractJsonU64(resp.body, "lease_token");
+        self.active_count += 1;
+        self.fetched += 1;
     }
 
     // ====================================================================
-    // Complete (ack or fail) — also track for bulk ops
+    // Complete (ack or fail) — via POST /api/v1/ack/{id} or /fail/{id}
     // ====================================================================
 
     fn doComplete(self: *SimClient) void {
@@ -290,29 +293,28 @@ pub const SimClient = struct {
         const idx = self.rng.intRangeAtMost(usize, 0, self.active_count - 1);
         const entry = self.active_jobs[idx];
         const job_id = entry.jobID();
-        const q = entry.queue();
-        const now_ns: u64 = @intCast(clock_mod.globalClockNow());
 
         if (entry.will_fail) {
-            const fail_jobs = [1]ops.FailJob{.{
-                .job_id = job_id,
-                .queue = q,
-                .error_msg = "sim-failure",
-            }};
-            const data = ops.OpData{
-                .fail = .{ .jobs = &fail_jobs, .now_ns = now_ns },
-            };
-            _ = self.engine.apply(.fail, &data);
+            var path_buf: [128]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "/api/v1/fail/{s}", .{job_id}) catch return;
+            var body_buf: [256]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf,
+                "{{\"error\":\"sim-failure\",\"lease_token\":{d}}}",
+                .{entry.lease_token},
+            ) catch return;
+            var resp_buf: [resp_buf_size]u8 = undefined;
+            _ = self.route("POST", path, body, &resp_buf);
             self.failed += 1;
         } else {
-            const acks = [1]ops.AckJob{.{
-                .job_id = job_id,
-                .queue = q,
-            }};
-            const data = ops.OpData{
-                .ack = .{ .acks = &acks, .now_ns = now_ns },
-            };
-            _ = self.engine.apply(.ack, &data);
+            var path_buf: [128]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "/api/v1/ack/{s}", .{job_id}) catch return;
+            var body_buf: [256]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf,
+                "{{\"lease_token\":{d}}}",
+                .{entry.lease_token},
+            ) catch return;
+            var resp_buf: [resp_buf_size]u8 = undefined;
+            _ = self.route("POST", path, body, &resp_buf);
             self.acked += 1;
         }
 
@@ -323,35 +325,27 @@ pub const SimClient = struct {
     }
 
     // ====================================================================
-    // Adversarial ack — double-ack, ack non-existent, ack already-completed
+    // Adversarial ack — double-ack, ack non-existent
     // ====================================================================
 
     fn doAdversarialAck(self: *SimClient) void {
-        const now_ns: u64 = @intCast(clock_mod.globalClockNow());
-
         if (self.completed_count > 0 and self.chance(0.5)) {
-            // Double-ack: ack an already-completed job (should be no-op or error).
             const ci = self.rng.intRangeAtMost(usize, 0, self.completed_count - 1);
             const job_id = self.completed_ids[ci].slice();
-            const acks = [1]ops.AckJob{.{ .job_id = job_id, .queue = "any" }};
-            const data = ops.OpData{
-                .ack = .{ .acks = &acks, .now_ns = now_ns },
-            };
-            _ = self.engine.apply(.ack, &data);
+            var path_buf: [128]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "/api/v1/ack/{s}", .{job_id}) catch return;
+            var resp_buf: [resp_buf_size]u8 = undefined;
+            _ = self.route("POST", path, "{}", &resp_buf);
             self.double_acks += 1;
         } else {
-            // Ack non-existent job.
-            const acks = [1]ops.AckJob{.{ .job_id = "nonexistent_job_xyz", .queue = "any" }};
-            const data = ops.OpData{
-                .ack = .{ .acks = &acks, .now_ns = now_ns },
-            };
-            _ = self.engine.apply(.ack, &data);
+            var resp_buf: [resp_buf_size]u8 = undefined;
+            _ = self.route("POST", "/api/v1/ack/nonexistent_job_xyz", "{}", &resp_buf);
             self.double_acks += 1;
         }
     }
 
     // ====================================================================
-    // Heartbeat
+    // Heartbeat — via POST /api/v1/heartbeat
     // ====================================================================
 
     fn doHeartbeat(self: *SimClient) void {
@@ -359,25 +353,20 @@ pub const SimClient = struct {
 
         const idx = self.rng.intRangeAtMost(usize, 0, self.active_count - 1);
         const entry = &self.active_jobs[idx];
-        const now_ns: u64 = @intCast(clock_mod.globalClockNow());
 
-        const job_ids = [1][]const u8{entry.jobID()};
-        const job_ops = [1]ops.HeartbeatJobOp{.{}};
-        const data = ops.OpData{
-            .heartbeat = .{
-                .job_ids = &job_ids,
-                .job_ops = &job_ops,
-                .worker_id = self.workerID(),
-                .now_ns = now_ns,
-            },
-        };
-        _ = self.engine.apply(.heartbeat, &data);
+        var body_buf: [512]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf,
+            "{{\"worker_id\":\"{s}\",\"jobs\":{{\"{s}\":{{}}}}}}",
+            .{ self.workerID(), entry.jobID() },
+        ) catch return;
+
+        var resp_buf: [resp_buf_size]u8 = undefined;
+        _ = self.route("POST", "/api/v1/heartbeat", body, &resp_buf);
         self.heartbeats += 1;
     }
 
     // ====================================================================
-    // Bulk actions — retry, requeue, cancel, delete
-    // (These are where the Go refactor found most bugs)
+    // Bulk actions — via POST /api/v1/jobs/bulk
     // ====================================================================
 
     fn doBulkAction(self: *SimClient) void {
@@ -388,44 +377,38 @@ pub const SimClient = struct {
             self.completed_count,
         );
 
-        var id_ptrs: [5][]const u8 = undefined;
-        for (0..count) |i| {
-            const ci = self.rng.intRangeAtMost(usize, 0, self.completed_count - 1);
-            id_ptrs[i] = self.completed_ids[ci].slice();
-        }
-
-        const now_ns: u64 = @intCast(clock_mod.globalClockNow());
-
-        // Include requeue — this is the action that exposed d| cleanup bugs.
-        const actions = [_]ops.BulkAction{ .retry, .delete, .cancel, .requeue };
+        const actions = [_][]const u8{ "requeue", "delete", "cancel" };
         const action = actions[self.rng.intRangeAtMost(usize, 0, actions.len - 1)];
 
-        const data = ops.OpData{
-            .bulk_action = .{
-                .job_ids = id_ptrs[0..count],
-                .action = action,
-                .now_ns = now_ns,
-            },
-        };
-        _ = self.engine.apply(.bulk_action, &data);
+        var body_buf: [2048]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&body_buf);
+        const w = stream.writer();
+
+        w.print("{{\"action\":\"{s}\",\"job_ids\":[", .{action}) catch return;
+        for (0..count) |i| {
+            if (i > 0) w.writeByte(',') catch return;
+            const ci = self.rng.intRangeAtMost(usize, 0, self.completed_count - 1);
+            w.print("\"{s}\"", .{self.completed_ids[ci].slice()}) catch return;
+        }
+        w.writeAll("]}") catch return;
+
+        var resp_buf: [resp_buf_size]u8 = undefined;
+        _ = self.route("POST", "/api/v1/jobs/bulk", stream.getWritten(), &resp_buf);
         self.bulk_ops += 1;
 
-        if (action == .delete) {
-            for (0..count) |i| {
-                self.removeCompleted(id_ptrs[i]);
-            }
+        if (std.mem.eql(u8, action, "delete")) {
+            // Can't easily track which specific IDs were in the random selection,
+            // so just leave completed_ids as-is (harmless stale entries).
         }
     }
 
     // ====================================================================
-    // Batch operations — create, enqueue into, seal
+    // Batch operations — via POST /api/v1/batch and /batch/{id}/seal
     // ====================================================================
 
     fn doBatchOp(self: *SimClient) void {
         if (self.batch_count > 0 and self.chance(0.4)) {
-            // Seal a random open batch.
-            const bi = self.rng.intRangeAtMost(usize, 0, self.batch_count - 1);
-            self.doBatchSeal(bi);
+            self.doBatchSeal(self.rng.intRangeAtMost(usize, 0, self.batch_count - 1));
         } else {
             self.doBatchCreate();
         }
@@ -437,41 +420,40 @@ pub const SimClient = struct {
             return;
         }
 
-        const now_ns: u64 = @intCast(clock_mod.globalClockNow());
-        var id_buf: [64]u8 = undefined;
-        const id = std.fmt.bufPrint(&id_buf, "batch_{d}_{d}_{d}", .{
-            self.id, self.batch_creates, self.rng.int(u16),
-        }) catch unreachable;
+        const q = self.queues[self.rng.intRangeAtMost(usize, 0, self.queues.len - 1)];
+        var body_buf: [256]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf,
+            "{{\"callback_queue\":\"{s}\"}}",
+            .{q},
+        ) catch return;
 
-        const data = ops.OpData{
-            .batch_create = .{
-                .batch_id = id,
-                .created_at_ns = now_ns,
-            },
-        };
-        const result = self.engine.apply(.batch_create, &data);
-        if (result.err == null) {
-            const len = @min(id.len, self.batches[self.batch_count].buf.len);
-            @memcpy(self.batches[self.batch_count].buf[0..len], id[0..len]);
-            self.batches[self.batch_count].len = len;
-            self.batch_job_counts[self.batch_count] = 0;
-            self.batch_count += 1;
-            self.batch_creates += 1;
-        }
+        var resp_buf: [resp_buf_size]u8 = undefined;
+        const resp = self.route("POST", "/api/v1/batch", body, &resp_buf);
+        if (resp.status != 201) return;
+
+        // Parse batch_id from response.
+        const batch_id = extractJsonString(resp.body, "batch_id") orelse return;
+        if (batch_id.len == 0) return;
+
+        const len = @min(batch_id.len, self.batches[self.batch_count].buf.len);
+        @memcpy(self.batches[self.batch_count].buf[0..len], batch_id[0..len]);
+        self.batches[self.batch_count].len = len;
+        self.batch_job_counts[self.batch_count] = 0;
+        self.batch_count += 1;
+        self.batch_creates += 1;
     }
 
     fn doBatchSeal(self: *SimClient, idx: usize) void {
         if (self.batch_count == 0) return;
         const bi = @min(idx, self.batch_count - 1);
 
-        const now_ns: u64 = @intCast(clock_mod.globalClockNow());
-        const data = ops.OpData{
-            .batch_seal = .{
-                .batch_id = self.batches[bi].slice(),
-                .now_ns = now_ns,
-            },
-        };
-        _ = self.engine.apply(.batch_seal, &data);
+        var path_buf: [128]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf,
+            "/api/v1/batch/{s}/seal", .{self.batches[bi].slice()},
+        ) catch return;
+
+        var resp_buf: [resp_buf_size]u8 = undefined;
+        _ = self.route("POST", path, null, &resp_buf);
         self.batch_seals += 1;
 
         self.batches[bi] = self.batches[self.batch_count - 1];
@@ -480,7 +462,7 @@ pub const SimClient = struct {
     }
 
     // ====================================================================
-    // Maintenance — all types, interleaved with operations
+    // Maintenance — via engine.apply() (no HTTP endpoint)
     // ====================================================================
 
     fn doMaintenance(self: *SimClient) void {
@@ -499,43 +481,33 @@ pub const SimClient = struct {
     }
 
     // ====================================================================
-    // Queue operations — pause, resume, AND clear (adversarial)
+    // Queue operations — via POST /api/v1/queues/{name}/pause|resume|clear
     // ====================================================================
 
     fn doQueueOp(self: *SimClient) void {
         const queue_idx = self.rng.intRangeAtMost(usize, 0, self.queues.len - 1);
         const q = self.queues[queue_idx];
 
-        // 10% chance of clear instead of pause/resume — this is adversarial.
+        // 10% chance of clear.
         if (self.chance(0.1)) {
-            const data = ops.OpData{
-                .clear_queue = .{ .queue = q },
-            };
-            _ = self.engine.apply(.clear_queue, &data);
+            var path_buf: [128]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "/api/v1/queues/{s}/clear", .{q}) catch return;
+            var resp_buf: [resp_buf_size]u8 = undefined;
+            _ = self.route("POST", path, null, &resp_buf);
             self.clear_queues += 1;
             self.queue_ops += 1;
-
-            // Remove active jobs from this queue (they were cleared).
-            var i: usize = 0;
-            while (i < self.active_count) {
-                if (std.mem.eql(u8, self.active_jobs[i].queue(), q)) {
-                    self.active_jobs[i] = self.active_jobs[self.active_count - 1];
-                    self.active_count -= 1;
-                } else {
-                    i += 1;
-                }
-            }
+            // Active jobs are NOT affected by queue clear — workers still hold them.
             return;
         }
 
         // Toggle pause state.
-        const action: ops.QueueAction = if (self.paused_queues[queue_idx]) .@"resume" else .pause;
+        const action_str: []const u8 = if (self.paused_queues[queue_idx]) "resume" else "pause";
         self.paused_queues[queue_idx] = !self.paused_queues[queue_idx];
 
-        const data = ops.OpData{
-            .queue_config = .{ .queue = q, .action = action },
-        };
-        _ = self.engine.apply(.queue_config, &data);
+        var path_buf: [128]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/api/v1/queues/{s}/{s}", .{ q, action_str }) catch return;
+        var resp_buf: [resp_buf_size]u8 = undefined;
+        _ = self.route("POST", path, null, &resp_buf);
         self.queue_ops += 1;
     }
 
@@ -553,19 +525,41 @@ pub const SimClient = struct {
         self.completed_count += 1;
     }
 
-    fn removeCompleted(self: *SimClient, job_id: []const u8) void {
-        var i: usize = 0;
-        while (i < self.completed_count) {
-            if (std.mem.eql(u8, self.completed_ids[i].slice(), job_id)) {
-                self.completed_ids[i] = self.completed_ids[self.completed_count - 1];
-                self.completed_count -= 1;
-            } else {
-                i += 1;
-            }
-        }
-    }
-
     fn chance(self: *SimClient, prob: f64) bool {
         return self.rng.float(f64) < prob;
+    }
+
+    /// Extract a JSON u64 value by key from a flat JSON object.
+    /// Simple parser — handles {"key":12345,...} patterns.
+    fn extractJsonU64(body: []const u8, key: []const u8) u64 {
+        var pattern_buf: [128]u8 = undefined;
+        const pattern = std.fmt.bufPrint(&pattern_buf, "\"{s}\":", .{key}) catch return 0;
+
+        const start_idx = std.mem.indexOf(u8, body, pattern) orelse return 0;
+        const val_start = start_idx + pattern.len;
+        if (val_start >= body.len) return 0;
+
+        // Parse decimal digits.
+        var end = val_start;
+        while (end < body.len and body[end] >= '0' and body[end] <= '9') : (end += 1) {}
+        if (end == val_start) return 0;
+
+        return std.fmt.parseUnsigned(u64, body[val_start..end], 10) catch 0;
+    }
+
+    /// Extract a JSON string value by key from a flat JSON object.
+    /// Simple parser — handles {"key":"value",...} patterns.
+    fn extractJsonString(body: []const u8, key: []const u8) ?[]const u8 {
+        // Build search pattern: "key":"
+        var pattern_buf: [128]u8 = undefined;
+        const pattern = std.fmt.bufPrint(&pattern_buf, "\"{s}\":\"", .{key}) catch return null;
+
+        const start_idx = std.mem.indexOf(u8, body, pattern) orelse return null;
+        const val_start = start_idx + pattern.len;
+        if (val_start >= body.len) return null;
+
+        // Find closing quote.
+        const val_end = std.mem.indexOf(u8, body[val_start..], "\"") orelse return null;
+        return body[val_start .. val_start + val_end];
     }
 };

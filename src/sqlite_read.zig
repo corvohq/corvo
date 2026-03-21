@@ -46,10 +46,6 @@ pub const JobRow = struct {
     chain_step: i32 = 0,
     group_key: [128]u8 = undefined,
     group_key_len: u8 = 0,
-    agent_iteration: i32 = 0,
-    agent_max_iterations: ?i32 = null,
-    agent_total_cost_usd: f64 = 0,
-    agent_max_cost_usd: ?f64 = null,
     created_at: [32]u8 = undefined,
     created_at_len: u8 = 0,
     started_at: [32]u8 = undefined,
@@ -272,37 +268,6 @@ pub const WorkerRow = struct {
     }
 };
 
-pub const IterationRow = struct {
-    job_id: [128]u8 = undefined,
-    job_id_len: u8 = 0,
-    iteration: i32 = 0,
-    status: [16]u8 = undefined,
-    status_len: u8 = 0,
-    checkpoint: [4096]u8 = undefined,
-    checkpoint_len: u16 = 0,
-    result: [4096]u8 = undefined,
-    result_len: u16 = 0,
-    cost_usd: f64 = 0,
-    completed_at: [32]u8 = undefined,
-    completed_at_len: u8 = 0,
-
-    pub fn jobIdSlice(self: *const IterationRow) []const u8 {
-        return self.job_id[0..self.job_id_len];
-    }
-    pub fn statusSlice(self: *const IterationRow) []const u8 {
-        return self.status[0..self.status_len];
-    }
-    pub fn checkpointSlice(self: *const IterationRow) []const u8 {
-        return self.checkpoint[0..self.checkpoint_len];
-    }
-    pub fn resultSlice(self: *const IterationRow) []const u8 {
-        return self.result[0..self.result_len];
-    }
-    pub fn completedAtSlice(self: *const IterationRow) []const u8 {
-        return self.completed_at[0..self.completed_at_len];
-    }
-};
-
 pub const BudgetRow = struct {
     scope: [64]u8 = undefined,
     scope_len: u8 = 0,
@@ -372,7 +337,6 @@ pub const Reader = struct {
         " worker_id, hostname, tags, checkpoint, result," ++
         " hold_reason, error_msg, batch_id, unique_key," ++
         " parent_id, chain_id, chain_step, group_key," ++
-        " agent_iteration, agent_max_iterations, agent_total_cost_usd, agent_max_cost_usd," ++
         " created_at, started_at, completed_at, failed_at, scheduled_at, lease_expires_at";
 
     // Full column list for cron queries — indices must match readCronRow.
@@ -692,49 +656,6 @@ pub const Reader = struct {
         return stmt.columnInt(0);
     }
 
-    /// Get checkpoint at a specific iteration for an agent job.
-    pub fn getJobCheckpointAtIteration(self: *Reader, job_id: []const u8, iteration: i32) !?IterationRow {
-        var stmt = try self.db.prepare(
-            "SELECT job_id, iteration, status, checkpoint, result, cost_usd, completed_at" ++
-                " FROM job_iterations WHERE job_id = ? AND iteration = ?",
-        );
-        defer stmt.finalize();
-        stmt.bindText(1, job_id);
-        stmt.bindInt(2, iteration);
-        if (!(try stmt.step())) return null;
-
-        var row = IterationRow{
-            .iteration = stmt.columnInt(1),
-            .cost_usd = stmt.columnDouble(5),
-        };
-        if (stmt.columnText(0)) |v| {
-            const len = @min(v.len, row.job_id.len);
-            @memcpy(row.job_id[0..len], v[0..len]);
-            row.job_id_len = @intCast(len);
-        }
-        if (stmt.columnText(2)) |v| {
-            const len = @min(v.len, row.status.len);
-            @memcpy(row.status[0..len], v[0..len]);
-            row.status_len = @intCast(len);
-        }
-        if (stmt.columnText(3)) |v| {
-            const len: u16 = @intCast(@min(v.len, row.checkpoint.len));
-            @memcpy(row.checkpoint[0..len], v[0..len]);
-            row.checkpoint_len = len;
-        }
-        if (stmt.columnText(4)) |v| {
-            const len: u16 = @intCast(@min(v.len, row.result.len));
-            @memcpy(row.result[0..len], v[0..len]);
-            row.result_len = len;
-        }
-        if (stmt.columnText(6)) |v| {
-            const len = @min(v.len, row.completed_at.len);
-            @memcpy(row.completed_at[0..len], v[0..len]);
-            row.completed_at_len = @intCast(len);
-        }
-        return row;
-    }
-
     // ====================================================================
     // FTS5 Search
     // ====================================================================
@@ -746,7 +667,6 @@ pub const Reader = struct {
                 " j.worker_id, j.hostname, j.tags, j.checkpoint, j.result," ++
                 " j.hold_reason, j.error_msg, j.batch_id, j.unique_key," ++
                 " j.parent_id, j.chain_id, j.chain_step, j.group_key," ++
-                " j.agent_iteration, j.agent_max_iterations, j.agent_total_cost_usd, j.agent_max_cost_usd," ++
                 " j.created_at, j.started_at, j.completed_at, j.failed_at, j.scheduled_at, j.lease_expires_at" ++
                 " FROM jobs_fts f JOIN jobs j ON j.id = f.job_id" ++
                 " WHERE jobs_fts MATCH ? ORDER BY rank LIMIT ?",
@@ -776,7 +696,6 @@ pub const Reader = struct {
                 " j.worker_id, j.hostname, j.tags, j.checkpoint, j.result," ++
                 " j.hold_reason, j.error_msg, j.batch_id, j.unique_key," ++
                 " j.parent_id, j.chain_id, j.chain_step, j.group_key," ++
-                " j.agent_iteration, j.agent_max_iterations, j.agent_total_cost_usd, j.agent_max_cost_usd," ++
                 " j.created_at, j.started_at, j.completed_at, j.failed_at, j.scheduled_at, j.lease_expires_at" ++
                 " FROM jobs j JOIN job_payloads jp ON jp.job_id = j.id" ++
                 " WHERE jp.payload LIKE ?" ++
@@ -799,89 +718,6 @@ pub const Reader = struct {
     // ====================================================================
     // Job Iterations
     // ====================================================================
-
-    /// Get iterations for an agent job.
-    pub fn getJobIterations(self: *Reader, job_id: []const u8, results: []IterationRow) !u32 {
-        var stmt = try self.db.prepare(
-            "SELECT job_id, iteration, status, checkpoint, result, cost_usd, completed_at" ++
-                " FROM job_iterations WHERE job_id = ? ORDER BY iteration",
-        );
-        defer stmt.finalize();
-
-        stmt.bindText(1, job_id);
-
-        var count: u32 = 0;
-        while (try stmt.step()) {
-            if (count >= results.len) break;
-            var row = IterationRow{
-                .iteration = stmt.columnInt(1),
-                .cost_usd = stmt.columnDouble(5),
-            };
-            if (stmt.columnText(0)) |v| {
-                const len = @min(v.len, row.job_id.len);
-                @memcpy(row.job_id[0..len], v[0..len]);
-                row.job_id_len = @intCast(len);
-            }
-            if (stmt.columnText(2)) |v| {
-                const len = @min(v.len, row.status.len);
-                @memcpy(row.status[0..len], v[0..len]);
-                row.status_len = @intCast(len);
-            }
-            if (stmt.columnText(3)) |v| {
-                const len: u16 = @intCast(@min(v.len, row.checkpoint.len));
-                @memcpy(row.checkpoint[0..len], v[0..len]);
-                row.checkpoint_len = len;
-            }
-            if (stmt.columnText(4)) |v| {
-                const len: u16 = @intCast(@min(v.len, row.result.len));
-                @memcpy(row.result[0..len], v[0..len]);
-                row.result_len = len;
-            }
-            if (stmt.columnText(6)) |v| {
-                const len = @min(v.len, row.completed_at.len);
-                @memcpy(row.completed_at[0..len], v[0..len]);
-                row.completed_at_len = @intCast(len);
-            }
-            results[count] = row;
-            count += 1;
-        }
-        return count;
-    }
-
-    // ====================================================================
-    // Usage Summary
-    // ====================================================================
-
-    pub const UsageTotals = struct {
-        input_tokens: i64 = 0,
-        output_tokens: i64 = 0,
-        cache_creation_tokens: i64 = 0,
-        cache_read_tokens: i64 = 0,
-        cost_usd: f64 = 0,
-        count: i64 = 0,
-    };
-
-    /// Get aggregate usage totals for a time range.
-    pub fn usageTotals(self: *Reader, from: []const u8, to: []const u8) !UsageTotals {
-        var stmt = try self.db.prepare(
-            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)," ++
-                " COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(cache_read_tokens),0)," ++
-                " COALESCE(SUM(cost_usd),0), COUNT(*)" ++
-                " FROM job_usage WHERE created_at >= ? AND created_at <= ?",
-        );
-        defer stmt.finalize();
-        stmt.bindText(1, from);
-        stmt.bindText(2, to);
-        if (!(try stmt.step())) return .{};
-        return .{
-            .input_tokens = stmt.columnInt64(0),
-            .output_tokens = stmt.columnInt64(1),
-            .cache_creation_tokens = stmt.columnInt64(2),
-            .cache_read_tokens = stmt.columnInt64(3),
-            .cost_usd = stmt.columnDouble(4),
-            .count = stmt.columnInt64(5),
-        };
-    }
 
     // ====================================================================
     // Budgets
@@ -958,29 +794,6 @@ pub const Reader = struct {
         return count;
     }
 
-    /// Get total daily spending for a queue since a given timestamp.
-    pub fn queueDailySpent(self: *Reader, queue: []const u8, since: []const u8) !f64 {
-        var stmt = try self.db.prepare(
-            "SELECT COALESCE(SUM(cost_usd), 0) FROM job_usage WHERE queue = ? AND created_at >= ?",
-        );
-        defer stmt.finalize();
-        stmt.bindText(1, queue);
-        stmt.bindText(2, since);
-        _ = try stmt.step();
-        return stmt.columnDouble(0);
-    }
-
-    /// Get average job cost for a queue.
-    pub fn queueAvgJobCost(self: *Reader, queue: []const u8) !f64 {
-        var stmt = try self.db.prepare(
-            "SELECT COALESCE(AVG(cost_usd), 0) FROM job_usage WHERE queue = ?",
-        );
-        defer stmt.finalize();
-        stmt.bindText(1, queue);
-        _ = try stmt.step();
-        return stmt.columnDouble(0);
-    }
-
     /// Find oldest pending job in a queue.
     pub fn findPendingJobInQueue(self: *Reader, queue: []const u8) !?[128]u8 {
         var stmt = try self.db.prepare(
@@ -996,17 +809,6 @@ pub const Reader = struct {
             return buf;
         }
         return null;
-    }
-
-    /// Get total cost for a job across all usage records.
-    pub fn jobTotalCost(self: *Reader, job_id: []const u8) !f64 {
-        var stmt = try self.db.prepare(
-            "SELECT COALESCE(SUM(cost_usd), 0) FROM job_usage WHERE job_id = ?",
-        );
-        defer stmt.finalize();
-        stmt.bindText(1, job_id);
-        _ = try stmt.step();
-        return stmt.columnDouble(0);
     }
 
     /// Check if any budgets are configured.
@@ -1061,67 +863,6 @@ pub const Reader = struct {
         while (try stmt.step()) {
             if (count >= results.len) break;
             results[count] = readBudgetRow(&stmt);
-            count += 1;
-        }
-        return count;
-    }
-
-    // ====================================================================
-    // Usage Grouped
-    // ====================================================================
-
-    pub const UsageSummaryGroup = struct {
-        key: [128]u8 = undefined,
-        key_len: u8 = 0,
-        input_tokens: i64 = 0,
-        output_tokens: i64 = 0,
-        cache_creation_tokens: i64 = 0,
-        cache_read_tokens: i64 = 0,
-        cost_usd: f64 = 0,
-        count: i64 = 0,
-
-        pub fn keySlice(self: *const UsageSummaryGroup) []const u8 {
-            return self.key[0..self.key_len];
-        }
-    };
-
-    /// Group usage by a column (queue, model, provider) for a time range.
-    /// Column must be one of: "queue", "model", "provider".
-    pub fn usageGrouped(self: *Reader, from: []const u8, to: []const u8, col: []const u8, results: []UsageSummaryGroup) !u32 {
-        // Validate column to prevent SQL injection.
-        if (!std.mem.eql(u8, col, "queue") and !std.mem.eql(u8, col, "model") and !std.mem.eql(u8, col, "provider")) {
-            return 0;
-        }
-        // Build query with validated column name.
-        var sql_buf: [512]u8 = undefined;
-        const sql = std.fmt.bufPrint(&sql_buf,
-            "SELECT {s}, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)," ++
-                " COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(cache_read_tokens),0)," ++
-                " COALESCE(SUM(cost_usd),0), COUNT(*)" ++
-                " FROM job_usage WHERE created_at >= ? AND created_at <= ? GROUP BY {s}", .{ col, col }) catch return 0;
-
-        var stmt = try self.db.prepareDynamic(sql);
-        defer stmt.finalize();
-        stmt.bindText(1, from);
-        stmt.bindText(2, to);
-
-        var count: u32 = 0;
-        while (try stmt.step()) {
-            if (count >= results.len) break;
-            var row = UsageSummaryGroup{
-                .input_tokens = stmt.columnInt64(1),
-                .output_tokens = stmt.columnInt64(2),
-                .cache_creation_tokens = stmt.columnInt64(3),
-                .cache_read_tokens = stmt.columnInt64(4),
-                .cost_usd = stmt.columnDouble(5),
-                .count = stmt.columnInt64(6),
-            };
-            if (stmt.columnText(0)) |v| {
-                const len = @min(v.len, row.key.len);
-                @memcpy(row.key[0..len], v[0..len]);
-                row.key_len = @intCast(len);
-            }
-            results[count] = row;
             count += 1;
         }
         return count;
@@ -1402,22 +1143,15 @@ pub const Reader = struct {
     /// 6:worker_id, 7:hostname, 8:tags, 9:checkpoint, 10:result,
     /// 11:hold_reason, 12:error_msg, 13:batch_id, 14:unique_key,
     /// 15:parent_id, 16:chain_id, 17:chain_step, 18:group_key,
-    /// 19:agent_iteration, 20:agent_max_iterations, 21:agent_total_cost_usd,
-    /// 22:agent_max_cost_usd,
-    /// 23:created_at, 24:started_at, 25:completed_at, 26:failed_at,
-    /// 27:scheduled_at, 28:lease_expires_at.
+    /// 19:created_at, 20:started_at, 21:completed_at, 22:failed_at,
+    /// 23:scheduled_at, 24:lease_expires_at.
     fn readJobRow(stmt: *sqlite.Stmt) JobRow {
         var row = JobRow{
             .priority = stmt.columnInt(3),
             .attempt = stmt.columnInt(4),
             .max_retries = stmt.columnInt(5),
             .chain_step = stmt.columnInt(17),
-            .agent_iteration = stmt.columnInt(19),
-            .agent_total_cost_usd = stmt.columnDouble(21),
         };
-        // Nullable ints/doubles.
-        if (!stmt.columnIsNull(20)) row.agent_max_iterations = stmt.columnInt(20);
-        if (!stmt.columnIsNull(22)) row.agent_max_cost_usd = stmt.columnDouble(22);
         // Text columns — small fixed buffers (u8 len).
         inline for (.{
             .{ @as(c_int, 0), &row.id, &row.id_len },
@@ -1431,12 +1165,12 @@ pub const Reader = struct {
             .{ @as(c_int, 15), &row.parent_id, &row.parent_id_len },
             .{ @as(c_int, 16), &row.chain_id, &row.chain_id_len },
             .{ @as(c_int, 18), &row.group_key, &row.group_key_len },
-            .{ @as(c_int, 23), &row.created_at, &row.created_at_len },
-            .{ @as(c_int, 24), &row.started_at, &row.started_at_len },
-            .{ @as(c_int, 25), &row.completed_at, &row.completed_at_len },
-            .{ @as(c_int, 26), &row.failed_at, &row.failed_at_len },
-            .{ @as(c_int, 27), &row.scheduled_at, &row.scheduled_at_len },
-            .{ @as(c_int, 28), &row.lease_expires_at, &row.lease_expires_at_len },
+            .{ @as(c_int, 19), &row.created_at, &row.created_at_len },
+            .{ @as(c_int, 20), &row.started_at, &row.started_at_len },
+            .{ @as(c_int, 21), &row.completed_at, &row.completed_at_len },
+            .{ @as(c_int, 22), &row.failed_at, &row.failed_at_len },
+            .{ @as(c_int, 23), &row.scheduled_at, &row.scheduled_at_len },
+            .{ @as(c_int, 24), &row.lease_expires_at, &row.lease_expires_at_len },
         }) |col| {
             if (stmt.columnText(col[0])) |v| {
                 const len = @min(v.len, col[1].len);

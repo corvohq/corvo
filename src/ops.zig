@@ -7,8 +7,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const JobState = types.JobState;
-const AgentState = types.AgentState;
-const AgentStatus = types.AgentStatus;
+const AckStatus = types.AckStatus;
 const Backoff = types.Backoff;
 
 // ============================================================================
@@ -61,7 +60,6 @@ pub const EnqueueJob = struct {
     expire_at_ns: u64 = 0,
     created_at_ns: u64 = 0,
     batch_id: ?[]const u8 = null,
-    agent: ?AgentState = null,
     parent_id: ?[]const u8 = null,
     chain_id: ?[]const u8 = null,
     chain_step: u16 = 0,
@@ -94,14 +92,12 @@ pub const FetchOp = struct {
 
 pub const AckJob = struct {
     job_id: []const u8 = "",
-    queue: []const u8 = "",
+    queue: []const u8 = "", // used for shard routing; handler reads job from KV by ID
     result: ?[]const u8 = null,
     checkpoint: ?[]const u8 = null,
-    usage: ?types.UsageReport = null,
-    agent_status: AgentStatus = .none,
+    ack_status: AckStatus = .done,
     hold_reason: ?[]const u8 = null,
-    step_status: ?[]const u8 = null,
-    exit_reason: ?[]const u8 = null,
+    lease_token: u64 = 0, // must match job's lease_token; 0 = don't check
 };
 
 pub const AckOp = struct {
@@ -119,10 +115,10 @@ pub const AckOp = struct {
 
 pub const FailJob = struct {
     job_id: []const u8 = "",
-    queue: []const u8 = "",
+    queue: []const u8 = "", // used for shard routing; handler reads job from KV by ID
     error_msg: []const u8 = "",
     backtrace: ?[]const u8 = null,
-    provider_error: bool = false,
+    lease_token: u64 = 0, // must match job's lease_token; 0 = don't check
 };
 
 pub const FailOp = struct {
@@ -138,7 +134,6 @@ pub const HeartbeatJobOp = struct {
     queue: []const u8 = "",
     progress: ?[]const u8 = null,
     checkpoint: ?[]const u8 = null,
-    usage: ?types.UsageReport = null,
 };
 
 pub const HeartbeatOp = struct {
@@ -155,7 +150,6 @@ pub const HeartbeatOp = struct {
 // ============================================================================
 
 pub const BulkAction = enum(u8) {
-    retry = 1,
     delete = 2,
     cancel = 3,
     move = 4,
@@ -167,7 +161,6 @@ pub const BulkAction = enum(u8) {
 
     pub fn toString(self: BulkAction) []const u8 {
         return switch (self) {
-            .retry => "retry",
             .delete => "delete",
             .cancel => "cancel",
             .move => "move",
@@ -182,7 +175,7 @@ pub const BulkAction = enum(u8) {
 
 pub const BulkActionOp = struct {
     job_ids: []const []const u8 = &.{},
-    action: BulkAction = .retry,
+    action: BulkAction = .requeue,
     queue: []const u8 = "",
     move_to_queue: ?[]const u8 = null,
     priority: u8 = 0,
@@ -435,6 +428,7 @@ pub const OpResult = struct {
         attempt: u16 = 0,
         max_retries: u16 = 0,
         lease_duration_ms: u32 = 0,
+        lease_token: u64 = 0,
     };
 };
 
@@ -456,7 +450,7 @@ test "OpType exhaustive" {
 
 test "BulkAction values" {
     const testing = std.testing;
-    try testing.expectEqualStrings("retry", BulkAction.retry.toString());
+    try testing.expectEqualStrings("requeue", BulkAction.requeue.toString());
     try testing.expectEqualStrings("delete", BulkAction.delete.toString());
     try testing.expectEqualStrings("reject", BulkAction.reject.toString());
 }

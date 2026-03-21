@@ -32,41 +32,68 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
     var batch_mods: [max_batch_mods]BatchMod = undefined;
     var batch_mod_count: u32 = 0;
 
-    for (op.job_ids) |job_id| {
+    for (op.job_ids, 0..) |job_id, job_idx| {
         var jk_buf: keys.KeyBuf = undefined;
-        const job_bytes = b.get(keys.jobKey(&jk_buf, job_id));
+
+        // For requeue: copy job data to stack buffer since applyEnqueue writes
+        // to the same batch and may invalidate slices from b.get().
+        var job_val_buf: [codec.max_job_encoded_size]u8 = undefined;
+        const job_bytes = if (op.action == .requeue)
+            b.getInto(keys.jobKey(&jk_buf, job_id), &job_val_buf)
+        else
+            b.get(keys.jobKey(&jk_buf, job_id));
         if (job_bytes == null) continue;
 
         var job = codec.decodeJob(job_bytes.?);
 
         switch (op.action) {
-            .retry => {
+            .requeue => {
                 if (!job.state.isTerminal()) continue;
-                // Clean up d| dead index key
-                if (job.completed_at_ns > 0) {
-                    var dk_buf: keys.KeyBuf = undefined;
-                    b.delete(keys.deadKey(&dk_buf, job.completed_at_ns, job_id));
-                }
-                // Delete self-owned unique lock before re-enqueue
-                var uk_buf: keys.KeyBuf = undefined;
-                if (OpHandler.jobUniqueKey(&uk_buf, &job)) |ukey| {
-                    if (b.get(ukey)) |ub| {
-                        const decoded = keys.decodeUniqueValue(ub);
-                        if (std.mem.eql(u8, decoded.job_id, job_id)) b.delete(ukey);
-                    }
-                }
-                job.state = .pending;
-                job.attempt = 0;
-                job.failed_at_ns = 0;
-                job.completed_at_ns = 0;
-                job.worker_id = null;
-                job.hostname = null;
-                job.lease_expires_at_ns = 0;
-                job.scheduled_at_ns = 0;
-                // Terminal jobs already had batch.pending decremented via
-                // handleBatchJobComplete. Just detach without adjusting counters.
-                job.batch_id = null;
-                self.pending.push(job.queue, job.priority, job.created_at_ns, job_id);
+
+                // Load payload from jp| key into stack buffer.
+                var payload_buf: [8192]u8 = undefined;
+                var jpk_buf: keys.KeyBuf = undefined;
+                const payload = b.getInto(keys.jobPayloadKey(&jpk_buf, job_id), &payload_buf);
+
+                // Generate new job ID: rq_{now_ns_hex}_{index_hex}
+                var new_id_buf: [64]u8 = undefined;
+                const new_id = std.fmt.bufPrint(&new_id_buf, "rq_{x}_{x}", .{ op.now_ns, job_idx }) catch "rq_err";
+
+                // Build enqueue op from old job's config.
+                const enq_job = ops.EnqueueJob{
+                    .job_id = new_id,
+                    .queue = job.queue,
+                    .state = .pending,
+                    .payload = payload,
+                    .priority = job.priority,
+                    .max_retries = job.max_retries,
+                    .backoff = job.retry_backoff,
+                    .base_delay_ms = job.retry_base_delay_ms,
+                    .max_delay_ms = job.retry_max_delay_ms,
+                    .unique_key = job.unique_key,
+                    .unique_period_s = job.unique_period_s,
+                    .tags = job.tags,
+                    .expire_after_ms = job.expire_after_ms,
+                    .created_at_ns = op.now_ns,
+                    // Drop batch_id — old batch already counted this job.
+                    .batch_id = null,
+                    .parent_id = job_id, // lineage: new job's parent is the old job
+                    .chain_id = if (job.chain_config != null) new_id else null,
+                    .chain_step = job.chain_step,
+                    .chain_config = job.chain_config,
+                    .group = job.group,
+                };
+
+                const jobs_arr = [_]ops.EnqueueJob{enq_job};
+                const enqueue_op = ops.EnqueueOp{
+                    .jobs = &jobs_arr,
+                    .now_ns = op.now_ns,
+                };
+                _ = self.applyEnqueue(b, &enqueue_op);
+
+                // Old job stays terminal — don't modify it.
+                affected += 1;
+                continue; // skip job write — old job is unchanged
             },
 
             .delete => {
@@ -206,54 +233,6 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 job.queue = move_to;
             },
 
-            .requeue => {
-                if (job.state != .dead) continue;
-                // Delete unique lock (will recreate below)
-                var uk_buf: keys.KeyBuf = undefined;
-                if (OpHandler.jobUniqueKey(&uk_buf, &job)) |ukey| {
-                    if (b.get(ukey)) |ub| {
-                        const decoded = keys.decodeUniqueValue(ub);
-                        if (std.mem.eql(u8, decoded.job_id, job_id)) b.delete(ukey);
-                    }
-                }
-                // Clean up d| key
-                if (job.completed_at_ns > 0) {
-                    var dk_buf: keys.KeyBuf = undefined;
-                    b.delete(keys.deadKey(&dk_buf, job.completed_at_ns, job_id));
-                }
-                // Terminal jobs already had batch.pending decremented. Just detach.
-                job.batch_id = null;
-                job.state = .pending;
-                job.attempt = 0;
-                job.failed_at_ns = 0;
-                job.completed_at_ns = 0;
-                job.worker_id = null;
-                job.hostname = null;
-                job.lease_expires_at_ns = 0;
-                self.pending.push(job.queue, job.priority, job.created_at_ns, job_id);
-                if (job.expire_after_ms > 0) {
-                    job.expire_at_ns = op.now_ns + @as(u64, job.expire_after_ms) * 1_000_000;
-                    var xk_buf: keys.KeyBuf = undefined;
-                    b.set(keys.expireKey(&xk_buf, job.expire_at_ns, job_id), "");
-                }
-                // Recreate unique lock. Without this, the re-enqueued pending
-                // job has no u| lock, allowing duplicates.
-                if (job.unique_key) |uk| {
-                    if (uk.len > 0) {
-                        var ruk_buf: keys.KeyBuf = undefined;
-                        var ruv_buf: keys.KeyBuf = undefined;
-                        var unique_expires_ns: u64 = 0;
-                        if (job.unique_period_s > 0) {
-                            unique_expires_ns = op.now_ns + @as(u64, job.unique_period_s) * 1_000_000_000;
-                        }
-                        b.set(
-                            keys.uniqueKey(&ruk_buf, job.queue, uk),
-                            keys.encodeUniqueValue(&ruv_buf, job_id, unique_expires_ns),
-                        );
-                    }
-                }
-            },
-
             .change_priority => {
                 if (job.state != .pending and job.state != .scheduled) continue;
                 if (job.state == .pending) {
@@ -377,11 +356,13 @@ fn applyBatchMods(self: *OpHandler, b: *kv.WriteBatch, mods: []const BatchMod, c
         const batch_bytes = b.getInto(bkey, &batch_val_buf) orelse continue;
         var batch = codec.decodeBatch(batch_bytes);
 
-        // Apply deltas with safe i64 arithmetic.
+        // Apply deltas.
         const new_pending = @as(i64, batch.pending) + @as(i64, m.pending_delta);
-        batch.pending = @intCast(@max(0, new_pending));
+        assert.check(new_pending >= 0, "applyBatchMods: pending underflow for batch {s} (pending={d} delta={d})", .{ m.batchId(), batch.pending, m.pending_delta });
+        batch.pending = @intCast(new_pending);
         const new_failed = @as(i64, batch.failed) + @as(i64, m.failed_delta);
-        batch.failed = @intCast(@max(0, @min(new_failed, @as(i64, batch.total))));
+        assert.check(new_failed >= 0, "applyBatchMods: failed underflow for batch {s}", .{m.batchId()});
+        batch.failed = @intCast(new_failed);
 
         assert.check(batch.succeeded + batch.failed <= batch.total, "batch completed exceeds total", .{});
 

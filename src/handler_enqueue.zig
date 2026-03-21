@@ -145,6 +145,7 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
                 assert.check(batch.open, "batch sealed between validation and update", .{});
                 batch.total += 1;
                 batch.pending += 1;
+                assert.check(batch.pending <= batch.total, "enqueue: batch {s} pending ({d}) > total ({d})", .{ batch_id, batch.pending, batch.total });
                 var batch_enc_buf: [codec.max_batch_encoded_size]u8 = undefined;
                 b.set(bkey, codec.encodeBatch(&batch_enc_buf, &batch));
             }
@@ -180,7 +181,6 @@ fn enqueueToJob(enq: *const ops.EnqueueJob) types.Job {
         .chain_step = enq.chain_step,
         .chain_config = enq.chain_config,
         .group = enq.group,
-        .agent = enq.agent,
         .checkpoint = enq.checkpoint,
     };
 }

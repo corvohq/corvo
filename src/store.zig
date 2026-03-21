@@ -137,19 +137,41 @@ pub const Store = struct {
     }
 
     /// Acknowledge job with full ack options (agent status, checkpoint, etc.).
+    /// Ack a batch of jobs in a single engine submit + mirror sync.
+    pub fn ackBatch(self: *Store, acks: []const ops_mod.AckJob) ops_mod.OpResult {
+        const now = self.nowNs();
+        const data = ops_mod.OpData{
+            .ack = .{ .acks = acks, .now_ns = now },
+        };
+        const result = self.engine.submit(.ack, &data);
+
+        if (self.mirror) |m| {
+            for (acks) |*a| {
+                var payload = mirror_mod.MirrorOp.AckPayload{ .now_ns = now };
+                const il = @min(a.job_id.len, payload.job_id.len);
+                @memcpy(payload.job_id[0..il], a.job_id[0..il]);
+                payload.job_id_len = @intCast(il);
+                if (a.result) |r| {
+                    const rl: u16 = @intCast(@min(r.len, payload.result.len));
+                    @memcpy(payload.result[0..rl], r[0..rl]);
+                    payload.result_len = rl;
+                }
+                if (a.hold_reason) |hr| {
+                    const hl = @min(hr.len, payload.hold_reason.len);
+                    @memcpy(payload.hold_reason[0..hl], hr[0..hl]);
+                    payload.hold_reason_len = @intCast(hl);
+                }
+                m.enqueue(.{ .op_type = .ack, .payload = .{ .ack = payload } });
+            }
+        }
+        return result;
+    }
+
     pub fn ackFull(self: *Store, job_id: []const u8, queue: []const u8, ack_job: ops_mod.AckJob) ops_mod.OpResult {
         _ = queue;
         const now = self.nowNs();
 
-        // Approval policy auto-hold: when agent_status is "continue",
-        // evaluate policies and override to "hold" if a policy matches.
-        var final_ack = ack_job;
-        if (ack_job.agent_status == .@"continue") {
-            if (self.evaluateApprovalPolicies(job_id, ack_job.queue)) |reason| {
-                final_ack.agent_status = .hold;
-                final_ack.hold_reason = reason;
-            }
-        }
+        const final_ack = ack_job;
 
         const acks = [1]ops_mod.AckJob{final_ack};
         const data = ops_mod.OpData{
@@ -179,61 +201,63 @@ pub const Store = struct {
                 payload.hold_reason_len = @intCast(hl);
             }
 
-            // Read back job from KV to populate agent fields and emit iteration.
-            if (result.err == null) {
-                var jk_buf: keys.KeyBuf = undefined;
-                if (self.engine.get(keys.jobKey(&jk_buf, job_id))) |job_bytes| {
-                    defer self.allocator.free(job_bytes);
-                    const job = codec.decodeJob(job_bytes);
-                    if (job.agent) |agent| {
-                        // Populate agent fields on the ack payload.
-                        payload.agent_iteration = agent.iteration;
-                        payload.agent_total_cost_usd = agent.total_cost_usd;
-
-                        // Emit iteration mirror op.
-                        var iter_payload = mirror_mod.MirrorOp.IterationPayload{
-                            .iteration = agent.iteration,
-                            .cost_usd = if (ack_job.usage) |u| u.cost_usd else 0,
-                            .completed_at_ns = now,
-                        };
-                        const jl = @min(job_id.len, iter_payload.job_id.len);
-                        @memcpy(iter_payload.job_id[0..jl], job_id[0..jl]);
-                        iter_payload.job_id_len = @intCast(jl);
-                        iter_payload.status = switch (job.state) {
-                            .completed => .completed,
-                            .held => .held,
-                            .pending => .@"continue",
-                            else => .completed,
-                        };
-                        if (ack_job.checkpoint) |cp| {
-                            const cl = @min(cp.len, iter_payload.checkpoint.len);
-                            @memcpy(iter_payload.checkpoint[0..cl], cp[0..cl]);
-                            iter_payload.checkpoint_len = @intCast(cl);
-                        }
-                        if (ack_job.result) |r| {
-                            const rl = @min(r.len, iter_payload.result.len);
-                            @memcpy(iter_payload.result[0..rl], r[0..rl]);
-                            iter_payload.result_len = @intCast(rl);
-                        }
-                        m.enqueue(.{ .op_type = .ack, .payload = .{ .iteration = iter_payload } });
-                    }
-                }
-            }
-
             m.enqueue(.{ .op_type = .ack, .payload = .{ .ack = payload } });
         }
 
         return result;
     }
 
+    /// Fail a batch of jobs in a single engine submit + mirror sync.
+    pub fn failBatch(self: *Store, jobs: []const ops_mod.FailJob) ops_mod.OpResult {
+        const now = self.nowNs();
+        const data = ops_mod.OpData{
+            .fail = .{ .jobs = jobs, .now_ns = now },
+        };
+        const result = self.engine.submit(.fail, &data);
+
+        if (self.mirror) |m| {
+            for (jobs) |*fj| {
+                var payload = mirror_mod.MirrorOp.FailPayload{ .now_ns = now };
+                const il = @min(fj.job_id.len, payload.job_id.len);
+                @memcpy(payload.job_id[0..il], fj.job_id[0..il]);
+                payload.job_id_len = @intCast(il);
+                const el = @min(fj.error_msg.len, payload.error_msg.len);
+                @memcpy(payload.error_msg[0..el], fj.error_msg[0..el]);
+                payload.error_msg_len = @intCast(el);
+
+                if (result.err == null) {
+                    var jk_buf: keys.KeyBuf = undefined;
+                    if (self.engine.get(keys.jobKey(&jk_buf, fj.job_id))) |job_bytes| {
+                        defer self.allocator.free(job_bytes);
+                        const job = codec.decodeJob(job_bytes);
+                        payload.new_state = job.state;
+                        payload.attempt = job.attempt;
+                        if (job.state == .retrying and job.scheduled_at_ns > 0) {
+                            payload.retry_at_ns = job.scheduled_at_ns;
+                        }
+                    }
+                }
+
+                m.enqueue(.{ .op_type = .fail, .payload = .{ .fail = payload } });
+            }
+        }
+        return result;
+    }
+
     /// Fail a job.
     pub fn fail(self: *Store, job_id: []const u8, queue: []const u8, error_msg: []const u8, backtrace: ?[]const u8) ops_mod.OpResult {
+        return self.failWithToken(job_id, queue, error_msg, backtrace, 0);
+    }
+
+    /// Fail a job with a lease token for stale-worker detection.
+    pub fn failWithToken(self: *Store, job_id: []const u8, queue: []const u8, error_msg: []const u8, backtrace: ?[]const u8, lease_token: u64) ops_mod.OpResult {
         const now = self.nowNs();
         const fail_jobs = [1]ops_mod.FailJob{.{
             .job_id = job_id,
             .queue = queue,
             .error_msg = error_msg,
             .backtrace = backtrace,
+            .lease_token = lease_token,
         }};
         const data = ops_mod.OpData{
             .fail = .{
@@ -398,6 +422,10 @@ pub const Store = struct {
                 for (bulk.job_ids) |job_id| {
                     if (bulk.action == .delete) {
                         m.enqueueBulkActionJob(job_id, .delete, "", bulk.now_ns);
+                    } else if (bulk.action == .move) {
+                        m.enqueueBulkActionMove(job_id, bulk.move_to_queue orelse "");
+                        // Also update state in mirror (move resets to pending).
+                        m.enqueueBulkActionJob(job_id, .update_state, "pending", bulk.now_ns);
                     } else {
                         // Read the job's new state from KV and update the mirror.
                         var jk_buf: keys.KeyBuf = undefined;

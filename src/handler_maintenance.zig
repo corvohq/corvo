@@ -218,7 +218,7 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     var dk_buf: keys.KeyBuf = undefined;
                     b.set(keys.deadKey(&dk_buf, now_ns, job_id), "");
 
-                    // Batch failure tracking
+                    // Batch failure tracking.
                     if (job.batch_id) |bid| {
                         if (bid.len > 0) self.handleBatchJobComplete(b, bid, false, now_ns);
                     }
@@ -321,7 +321,7 @@ fn applyExpire(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     }
                 }
 
-                // Batch failure tracking
+                // Batch failure tracking.
                 if (job.batch_id) |bid| {
                     if (bid.len > 0) self.handleBatchJobComplete(b, bid, false, now_ns);
                 }
@@ -390,21 +390,7 @@ fn applyPurge(b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult {
                     b.deleteRange(err_prefix, err_end);
                 }
 
-                // Delete iterations
-                var jip_buf: keys.KeyBuf = undefined;
-                var jie_buf: keys.KeyBuf = undefined;
-                const iter_prefix = keys.jobIterationPrefix(&jip_buf, job_id);
-                if (keys.prefixEnd(&jie_buf, iter_prefix)) |iter_end| {
-                    b.deleteRange(iter_prefix, iter_end);
-                }
 
-                // Delete usage
-                var jup_buf: keys.KeyBuf = undefined;
-                var jue_buf: keys.KeyBuf = undefined;
-                const usage_prefix = keys.jobUsagePrefix(&jup_buf, job_id);
-                if (keys.prefixEnd(&jue_buf, usage_prefix)) |usage_end| {
-                    b.deleteRange(usage_prefix, usage_end);
-                }
 
                 b.delete(key); // d| key
                 affected += 1;

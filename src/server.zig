@@ -401,7 +401,7 @@ pub const Server = struct {
                 };
 
                 // SSE streaming — takes over the connection indefinitely.
-                if (eql(req.method, "GET") and eql(req.path, "/api/v1/events")) {
+                if (eql(req.method, "GET") and (eql(req.path, "/api/v1/events") or startsWith(req.path, "/api/v1/events?"))) {
                     self.handleSSE(conn);
                     return;
                 }
@@ -625,7 +625,7 @@ pub const Server = struct {
         content_type: []const u8 = "application/json",
     };
 
-    fn route(self: *Server, req: Request, buf: []u8) Response {
+    pub fn route(self: *Server, req: Request, buf: []u8) Response {
         const path = req.path;
 
         // CORS preflight.
@@ -664,7 +664,7 @@ pub const Server = struct {
                 if (startsWith(api_path, "/fail/")) return self.handleFail(api_path[6..], req, buf);
                 if (eql(api_path, "/heartbeat")) return self.handleHeartbeat(req, buf);
                 if (eql(api_path, "/jobs/bulk")) return self.handleBulk(req, buf);
-                if (startsWith(api_path, "/jobs/") and endsWith(api_path, "/retry")) return self.handleJobAction(api_path, .retry, buf);
+                if (startsWith(api_path, "/jobs/") and endsWith(api_path, "/requeue")) return self.handleJobAction(api_path, .requeue, buf);
                 if (startsWith(api_path, "/jobs/") and endsWith(api_path, "/cancel")) return self.handleJobAction(api_path, .cancel, buf);
                 if (startsWith(api_path, "/jobs/") and endsWith(api_path, "/hold")) return self.handleJobAction(api_path, .hold, buf);
                 if (startsWith(api_path, "/jobs/") and endsWith(api_path, "/approve")) return self.handleJobAction(api_path, .approve, buf);
@@ -715,8 +715,6 @@ pub const Server = struct {
                 if (startsWith(api_path, "/cron-jobs/")) return self.handleGetCron(api_path, buf);
                 if (eql(api_path, "/search/fulltext")) return self.handleFullTextSearch(req, buf);
                 if (startsWith(api_path, "/jobs/search")) return self.handleJobSearch(req, buf);
-                if (startsWith(api_path, "/jobs/") and endsWith(api_path, "/iterations"))
-                    return self.handleJobIterations(api_path, buf);
                 if (startsWith(api_path, "/jobs/")) return self.handleGetJob(api_path[6..], buf);
                 if (eql(api_path, "/info")) return jsonOk(buf, "{\"version\":\"0.1.0\",\"engine\":\"zig\"}");
 
@@ -724,8 +722,6 @@ pub const Server = struct {
                     return self.handleClusterStatus(buf);
                 if (startsWith(api_path, "/metrics/throughput"))
                     return self.handleThroughput(buf);
-                if (startsWith(api_path, "/usage/summary"))
-                    return self.handleUsageSummary(req, buf);
                 if (eql(api_path, "/budgets"))
                     return self.handleListBudgets(buf);
                 if (eql(api_path, "/approval-policies"))
@@ -803,11 +799,6 @@ pub const Server = struct {
     fn handleEnqueue(self: *Server, req: Request, buf: []u8) Response {
         const body = req.body orelse return jsonError(buf, 400, "missing request body");
 
-        const AgentConfigReq = struct {
-            max_iterations: ?i64 = null,
-            max_cost_usd: ?f64 = null,
-            iteration_timeout_ms: ?i64 = null,
-        };
         const EnqueueReq = struct {
             queue: ?[]const u8 = null,
             priority: ?std.json.Value = null,
@@ -824,11 +815,11 @@ pub const Server = struct {
             expire_after_ms: ?i64 = null,
             batch_id: ?[]const u8 = null,
             scheduled_at: ?[]const u8 = null,
-            agent: ?AgentConfigReq = null,
             parent_id: ?[]const u8 = null,
             chain_id: ?[]const u8 = null,
             chain_step: ?i64 = null,
             chain_config: ?[]const u8 = null,
+            chain: ?std.json.Value = null,
         };
 
         const parsed = std.json.parseFromSlice(EnqueueReq, self.allocator, body, .{
@@ -879,6 +870,17 @@ pub const Server = struct {
             }
         }
 
+        // Stringify chain config (accept both "chain" object and "chain_config" string).
+        var chain_config_str: ?[]const u8 = r.chain_config;
+        var chain_config_allocated = false;
+        defer if (chain_config_allocated) if (chain_config_str) |s| self.allocator.free(s);
+        if (chain_config_str == null) {
+            if (r.chain) |cv| {
+                chain_config_str = std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(cv, .{})}) catch null;
+                chain_config_allocated = chain_config_str != null;
+            }
+        }
+
         // Payload size validation.
         if (self.config.max_payload_bytes > 0) {
             if (payload_str) |p| {
@@ -892,17 +894,6 @@ pub const Server = struct {
         if (r.scheduled_at) |sat| {
             scheduled_at_ns = parseRfc3339Ns(sat) orelse return jsonError(buf, 400, "invalid scheduled_at value (use RFC3339)");
             state = .scheduled;
-        }
-
-        // Parse agent config if provided.
-        var agent: ?types.AgentState = null;
-        if (r.agent) |ac| {
-            agent = .{
-                .max_iterations = if (ac.max_iterations) |mi| @intCast(@max(mi, 0)) else 0,
-                .max_cost_usd = if (ac.max_cost_usd) |mc| @max(mc, 0) else 0,
-                .iteration_timeout = if (ac.iteration_timeout_ms) |it| @intCast(@max(it, 0)) else 0,
-                .iteration = 1,
-            };
         }
 
         var id_buf: [64]u8 = undefined;
@@ -927,11 +918,10 @@ pub const Server = struct {
             .batch_id = r.batch_id,
             .scheduled_at_ns = scheduled_at_ns,
             .created_at_ns = self.store.nowNs(),
-            .agent = agent,
             .parent_id = r.parent_id,
-            .chain_id = r.chain_id,
+            .chain_id = r.chain_id orelse if (chain_config_str != null) job_id else null,
             .chain_step = if (r.chain_step) |cs| @intCast(@max(cs, 0)) else 0,
-            .chain_config = r.chain_config,
+            .chain_config = chain_config_str,
         };
 
         const result = self.store.enqueue(job);
@@ -1086,6 +1076,10 @@ pub const Server = struct {
     }
 
     fn handleFetch(self: *Server, req: Request, buf: []u8) Response {
+        return self.handleFetchInner(req, buf, false);
+    }
+
+    fn handleFetchInner(self: *Server, req: Request, buf: []u8, batch_mode: bool) Response {
         const body = req.body orelse return jsonError(buf, 400, "missing request body");
 
         const FetchReq = struct {
@@ -1094,6 +1088,7 @@ pub const Server = struct {
             hostname: ?[]const u8 = null,
             count: ?i64 = null,
             wait_timeout_ms: ?i64 = null,
+            timeout: ?i64 = null, // seconds (SDK compat)
         };
 
         const parsed = std.json.parseFromSlice(FetchReq, self.allocator, body, .{
@@ -1106,8 +1101,11 @@ pub const Server = struct {
         if (queues.len == 0) return jsonError(buf, 400, "queues must not be empty");
 
         const count: u32 = if (r.count) |c| @intCast(@min(@max(c, 1), 512)) else 1;
+        // Accept both wait_timeout_ms (native) and timeout (seconds, SDK compat).
         const wait_timeout_ms: u64 = if (r.wait_timeout_ms) |w|
             @intCast(@min(@max(w, 0), 30_000))
+        else if (r.timeout) |t|
+            @as(u64, @intCast(@min(@max(t, 0), 30))) * 1000
         else
             0;
 
@@ -1140,11 +1138,63 @@ pub const Server = struct {
             );
         }
 
-        if (result.affected == 0) {
-            return jsonOk(buf, "{\"jobs\":[]}");
+        if (batch_mode) {
+            if (result.affected == 0) {
+                return jsonOk(buf, "{\"jobs\":[]}");
+            }
+            return self.formatFetchResponse(result, buf);
         }
 
-        return self.formatFetchResponse(result, buf);
+        // Single fetch: return flat job object (SDK compat).
+        if (result.affected == 0) {
+            return jsonOk(buf, "{\"job_id\":\"\",\"queue\":\"\",\"payload\":null,\"attempt\":0,\"max_retries\":0,\"lease_duration\":0}");
+        }
+        return self.formatSingleFetchResponse(result, buf);
+    }
+
+    /// Write a single fetched job as JSON into the stream. Shared by both
+    /// formatFetchResponse (batch) and formatSingleFetchResponse (single).
+    fn writeFetchedJobJson(self: *Server, w: anytype, f: *const ops_mod.OpResult.FetchedJob) void {
+        const fid = f.id_buf[0..f.id_len];
+        const fq = f.queue_buf[0..f.queue_len];
+
+        w.print("{{\"job_id\":\"{s}\",\"queue\":\"{s}\",\"attempt\":{d},\"max_retries\":{d},\"lease_duration\":{d},\"lease_token\":{d}", .{
+            fid,
+            fq,
+            f.attempt,
+            f.max_retries,
+            f.lease_duration_ms / 1000,
+            f.lease_token,
+        }) catch return;
+
+        // Load payload from KV (separate key, matches Go pattern).
+        var jpk_buf: keys.KeyBuf = undefined;
+        if (self.store.engine.get(keys.jobPayloadKey(&jpk_buf, fid))) |payload| {
+            defer self.allocator.free(payload);
+            w.writeAll(",\"payload\":") catch return;
+            w.writeAll(payload) catch return;
+        }
+
+        // Load job header from KV for checkpoint, tags.
+        var jk_buf: keys.KeyBuf = undefined;
+        if (self.store.engine.get(keys.jobKey(&jk_buf, fid))) |job_bytes| {
+            defer self.allocator.free(job_bytes);
+            const job = codec.decodeJob(job_bytes);
+            if (job.checkpoint) |cp| {
+                if (cp.len > 0) {
+                    w.writeAll(",\"checkpoint\":") catch return;
+                    w.writeAll(cp) catch return;
+                }
+            }
+            if (job.tags) |tags| {
+                if (tags.len > 0) {
+                    w.writeAll(",\"tags\":") catch return;
+                    w.writeAll(tags) catch return;
+                }
+            }
+        }
+
+        w.writeByte('}') catch return;
     }
 
     fn formatFetchResponse(self: *Server, result: ops_mod.OpResult, buf: []u8) Response {
@@ -1155,64 +1205,22 @@ pub const Server = struct {
 
         for (0..result.affected) |i| {
             if (i > 0) w.writeByte(',') catch break;
-            const f = &result.fetched[i];
-            const fid = f.id_buf[0..f.id_len];
-            const fq = f.queue_buf[0..f.queue_len];
-
-            // Core fields from FetchedJob (set in handler, no KV read needed).
-            w.print("{{\"job_id\":\"{s}\",\"queue\":\"{s}\",\"attempt\":{d},\"max_retries\":{d},\"lease_duration\":{d}", .{
-                fid,
-                fq,
-                f.attempt,
-                f.max_retries,
-                f.lease_duration_ms / 1000,
-            }) catch break;
-
-            // Load payload from KV (separate key, matches Go pattern).
-            var jpk_buf: keys.KeyBuf = undefined;
-            if (self.store.engine.get(keys.jobPayloadKey(&jpk_buf, fid))) |payload| {
-                defer self.allocator.free(payload);
-                w.writeAll(",\"payload\":") catch break;
-                w.writeAll(payload) catch break;
-            }
-
-            // Load job header from KV for checkpoint, tags, agent state.
-            var jk_buf: keys.KeyBuf = undefined;
-            if (self.store.engine.get(keys.jobKey(&jk_buf, fid))) |job_bytes| {
-                defer self.allocator.free(job_bytes);
-                const job = codec.decodeJob(job_bytes);
-                if (job.checkpoint) |cp| {
-                    if (cp.len > 0) {
-                        w.writeAll(",\"checkpoint\":") catch break;
-                        w.writeAll(cp) catch break;
-                    }
-                }
-                if (job.tags) |tags| {
-                    if (tags.len > 0) {
-                        w.writeAll(",\"tags\":") catch break;
-                        w.writeAll(tags) catch break;
-                    }
-                }
-                if (job.agent) |agent| {
-                    w.print(",\"agent\":{{\"iteration\":{d},\"max_iterations\":{d},\"total_cost_usd\":{d:.6},\"max_cost_usd\":{d:.6}}}", .{
-                        agent.iteration,
-                        agent.max_iterations,
-                        agent.total_cost_usd,
-                        agent.max_cost_usd,
-                    }) catch break;
-                }
-            }
-
-            w.writeByte('}') catch break;
+            self.writeFetchedJobJson(w, &result.fetched[i]);
         }
 
         w.writeAll("]}") catch {};
         return .{ .status = 200, .body = stream.getWritten() };
     }
 
+    fn formatSingleFetchResponse(self: *Server, result: ops_mod.OpResult, buf: []u8) Response {
+        var stream = std.io.fixedBufferStream(buf);
+        const w = stream.writer();
+        self.writeFetchedJobJson(w, &result.fetched[0]);
+        return .{ .status = 200, .body = stream.getWritten() };
+    }
+
     fn handleFetchBatch(self: *Server, req: Request, buf: []u8) Response {
-        // Fetch/batch is the same as fetch with count > 1 — delegate.
-        return self.handleFetch(req, buf);
+        return self.handleFetchInner(req, buf, true);
     }
 
     fn handleAck(self: *Server, job_id: []const u8, req: Request, buf: []u8) Response {
@@ -1222,30 +1230,19 @@ pub const Server = struct {
         var qbuf: [64]u8 = undefined;
         const queue = self.store.lookupJobQueue(job_id, &qbuf) orelse return jsonError(buf, 404, "job not found");
 
-        // Parse optional ack body (result, checkpoint, usage, agent_status, etc.).
+        // Parse optional ack body (result, checkpoint, ack_status, etc.).
         var ack_job = ops_mod.AckJob{
             .job_id = job_id,
             .queue = queue,
         };
 
         if (req.body) |body| {
-            const UsageReq = struct {
-                input_tokens: ?i64 = null,
-                output_tokens: ?i64 = null,
-                cache_creation_tokens: ?i64 = null,
-                cache_read_tokens: ?i64 = null,
-                cost_usd: ?f64 = null,
-                model: ?[]const u8 = null,
-                provider: ?[]const u8 = null,
-            };
             const AckReq = struct {
                 result: ?[]const u8 = null,
                 checkpoint: ?[]const u8 = null,
-                usage: ?UsageReq = null,
-                agent_status: ?[]const u8 = null,
+                ack_status: ?[]const u8 = null,
                 hold_reason: ?[]const u8 = null,
-                step_status: ?[]const u8 = null,
-                exit_reason: ?[]const u8 = null,
+                lease_token: ?u64 = null,
             };
             const parsed = std.json.parseFromSlice(AckReq, self.allocator, body, .{
                 .ignore_unknown_fields = true,
@@ -1256,21 +1253,9 @@ pub const Server = struct {
                 ack_job.result = r.result;
                 ack_job.checkpoint = r.checkpoint;
                 ack_job.hold_reason = r.hold_reason;
-                ack_job.step_status = r.step_status;
-                ack_job.exit_reason = r.exit_reason;
-                if (r.agent_status) |as| {
-                    ack_job.agent_status = parseAgentStatus(as);
-                }
-                if (r.usage) |u| {
-                    ack_job.usage = .{
-                        .input_tokens = if (u.input_tokens) |t| @intCast(@max(t, 0)) else 0,
-                        .output_tokens = if (u.output_tokens) |t| @intCast(@max(t, 0)) else 0,
-                        .cache_creation_tokens = if (u.cache_creation_tokens) |t| @intCast(@max(t, 0)) else 0,
-                        .cache_read_tokens = if (u.cache_read_tokens) |t| @intCast(@max(t, 0)) else 0,
-                        .cost_usd = if (u.cost_usd) |c| @max(c, 0) else 0,
-                        .model = u.model orelse "",
-                        .provider = u.provider orelse "",
-                    };
+                ack_job.lease_token = r.lease_token orelse 0;
+                if (r.ack_status) |as| {
+                    ack_job.ack_status = parseAckStatus(as);
                 }
             }
         }
@@ -1332,10 +1317,12 @@ pub const Server = struct {
 
         var error_msg: []const u8 = "";
         var backtrace: ?[]const u8 = null;
+        var lease_token: u64 = 0;
         if (req.body) |body| {
             const FailReq = struct {
                 @"error": ?[]const u8 = null,
                 backtrace: ?[]const u8 = null,
+                lease_token: ?u64 = null,
             };
             const parsed = std.json.parseFromSlice(FailReq, self.allocator, body, .{
                 .ignore_unknown_fields = true,
@@ -1344,12 +1331,13 @@ pub const Server = struct {
                 defer p.deinit();
                 error_msg = p.value.@"error" orelse "";
                 backtrace = p.value.backtrace;
+                lease_token = p.value.lease_token orelse 0;
             }
         }
 
         var qbuf: [64]u8 = undefined;
         const queue = self.store.lookupJobQueue(job_id, &qbuf) orelse return jsonError(buf, 404, "job not found");
-        const result = self.store.fail(job_id, queue, error_msg, backtrace);
+        const result = self.store.failWithToken(job_id, queue, error_msg, backtrace, lease_token);
         if (result.err) |err| {
             return jsonError(buf, 500, err);
         }
@@ -1536,7 +1524,7 @@ pub const Server = struct {
         const data = ops_mod.OpData{
             .bulk_action = .{
                 .job_ids = &job_ids,
-                .action = .retry,
+                .action = .requeue,
                 .queue = queue,
                 .now_ns = self.store.nowNs(),
             },
@@ -1721,11 +1709,43 @@ pub const Server = struct {
         }
 
         const j = job.?;
-        const resp = std.fmt.bufPrint(buf,
-            "{{\"id\":\"{s}\",\"queue\":\"{s}\",\"state\":\"{s}\",\"priority\":{d},\"attempt\":{d}}}",
-            .{ j.idSlice(), j.queueSlice(), j.stateSlice(), j.priority, j.attempt },
-        ) catch "{}";
-        return .{ .status = 200, .body = resp };
+        var stream = std.io.fixedBufferStream(buf);
+        const w = stream.writer();
+
+        w.print("{{\"id\":\"{s}\",\"queue\":\"{s}\",\"state\":\"{s}\",\"priority\":{d},\"attempt\":{d},\"max_retries\":{d}", .{
+            j.idSlice(), j.queueSlice(), j.stateSlice(), j.priority, j.attempt, j.max_retries,
+        }) catch return jsonOk(buf, "{}");
+
+        if (j.hold_reason_len > 0) {
+            w.print(",\"hold_reason\":\"{s}\"", .{j.holdReasonSlice()}) catch {};
+        }
+        if (j.chain_id_len > 0) {
+            w.print(",\"chain_id\":\"{s}\",\"chain_step\":{d}", .{ j.chainIdSlice(), j.chain_step }) catch {};
+        }
+        if (j.tags_len > 0) {
+            w.writeAll(",\"tags\":") catch {};
+            w.writeAll(j.tagsSlice()) catch {};
+        }
+        if (j.checkpoint_len > 0) {
+            w.writeAll(",\"checkpoint\":") catch {};
+            w.writeAll(j.checkpointSlice()) catch {};
+        }
+        if (j.result_len > 0) {
+            w.writeAll(",\"result\":") catch {};
+            w.writeAll(j.resultSlice()) catch {};
+        }
+        if (j.created_at_len > 0) {
+            w.print(",\"created_at\":\"{s}\"", .{j.created_at[0..j.created_at_len]}) catch {};
+        }
+        if (j.started_at_len > 0) {
+            w.print(",\"started_at\":\"{s}\"", .{j.started_at[0..j.started_at_len]}) catch {};
+        }
+        if (j.completed_at_len > 0) {
+            w.print(",\"completed_at\":\"{s}\"", .{j.completed_at[0..j.completed_at_len]}) catch {};
+        }
+
+        w.writeByte('}') catch {};
+        return .{ .status = 200, .body = stream.getWritten() };
     }
 
     // ====================================================================
@@ -2026,7 +2046,6 @@ pub const Server = struct {
         m.getDB().exec("DELETE FROM jobs") catch {};
         m.getDB().exec("DELETE FROM job_payloads") catch {};
         m.getDB().exec("DELETE FROM job_errors") catch {};
-        m.getDB().exec("DELETE FROM job_iterations") catch {};
         m.getDB().exec("DELETE FROM queues") catch {};
         m.getDB().exec("DELETE FROM workers") catch {};
 
@@ -2300,67 +2319,8 @@ pub const Server = struct {
     }
 
     // ====================================================================
-    // Handlers — Job Iterations
-    // ====================================================================
-
-    fn handleJobIterations(self: *Server, api_path: []const u8, buf: []u8) Response {
-        self.store.flushMirror();
-        // Extract job ID: /jobs/{id}/iterations
-        const rest = api_path["/jobs/".len..];
-        const slash = std.mem.indexOf(u8, rest, "/") orelse return jsonError(buf, 400, "invalid path");
-        const job_id = rest[0..slash];
-        if (job_id.len == 0) return jsonError(buf, 400, "missing job_id");
-
-        var r = self.store.reader() orelse return jsonError(buf, 503, "mirror not available");
-        var iter_buf: [100]sqlite_read.IterationRow = undefined;
-        const count = r.getJobIterations(job_id, &iter_buf) catch {
-            return jsonError(buf, 500, "query failed");
-        };
-
-        var stream = std.io.fixedBufferStream(buf);
-        const w = stream.writer();
-        w.writeAll("{\"iterations\":[") catch return jsonOk(buf, "{\"iterations\":[]}");
-
-        for (0..count) |i| {
-            if (i > 0) w.writeByte(',') catch break;
-            const it = &iter_buf[i];
-            w.print("{{\"iteration\":{d},\"status\":\"{s}\",\"completed_at\":\"{s}\"}}",
-                .{ it.iteration, it.statusSlice(), it.completedAtSlice() },
-            ) catch break;
-        }
-
-        w.writeAll("]}") catch {};
-        return .{ .status = 200, .body = stream.getWritten() };
-    }
-
-    // ====================================================================
     // Handlers — Prometheus Metrics
     // ====================================================================
-
-    fn handleUsageSummary(self: *Server, req: Request, buf: []u8) Response {
-        _ = req;
-        var reader = self.store.reader() orelse
-            return jsonOk(buf, "{\"period\":\"24h\",\"totals\":{\"input_tokens\":0,\"output_tokens\":0,\"cost_usd\":0,\"count\":0}}");
-
-        // Default period: 24h. Parse from query string if present.
-        const now_ns = self.store.nowNs();
-        const period_ns: u64 = 24 * 3600 * 1_000_000_000; // 24h default
-        const from_ns = now_ns -| period_ns;
-
-        var from_buf: [32]u8 = undefined;
-        var to_buf: [32]u8 = undefined;
-        const from_str = std.fmt.bufPrint(&from_buf, "{d}", .{from_ns}) catch "0";
-        const to_str = std.fmt.bufPrint(&to_buf, "{d}", .{now_ns}) catch "0";
-
-        const totals = reader.usageTotals(from_str, to_str) catch
-            return jsonError(buf, 500, "usage query failed");
-
-        const resp = std.fmt.bufPrint(buf,
-            "{{\"period\":\"24h\",\"totals\":{{\"input_tokens\":{d},\"output_tokens\":{d},\"cache_creation_tokens\":{d},\"cache_read_tokens\":{d},\"cost_usd\":{d:.4},\"count\":{d}}}}}",
-            .{ totals.input_tokens, totals.output_tokens, totals.cache_creation_tokens, totals.cache_read_tokens, totals.cost_usd, totals.count },
-        ) catch return jsonError(buf, 500, "format error");
-        return jsonOk(buf, resp);
-    }
 
     fn handleThroughput(self: *Server, buf: []u8) Response {
         const data = self.throughput.snapshot(buf);
@@ -3234,11 +3194,9 @@ fn parseBatchCount(body: []const u8) u32 {
     return 1;
 }
 
-fn parseAgentStatus(s: []const u8) types.AgentStatus {
-    if (eql(s, "continue")) return .@"continue";
-    if (eql(s, "done")) return .done;
+fn parseAckStatus(s: []const u8) types.AckStatus {
     if (eql(s, "hold")) return .hold;
-    return .none;
+    return .done;
 }
 
 /// Parse RFC3339 timestamp to nanoseconds since epoch.
@@ -3293,7 +3251,6 @@ fn parseRfc3339Ns(s: []const u8) ?u64 {
 }
 
 fn parseBulkAction(s: []const u8) ?ops_mod.BulkAction {
-    if (eql(s, "retry")) return .retry;
     if (eql(s, "delete")) return .delete;
     if (eql(s, "cancel")) return .cancel;
     if (eql(s, "move")) return .move;
@@ -3632,7 +3589,7 @@ test "job action on non-existent job returns 404" {
     defer ctx.deinit();
 
     var buf: [4096]u8 = undefined;
-    const resp = ctx.route("POST", "/api/v1/jobs/nonexistent-job/retry", null, &buf);
+    const resp = ctx.route("POST", "/api/v1/jobs/nonexistent-job/requeue", null, &buf);
     try std.testing.expectEqual(@as(u16, 404), resp.status);
 }
 
@@ -4497,36 +4454,9 @@ test "ack with result and checkpoint" {
     try std.testing.expectEqual(@as(u16, 200), ack_resp.status);
 }
 
-test "ack with usage report" {
+test "ack with hold status" {
     var ctx: TestContext = undefined;
-    try ctx.setup(std.testing.allocator, "/tmp/corvo-test-ack-usage");
-    defer ctx.deinit();
-
-    var buf: [8192]u8 = undefined;
-
-    // Enqueue + fetch.
-    const enq_resp = ctx.route("POST", "/api/v1/enqueue", "{\"queue\":\"q\"}", &buf);
-    try std.testing.expectEqual(@as(u16, 201), enq_resp.status);
-    var jid_buf: [64]u8 = undefined;
-    const jid_raw = MirrorTestContext.extractJobId(enq_resp.body);
-    @memcpy(jid_buf[0..jid_raw.len], jid_raw);
-    const jid = jid_buf[0..jid_raw.len];
-
-    var fbuf: [8192]u8 = undefined;
-    _ = ctx.route("POST", "/api/v1/fetch", "{\"queues\":[\"q\"],\"worker_id\":\"w1\",\"count\":1}", &fbuf);
-
-    // Ack with usage.
-    var ack_path: [256]u8 = undefined;
-    const ap = std.fmt.bufPrint(&ack_path, "/api/v1/ack/{s}", .{jid}) catch return;
-    var abuf: [8192]u8 = undefined;
-    const ack_resp = ctx.route("POST", ap,
-        "{\"usage\":{\"input_tokens\":100,\"output_tokens\":50,\"cost_usd\":0.01,\"model\":\"claude-3\",\"provider\":\"anthropic\"}}", &abuf);
-    try std.testing.expectEqual(@as(u16, 200), ack_resp.status);
-}
-
-test "ack with agent_status hold" {
-    var ctx: TestContext = undefined;
-    try ctx.setup(std.testing.allocator, "/tmp/corvo-test-ack-agent");
+    try ctx.setup(std.testing.allocator, "/tmp/corvo-test-ack-hold");
     defer ctx.deinit();
 
     var buf: [8192]u8 = undefined;
@@ -4545,7 +4475,7 @@ test "ack with agent_status hold" {
     const ap = std.fmt.bufPrint(&ack_path, "/api/v1/ack/{s}", .{jid}) catch return;
     var abuf: [8192]u8 = undefined;
     const ack_resp = ctx.route("POST", ap,
-        "{\"agent_status\":\"hold\",\"hold_reason\":\"budget exceeded\"}", &abuf);
+        "{\"ack_status\":\"hold\",\"hold_reason\":\"budget exceeded\"}", &abuf);
     try std.testing.expectEqual(@as(u16, 200), ack_resp.status);
 }
 
@@ -4642,18 +4572,6 @@ test "enqueue with retry config" {
     var buf: [8192]u8 = undefined;
     const resp = ctx.route("POST", "/api/v1/enqueue",
         "{\"queue\":\"q\",\"retry_backoff\":\"linear\",\"retry_base_delay_ms\":1000,\"retry_max_delay_ms\":30000}", &buf);
-    try std.testing.expectEqual(@as(u16, 201), resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"id\":\"job_") != null);
-}
-
-test "enqueue with agent config" {
-    var ctx: TestContext = undefined;
-    try ctx.setup(std.testing.allocator, "/tmp/corvo-test-agent-cfg");
-    defer ctx.deinit();
-
-    var buf: [8192]u8 = undefined;
-    const resp = ctx.route("POST", "/api/v1/enqueue",
-        "{\"queue\":\"q\",\"agent\":{\"max_iterations\":10,\"max_cost_usd\":5.0,\"iteration_timeout_ms\":30000}}", &buf);
     try std.testing.expectEqual(@as(u16, 201), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"id\":\"job_") != null);
 }
@@ -4859,11 +4777,10 @@ test "parseBackoff: all variants" {
     try std.testing.expectEqual(types.Backoff.exponential, parseBackoff("unknown"));
 }
 
-test "parseAgentStatus: all variants" {
-    try std.testing.expectEqual(types.AgentStatus.@"continue", parseAgentStatus("continue"));
-    try std.testing.expectEqual(types.AgentStatus.done, parseAgentStatus("done"));
-    try std.testing.expectEqual(types.AgentStatus.hold, parseAgentStatus("hold"));
-    try std.testing.expectEqual(types.AgentStatus.none, parseAgentStatus("unknown"));
+test "parseAckStatus: all variants" {
+    try std.testing.expectEqual(types.AckStatus.done, parseAckStatus("done"));
+    try std.testing.expectEqual(types.AckStatus.hold, parseAckStatus("hold"));
+    try std.testing.expectEqual(types.AckStatus.done, parseAckStatus("unknown"));
 }
 
 test "extractQueryParam: various cases" {
@@ -5186,11 +5103,12 @@ test "bulk requeue recreates unique lock" {
     };
     _ = ctx.store.bulkAction(&requeue_data);
 
-    // Try to enqueue a new job with the same unique key — should be rejected.
+    // Try to enqueue a new job with the same unique key — should get unique_existing.
     const resp2 = ctx.route("POST", "/api/v1/enqueue",
         "{\"queue\":\"q\",\"unique_key\":\"ruk1\"}", &buf);
-    // Should get 409 (unique conflict) since the requeued job owns the lock.
+    // 409 = unique conflict. The requeued job owns the lock.
     try std.testing.expectEqual(@as(u16, 409), resp2.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp2.body, "unique_existing") != null);
 }
 
 // ============================================================================
@@ -5349,27 +5267,3 @@ test "fetch response includes payload, attempt, max_retries, tags, checkpoint" {
     try std.testing.expect(std.mem.indexOf(u8, fetch_resp.body, "\"step\":1") != null);
 }
 
-test "fetch response includes agent state for agent jobs" {
-    const allocator = std.testing.allocator;
-    var ctx: TestContext = undefined;
-    try ctx.setup(allocator, "/tmp/corvo-srv-test-fetch-agent");
-    defer ctx.deinit();
-
-    // Enqueue an agent job.
-    var buf: [8192]u8 = undefined;
-    const enq_resp = ctx.route("POST", "/api/v1/enqueue",
-        \\{"queue":"aq","payload":{"task":"analyze"},"agent":{"max_iterations":10,"max_cost_usd":5.0}}
-    , &buf);
-    try std.testing.expectEqual(@as(u16, 201), enq_resp.status);
-
-    // Fetch.
-    var buf2: [8192]u8 = undefined;
-    const fetch_resp = ctx.route("POST", "/api/v1/fetch",
-        \\{"queues":["aq"],"worker_id":"w-1","count":1}
-    , &buf2);
-    try std.testing.expectEqual(@as(u16, 200), fetch_resp.status);
-
-    // Agent state should be in the response.
-    try std.testing.expect(std.mem.indexOf(u8, fetch_resp.body, "\"agent\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fetch_resp.body, "\"max_iterations\":10") != null);
-}

@@ -1,5 +1,5 @@
 import { useSearch } from "@/hooks/use-search";
-import { HeldCard } from "@/components/ai/held-card";
+import { HeldCard } from "@/components/jobs/held-card";
 
 export default function HeldJobs() {
   const { data: searchResult, isLoading } = useSearch({
@@ -27,8 +27,8 @@ export default function HeldJobs() {
       {!isLoading && (!searchResult?.jobs || searchResult.jobs.length === 0) && (
         <div className="rounded-lg border border-dashed p-12 text-center">
           <p className="text-sm text-muted-foreground">
-            No held jobs. When AI agent jobs require human approval, they will
-            appear here.
+            No held jobs. When jobs requiring human review are created, they
+            will appear here.
           </p>
         </div>
       )}

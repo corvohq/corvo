@@ -72,35 +72,19 @@ pub const Backoff = enum(u8) {
 };
 
 // ============================================================================
-// Agent Status
+// Ack Status
 // ============================================================================
 
-pub const AgentStatus = enum(u8) {
-    none = 0,
-    @"continue" = 1,
-    done = 2,
-    hold = 3,
+pub const AckStatus = enum(u8) {
+    done = 0,
+    hold = 1,
 
-    pub fn toString(self: AgentStatus) []const u8 {
+    pub fn toString(self: AckStatus) []const u8 {
         return switch (self) {
-            .none => "",
-            .@"continue" => "continue",
             .done => "done",
             .hold => "hold",
         };
     }
-};
-
-// ============================================================================
-// Agent State
-// ============================================================================
-
-pub const AgentState = struct {
-    max_iterations: u32 = 0,
-    max_cost_usd: f64 = 0,
-    iteration_timeout: u32 = 0, // ms
-    iteration: u32 = 0,
-    total_cost_usd: f64 = 0,
 };
 
 // ============================================================================
@@ -159,11 +143,13 @@ pub const Job = struct {
     // Group (for fairness)
     group: ?[]const u8 = null,
 
-    // Agent
-    agent: ?AgentState = null,
-
     // Hold
     hold_reason: ?[]const u8 = null,
+
+    // Lease token — set on fetch, verified on ack/fail.
+    // Prevents stale workers (whose lease expired and was reclaimed)
+    // from completing jobs they no longer own.
+    lease_token: u64 = 0,
 };
 
 // ============================================================================
@@ -242,38 +228,6 @@ pub const Budget = struct {
 };
 
 // ============================================================================
-// Iteration Status (for agent jobs)
-// ============================================================================
-
-pub const IterationStatus = enum(u8) {
-    completed = 0,
-    @"continue" = 1,
-    held = 2,
-
-    pub fn toString(self: IterationStatus) []const u8 {
-        return switch (self) {
-            .completed => "completed",
-            .@"continue" => "continue",
-            .held => "held",
-        };
-    }
-};
-
-// ============================================================================
-// Job Iteration (agent job tracking)
-// ============================================================================
-
-pub const JobIteration = struct {
-    job_id: []const u8 = "",
-    iteration: u32 = 0,
-    status: IterationStatus = .completed,
-    checkpoint: ?[]const u8 = null,
-    result: ?[]const u8 = null,
-    cost_usd: f64 = 0,
-    completed_at_ns: u64 = 0,
-};
-
-// ============================================================================
 // Job Error
 // ============================================================================
 
@@ -281,20 +235,6 @@ pub const JobError = struct {
     attempt: u16 = 0,
     error_msg: []const u8 = "",
     backtrace: ?[]const u8 = null,
-};
-
-// ============================================================================
-// Usage Report
-// ============================================================================
-
-pub const UsageReport = struct {
-    input_tokens: u64 = 0,
-    output_tokens: u64 = 0,
-    cache_creation_tokens: u64 = 0,
-    cache_read_tokens: u64 = 0,
-    cost_usd: f64 = 0,
-    model: []const u8 = "",
-    provider: []const u8 = "",
 };
 
 // ============================================================================

@@ -95,13 +95,8 @@ pub fn applyDeleteQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Dele
 // ============================================================================
 
 fn deleteAllQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, now_ns: u64) void {
-    // Delete active jobs
-    var ap_buf: keys.KeyBuf = undefined;
-    var ape_buf: keys.KeyBuf = undefined;
-    const ap = keys.activePrefix(&ap_buf, queue);
-    if (keys.prefixEnd(&ape_buf, ap)) |end| {
-        deleteJobsByPrefix(self, b, ap, end, extractJobIDFromActive, now_ns);
-    }
+    // NOTE: active jobs are NOT deleted — they have a worker processing them.
+    // They will complete naturally via ack/fail, or be reclaimed by maintenance.
 
     // Delete scheduled jobs
     var sp_buf: keys.KeyBuf = undefined;
@@ -171,9 +166,7 @@ fn deleteAllQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, no
         b.deleteRange(qa, end);
     }
 
-    // Reset in-memory counts
-    _ = self.active_counts.remove(queue);
-    _ = self.fairness_active.remove(queue);
+    // Don't reset active counts — active jobs are still in flight.
     _ = self.fairness_served.remove(queue);
 
     // Delete rate limit data
@@ -312,8 +305,10 @@ fn adjustBatchForDeletedJob(_: *OpHandler, b: *kv.WriteBatch, batch_id: []const 
     var batch = codec.decodeBatch(batch_bytes.?);
     if (batch.total == 0) return;
 
-    if (batch.pending > 0) batch.pending -= 1;
+    assert.check(batch.pending > 0, "adjustBatchForDeletedJob: pending underflow for batch {s} (pending={d} failed={d} total={d})", .{ batch_id, batch.pending, batch.failed, batch.total });
+    batch.pending -= 1;
     batch.failed += 1;
+    assert.check(batch.succeeded + batch.failed <= batch.total, "adjustBatchForDeletedJob: completed ({d}+{d}) exceeds total ({d}) for batch {s}", .{ batch.succeeded, batch.failed, batch.total, batch_id });
 
     if (batch.pending == 0 and !batch.open and batch.total > 0) {
         batch.completed_at_ns = now_ns;

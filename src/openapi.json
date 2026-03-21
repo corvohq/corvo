@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Corvo API",
-    "description": "Distributed job queue with priorities, scheduling, batches, and agent workflows.",
+    "description": "Distributed job queue with priorities, scheduling, and batches.",
     "version": "0.1.0"
   },
   "paths": {
@@ -104,12 +104,6 @@
     "/api/v1/jobs/{id}/move": {
       "post": { "summary": "Move job to another queue", "tags": ["Jobs"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "queue": { "type": "string" } } } } } }, "responses": { "200": { "description": "OK" } } }
     },
-    "/api/v1/jobs/{id}/replay": {
-      "post": { "summary": "Replay job from an iteration", "tags": ["Jobs"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
-    },
-    "/api/v1/jobs/{id}/iterations": {
-      "get": { "summary": "List job iterations", "tags": ["Jobs"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "Iterations list" } } }
-    },
     "/api/v1/jobs/bulk": {
       "post": { "summary": "Bulk action on jobs", "tags": ["Jobs"], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BulkRequest" } } } }, "responses": { "200": { "description": "Bulk result" } } }
     },
@@ -204,9 +198,6 @@
     "/api/v1/webhooks/{queue}": {
       "post": { "summary": "Enqueue via webhook", "tags": ["Webhooks"], "parameters": [{ "name": "queue", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "201": { "description": "Job created" } } }
     },
-    "/api/v1/usage/summary": {
-      "get": { "summary": "Usage summary", "tags": ["Usage"], "parameters": [{ "name": "from", "in": "query", "schema": { "type": "string" } }, { "name": "to", "in": "query", "schema": { "type": "string" } }], "responses": { "200": { "description": "Usage data" } } }
-    },
     "/api/v1/metrics/throughput": {
       "get": { "summary": "Throughput metrics (60-min ring)", "tags": ["Metrics"], "responses": { "200": { "description": "Throughput data" } } }
     },
@@ -247,8 +238,7 @@
           "batch_id": { "type": "string" },
           "parent_id": { "type": "string" },
           "chain_id": { "type": "string" },
-          "expire_after_ms": { "type": "integer" },
-          "agent": { "type": "object", "properties": { "max_iterations": { "type": "integer" }, "max_cost_usd": { "type": "number" }, "iteration_timeout_ms": { "type": "integer" } } }
+          "expire_after_ms": { "type": "integer" }
         }
       },
       "FetchRequest": {
@@ -266,8 +256,8 @@
         "properties": {
           "result": {},
           "checkpoint": {},
-          "usage": { "type": "object", "properties": { "input_tokens": { "type": "integer" }, "output_tokens": { "type": "integer" }, "cost_usd": { "type": "number" }, "model": { "type": "string" } } },
-          "agent_status": { "type": "string", "enum": ["continue", "done", "hold"] }
+          "ack_status": { "type": "string", "enum": ["done", "hold"] },
+          "hold_reason": { "type": "string" }
         }
       },
       "HeartbeatRequest": {

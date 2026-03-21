@@ -16,7 +16,7 @@ import QueueDetail from "@/pages/queue-detail";
 import JobDetailPage from "@/pages/job-detail-page";
 import DeadLetter from "@/pages/dead-letter";
 import HeldJobs from "@/pages/held-jobs";
-import CostDashboard from "@/pages/cost-dashboard";
+
 import WorkersPage from "@/pages/workers-page";
 import ClusterPage from "@/pages/cluster-page";
 import ScheduledJobs from "@/pages/scheduled-jobs";
@@ -121,7 +121,7 @@ export default function App() {
                 <Route path="/ui/jobs/:id" element={<JobDetailPage />} />
                 <Route path="/ui/dead-letter" element={<DeadLetter />} />
                 <Route path="/ui/held" element={<HeldJobs />} />
-                <Route path="/ui/cost" element={<CostDashboard />} />
+
                 <Route path="/ui/workers" element={<WorkersPage />} />
                 <Route path="/ui/cluster" element={<ClusterPage />} />
                 <Route path="/ui/scheduled" element={<ScheduledJobs />} />

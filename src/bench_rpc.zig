@@ -86,6 +86,22 @@ const RpcClient = struct {
             w.writeU8(50);
             // Max retries
             w.writeU16(3);
+            // Backoff
+            w.writeU8(0);
+            // Base delay ms
+            w.writeU32(0);
+            // Max delay ms
+            w.writeU32(0);
+            // Unique period s
+            w.writeU32(0);
+            // Scheduled at ns
+            w.writeU64(0);
+            // Expire after ms
+            w.writeU32(0);
+            // Chain step
+            w.writeU16(0);
+            // Flags (no optional fields)
+            w.writeU16(0);
         }
 
         try rpc.writeFrame(self.stream, rpc.MSG_ENQUEUE_BATCH, self.req_id, w.slice());
@@ -175,6 +191,8 @@ const RpcClient = struct {
         for (acks) |a| {
             w.writeLenPrefixed(a.id_buf[0..a.id_len]);
             w.writeLenPrefixed(a.queue_buf[0..a.queue_len]);
+            w.writeU8(0); // ack_status: done
+            w.writeU8(0); // flags: no optional fields
         }
 
         try rpc.writeFrame(self.stream, rpc.MSG_ACK_BATCH, self.req_id, w.slice());
@@ -218,6 +236,8 @@ const RpcClient = struct {
         for (acks) |a| {
             w.writeLenPrefixed(a.id_buf[0..a.id_len]);
             w.writeLenPrefixed(a.queue_buf[0..a.queue_len]);
+            w.writeU8(0); // ack_status: done
+            w.writeU8(0); // flags: no optional fields
         }
 
         try rpc.writeFrame(self.stream, rpc.MSG_FETCH_ACK_BATCH, self.req_id, w.slice());

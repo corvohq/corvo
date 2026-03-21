@@ -181,6 +181,15 @@ pub const BufReader = struct {
         return data;
     }
 
+    /// Read a u16-length-prefixed byte slice (for payloads up to 64KB).
+    pub fn readU16Prefixed(self: *BufReader) ![]const u8 {
+        const len = try self.readU16();
+        if (self.pos + len > self.data.len) return error.ShortRead;
+        const data = self.data[self.pos..][0..len];
+        self.pos += len;
+        return data;
+    }
+
     pub fn skip(self: *BufReader, n: u16) !void {
         if (self.pos + n > self.data.len) return error.ShortRead;
         self.pos += n;
@@ -328,371 +337,375 @@ pub const RpcServer = struct {
         }
     }
 
-    // ========================================================================
-    // EnqueueBatch
-    // ========================================================================
-
     fn handleEnqueueBatch(self: *RpcServer, payload: []const u8, resp_buf: *[CONN_BUF_SIZE]u8) ![]const u8 {
-        var reader = BufReader{ .data = payload };
-
-        const count = try reader.readU16();
-        const now_ns = try reader.readU64();
-
-        // Decode jobs — use stack buffer for small batches, heap for large.
-        var stack_jobs: [128]ops_mod.EnqueueJob = undefined;
-        const jobs = stack_jobs[0..@min(count, 128)];
-
-        // Also need ID buffers since IDs come from the wire and we need stable pointers.
-        var id_bufs: [128][64]u8 = undefined;
-        var queue_bufs: [128][64]u8 = undefined;
-
-        for (0..@min(count, 128)) |i| {
-            const queue = try reader.readLenPrefixed();
-            const job_id = try reader.readLenPrefixed();
-            const priority = try reader.readU8();
-            const max_retries = try reader.readU16();
-
-            @memcpy(id_bufs[i][0..job_id.len], job_id);
-            @memcpy(queue_bufs[i][0..queue.len], queue);
-
-            jobs[i] = .{
-                .job_id = id_bufs[i][0..job_id.len],
-                .queue = queue_bufs[i][0..queue.len],
-                .priority = priority,
-                .max_retries = max_retries,
-                .created_at_ns = now_ns,
-            };
-        }
-
-        const result = self.store.enqueueBatch(jobs);
-
-        // Encode response: [count:u16][err_code:u8]
-        var writer = BufWriter{ .buf = resp_buf };
-        writer.writeU16(@intCast(jobs.len));
-        if (result.err != null) {
-            writer.writeU8(1);
-        } else {
-            writer.writeU8(0);
-        }
-        return writer.slice();
+        return processEnqueueBatch(self.store, payload, resp_buf);
     }
-
-    // ========================================================================
-    // FetchBatch
-    // ========================================================================
-
     fn handleFetchBatch(self: *RpcServer, payload: []const u8, resp_buf: *[CONN_BUF_SIZE]u8) ![]const u8 {
-        var reader = BufReader{ .data = payload };
-
-        const now_ns = try reader.readU64();
-        const count = try reader.readU16();
-        const lease_ms = try reader.readU32();
-        const worker_id = try reader.readLenPrefixed();
-        const queue_count = try reader.readU8();
-
-        var queue_bufs: [16][64]u8 = undefined;
-        var queue_slices: [16][]const u8 = undefined;
-        for (0..@min(queue_count, 16)) |i| {
-            const q = try reader.readLenPrefixed();
-            @memcpy(queue_bufs[i][0..q.len], q);
-            queue_slices[i] = queue_bufs[i][0..q.len];
-        }
-        const queues = queue_slices[0..@min(queue_count, 16)];
-
-        const result = self.store.fetch(queues, worker_id, count, lease_ms, now_ns);
-
-        // Encode response: [count:u16] then per job:
-        //   [id:lenPrefixed][queue:lenPrefixed][attempt:u16][max_retries:u16]
-        //   [payload:u16+data][checkpoint:lenPrefixed][tags:lenPrefixed]
-        var writer = BufWriter{ .buf = resp_buf };
-        writer.writeU16(@intCast(result.affected));
-
-        for (0..result.affected) |i| {
-            const f = &result.fetched[i];
-            const job_id = f.id_buf[0..f.id_len];
-            writer.writeLenPrefixed(job_id);
-            writer.writeLenPrefixed(f.queue_buf[0..f.queue_len]);
-
-            // Read job header from KV for metadata.
-            var jk_buf: keys.KeyBuf = undefined;
-            if (self.store.engine.get(keys.jobKey(&jk_buf, job_id))) |job_bytes| {
-                defer self.allocator.free(job_bytes);
-                const job = codec.decodeJob(job_bytes);
-                writer.writeU16(@intCast(job.attempt));
-                writer.writeU16(job.max_retries);
-                // Checkpoint
-                if (job.checkpoint) |cp| {
-                    writer.writeLenPrefixed(cp);
-                } else {
-                    writer.writeU8(0);
-                }
-                // Tags
-                if (job.tags) |t| {
-                    writer.writeLenPrefixed(t);
-                } else {
-                    writer.writeU8(0);
-                }
-            } else {
-                writer.writeU16(0); // attempt
-                writer.writeU16(0); // max_retries
-                writer.writeU8(0); // checkpoint
-                writer.writeU8(0); // tags
-            }
-
-            // Read payload from KV (separate key, loaded outside apply loop).
-            var jpk_buf: keys.KeyBuf = undefined;
-            if (self.store.engine.get(keys.jobPayloadKey(&jpk_buf, job_id))) |payload_bytes| {
-                defer self.allocator.free(payload_bytes);
-                const pl = @min(payload_bytes.len, @as(usize, 32768));
-                writer.writeU16(@intCast(pl));
-                writer.writeBytes(payload_bytes[0..pl]);
-            } else {
-                writer.writeU16(0);
-            }
-        }
-
-        return writer.slice();
+        return processFetchBatch(self.store, self.allocator, payload, resp_buf);
     }
-
-    // ========================================================================
-    // AckBatch
-    // ========================================================================
-
     fn handleAckBatch(self: *RpcServer, payload: []const u8, resp_buf: *[CONN_BUF_SIZE]u8) ![]const u8 {
-        var reader = BufReader{ .data = payload };
-
-        const now_ns = try reader.readU64();
-        const count = try reader.readU16();
-
-        var stack_acks: [128]ops_mod.AckJob = undefined;
-        var id_bufs: [128][64]u8 = undefined;
-        var queue_bufs: [128][64]u8 = undefined;
-        const n = @min(count, 128);
-
-        for (0..n) |i| {
-            const job_id = try reader.readLenPrefixed();
-            const queue = try reader.readLenPrefixed();
-            @memcpy(id_bufs[i][0..job_id.len], job_id);
-            @memcpy(queue_bufs[i][0..queue.len], queue);
-            stack_acks[i] = .{
-                .job_id = id_bufs[i][0..job_id.len],
-                .queue = queue_bufs[i][0..queue.len],
-            };
-        }
-
-        const data = ops_mod.OpData{
-            .ack = .{
-                .acks = stack_acks[0..n],
-                .now_ns = now_ns,
-            },
-        };
-        const result = self.store.engine.submit(.ack, &data);
-
-        // Encode response: [acked:u16][err_code:u8]
-        var writer = BufWriter{ .buf = resp_buf };
-        writer.writeU16(@intCast(result.affected));
-        if (result.err != null) {
-            writer.writeU8(1);
-        } else {
-            writer.writeU8(0);
-        }
-        return writer.slice();
+        return processAckBatch(self.store, payload, resp_buf);
     }
-
-    // ========================================================================
-    // Heartbeat
-    // ========================================================================
-
-    /// Wire format:
-    ///   [worker_id:lenPrefixed][count:u16]
-    ///   per job: [job_id:lenPrefixed][flags:u8][progress:lenPrefixed?][checkpoint:lenPrefixed?]
-    ///   flags: bit 0 = has progress, bit 1 = has checkpoint
-    /// Response: [affected:u16][err_code:u8]
     fn handleHeartbeat(self: *RpcServer, payload: []const u8, resp_buf: *[CONN_BUF_SIZE]u8) ![]const u8 {
-        var reader = BufReader{ .data = payload };
-
-        const worker_id = try reader.readLenPrefixed();
-        const count = try reader.readU16();
-
-        var id_bufs: [128][64]u8 = undefined;
-        var id_slices: [128][]const u8 = undefined;
-        var hb_ops: [128]ops_mod.HeartbeatJobOp = undefined;
-        const n = @min(count, 128);
-
-        for (0..n) |i| {
-            const job_id = try reader.readLenPrefixed();
-            @memcpy(id_bufs[i][0..job_id.len], job_id);
-            id_slices[i] = id_bufs[i][0..job_id.len];
-
-            const flags = try reader.readU8();
-            var op = ops_mod.HeartbeatJobOp{};
-            if (flags & 0x01 != 0) op.progress = try reader.readLenPrefixed();
-            if (flags & 0x02 != 0) op.checkpoint = try reader.readLenPrefixed();
-            hb_ops[i] = op;
-        }
-
-        const result = self.store.heartbeat(id_slices[0..n], hb_ops[0..n], worker_id);
-
-        var writer = BufWriter{ .buf = resp_buf };
-        writer.writeU16(@intCast(result.affected));
-        if (result.err != null) {
-            writer.writeU8(1);
-        } else {
-            writer.writeU8(0);
-        }
-        return writer.slice();
+        return processHeartbeat(self.store, payload, resp_buf);
     }
-
-    // ========================================================================
-    // FetchAckBatch — combined fetch+ack in one round-trip
-    // ========================================================================
-
     fn handleFetchAckBatch(self: *RpcServer, payload: []const u8, resp_buf: *[CONN_BUF_SIZE]u8) ![]const u8 {
-        var reader = BufReader{ .data = payload };
-
-        const now_ns = try reader.readU64();
-        const fetch_count = try reader.readU16();
-        const lease_ms = try reader.readU32();
-        const worker_id = try reader.readLenPrefixed();
-        const queue_count = try reader.readU8();
-
-        var queue_bufs: [16][64]u8 = undefined;
-        var queue_slices: [16][]const u8 = undefined;
-        for (0..@min(queue_count, 16)) |i| {
-            const q = try reader.readLenPrefixed();
-            @memcpy(queue_bufs[i][0..q.len], q);
-            queue_slices[i] = queue_bufs[i][0..q.len];
-        }
-        const queues = queue_slices[0..@min(queue_count, 16)];
-
-        // Read ack jobs (from previous fetch)
-        const ack_count = try reader.readU16();
-        var stack_acks: [128]ops_mod.AckJob = undefined;
-        var ack_id_bufs: [128][64]u8 = undefined;
-        var ack_queue_bufs: [128][64]u8 = undefined;
-        const ack_n = @min(ack_count, 128);
-
-        for (0..ack_n) |i| {
-            const job_id = try reader.readLenPrefixed();
-            const queue = try reader.readLenPrefixed();
-            @memcpy(ack_id_bufs[i][0..job_id.len], job_id);
-            @memcpy(ack_queue_bufs[i][0..queue.len], queue);
-            stack_acks[i] = .{
-                .job_id = ack_id_bufs[i][0..job_id.len],
-                .queue = ack_queue_bufs[i][0..queue.len],
-            };
-        }
-
-        // Submit ack first (if any), then fetch — both go through pipeline.
-        if (ack_n > 0) {
-            const ack_data = ops_mod.OpData{
-                .ack = .{
-                    .acks = stack_acks[0..ack_n],
-                    .now_ns = now_ns,
-                },
-            };
-            _ = self.store.engine.submit(.ack, &ack_data);
-        }
-
-        // Fetch
-        const fetch_result = self.store.fetch(queues, worker_id, fetch_count, lease_ms, now_ns);
-
-        // Encode response: same as fetch response (with full job data)
-        var writer = BufWriter{ .buf = resp_buf };
-        writer.writeU16(@intCast(fetch_result.affected));
-
-        for (0..fetch_result.affected) |i| {
-            const f = &fetch_result.fetched[i];
-            const job_id = f.id_buf[0..f.id_len];
-            writer.writeLenPrefixed(job_id);
-            writer.writeLenPrefixed(f.queue_buf[0..f.queue_len]);
-
-            var jk_buf: keys.KeyBuf = undefined;
-            if (self.store.engine.get(keys.jobKey(&jk_buf, job_id))) |job_bytes| {
-                defer self.allocator.free(job_bytes);
-                const job = codec.decodeJob(job_bytes);
-                writer.writeU16(@intCast(job.attempt));
-                writer.writeU16(job.max_retries);
-                if (job.checkpoint) |cp| {
-                    writer.writeLenPrefixed(cp);
-                } else {
-                    writer.writeU8(0);
-                }
-                if (job.tags) |t| {
-                    writer.writeLenPrefixed(t);
-                } else {
-                    writer.writeU8(0);
-                }
-            } else {
-                writer.writeU16(0);
-                writer.writeU16(0);
-                writer.writeU8(0);
-                writer.writeU8(0);
-            }
-
-            var jpk_buf: keys.KeyBuf = undefined;
-            if (self.store.engine.get(keys.jobPayloadKey(&jpk_buf, job_id))) |payload_bytes| {
-                defer self.allocator.free(payload_bytes);
-                const pl = @min(payload_bytes.len, @as(usize, 32768));
-                writer.writeU16(@intCast(pl));
-                writer.writeBytes(payload_bytes[0..pl]);
-            } else {
-                writer.writeU16(0);
-            }
-        }
-
-        return writer.slice();
+        return processFetchAckBatch(self.store, self.allocator, payload, resp_buf);
     }
-
-    // ========================================================================
-    // FailBatch
-    // ========================================================================
-
-    /// Wire format:
-    ///   [now_ns:u64][count:u16]
-    ///   per job: [job_id:lenPrefixed][queue:lenPrefixed][error_msg:lenPrefixed]
-    /// Response: [affected:u16][err_code:u8]
     fn handleFailBatch(self: *RpcServer, payload_data: []const u8, resp_buf: *[CONN_BUF_SIZE]u8) ![]const u8 {
-        var reader = BufReader{ .data = payload_data };
-
-        const now_ns = try reader.readU64();
-        const count = try reader.readU16();
-
-        var stack_fails: [128]ops_mod.FailJob = undefined;
-        var id_bufs: [128][64]u8 = undefined;
-        var queue_bufs: [128][64]u8 = undefined;
-        var err_bufs: [128][256]u8 = undefined;
-        const n = @min(count, 128);
-
-        for (0..n) |i| {
-            const job_id = try reader.readLenPrefixed();
-            const queue = try reader.readLenPrefixed();
-            const err_msg = try reader.readLenPrefixed();
-            @memcpy(id_bufs[i][0..job_id.len], job_id);
-            @memcpy(queue_bufs[i][0..queue.len], queue);
-            @memcpy(err_bufs[i][0..err_msg.len], err_msg);
-            stack_fails[i] = .{
-                .job_id = id_bufs[i][0..job_id.len],
-                .queue = queue_bufs[i][0..queue.len],
-                .error_msg = err_bufs[i][0..err_msg.len],
-            };
-        }
-
-        const data = ops_mod.OpData{
-            .fail = .{
-                .jobs = stack_fails[0..n],
-                .now_ns = now_ns,
-            },
-        };
-        const result = self.store.engine.submit(.fail, &data);
-
-        var writer = BufWriter{ .buf = resp_buf };
-        writer.writeU16(@intCast(result.affected));
-        if (result.err != null) {
-            writer.writeU8(1);
-        } else {
-            writer.writeU8(0);
-        }
-        return writer.slice();
+        return processFailBatch(self.store, payload_data, resp_buf);
     }
 };
+
+// ============================================================================
+// Shared RPC handlers — used by both RpcServer and IoUringRpcServer
+// ============================================================================
+
+pub fn processEnqueueBatch(store: *store_mod.Store, payload: []const u8, resp_buf: []u8) ![]const u8 {
+    var reader = BufReader{ .data = payload };
+
+    const count = try reader.readU16();
+    const now_ns = try reader.readU64();
+
+    var stack_jobs: [128]ops_mod.EnqueueJob = undefined;
+    const n = @min(count, 128);
+    const jobs = stack_jobs[0..n];
+
+    var id_bufs: [128][64]u8 = undefined;
+    var queue_bufs: [128][64]u8 = undefined;
+    var gen_id_bufs: [128][64]u8 = undefined;
+
+    for (0..n) |i| {
+        const queue = try reader.readLenPrefixed();
+        var job_id = try reader.readLenPrefixed();
+
+        if (job_id.len == 0) {
+            const generated = store.generateID(&gen_id_bufs[i]);
+            job_id = generated;
+        }
+        const priority = try reader.readU8();
+        const max_retries = try reader.readU16();
+        const backoff_raw = try reader.readU8();
+        const base_delay_ms = try reader.readU32();
+        const max_delay_ms = try reader.readU32();
+        const unique_period_s = try reader.readU32();
+        const scheduled_at_ns = try reader.readU64();
+        const expire_after_ms = try reader.readU32();
+        const chain_step = try reader.readU16();
+        const flags = try reader.readU16();
+
+        @memcpy(id_bufs[i][0..job_id.len], job_id);
+        @memcpy(queue_bufs[i][0..queue.len], queue);
+
+        const backoff: types.Backoff = std.meta.intToEnum(types.Backoff, backoff_raw) catch .none;
+
+        jobs[i] = .{
+            .job_id = id_bufs[i][0..job_id.len],
+            .queue = queue_bufs[i][0..queue.len],
+            .priority = priority,
+            .max_retries = max_retries,
+            .backoff = backoff,
+            .base_delay_ms = base_delay_ms,
+            .max_delay_ms = max_delay_ms,
+            .unique_period_s = unique_period_s,
+            .scheduled_at_ns = scheduled_at_ns,
+            .expire_after_ms = expire_after_ms,
+            .chain_step = chain_step,
+            .created_at_ns = now_ns,
+        };
+
+        if (flags & 0x0001 != 0) jobs[i].payload = try reader.readU16Prefixed();
+        if (flags & 0x0002 != 0) jobs[i].unique_key = try reader.readLenPrefixed();
+        if (flags & 0x0004 != 0) jobs[i].tags = try reader.readLenPrefixed();
+        if (flags & 0x0008 != 0) jobs[i].batch_id = try reader.readLenPrefixed();
+        if (flags & 0x0010 != 0) jobs[i].chain_id = try reader.readLenPrefixed();
+        if (flags & 0x0020 != 0) jobs[i].chain_config = try reader.readLenPrefixed();
+        if (flags & 0x0040 != 0) jobs[i].group = try reader.readLenPrefixed();
+        if (flags & 0x0080 != 0) jobs[i].parent_id = try reader.readLenPrefixed();
+    }
+
+    const result = store.enqueueBatch(jobs);
+
+    var writer = BufWriter{ .buf = resp_buf };
+    writer.writeU16(@intCast(jobs.len));
+    writer.writeU8(if (result.err != null) 1 else 0);
+    return writer.slice();
+}
+
+pub fn processAckBatch(store: *store_mod.Store, payload: []const u8, resp_buf: []u8) ![]const u8 {
+    var reader = BufReader{ .data = payload };
+
+    _ = try reader.readU64(); // now_ns — store generates its own
+    const count = try reader.readU16();
+
+    var stack_acks: [128]ops_mod.AckJob = undefined;
+    var id_bufs: [128][64]u8 = undefined;
+    var queue_bufs: [128][64]u8 = undefined;
+    const n = @min(count, 128);
+
+    for (0..n) |i| {
+        const job_id = try reader.readLenPrefixed();
+        const queue = try reader.readLenPrefixed();
+        const ack_status_raw = try reader.readU8();
+        const flags = try reader.readU8();
+
+        @memcpy(id_bufs[i][0..job_id.len], job_id);
+        @memcpy(queue_bufs[i][0..queue.len], queue);
+
+        const ack_status: types.AckStatus = std.meta.intToEnum(types.AckStatus, ack_status_raw) catch .done;
+
+        stack_acks[i] = .{
+            .job_id = id_bufs[i][0..job_id.len],
+            .queue = queue_bufs[i][0..queue.len],
+            .ack_status = ack_status,
+        };
+
+        if (flags & 0x01 != 0) stack_acks[i].result = try reader.readLenPrefixed();
+        if (flags & 0x02 != 0) stack_acks[i].checkpoint = try reader.readLenPrefixed();
+        if (flags & 0x04 != 0) stack_acks[i].hold_reason = try reader.readLenPrefixed();
+    }
+
+    const result = store.ackBatch(stack_acks[0..n]);
+
+    var writer = BufWriter{ .buf = resp_buf };
+    writer.writeU16(@intCast(result.affected));
+    writer.writeU8(if (result.err != null) 1 else 0);
+    return writer.slice();
+}
+
+pub fn processFailBatch(store: *store_mod.Store, payload: []const u8, resp_buf: []u8) ![]const u8 {
+    var reader = BufReader{ .data = payload };
+
+    _ = try reader.readU64(); // now_ns — store generates its own
+    const count = try reader.readU16();
+
+    var stack_fails: [128]ops_mod.FailJob = undefined;
+    var id_bufs: [128][64]u8 = undefined;
+    var queue_bufs: [128][64]u8 = undefined;
+    var err_bufs: [128][256]u8 = undefined;
+    const n = @min(count, 128);
+
+    for (0..n) |i| {
+        const job_id = try reader.readLenPrefixed();
+        const queue = try reader.readLenPrefixed();
+        const err_msg = try reader.readLenPrefixed();
+        const backtrace = try reader.readLenPrefixed();
+        @memcpy(id_bufs[i][0..job_id.len], job_id);
+        @memcpy(queue_bufs[i][0..queue.len], queue);
+        @memcpy(err_bufs[i][0..err_msg.len], err_msg);
+        stack_fails[i] = .{
+            .job_id = id_bufs[i][0..job_id.len],
+            .queue = queue_bufs[i][0..queue.len],
+            .error_msg = err_bufs[i][0..err_msg.len],
+            .backtrace = if (backtrace.len > 0) backtrace else null,
+        };
+    }
+
+    const result = store.failBatch(stack_fails[0..n]);
+
+    var writer = BufWriter{ .buf = resp_buf };
+    writer.writeU16(@intCast(result.affected));
+    writer.writeU8(if (result.err != null) 1 else 0);
+    return writer.slice();
+}
+
+pub fn processHeartbeat(store: *store_mod.Store, payload: []const u8, resp_buf: []u8) ![]const u8 {
+    var reader = BufReader{ .data = payload };
+
+    const worker_id = try reader.readLenPrefixed();
+    const count = try reader.readU16();
+
+    var id_bufs: [128][64]u8 = undefined;
+    var id_slices: [128][]const u8 = undefined;
+    var hb_ops: [128]ops_mod.HeartbeatJobOp = undefined;
+    const n = @min(count, 128);
+
+    for (0..n) |i| {
+        const job_id = try reader.readLenPrefixed();
+        const queue = try reader.readLenPrefixed();
+        @memcpy(id_bufs[i][0..job_id.len], job_id);
+        id_slices[i] = id_bufs[i][0..job_id.len];
+
+        const flags = try reader.readU8();
+        var op = ops_mod.HeartbeatJobOp{ .queue = queue };
+        if (flags & 0x01 != 0) op.progress = try reader.readLenPrefixed();
+        if (flags & 0x02 != 0) op.checkpoint = try reader.readLenPrefixed();
+        hb_ops[i] = op;
+    }
+
+    const result = store.heartbeat(id_slices[0..n], hb_ops[0..n], worker_id);
+
+    var writer = BufWriter{ .buf = resp_buf };
+    writer.writeU16(@intCast(result.affected));
+    writer.writeU8(if (result.err != null) 1 else 0);
+    return writer.slice();
+}
+
+/// Fetch with full job data response (job header + payload from KV).
+pub fn processFetchBatch(store: *store_mod.Store, allocator: std.mem.Allocator, payload: []const u8, resp_buf: []u8) ![]const u8 {
+    var reader = BufReader{ .data = payload };
+
+    const now_ns = try reader.readU64();
+    const count = try reader.readU16();
+    const lease_ms = try reader.readU32();
+    const worker_id = try reader.readLenPrefixed();
+    const queue_count = try reader.readU8();
+
+    var queue_bufs: [16][64]u8 = undefined;
+    var queue_slices: [16][]const u8 = undefined;
+    const qn = @min(queue_count, 16);
+    for (0..qn) |i| {
+        const q = try reader.readLenPrefixed();
+        @memcpy(queue_bufs[i][0..q.len], q);
+        queue_slices[i] = queue_bufs[i][0..q.len];
+    }
+
+    const result = store.fetch(queue_slices[0..qn], worker_id, count, lease_ms, now_ns);
+
+    var writer = BufWriter{ .buf = resp_buf };
+    writer.writeU16(@intCast(result.affected));
+
+    for (0..result.affected) |i| {
+        const f = &result.fetched[i];
+        const job_id = f.id_buf[0..f.id_len];
+        writer.writeLenPrefixed(job_id);
+        writer.writeLenPrefixed(f.queue_buf[0..f.queue_len]);
+
+        var jk_buf: keys.KeyBuf = undefined;
+        if (store.engine.get(keys.jobKey(&jk_buf, job_id))) |job_bytes| {
+            defer allocator.free(job_bytes);
+            const job = codec.decodeJob(job_bytes);
+            writer.writeU16(@intCast(job.attempt));
+            writer.writeU16(job.max_retries);
+            if (job.checkpoint) |cp| {
+                writer.writeLenPrefixed(cp);
+            } else {
+                writer.writeU8(0);
+            }
+            if (job.tags) |t| {
+                writer.writeLenPrefixed(t);
+            } else {
+                writer.writeU8(0);
+            }
+        } else {
+            writer.writeU16(0);
+            writer.writeU16(0);
+            writer.writeU8(0);
+            writer.writeU8(0);
+        }
+
+        var jpk_buf: keys.KeyBuf = undefined;
+        if (store.engine.get(keys.jobPayloadKey(&jpk_buf, job_id))) |payload_bytes| {
+            defer allocator.free(payload_bytes);
+            const pl = @min(payload_bytes.len, @as(usize, 32768));
+            writer.writeU16(@intCast(pl));
+            writer.writeBytes(payload_bytes[0..pl]);
+        } else {
+            writer.writeU16(0);
+        }
+    }
+
+    return writer.slice();
+}
+
+/// Combined ack + fetch with full job data response.
+pub fn processFetchAckBatch(store: *store_mod.Store, allocator: std.mem.Allocator, payload: []const u8, resp_buf: []u8) ![]const u8 {
+    var reader = BufReader{ .data = payload };
+
+    const now_ns = try reader.readU64();
+    const fetch_count = try reader.readU16();
+    const lease_ms = try reader.readU32();
+    const worker_id = try reader.readLenPrefixed();
+    const queue_count = try reader.readU8();
+
+    var queue_bufs: [16][64]u8 = undefined;
+    var queue_slices: [16][]const u8 = undefined;
+    const qn = @min(queue_count, 16);
+    for (0..qn) |i| {
+        const q = try reader.readLenPrefixed();
+        @memcpy(queue_bufs[i][0..q.len], q);
+        queue_slices[i] = queue_bufs[i][0..q.len];
+    }
+
+    // Read ack jobs — same wire format as AckBatch.
+    const ack_count = try reader.readU16();
+    var stack_acks: [128]ops_mod.AckJob = undefined;
+    var ack_id_bufs: [128][64]u8 = undefined;
+    var ack_queue_bufs: [128][64]u8 = undefined;
+    const ack_n = @min(ack_count, 128);
+
+    for (0..ack_n) |i| {
+        const job_id = try reader.readLenPrefixed();
+        const queue = try reader.readLenPrefixed();
+        const ack_status_raw = try reader.readU8();
+        const ack_flags = try reader.readU8();
+
+        @memcpy(ack_id_bufs[i][0..job_id.len], job_id);
+        @memcpy(ack_queue_bufs[i][0..queue.len], queue);
+
+        const ack_status: types.AckStatus = std.meta.intToEnum(types.AckStatus, ack_status_raw) catch .done;
+
+        stack_acks[i] = .{
+            .job_id = ack_id_bufs[i][0..job_id.len],
+            .queue = ack_queue_bufs[i][0..queue.len],
+            .ack_status = ack_status,
+        };
+
+        if (ack_flags & 0x01 != 0) stack_acks[i].result = try reader.readLenPrefixed();
+        if (ack_flags & 0x02 != 0) stack_acks[i].checkpoint = try reader.readLenPrefixed();
+        if (ack_flags & 0x04 != 0) stack_acks[i].hold_reason = try reader.readLenPrefixed();
+    }
+
+    // Ack first, then fetch.
+    if (ack_n > 0) {
+        _ = store.ackBatch(stack_acks[0..ack_n]);
+    }
+
+    const fetch_result = store.fetch(queue_slices[0..qn], worker_id, fetch_count, lease_ms, now_ns);
+
+    // Encode response: same as fetch response (with full job data).
+    var writer = BufWriter{ .buf = resp_buf };
+    writer.writeU16(@intCast(fetch_result.affected));
+
+    for (0..fetch_result.affected) |i| {
+        const f = &fetch_result.fetched[i];
+        const job_id = f.id_buf[0..f.id_len];
+        writer.writeLenPrefixed(job_id);
+        writer.writeLenPrefixed(f.queue_buf[0..f.queue_len]);
+
+        var jk_buf: keys.KeyBuf = undefined;
+        if (store.engine.get(keys.jobKey(&jk_buf, job_id))) |job_bytes| {
+            defer allocator.free(job_bytes);
+            const job = codec.decodeJob(job_bytes);
+            writer.writeU16(@intCast(job.attempt));
+            writer.writeU16(job.max_retries);
+            if (job.checkpoint) |cp| {
+                writer.writeLenPrefixed(cp);
+            } else {
+                writer.writeU8(0);
+            }
+            if (job.tags) |t| {
+                writer.writeLenPrefixed(t);
+            } else {
+                writer.writeU8(0);
+            }
+        } else {
+            writer.writeU16(0);
+            writer.writeU16(0);
+            writer.writeU8(0);
+            writer.writeU8(0);
+        }
+
+        var jpk_buf: keys.KeyBuf = undefined;
+        if (store.engine.get(keys.jobPayloadKey(&jpk_buf, job_id))) |payload_bytes| {
+            defer allocator.free(payload_bytes);
+            const pl = @min(payload_bytes.len, @as(usize, 32768));
+            writer.writeU16(@intCast(pl));
+            writer.writeBytes(payload_bytes[0..pl]);
+        } else {
+            writer.writeU16(0);
+        }
+    }
+
+    return writer.slice();
+}

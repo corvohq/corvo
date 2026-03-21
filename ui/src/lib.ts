@@ -12,7 +12,7 @@ export { default as HeldJobs } from "@/pages/held-jobs";
 export { default as ScheduledJobs } from "@/pages/scheduled-jobs";
 export { default as WorkersPage } from "@/pages/workers-page";
 export { default as ClusterPage } from "@/pages/cluster-page";
-export { default as CostDashboard } from "@/pages/cost-dashboard";
+
 export { default as EventsPage } from "@/pages/events-page";
 export { default as AuditLogsPage } from "@/pages/audit-logs";
 export { default as RolesPage } from "@/pages/roles-page";

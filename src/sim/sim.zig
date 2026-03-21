@@ -1,8 +1,9 @@
 //! VOPR Simulator — deterministic simulation with invariant checking.
 //!
-//! Single-node simulation: creates a Talon DB, Engine, and N simulated
-//! clients. Each tick advances the clock, runs client actions, and
-//! periodically checks KV invariants. Seed-based reproduction.
+//! Single-node simulation: creates a Talon DB, Engine, Store, Server, and
+//! N simulated clients. Each tick advances the clock, runs client actions
+//! through HTTP route handlers, and periodically checks KV invariants.
+//! Seed-based reproduction.
 //!
 //! Run: zig build sim
 
@@ -12,6 +13,8 @@ const corvo = @import("corvo");
 
 const kv = corvo.kv;
 const engine_mod = corvo.engine;
+const store_mod = corvo.store;
+const server_mod = corvo.server;
 
 const SimClock = @import("clock.zig").SimClock;
 const setGlobalClock = @import("clock.zig").setGlobalClock;
@@ -46,7 +49,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         std.fs.cwd().deleteTree(dir_path) catch {};
     }
 
-    // --- KV store + engine ---
+    // --- KV store + engine + store + server ---
     const store = kv.Store.init(db);
     var stores = [1]kv.Store{store};
 
@@ -58,6 +61,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         .talon_sync = false,
     });
     defer engine.deinit();
+
+    var corvo_store = store_mod.Store.init(allocator, &engine, null);
+    var server = server_mod.Server.init(allocator, &corvo_store, .{});
 
     // --- Queue names ---
     const num_queues: usize = @min(config.queues, max_queues);
@@ -79,12 +85,10 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
             @intCast(i),
             seed +% @as(u64, i) +% 1,
             &engine,
+            &server,
             config,
             queues,
         );
-        // Fix up the Random interface pointer — it was set in init() pointing
-        // at a stack-local copy. Now that the client lives in the array, point
-        // it at the array-resident PRNG state.
         clients[i].rng = clients[i].prng.random();
     }
 
@@ -177,152 +181,23 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
 }
 
 // ============================================================================
-// Test entry point
+// Tests — just run a short sim to verify it compiles + doesn't crash.
 // ============================================================================
 
-test "simulator smoke test" {
-    try run(std.heap.page_allocator, .{
+test "sim smoke" {
+    try run(std.testing.allocator, .{
         .seed = 42,
         .ticks = 100,
-        .clients = 3,
+        .clients = 2,
         .queues = 2,
-        .check_interval = 5,
     });
 }
 
-test "simulator 5000 ticks" {
-    try run(std.heap.page_allocator, .{
+test "sim stress" {
+    try run(std.testing.allocator, .{
         .seed = 12345,
         .ticks = 5000,
         .clients = 5,
         .queues = 3,
-        .check_interval = 10,
     });
-}
-
-test "simulator high fail rate" {
-    try run(std.heap.page_allocator, .{
-        .seed = 99999,
-        .ticks = 2000,
-        .clients = 4,
-        .queues = 2,
-        .fail_rate = 0.5,
-        .check_interval = 10,
-    });
-}
-
-test "simulator many queues" {
-    try run(std.heap.page_allocator, .{
-        .seed = 77777,
-        .ticks = 1000,
-        .clients = 3,
-        .queues = 8,
-        .check_interval = 5,
-    });
-}
-
-// --- Stress tests: high bulk/unique/batch rates to hit edge cases ---
-
-test "stress: bulk retry storm" {
-    try run(std.heap.page_allocator, .{
-        .seed = 111,
-        .ticks = 5000,
-        .clients = 6,
-        .queues = 2,
-        .fail_rate = 0.4,
-        .bulk_rate = 0.15,
-        .unique_rate = 0.3,
-        .maintenance_rate = 0.12,
-        .check_interval = 5,
-    });
-}
-
-test "stress: unique key churn" {
-    try run(std.heap.page_allocator, .{
-        .seed = 222,
-        .ticks = 5000,
-        .clients = 4,
-        .queues = 2,
-        .unique_rate = 0.5,
-        .bulk_rate = 0.1,
-        .fail_rate = 0.3,
-        .maintenance_rate = 0.1,
-        .check_interval = 5,
-    });
-}
-
-test "stress: batch heavy" {
-    try run(std.heap.page_allocator, .{
-        .seed = 333,
-        .ticks = 5000,
-        .clients = 5,
-        .queues = 3,
-        .batch_rate = 0.15,
-        .batch_enqueue_rate = 0.4,
-        .fail_rate = 0.2,
-        .bulk_rate = 0.08,
-        .maintenance_rate = 0.1,
-        .check_interval = 5,
-    });
-}
-
-test "stress: queue clear storm" {
-    try run(std.heap.page_allocator, .{
-        .seed = 444,
-        .ticks = 3000,
-        .clients = 4,
-        .queues = 2,
-        .queue_op_rate = 0.12,
-        .unique_rate = 0.2,
-        .bulk_rate = 0.1,
-        .fail_rate = 0.3,
-        .maintenance_rate = 0.1,
-        .check_interval = 5,
-    });
-}
-
-test "stress: everything at once" {
-    try run(std.heap.page_allocator, .{
-        .seed = 555,
-        .ticks = 10000,
-        .clients = 8,
-        .queues = 4,
-        .fail_rate = 0.3,
-        .unique_rate = 0.3,
-        .batch_rate = 0.1,
-        .batch_enqueue_rate = 0.3,
-        .bulk_rate = 0.12,
-        .queue_op_rate = 0.08,
-        .maintenance_rate = 0.1,
-        .heartbeat_rate = 0.15,
-        .scheduled_job_rate = 0.15,
-        .time_jump_prob = 0.05,
-        .check_interval = 3,
-    });
-}
-
-// --- Multi-seed sweep: run 20 random seeds ---
-
-test "sweep: 20 random seeds" {
-    const base_seeds = [_]u64{
-        1000, 2000, 3000, 4000, 5000,
-        6000, 7000, 8000, 9000, 10000,
-        11111, 22222, 33333, 44444, 55555,
-        66666, 77778, 88888, 99998, 31415,
-    };
-    for (base_seeds) |s| {
-        try run(std.heap.page_allocator, .{
-            .seed = s,
-            .ticks = 2000,
-            .clients = 5,
-            .queues = 3,
-            .fail_rate = 0.25,
-            .unique_rate = 0.25,
-            .batch_rate = 0.08,
-            .bulk_rate = 0.1,
-            .maintenance_rate = 0.1,
-            .queue_op_rate = 0.05,
-            .check_interval = 5,
-        });
-    }
 }

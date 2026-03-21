@@ -38,23 +38,6 @@ pub fn applyHeartbeat(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Heartb
             if (cp.len > 0) job.checkpoint = cp;
         }
 
-        // Write heartbeat usage KV entry if usage data present.
-        if (update_op.usage) |usage| {
-            if (usage.cost_usd > 0 or usage.input_tokens > 0 or usage.output_tokens > 0) {
-                var uk_buf: keys.KeyBuf = undefined;
-                var usage_val_buf: [256]u8 = undefined;
-                const usage_json = std.fmt.bufPrint(&usage_val_buf, "{{\"input_tokens\":{d},\"output_tokens\":{d},\"cost_usd\":{d:.6},\"created_at_ns\":{d}}}", .{
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    usage.cost_usd,
-                    op.now_ns,
-                }) catch "";
-                if (usage_json.len > 0) {
-                    b.set(keys.jobUsageHeartbeatKey(&uk_buf, job_id, @intCast(job.attempt), op.now_ns), usage_json);
-                }
-            }
-        }
-
         var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
         b.set(keys.jobKey(&jk_buf, job_id), codec.encodeJob(&job_enc_buf, &job));
 
