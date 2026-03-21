@@ -14,12 +14,12 @@ const ops = @import("ops.zig");
 pub const QueueNotifier = struct {
     mu: std.Thread.Mutex = .{},
     /// Per-queue FIFO of waiting workers. Key is queue name (not owned).
-    waiters: std.StringHashMap(std.ArrayList(*QueueWaiter)),
+    waiters: std.StringHashMap(std.ArrayList(*Waiter)),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) QueueNotifier {
         return .{
-            .waiters = std.StringHashMap(std.ArrayList(*QueueWaiter)).init(allocator),
+            .waiters = std.StringHashMap(std.ArrayList(*Waiter)).init(allocator),
             .allocator = allocator,
         };
     }
@@ -75,14 +75,14 @@ pub const QueueNotifier = struct {
         if (remaining == 0) {
             list.clearRetainingCapacity();
         } else {
-            std.mem.copyForwards(*QueueWaiter, list.items[0..remaining], list.items[wake..]);
+            std.mem.copyForwards(*Waiter, list.items[0..remaining], list.items[wake..]);
             list.shrinkRetainingCapacity(remaining);
         }
     }
 
     /// Register a waiter for one or more queues. Returns the waiter.
     /// Caller must call unregister() when done (even if woken).
-    pub fn register(self: *QueueNotifier, queues: []const []const u8, waiter: *QueueWaiter) void {
+    pub fn register(self: *QueueNotifier, queues: []const []const u8, waiter: *Waiter) void {
         self.mu.lock();
         defer self.mu.unlock();
         for (queues) |q| {
@@ -93,7 +93,7 @@ pub const QueueNotifier = struct {
     }
 
     /// Unregister a waiter from all queues.
-    pub fn unregister(self: *QueueNotifier, queues: []const []const u8, waiter: *QueueWaiter) void {
+    pub fn unregister(self: *QueueNotifier, queues: []const []const u8, waiter: *Waiter) void {
         self.mu.lock();
         defer self.mu.unlock();
         for (queues) |q| {
@@ -125,25 +125,53 @@ pub const QueueNotifier = struct {
     }
 };
 
-/// A parked worker waiting for notification.
-pub const QueueWaiter = struct {
+/// A waiter that can be woken by either a thread (futex) or a connection
+/// (eventfd/pipe write). Tagged union so QueueNotifier can hold both kinds.
+pub const Waiter = union(enum) {
+    /// Thread-based: blocks on futex. Used by HTTP long-poll fetch.
+    thread: ThreadWaiter,
+    /// Connection-based: pokes event loop via eventfd/pipe. Used by bidi RPC.
+    conn: ConnWaiter,
+
+    pub fn wake(self: *Waiter) void {
+        switch (self.*) {
+            .thread => |*t| t.wake(),
+            .conn => |*c| c.wake(),
+        }
+    }
+};
+
+/// Thread-based waiter. Blocks the calling thread on a ResetEvent (futex).
+pub const ThreadWaiter = struct {
     woken: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     event: std.Thread.ResetEvent = .{},
 
-    pub fn wake(self: *QueueWaiter) void {
+    pub fn wake(self: *ThreadWaiter) void {
         if (!self.woken.swap(true, .release)) {
             self.event.set();
         }
     }
 
-    pub fn isWoken(self: *const QueueWaiter) bool {
+    pub fn isWoken(self: *const ThreadWaiter) bool {
         return self.woken.load(.acquire);
     }
 
     /// Block until woken or timeout_ns elapses. Returns true if woken.
-    pub fn wait(self: *QueueWaiter, timeout_ns: u64) bool {
+    pub fn wait(self: *ThreadWaiter, timeout_ns: u64) bool {
         self.event.timedWait(timeout_ns) catch return false;
         return self.isWoken();
+    }
+};
+
+/// Connection-based waiter. Pokes an event loop via a single-byte write to
+/// an eventfd (Linux) or the write end of a pipe (macOS).
+pub const ConnWaiter = struct {
+    conn_id: u16,
+    wake_fd: i32,
+
+    pub fn wake(self: *ConnWaiter) void {
+        const val = [_]u8{1};
+        _ = std.posix.write(self.wake_fd, &val) catch {};
     }
 };
 

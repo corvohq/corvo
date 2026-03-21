@@ -1122,11 +1122,11 @@ pub const Server = struct {
         // and block until notified or timeout.
         if (result.affected == 0 and wait_timeout_ms > 0) {
             const notifier = self.store.engine.getNotifier();
-            var waiter = notify_mod.QueueWaiter{};
+            var waiter = notify_mod.Waiter{ .thread = .{} };
             notifier.register(queues, &waiter);
             defer notifier.unregister(queues, &waiter);
 
-            _ = waiter.wait(wait_timeout_ms * 1_000_000); // ms → ns
+            _ = waiter.thread.wait(wait_timeout_ms * 1_000_000); // ms → ns
 
             // Retry fetch after wake.
             result = self.store.fetch(
