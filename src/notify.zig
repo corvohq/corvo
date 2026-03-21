@@ -111,6 +111,27 @@ pub const QueueNotifier = struct {
         }
     }
 
+    /// Wake one waiter per queue (all queues with waiters). Used after promote/reclaim
+    /// where we don't track which specific queues were affected.
+    pub fn notifyAll(self: *QueueNotifier) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var iter = self.waiters.iterator();
+        while (iter.next()) |entry| {
+            const list = entry.value_ptr;
+            if (list.items.len > 0) {
+                list.items[0].wake();
+                const remaining = list.items.len - 1;
+                if (remaining == 0) {
+                    list.clearRetainingCapacity();
+                } else {
+                    std.mem.copyForwards(*Waiter, list.items[0..remaining], list.items[1..]);
+                    list.shrinkRetainingCapacity(remaining);
+                }
+            }
+        }
+    }
+
     /// Remove all waiters for a deleted queue, waking any that are parked.
     pub fn remove(self: *QueueNotifier, queue: []const u8) void {
         self.mu.lock();
@@ -181,16 +202,20 @@ pub const ConnWaiter = struct {
 
 /// Wake fetch waiters after an apply that may have made jobs fetchable.
 /// Called after each successful apply.
-pub fn notifyFromOp(n: *QueueNotifier, op_type: ops.OpType, data: *const ops.OpData) void {
+pub fn notifyFromOp(n: *QueueNotifier, op_type: ops.OpType, data: *const ops.OpData, result: *const ops.OpResult) void {
     switch (op_type) {
         .enqueue => {
-            // Count jobs per queue, wake that many waiters.
             for (data.enqueue.jobs) |j| {
                 if (j.queue.len > 0) n.notify(j.queue);
             }
         },
-        // Promote made jobs fetchable — notifyQueues is handled by caller
-        // since we don't have MaintenanceResult in OpResult yet.
+        .maintenance => {
+            if (result.affected > 0 and
+                (data.maintenance.action == .promote or data.maintenance.action == .reclaim))
+            {
+                n.notifyAll();
+            }
+        },
         else => {},
     }
 }

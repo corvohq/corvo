@@ -239,7 +239,7 @@ pub const Engine = struct {
         }
 
         // Notify waiters
-        notify_mod.notifyFromOp(&self.notify, op_type, data);
+        notify_mod.notifyFromOp(&self.notify, op_type, data, &result);
 
         return result;
     }

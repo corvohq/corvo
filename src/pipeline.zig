@@ -390,7 +390,7 @@ pub const Pipeline = struct {
 
                 // Notify queue waiters.
                 for (batch_buf[0..batch_size]) |req| {
-                    notify_mod.notifyFromOp(self.notify, req.op_type, &req.data);
+                    notify_mod.notifyFromOp(self.notify, req.op_type, &req.data, &req.result);
                 }
 
                 // Replicate encoded overlay.
@@ -459,7 +459,7 @@ pub const Pipeline = struct {
         }
 
         for (batch) |req| {
-            notify_mod.notifyFromOp(self.notify, req.op_type, &req.data);
+            notify_mod.notifyFromOp(self.notify, req.op_type, &req.data, &req.result);
             req.event.set();
         }
     }
