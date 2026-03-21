@@ -43,6 +43,7 @@ pub const rate_limiter = @import("rate_limiter.zig");
 // Binary RPC
 pub const rpc = @import("rpc.zig");
 pub const rpc_uring = @import("rpc_uring.zig");
+pub const poller = @import("poller.zig");
 
 // Cluster mode (PBR)
 pub const cluster = @import("cluster.zig");
@@ -73,5 +74,6 @@ test {
     testing.refAllDecls(@import("server.zig"));
     testing.refAllDecls(@import("request_metrics.zig"));
     testing.refAllDecls(@import("rate_limiter.zig"));
+    testing.refAllDecls(@import("poller.zig"));
     // sqlite, schema, mirror, sqlite_read — tested via `zig build test-sqlite`
 }
