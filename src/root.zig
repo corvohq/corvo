@@ -40,6 +40,9 @@ pub const scheduler = @import("scheduler.zig");
 pub const request_metrics = @import("request_metrics.zig");
 pub const rate_limiter = @import("rate_limiter.zig");
 
+// IO backend (io_uring / kqueue / sim)
+pub const io = @import("io.zig");
+
 // Binary RPC
 pub const rpc = @import("rpc.zig");
 pub const rpc_uring = @import("rpc_uring.zig");
@@ -75,5 +78,6 @@ test {
     testing.refAllDecls(@import("request_metrics.zig"));
     testing.refAllDecls(@import("rate_limiter.zig"));
     testing.refAllDecls(@import("poller.zig"));
+    testing.refAllDecls(@import("io.zig"));
     // sqlite, schema, mirror, sqlite_read — tested via `zig build test-sqlite`
 }

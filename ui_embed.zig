@@ -11,8 +11,8 @@ const std = @import("std");
 const index_html = @embedFile("ui/dist/index.html");
 const favicon_svg = @embedFile("ui/dist/favicon.svg");
 const logo_full_svg = @embedFile("ui/dist/logo-full.svg");
-const index_js = @embedFile("ui/dist/assets/index-Bbxxm17d.js");
-const index_css = @embedFile("ui/dist/assets/index-yzDUWutW.css");
+const index_js = @embedFile("ui/dist/assets/index-Be2C-ojH.js");
+const index_css = @embedFile("ui/dist/assets/index-DqOUNrgT.css");
 
 pub const EmbeddedFile = struct {
     data: []const u8,
@@ -31,10 +31,10 @@ pub fn lookup(path: []const u8) ?EmbeddedFile {
     if (eql(path, "/logo-full.svg")) {
         return .{ .data = logo_full_svg, .content_type = "image/svg+xml" };
     }
-    if (eql(path, "/assets/index-Bbxxm17d.js")) {
+    if (eql(path, "/assets/index-Be2C-ojH.js")) {
         return .{ .data = index_js, .content_type = "application/javascript" };
     }
-    if (eql(path, "/assets/index-yzDUWutW.css")) {
+    if (eql(path, "/assets/index-DqOUNrgT.css")) {
         return .{ .data = index_css, .content_type = "text/css" };
     }
     return null;

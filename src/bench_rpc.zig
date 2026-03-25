@@ -77,11 +77,11 @@ const RpcClient = struct {
 
         for (0..count) |i| {
             // Queue
-            w.writeLenPrefixed(queue);
+            w.writePrefixed(queue);
             // Job ID: "{prefix}-{idx}"
             var id_buf: [64]u8 = undefined;
             const id = std.fmt.bufPrint(&id_buf, "{s}-{d}", .{ id_prefix, start_idx + @as(u32, @intCast(i)) }) catch "err";
-            w.writeLenPrefixed(id);
+            w.writePrefixed(id);
             // Priority
             w.writeU8(50);
             // Max retries
@@ -104,23 +104,23 @@ const RpcClient = struct {
             w.writeU16(0);
         }
 
-        try rpc.writeFrame(self.stream, rpc.MSG_ENQUEUE_BATCH, self.req_id, w.slice());
+        try rpc.writeFrame(self.stream, rpc.MSG_ENQUEUE_BATCH, self.req_id, w.written());
 
         // Read response.
         const header = try rpc.readHeader(self.stream);
         if (header.msg_type == rpc.MSG_ERROR) {
             // Read and discard error payload.
-            if (header.length > 0) {
-                try rpc.readExact(self.stream, self.recv_buf[0..header.length]);
+            if (header.payload_len > 0) {
+                try rpc.readExact(self.stream, self.recv_buf[0..header.payload_len]);
             }
             return 0;
         }
-        if (header.length > 0) {
-            try rpc.readExact(self.stream, self.recv_buf[0..header.length]);
+        if (header.payload_len > 0) {
+            try rpc.readExact(self.stream, self.recv_buf[0..header.payload_len]);
         }
 
         // Decode: [count:u16][err_code:u8]
-        var r = rpc.BufReader{ .data = self.recv_buf[0..header.length] };
+        var r = rpc.BufReader{ .data = self.recv_buf[0..header.payload_len] };
         const enqueued = r.readU16() catch 0;
         return enqueued;
     }
@@ -139,30 +139,30 @@ const RpcClient = struct {
         w.writeU64(now_ns);
         w.writeU16(count);
         w.writeU32(30_000); // lease_ms
-        w.writeLenPrefixed("bench-worker"); // worker_id
+        w.writePrefixed("bench-worker"); // worker_id
         w.writeU8(1); // queue_count
-        w.writeLenPrefixed(queue);
+        w.writePrefixed(queue);
 
-        try rpc.writeFrame(self.stream, rpc.MSG_FETCH_BATCH, self.req_id, w.slice());
+        try rpc.writeFrame(self.stream, rpc.MSG_FETCH_BATCH, self.req_id, w.written());
 
         const header = try rpc.readHeader(self.stream);
         if (header.msg_type == rpc.MSG_ERROR) {
-            if (header.length > 0) {
-                try rpc.readExact(self.stream, self.recv_buf[0..header.length]);
+            if (header.payload_len > 0) {
+                try rpc.readExact(self.stream, self.recv_buf[0..header.payload_len]);
             }
             return 0;
         }
-        if (header.length > 0) {
-            try rpc.readExact(self.stream, self.recv_buf[0..header.length]);
+        if (header.payload_len > 0) {
+            try rpc.readExact(self.stream, self.recv_buf[0..header.payload_len]);
         }
 
-        var r = rpc.BufReader{ .data = self.recv_buf[0..header.length] };
+        var r = rpc.BufReader{ .data = self.recv_buf[0..header.payload_len] };
         const fetched_count = r.readU16() catch 0;
         const n = @min(fetched_count, @as(u16, @intCast(fetched_ids.len)));
 
         for (0..n) |i| {
-            const id = r.readLenPrefixed() catch break;
-            const q = r.readLenPrefixed() catch break;
+            const id = r.readPrefixed() catch break;
+            const q = r.readPrefixed() catch break;
             @memcpy(fetched_ids[i].id_buf[0..id.len], id);
             fetched_ids[i].id_len = @intCast(id.len);
             @memcpy(fetched_ids[i].queue_buf[0..q.len], q);
@@ -170,8 +170,8 @@ const RpcClient = struct {
             // Skip per-job metadata: attempt, max_retries, checkpoint, tags, payload.
             _ = r.readU16() catch break; // attempt
             _ = r.readU16() catch break; // max_retries
-            _ = r.readLenPrefixed() catch break; // checkpoint
-            _ = r.readLenPrefixed() catch break; // tags
+            _ = r.readPrefixed() catch break; // checkpoint
+            _ = r.readPrefixed() catch break; // tags
             const pl = r.readU16() catch break; // payload length
             r.skip(pl) catch break; // payload data
         }
@@ -189,26 +189,26 @@ const RpcClient = struct {
         w.writeU16(@intCast(acks.len));
 
         for (acks) |a| {
-            w.writeLenPrefixed(a.id_buf[0..a.id_len]);
-            w.writeLenPrefixed(a.queue_buf[0..a.queue_len]);
+            w.writePrefixed(a.id_buf[0..a.id_len]);
+            w.writePrefixed(a.queue_buf[0..a.queue_len]);
             w.writeU8(0); // ack_status: done
             w.writeU8(0); // flags: no optional fields
         }
 
-        try rpc.writeFrame(self.stream, rpc.MSG_ACK_BATCH, self.req_id, w.slice());
+        try rpc.writeFrame(self.stream, rpc.MSG_ACK_BATCH, self.req_id, w.written());
 
         const header = try rpc.readHeader(self.stream);
         if (header.msg_type == rpc.MSG_ERROR) {
-            if (header.length > 0) {
-                try rpc.readExact(self.stream, self.recv_buf[0..header.length]);
+            if (header.payload_len > 0) {
+                try rpc.readExact(self.stream, self.recv_buf[0..header.payload_len]);
             }
             return 0;
         }
-        if (header.length > 0) {
-            try rpc.readExact(self.stream, self.recv_buf[0..header.length]);
+        if (header.payload_len > 0) {
+            try rpc.readExact(self.stream, self.recv_buf[0..header.payload_len]);
         }
 
-        var r = rpc.BufReader{ .data = self.recv_buf[0..header.length] };
+        var r = rpc.BufReader{ .data = self.recv_buf[0..header.payload_len] };
         const acked = r.readU16() catch 0;
         return acked;
     }
