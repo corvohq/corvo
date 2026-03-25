@@ -24,6 +24,9 @@ pub const Backend = switch (builtin.os.tag) {
     else => @compileError("unsupported OS: need io_uring (Linux) or kqueue (macOS)"),
 };
 
+/// Deterministic IO backend for simulation.
+pub const SimBackend = @import("io/sim.zig").SimBackend;
+
 /// Configuration for the IO backend.
 pub const Config = struct {
     listen_fd: std.posix.fd_t,

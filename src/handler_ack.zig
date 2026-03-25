@@ -33,7 +33,7 @@ pub fn applyAck(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.AckOp) ops.O
         if (job.state != .active) continue; // not active, skip
 
         // Lease token check: reject stale acks from workers whose lease was reclaimed.
-        if (ack.lease_token != 0 and job.lease_token != 0 and ack.lease_token != job.lease_token) continue;
+        if (job.lease_token != 0 and ack.lease_token != job.lease_token) continue;
 
         // Hold logic
         var next_state: types.JobState = .completed;

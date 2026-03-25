@@ -31,7 +31,7 @@ pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops
         if (job.state != .active) continue;
 
         // Lease token check: reject stale fails from workers whose lease was reclaimed.
-        if (fail_job.lease_token != 0 and job.lease_token != 0 and fail_job.lease_token != job.lease_token) continue;
+        if (job.lease_token != 0 and fail_job.lease_token != job.lease_token) continue;
 
         // Delete active key + decrement counts
         var ak_buf: keys.KeyBuf = undefined;

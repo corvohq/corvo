@@ -1,9 +1,15 @@
 //! VOPR Simulator — deterministic simulation with invariant checking.
 //!
-//! Single-node simulation: creates a Talon DB, Engine, Store, Server, and
-//! N simulated clients. Each tick advances the clock, runs client actions
-//! through HTTP route handlers, and periodically checks KV invariants.
-//! Seed-based reproduction.
+//! Single-node simulation: creates a Pipeline v2 over SimBackend and
+//! N simulated clients with persistent connections. Each tick:
+//!   1. Advance clock (+ random time jumps)
+//!   2. Each client injects one RPC frame into SimBackend
+//!   3. pipeline.tick() — drain, decode, executeBatch, encode, submit
+//!   4. Each client reads its response and updates state
+//!   5. Periodic KV invariant checks
+//!
+//! All operations go through the real write path. Deterministic: same seed
+//! produces identical behavior (SimBackend makes drain() deterministic).
 //!
 //! Run: zig build sim
 
@@ -12,9 +18,11 @@ const talon = @import("talon");
 const corvo = @import("corvo");
 
 const kv = corvo.kv;
-const engine_mod = corvo.engine;
-const store_mod = corvo.store;
-const server_mod = corvo.server;
+const handler_mod = corvo.handler;
+const oplog_mod = corvo.oplog;
+const notify_mod = corvo.notify;
+const pipeline_v2 = corvo.pipeline_v2;
+const io_mod = corvo.io;
 
 const SimClock = @import("clock.zig").SimClock;
 const setGlobalClock = @import("clock.zig").setGlobalClock;
@@ -23,14 +31,13 @@ const Config = @import("config.zig").Config;
 const SimClient = @import("client.zig").SimClient;
 const invariants = @import("invariants.zig");
 
-/// Maximum number of simulated queues.
 const max_queues = 8;
-/// Maximum number of simulated clients.
 const max_clients = 16;
 
-/// Run a complete single-node simulation. Returns error on invariant violation.
+const SimBackend = io_mod.SimBackend;
+const Pipeline = pipeline_v2.Pipeline(SimBackend);
+
 pub fn run(allocator: std.mem.Allocator, config: Config) !void {
-    // Resolve seed: 0 means pick from timestamp.
     const seed: u64 = if (config.seed == 0)
         @intCast(@as(u128, @bitCast(std.time.nanoTimestamp())) & 0xFFFFFFFFFFFFFFFF)
     else
@@ -49,21 +56,45 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         std.fs.cwd().deleteTree(dir_path) catch {};
     }
 
-    // --- KV store + engine + store + server ---
+    // --- KV store ---
     const store = kv.Store.init(db);
     var stores = [1]kv.Store{store};
 
+    // --- Clock ---
     var clock = SimClock.init(1_000_000_000_000); // start at 1000s
     setGlobalClock(&clock);
 
-    var engine = engine_mod.Engine.init(allocator, &stores, .{
-        .clock_fn = &globalClockNow,
-        .talon_sync = false,
-    });
-    defer engine.deinit();
+    // --- Handler ---
+    var handler = handler_mod.OpHandler.init(allocator);
+    defer handler.deinit();
+    handler.rebuildState(&stores);
 
-    var corvo_store = store_mod.Store.init(allocator, &engine, null);
-    var server = server_mod.Server.init(allocator, &corvo_store, .{});
+    // --- Oplog ---
+    var oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &globalClockNow }, null);
+    defer oplog.deinit();
+
+    // --- Notifier ---
+    var notify_inst = notify_mod.QueueNotifier.init(allocator);
+    defer notify_inst.deinit();
+
+    // --- SimBackend ---
+    var backend = try SimBackend.init(allocator, .{
+        .listen_fd = -1,
+        .max_conns = max_clients + 4,
+        .recv_buf_size = 65536,
+        .send_buf_size = 65536,
+    });
+    defer backend.deinit(allocator);
+
+    // --- Pipeline ---
+    var pipeline = Pipeline.init(
+        &backend,
+        &handler,
+        &stores,
+        &oplog,
+        &notify_inst,
+        .{ .clock_fn = &globalClockNow },
+    );
 
     // --- Queue names ---
     const num_queues: usize = @min(config.queues, max_queues);
@@ -76,16 +107,17 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     }
     const queues = queue_slices[0..num_queues];
 
-    // --- Clients ---
+    // --- Clients (each gets a persistent SimBackend connection) ---
     const num_clients: usize = @min(config.clients, max_clients);
     var clients: [max_clients]SimClient = undefined;
 
     for (0..num_clients) |i| {
+        const conn_id = backend.connect() orelse unreachable;
         clients[i] = SimClient.init(
             @intCast(i),
             seed +% @as(u64, i) +% 1,
-            &engine,
-            &server,
+            &backend,
+            conn_id,
             config,
             queues,
         );
@@ -95,25 +127,33 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     // --- Main tick loop ---
     var tick: u32 = 0;
     while (tick < config.ticks) : (tick += 1) {
-        // Advance clock by tick duration.
+        // Advance clock
         clock.advance(config.tick_duration_ns);
 
-        // Random time jump (simulates clock skew / idle periods).
+        // Random time jump (simulates clock skew / idle periods)
         if (rng.float(f64) < config.time_jump_prob) {
             const jump = rng.intRangeAtMost(i64, 1_000_000, config.time_jump_max_ns);
             clock.advance(jump);
         }
 
-        // Each client performs one action.
+        // Phase 1: each client injects one RPC frame
         for (clients[0..num_clients]) |*c| {
-            c.act();
+            c.inject();
         }
 
-        // Periodic invariant checks.
+        // Phase 2: pipeline processes all frames in one batch
+        pipeline.tick();
+
+        // Phase 3: each client reads its response
+        for (clients[0..num_clients]) |*c| {
+            c.processResponse();
+        }
+
+        // Periodic invariant checks
         if (tick > 0 and tick % config.check_interval == 0) {
             const result = invariants.checkAll(
                 &stores[0],
-                engine.getHandler(),
+                &handler,
                 tick,
                 seed,
             );
@@ -131,7 +171,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     {
         const result = invariants.checkAll(
             &stores[0],
-            engine.getHandler(),
+            &handler,
             config.ticks,
             seed,
         );
@@ -150,8 +190,6 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     var total_acked: u32 = 0;
     var total_failed: u32 = 0;
     var total_bulk: u32 = 0;
-    var total_batch_creates: u32 = 0;
-    var total_batch_seals: u32 = 0;
     var total_maintenance: u32 = 0;
     var total_heartbeats: u32 = 0;
     var total_queue_ops: u32 = 0;
@@ -162,26 +200,23 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         total_acked += c.acked;
         total_failed += c.failed;
         total_bulk += c.bulk_ops;
-        total_batch_creates += c.batch_creates;
-        total_batch_seals += c.batch_seals;
         total_maintenance += c.maintenance_ops;
         total_heartbeats += c.heartbeats;
         total_queue_ops += c.queue_ops;
     }
 
     std.debug.print(
-        "OK seed={d} ticks={d} clients={d} queues={d} | enq={d} fetch={d} ack={d} fail={d} bulk={d} batch={d}/{d} maint={d} hb={d} qop={d}\n",
+        "OK seed={d} ticks={d} clients={d} queues={d} | enq={d} fetch={d} ack={d} fail={d} bulk={d} maint={d} hb={d} qop={d}\n",
         .{
-            seed,           config.ticks,     num_clients,        num_queues,
-            total_enqueued, total_fetched,     total_acked,        total_failed,
-            total_bulk,     total_batch_creates, total_batch_seals, total_maintenance,
-            total_heartbeats, total_queue_ops,
+            seed,            config.ticks,       num_clients,        num_queues,
+            total_enqueued,  total_fetched,      total_acked,        total_failed,
+            total_bulk,      total_maintenance,  total_heartbeats,   total_queue_ops,
         },
     );
 }
 
 // ============================================================================
-// Tests — just run a short sim to verify it compiles + doesn't crash.
+// Tests — run short sims to verify compile + correctness.
 // ============================================================================
 
 test "sim smoke" {
