@@ -41,6 +41,7 @@ pub const ConnState = struct {
     fd: std.posix.fd_t = -1,
     generation: u16 = 0,
     phase: Phase = .free,
+    protocol: Protocol = .unknown,
     recv_buf: []u8,
     send_buf: []u8,
     recv_pos: u32 = 0,
@@ -59,11 +60,13 @@ pub const ConnState = struct {
     last_req_id: u32 = 0,
 
     pub const Phase = enum { free, recv_pending, ready, send_pending };
+    pub const Protocol = enum { unknown, rpc, http };
 
     pub fn reset(self: *ConnState) void {
         self.fd = -1;
         self.generation +%= 1;
         self.phase = .free;
+        self.protocol = .unknown;
         self.recv_pos = 0;
         self.send_pos = 0;
         self.send_len = 0;

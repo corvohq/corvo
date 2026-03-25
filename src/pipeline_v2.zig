@@ -13,11 +13,16 @@
 const std = @import("std");
 const io_mod = @import("io.zig");
 const rpc = @import("rpc.zig");
+const http = @import("http.zig");
+const http_read = @import("http_read.zig");
+const sqlite_read = @import("sqlite_read.zig");
 const ops_mod = @import("ops.zig");
 const kv = @import("kv.zig");
 const handler_mod = @import("handler.zig");
 const oplog_mod = @import("oplog.zig");
 const notify_mod = @import("notify.zig");
+const mirror_mod = @import("mirror.zig");
+const mirror_events = @import("mirror_events.zig");
 const assert = @import("assert.zig");
 const keys = @import("keys.zig");
 const codec = @import("codec.zig");
@@ -26,6 +31,7 @@ const types = @import("types.zig");
 const OpHandler = handler_mod.OpHandler;
 const QueueNotifier = notify_mod.QueueNotifier;
 const ConnState = io_mod.ConnState;
+const Protocol = ConnState.Protocol;
 const Completion = io_mod.Completion;
 const BufReader = rpc.BufReader;
 const BufWriter = rpc.BufWriter;
@@ -39,7 +45,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
         stores: []kv.Store,
         oplog: *oplog_mod.Log,
         notify: *QueueNotifier,
+        reader: ?*sqlite_read.Reader,
+        mirror: ?*mirror_mod.Mirror,
         config: Config,
+
+        // HTTP decode scratch (reused per tick)
+        http_scratch: http.DecodeScratch = .{},
+        http_id_counter: u64 = 0,
+        http_id_bufs: [max_frames][64]u8 = undefined,
 
         // Frame tracking for current tick
         frames: [max_frames]FrameDesc = undefined,
@@ -90,6 +103,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
             msg_type: u8,
             payload: []const u8,
             count: u16 = 0,
+            protocol: Protocol = .rpc,
+            path_param: []const u8 = "",
         };
 
         const RecvCompaction = struct {
@@ -107,6 +122,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
             stores: []kv.Store,
             oplog: *oplog_mod.Log,
             notify: *QueueNotifier,
+            reader: ?*sqlite_read.Reader,
+            mirror: ?*mirror_mod.Mirror,
             config: Config,
         ) Self {
             return .{
@@ -115,6 +132,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 .stores = stores,
                 .oplog = oplog,
                 .notify = notify,
+                .reader = reader,
+                .mirror = mirror,
                 .config = config,
             };
         }
@@ -187,7 +206,21 @@ pub fn Pipeline(comptime IoBackend: type) type {
         fn extractFrames(self: *Self, conn_id: u16) void {
             const c = self.io.conn(conn_id);
             if (c.phase == .free) return;
+            if (c.recv_pos == 0) return;
 
+            // Detect protocol on first data.
+            if (c.protocol == .unknown) {
+                c.protocol = if (http.isHttpByte(c.recv_buf[0])) .http else .rpc;
+            }
+
+            switch (c.protocol) {
+                .rpc => self.extractRpcFrames(conn_id, c),
+                .http => self.extractHttpFrames(conn_id, c),
+                .unknown => unreachable,
+            }
+        }
+
+        fn extractRpcFrames(self: *Self, conn_id: u16, c: *ConnState) void {
             var pos: u32 = 0;
             const data_end = c.recv_pos;
 
@@ -215,19 +248,85 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 pos = @intCast(frame_end);
             }
 
-            // Record compaction (deferred until after execute+encode)
-            if (pos > 0) {
-                assert.check(
-                    self.recv_compaction_count < max_completions,
-                    "pipeline: recv_compaction overflow",
-                    .{},
-                );
-                self.recv_compactions[self.recv_compaction_count] = .{
-                    .conn_id = conn_id,
-                    .consumed = pos,
-                };
-                self.recv_compaction_count += 1;
+            self.recordRecvCompaction(conn_id, pos);
+        }
+
+        fn extractHttpFrames(self: *Self, conn_id: u16, c: *ConnState) void {
+            const data = c.recv_buf[0..c.recv_pos];
+            const req = http.parseRequest(data) orelse return; // incomplete, wait
+
+            const route = http.classifyRoute(req.method, req.path);
+
+            switch (route) {
+                .read => {
+                    // Handle inline — write response directly, bypass batch.
+                    const clean = if (std.mem.indexOfScalar(u8, req.path, '?')) |qi| req.path[0..qi] else req.path;
+                    const api = if (std.mem.startsWith(u8, clean, "/api/v1/")) clean["/api/v1".len..] else clean;
+                    const param = extractPathParam(api);
+                    const resp_len = http_read.dispatch(
+                        req.method,
+                        req.path,
+                        param,
+                        req.body,
+                        c.send_buf,
+                        self.reader,
+                    );
+                    if (resp_len > 0) {
+                        c.send_len = resp_len;
+                        self.io.queueSend(conn_id, resp_len);
+                    }
+                    self.recordRecvCompaction(conn_id, req.total_len);
+                },
+                .write => |w| {
+                    if (self.frame_count >= max_frames) return; // back-pressure
+
+                    self.frames[self.frame_count] = .{
+                        .conn_id = conn_id,
+                        .req_id = 0,
+                        .msg_type = w.msg_type,
+                        .payload = req.body,
+                        .protocol = .http,
+                        .path_param = w.param,
+                    };
+                    self.frame_count += 1;
+                    self.recordRecvCompaction(conn_id, req.total_len);
+                },
+                .not_found => {
+                    const resp_len = http.writeResponse(c.send_buf, 404, "{\"error\":\"not found\"}");
+                    c.send_len = resp_len;
+                    self.io.queueSend(conn_id, resp_len);
+                    self.recordRecvCompaction(conn_id, req.total_len);
+                },
+                .method_not_allowed => {
+                    const resp_len = http.writeResponse(c.send_buf, 405, "{\"error\":\"method not allowed\"}");
+                    c.send_len = resp_len;
+                    self.io.queueSend(conn_id, resp_len);
+                    self.recordRecvCompaction(conn_id, req.total_len);
+                },
             }
+        }
+
+        fn extractPathParam(api_path: []const u8) []const u8 {
+            // Extract trailing segment: /jobs/{id} → {id}, /ack/{id} → {id}
+            if (std.mem.lastIndexOfScalar(u8, api_path, '/')) |last_slash| {
+                const param = api_path[last_slash + 1 ..];
+                if (param.len > 0) return param;
+            }
+            return "";
+        }
+
+        fn recordRecvCompaction(self: *Self, conn_id: u16, consumed: u32) void {
+            if (consumed == 0) return;
+            assert.check(
+                self.recv_compaction_count < max_completions,
+                "pipeline: recv_compaction overflow",
+                .{},
+            );
+            self.recv_compactions[self.recv_compaction_count] = .{
+                .conn_id = conn_id,
+                .consumed = consumed,
+            };
+            self.recv_compaction_count += 1;
         }
 
         // ====================================================================
@@ -235,15 +334,21 @@ pub fn Pipeline(comptime IoBackend: type) type {
         // ====================================================================
 
         fn executeBatch(self: *Self) void {
+            self.handler.resetEffects();
             var kv_batch = self.stores[0].newBatch();
             defer kv_batch.close();
 
             for (self.frames[0..self.frame_count], 0..) |*frame, i| {
-                self.results[i] = self.decodeAndApply(&kv_batch, frame);
+                self.results[i] = self.decodeAndApply(&kv_batch, frame, @intCast(i));
             }
 
             kv_batch.commit();
             self.applied_total += self.frame_count;
+
+            // Post-commit: drain handler effect buffers into mirror.
+            if (self.mirror) |m| {
+                mirror_events.mirrorEffects(m, self.handler);
+            }
 
             // Post-commit: notify queue waiters
             for (self.frames[0..self.frame_count], 0..) |frame, i| {
@@ -251,7 +356,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
         }
 
-        fn decodeAndApply(self: *Self, batch: *kv.WriteBatch, frame: *FrameDesc) ops_mod.OpResult {
+        fn decodeAndApply(self: *Self, batch: *kv.WriteBatch, frame: *FrameDesc, frame_idx: u32) ops_mod.OpResult {
+            // HTTP writes use JSON decode; RPC uses binary decode.
+            if (frame.protocol == .http)
+                return self.decodeAndApplyHttp(batch, frame, frame_idx);
+
             switch (frame.msg_type) {
                 rpc.MSG_PING => return .{},
 
@@ -262,7 +371,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         return .{ .err = "parse error" };
                     frame.count = parsed.count;
                     const op_data = ops_mod.OpData{ .enqueue = parsed.op };
-                    return self.handler.apply(batch, .enqueue, &op_data);
+                    const result = self.handler.apply(batch, .enqueue, &op_data);
+                    self.emitMirrorOp(.enqueue, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_ACK_BATCH => {
@@ -273,7 +384,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     var op = parsed.op;
                     op.now_ns = self.nowNs();
                     const op_data = ops_mod.OpData{ .ack = op };
-                    return self.handler.apply(batch, .ack, &op_data);
+                    const result = self.handler.apply(batch, .ack, &op_data);
+                    self.emitMirrorOp(.ack, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_FAIL_BATCH => {
@@ -284,7 +397,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     var op = parsed.op;
                     op.now_ns = self.nowNs();
                     const op_data = ops_mod.OpData{ .fail = op };
-                    return self.handler.apply(batch, .fail, &op_data);
+                    const result = self.handler.apply(batch, .fail, &op_data);
+                    self.emitMirrorOp(.fail, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_HEARTBEAT => {
@@ -297,7 +412,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     var op = parsed;
                     op.now_ns = self.nowNs();
                     const op_data = ops_mod.OpData{ .heartbeat = op };
-                    return self.handler.apply(batch, .heartbeat, &op_data);
+                    const result = self.handler.apply(batch, .heartbeat, &op_data);
+                    self.emitMirrorOp(.heartbeat, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_FETCH_BATCH => {
@@ -316,7 +433,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         .count = sub.credits,
                         .now_ns = now_ns,
                     } };
-                    return self.handler.apply(batch, .fetch, &op_data);
+                    const result = self.handler.apply(batch, .fetch, &op_data);
+                    self.emitMirrorOp(.fetch, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_MAINTENANCE => {
@@ -324,7 +443,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     const parsed = rpc.management.parseMaintenance(&reader) catch
                         return .{ .err = "parse error" };
                     const op_data = ops_mod.OpData{ .maintenance = parsed };
-                    return self.handler.apply(batch, .maintenance, &op_data);
+                    const result = self.handler.apply(batch, .maintenance, &op_data);
+                    self.emitMirrorOp(.maintenance, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_QUEUE_CONFIG => {
@@ -332,7 +453,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     const parsed = rpc.management.parseQueueConfig(&reader) catch
                         return .{ .err = "parse error" };
                     const op_data = ops_mod.OpData{ .queue_config = parsed };
-                    return self.handler.apply(batch, .queue_config, &op_data);
+                    const result = self.handler.apply(batch, .queue_config, &op_data);
+                    self.emitMirrorOp(.queue_config, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_CLEAR_QUEUE => {
@@ -340,7 +463,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     const parsed = rpc.management.parseClearQueue(&reader) catch
                         return .{ .err = "parse error" };
                     const op_data = ops_mod.OpData{ .clear_queue = parsed };
-                    return self.handler.apply(batch, .clear_queue, &op_data);
+                    const result = self.handler.apply(batch, .clear_queue, &op_data);
+                    self.emitMirrorOp(.clear_queue, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_DELETE_QUEUE => {
@@ -348,7 +473,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     const parsed = rpc.management.parseDeleteQueue(&reader) catch
                         return .{ .err = "parse error" };
                     const op_data = ops_mod.OpData{ .delete_queue = parsed };
-                    return self.handler.apply(batch, .delete_queue, &op_data);
+                    const result = self.handler.apply(batch, .delete_queue, &op_data);
+                    self.emitMirrorOp(.delete_queue, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_BULK_ACTION => {
@@ -356,7 +483,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     const parsed = rpc.bulk.parseBulkAction(&reader, &self.bulk_ids_buf) catch
                         return .{ .err = "parse error" };
                     const op_data = ops_mod.OpData{ .bulk_action = parsed };
-                    return self.handler.apply(batch, .bulk_action, &op_data);
+                    const result = self.handler.apply(batch, .bulk_action, &op_data);
+                    self.emitMirrorOp(.bulk_action, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_BATCH_CREATE => {
@@ -364,7 +493,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     const parsed = rpc.batch.parseBatchCreate(&reader) catch
                         return .{ .err = "parse error" };
                     const op_data = ops_mod.OpData{ .batch_create = parsed };
-                    return self.handler.apply(batch, .batch_create, &op_data);
+                    const result = self.handler.apply(batch, .batch_create, &op_data);
+                    self.emitMirrorOp(.batch_create, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_BATCH_SEAL => {
@@ -372,7 +503,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     const parsed = rpc.batch.parseBatchSeal(&reader) catch
                         return .{ .err = "parse error" };
                     const op_data = ops_mod.OpData{ .batch_seal = parsed };
-                    return self.handler.apply(batch, .batch_seal, &op_data);
+                    const result = self.handler.apply(batch, .batch_seal, &op_data);
+                    self.emitMirrorOp(.batch_seal, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_CRON_CREATE => {
@@ -380,7 +513,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     const parsed = rpc.cron.parseCronCreate(&reader) catch
                         return .{ .err = "parse error" };
                     const op_data = ops_mod.OpData{ .cron_create = parsed };
-                    return self.handler.apply(batch, .cron_create, &op_data);
+                    const result = self.handler.apply(batch, .cron_create, &op_data);
+                    self.emitMirrorOp(.cron_create, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_CRON_UPDATE => {
@@ -388,7 +523,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     const parsed = rpc.cron.parseCronUpdate(&reader) catch
                         return .{ .err = "parse error" };
                     const op_data = ops_mod.OpData{ .cron_update = parsed };
-                    return self.handler.apply(batch, .cron_update, &op_data);
+                    const result = self.handler.apply(batch, .cron_update, &op_data);
+                    self.emitMirrorOp(.cron_update, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_CRON_DELETE => {
@@ -396,7 +533,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     const parsed = rpc.cron.parseCronDelete(&reader) catch
                         return .{ .err = "parse error" };
                     const op_data = ops_mod.OpData{ .cron_delete = parsed };
-                    return self.handler.apply(batch, .cron_delete, &op_data);
+                    const result = self.handler.apply(batch, .cron_delete, &op_data);
+                    self.emitMirrorOp(.cron_delete, &op_data, &result);
+                    return result;
                 },
 
                 rpc.MSG_CRON_TRIGGER => {
@@ -404,11 +543,48 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     const parsed = rpc.cron.parseCronTrigger(&reader) catch
                         return .{ .err = "parse error" };
                     const op_data = ops_mod.OpData{ .cron_trigger = parsed };
-                    return self.handler.apply(batch, .cron_trigger, &op_data);
+                    const result = self.handler.apply(batch, .cron_trigger, &op_data);
+                    self.emitMirrorOp(.cron_trigger, &op_data, &result);
+                    return result;
                 },
 
                 else => return .{ .err = "unknown message type" },
             }
+        }
+
+        fn decodeAndApplyHttp(self: *Self, batch: *kv.WriteBatch, frame: *FrameDesc, frame_idx: u32) ops_mod.OpResult {
+            const now_ns = self.nowNs();
+
+            // For enqueue, generate job_id into per-frame buffer before decode.
+            if (frame.msg_type == rpc.MSG_ENQUEUE_BATCH) {
+                self.http_id_counter += 1;
+                const id = http.generateId(&self.http_id_bufs[frame_idx], now_ns, self.http_id_counter);
+                self.http_scratch.jobs[0].job_id = id;
+                frame.path_param = id;
+            }
+
+            const decoded = http.decodeWrite(
+                frame.msg_type,
+                frame.payload,
+                frame.path_param,
+                now_ns,
+                &self.http_scratch,
+            );
+
+            frame.count = decoded.count;
+
+            const op_type: ops_mod.OpType = switch (frame.msg_type) {
+                rpc.MSG_ENQUEUE_BATCH => .enqueue,
+                rpc.MSG_FETCH_BATCH => .fetch,
+                rpc.MSG_ACK_BATCH => .ack,
+                rpc.MSG_FAIL_BATCH => .fail,
+                rpc.MSG_HEARTBEAT => .heartbeat,
+                else => return .{ .err = "unsupported http write" },
+            };
+
+            const result = self.handler.apply(batch, op_type, &decoded.op_data);
+            self.emitMirrorOp(op_type, &decoded.op_data, &result);
+            return result;
         }
 
         // ====================================================================
@@ -423,6 +599,25 @@ pub fn Pipeline(comptime IoBackend: type) type {
             for (self.frames[0..self.frame_count], 0..) |frame, i| {
                 const c = self.io.conn(frame.conn_id);
                 if (c.phase == .free) continue;
+
+                if (frame.protocol == .http) {
+                    // HTTP: delegate response encoding to http module.
+                    // For enqueue, path_param holds the generated job_id.
+                    const resp_len = http.encodeWriteResponse(
+                        c.send_buf,
+                        frame.msg_type,
+                        &self.results[i],
+                        frame.path_param,
+                    );
+                    if (resp_len > 0) {
+                        if (c.send_len == 0) {
+                            send_conns[send_conn_count] = frame.conn_id;
+                            send_conn_count += 1;
+                        }
+                        c.send_len = resp_len;
+                    }
+                    continue;
+                }
 
                 const resp_type = switch (frame.msg_type) {
                     rpc.MSG_PING => rpc.MSG_PONG,
@@ -611,6 +806,15 @@ pub fn Pipeline(comptime IoBackend: type) type {
         // Helpers
         // ====================================================================
 
+        /// Emit a mirror event for a single op. Called inline during decode
+        /// while OpData is still live on the stack. mirrorFromOp copies all
+        /// fields into fixed-size MirrorOp payloads, so no dangling pointers.
+        fn emitMirrorOp(self: *Self, op_type: ops_mod.OpType, op_data: *const ops_mod.OpData, result: *const ops_mod.OpResult) void {
+            if (self.mirror) |m| {
+                mirror_events.mirrorFromOp(m, op_type, op_data, result);
+            }
+        }
+
         fn nowNs(self: *const Self) u64 {
             const ts = self.config.clock_fn();
             assert.check(ts > 0, "pipeline: clock_fn returned non-positive value: {d}", .{ts});
@@ -681,6 +885,8 @@ const TestContext = struct {
             &self.stores,
             &self.oplog,
             &self.notify,
+            null, // no SQLite reader in tests
+            null, // no mirror in unit tests
             .{ .clock_fn = &testClockFn },
         );
     }
@@ -727,6 +933,35 @@ const TestContext = struct {
             .header = header,
             .payload = data[payload_start..payload_end],
         };
+    }
+
+    /// Inject a raw HTTP request into a connection's recv_buf.
+    fn injectHttp(self: *TestContext, conn_id: u16, request: []const u8) void {
+        self.backend.injectRecv(conn_id, request);
+    }
+
+    /// Read the raw HTTP response from a connection's send_buf.
+    fn readHttpResponse(self: *TestContext, conn_id: u16) ?[]const u8 {
+        const c = self.backend.conn(conn_id);
+        if (c.send_len == 0) return null;
+        return c.send_buf[0..c.send_len];
+    }
+
+    /// Extract the HTTP response body (everything after \r\n\r\n).
+    fn httpResponseBody(resp: []const u8) ?[]const u8 {
+        var i: usize = 0;
+        while (i + 3 < resp.len) : (i += 1) {
+            if (resp[i] == '\r' and resp[i + 1] == '\n' and resp[i + 2] == '\r' and resp[i + 3] == '\n')
+                return resp[i + 4 ..];
+        }
+        return null;
+    }
+
+    /// Check HTTP response starts with expected status line.
+    fn httpResponseStatus(resp: []const u8) ?u16 {
+        // "HTTP/1.1 200 OK\r\n"
+        if (!std.mem.startsWith(u8, resp, "HTTP/1.1 ")) return null;
+        return std.fmt.parseInt(u16, resp[9..12], 10) catch null;
     }
 };
 
@@ -916,4 +1151,108 @@ test "recv_buf compaction preserves unconsumed data" {
     const c = ctx.backend.conn(conn_id);
     try testing.expectEqual(@as(u32, 3), c.recv_pos);
     try testing.expectEqual(rpc.MSG_PING, c.recv_buf[0]);
+}
+
+// ============================================================================
+// HTTP Integration Tests
+// ============================================================================
+
+test "HTTP GET /api/v1/info returns version" {
+    var ctx: TestContext = undefined;
+    try ctx.init("/tmp/corvo-pv2-http-info");
+    defer ctx.deinit();
+
+    const conn_id = ctx.backend.connect().?;
+    ctx.injectHttp(conn_id, "GET /api/v1/info HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    ctx.pipeline.tick();
+
+    const resp = ctx.readHttpResponse(conn_id).?;
+    try testing.expectEqual(@as(u16, 200), TestContext.httpResponseStatus(resp).?);
+    const body = TestContext.httpResponseBody(resp).?;
+    try testing.expect(std.mem.indexOf(u8, body, "\"version\"") != null);
+    // Read bypasses batch — applied_total should be 0.
+    try testing.expectEqual(@as(u64, 0), ctx.pipeline.applied_total);
+}
+
+test "HTTP GET unknown route returns 404" {
+    var ctx: TestContext = undefined;
+    try ctx.init("/tmp/corvo-pv2-http-404");
+    defer ctx.deinit();
+
+    const conn_id = ctx.backend.connect().?;
+    ctx.injectHttp(conn_id, "GET /nonexistent HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    ctx.pipeline.tick();
+
+    const resp = ctx.readHttpResponse(conn_id).?;
+    try testing.expectEqual(@as(u16, 404), TestContext.httpResponseStatus(resp).?);
+}
+
+test "HTTP POST /api/v1/enqueue creates job" {
+    var ctx: TestContext = undefined;
+    try ctx.init("/tmp/corvo-pv2-http-enq");
+    defer ctx.deinit();
+
+    const conn_id = ctx.backend.connect().?;
+    const body = "{\"queue\":\"default\",\"priority\":5}";
+    var req_buf: [512]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf,
+        "POST /api/v1/enqueue HTTP/1.1\r\nContent-Length: {d}\r\nHost: localhost\r\n\r\n{s}",
+        .{ body.len, body },
+    ) catch unreachable;
+
+    ctx.injectHttp(conn_id, req);
+    ctx.pipeline.tick();
+
+    const resp = ctx.readHttpResponse(conn_id).?;
+    try testing.expectEqual(@as(u16, 201), TestContext.httpResponseStatus(resp).?);
+    const resp_body = TestContext.httpResponseBody(resp).?;
+    // Response should contain a generated job_id.
+    try testing.expect(std.mem.indexOf(u8, resp_body, "\"id\":\"job_") != null);
+    // Batch was used.
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.applied_total);
+}
+
+test "HTTP protocol detection — same pipeline handles both" {
+    var ctx: TestContext = undefined;
+    try ctx.init("/tmp/corvo-pv2-http-mixed");
+    defer ctx.deinit();
+
+    // RPC connection: ping
+    const rpc_conn = ctx.backend.connect().?;
+    ctx.injectFrame(rpc_conn, rpc.MSG_PING, 1, "");
+
+    // HTTP connection: GET info
+    const http_conn = ctx.backend.connect().?;
+    ctx.injectHttp(http_conn, "GET /api/v1/info HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    ctx.pipeline.tick();
+
+    // RPC conn should have pong
+    const rpc_resp = ctx.readResponseHeader(rpc_conn).?;
+    try testing.expectEqual(rpc.MSG_PONG, rpc_resp.msg_type);
+
+    // HTTP conn should have 200 JSON
+    const http_resp = ctx.readHttpResponse(http_conn).?;
+    try testing.expectEqual(@as(u16, 200), TestContext.httpResponseStatus(http_resp).?);
+
+    // Protocol detection should be sticky
+    const rpc_c = ctx.backend.conn(rpc_conn);
+    try testing.expectEqual(ConnState.Protocol.rpc, rpc_c.protocol);
+    const http_c = ctx.backend.conn(http_conn);
+    try testing.expectEqual(ConnState.Protocol.http, http_c.protocol);
+}
+
+test "HTTP incomplete request waits for more data" {
+    var ctx: TestContext = undefined;
+    try ctx.init("/tmp/corvo-pv2-http-partial");
+    defer ctx.deinit();
+
+    const conn_id = ctx.backend.connect().?;
+    // Send partial headers (no \r\n\r\n terminator yet).
+    ctx.injectHttp(conn_id, "GET /api/v1/info HTTP/1.1\r\nHost: local");
+    ctx.pipeline.tick();
+
+    // No response yet.
+    try testing.expect(ctx.readHttpResponse(conn_id) == null);
+    try testing.expectEqual(@as(u64, 0), ctx.pipeline.applied_total);
 }

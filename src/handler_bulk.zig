@@ -138,6 +138,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                     keys.jobErrorPrefix(&jep_buf, job_id),
                     keys.prefixEnd(&jee_buf, keys.jobErrorPrefix(&jep_buf, job_id)) orelse "",
                 );
+                self.recordBulkResult(job_id, .delete, "", "", op.now_ns);
                 affected += 1;
                 continue; // skip job write — it's deleted
             },
@@ -191,6 +192,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 job.lease_expires_at_ns = 0;
                 var dk_buf: keys.KeyBuf = undefined;
                 b.set(keys.deadKey(&dk_buf, op.now_ns, job_id), "");
+                self.recordBulkResult(job_id, .update_state, "cancelled", "", op.now_ns);
             },
 
             .move => {
@@ -231,6 +233,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                     }
                 }
                 job.queue = move_to;
+                self.recordBulkResult(job_id, .move, "pending", move_to, op.now_ns);
             },
 
             .change_priority => {
@@ -268,6 +271,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 job.state = .held;
                 job.hold_reason = "bulk_hold";
                 job.scheduled_at_ns = 0;
+                self.recordBulkResult(job_id, .update_state, "held", "", op.now_ns);
             },
 
             .approve => {
@@ -279,6 +283,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                     var xk_buf: keys.KeyBuf = undefined;
                     b.set(keys.expireKey(&xk_buf, job.expire_at_ns, job_id), "");
                 }
+                self.recordBulkResult(job_id, .update_state, "pending", "", op.now_ns);
             },
 
             .reject => {
@@ -307,6 +312,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                         b.set(keys.jobErrorKey(&ek_buf, job_id, @intCast(job.attempt)), err_json);
                     }
                 }
+                self.recordBulkResult(job_id, .update_state, "dead", "", op.now_ns);
             },
         }
 
@@ -388,6 +394,7 @@ fn applyBatchMods(self: *OpHandler, b: *kv.WriteBatch, mods: []const BatchMod, c
                         .now_ns = now_ns,
                     };
                     _ = self.applyEnqueue(b, &enqueue_op);
+                    self.recordSideEffect(&cb_job);
                 }
             }
         }

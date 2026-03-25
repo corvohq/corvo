@@ -93,6 +93,8 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         &stores,
         &oplog,
         &notify_inst,
+        null, // no SQLite reader in sim
+        null, // no mirror in sim
         .{ .clock_fn = &globalClockNow },
     );
 

@@ -246,5 +246,6 @@ fn advanceChain(self: *OpHandler, b: *kv.WriteBatch, job: *const types.Job, ack:
         .now_ns = now_ns,
     };
     _ = self.applyEnqueue(b, &enqueue_op);
+    self.recordSideEffect(&chain_job);
 }
 

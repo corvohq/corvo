@@ -132,6 +132,16 @@ pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops
             }
         }
 
+        self.recordFailResult(
+            fail_job.job_id,
+            fail_job.error_msg,
+            fail_job.backtrace,
+            job.state,
+            job.attempt,
+            if (job.state == .retrying) job.scheduled_at_ns else 0,
+            op.now_ns,
+        );
+
         // Write updated job
         var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
         b.set(keys.jobKey(&jk_buf, fail_job.job_id), codec.encodeJob(&job_enc_buf, &job));
@@ -195,4 +205,5 @@ pub fn fireChainOnFailure(self: *OpHandler, b: *kv.WriteBatch, job: *const types
         .now_ns = now_ns,
     };
     _ = self.applyEnqueue(b, &enqueue_op);
+    self.recordSideEffect(&chain_job);
 }

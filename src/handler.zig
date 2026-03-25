@@ -38,8 +38,67 @@ pub const OpHandler = struct {
     verify_indexes: bool = false,
     /// Monotonic counter for lease tokens. Unique per fetch claim.
     lease_counter: u64 = 0,
+    // Effect buffers — accumulated during apply, drained by pipeline after commit.
+    side_effects: [max_side_effects]mirror_mod.MirrorOp.EnqueuePayload = undefined,
+    side_effect_count: u8 = 0,
+    fail_results: [max_fail_results]FailResult = undefined,
+    fail_result_count: u16 = 0,
+    bulk_results: [max_bulk_results]BulkResult = undefined,
+    bulk_result_count: u16 = 0,
     /// Allocator for handler-owned state (maps, etc).
     allocator: Allocator,
+
+    const mirror_mod = @import("mirror.zig");
+
+    const max_side_effects = 32;
+    const max_fail_results = 256;
+    const max_bulk_results = 256;
+
+    pub const FailResult = struct {
+        job_id: [128]u8 = undefined,
+        job_id_len: u8 = 0,
+        error_msg: [256]u8 = undefined,
+        error_msg_len: u16 = 0,
+        backtrace: [1024]u8 = undefined,
+        backtrace_len: u16 = 0,
+        new_state: types.JobState = .retrying,
+        attempt: u16 = 0,
+        retry_at_ns: u64 = 0,
+        now_ns: u64 = 0,
+
+        pub fn jobId(self: *const FailResult) []const u8 {
+            return self.job_id[0..self.job_id_len];
+        }
+        pub fn errorMsg(self: *const FailResult) []const u8 {
+            return self.error_msg[0..self.error_msg_len];
+        }
+        pub fn backtraceSlice(self: *const FailResult) []const u8 {
+            return self.backtrace[0..self.backtrace_len];
+        }
+    };
+
+    pub const BulkResult = struct {
+        pub const ActionType = enum { update_state, delete, move };
+
+        job_id: [128]u8 = undefined,
+        job_id_len: u8 = 0,
+        action: ActionType = .update_state,
+        new_state: [16]u8 = undefined,
+        new_state_len: u8 = 0,
+        new_queue: [128]u8 = undefined,
+        new_queue_len: u8 = 0,
+        now_ns: u64 = 0,
+
+        pub fn jobId(self: *const BulkResult) []const u8 {
+            return self.job_id[0..self.job_id_len];
+        }
+        pub fn stateSlice(self: *const BulkResult) []const u8 {
+            return self.new_state[0..self.new_state_len];
+        }
+        pub fn queueSlice(self: *const BulkResult) []const u8 {
+            return self.new_queue[0..self.new_queue_len];
+        }
+    };
 
     pub fn init(allocator: Allocator) OpHandler {
         return .{
@@ -207,6 +266,97 @@ pub const OpHandler = struct {
         }
 
         _ = .{ pending_count, active_count, total_count };
+    }
+
+    // ========================================================================
+    // Effect buffer methods — pipeline drains these after commit
+    // ========================================================================
+
+    pub fn resetEffects(self: *OpHandler) void {
+        self.side_effect_count = 0;
+        self.fail_result_count = 0;
+        self.bulk_result_count = 0;
+    }
+
+    pub fn recordSideEffect(self: *OpHandler, job: *const ops.EnqueueJob) void {
+        assert.check(self.side_effect_count < max_side_effects, "recordSideEffect: overflow ({d})", .{self.side_effect_count});
+        var p = mirror_mod.MirrorOp.EnqueuePayload{
+            .state = job.state,
+            .priority = job.priority,
+            .max_retries = job.max_retries,
+            .created_at_ns = job.created_at_ns,
+        };
+        inline for (.{
+            .{ &p.job_id, &p.job_id_len, job.job_id },
+            .{ &p.queue, &p.queue_len, job.queue },
+        }) |t| {
+            const dst, const dst_len, const src = t;
+            const l: u8 = @intCast(@min(src.len, dst.len));
+            @memcpy(dst[0..l], src[0..l]);
+            dst_len.* = l;
+        }
+        if (job.payload) |pl| {
+            const l: u16 = @intCast(@min(pl.len, p.payload_preview.len));
+            @memcpy(p.payload_preview[0..l], pl[0..l]);
+            p.payload_preview_len = l;
+        }
+        if (job.tags) |t| {
+            const l: u8 = @intCast(@min(t.len, p.tags.len));
+            @memcpy(p.tags[0..l], t[0..l]);
+            p.tags_len = l;
+        }
+        if (job.parent_id) |pid| {
+            const l: u8 = @intCast(@min(pid.len, p.parent_id.len));
+            @memcpy(p.parent_id[0..l], pid[0..l]);
+            p.parent_id_len = l;
+        }
+        if (job.chain_id) |cid| {
+            const l: u8 = @intCast(@min(cid.len, p.chain_id.len));
+            @memcpy(p.chain_id[0..l], cid[0..l]);
+            p.chain_id_len = l;
+        }
+        p.chain_step = job.chain_step;
+        self.side_effects[self.side_effect_count] = p;
+        self.side_effect_count += 1;
+    }
+
+    pub fn recordFailResult(self: *OpHandler, job_id: []const u8, error_msg: []const u8, backtrace: ?[]const u8, new_state: types.JobState, attempt: u16, retry_at_ns: u64, now_ns: u64) void {
+        assert.check(self.fail_result_count < max_fail_results, "recordFailResult: overflow ({d})", .{self.fail_result_count});
+        var r = FailResult{
+            .new_state = new_state,
+            .attempt = attempt,
+            .retry_at_ns = retry_at_ns,
+            .now_ns = now_ns,
+        };
+        const il: u8 = @intCast(@min(job_id.len, r.job_id.len));
+        @memcpy(r.job_id[0..il], job_id[0..il]);
+        r.job_id_len = il;
+        const el: u16 = @intCast(@min(error_msg.len, r.error_msg.len));
+        @memcpy(r.error_msg[0..el], error_msg[0..el]);
+        r.error_msg_len = el;
+        if (backtrace) |bt| {
+            const bl: u16 = @intCast(@min(bt.len, r.backtrace.len));
+            @memcpy(r.backtrace[0..bl], bt[0..bl]);
+            r.backtrace_len = bl;
+        }
+        self.fail_results[self.fail_result_count] = r;
+        self.fail_result_count += 1;
+    }
+
+    pub fn recordBulkResult(self: *OpHandler, job_id: []const u8, action: BulkResult.ActionType, state: []const u8, queue: []const u8, now_ns: u64) void {
+        assert.check(self.bulk_result_count < max_bulk_results, "recordBulkResult: overflow ({d})", .{self.bulk_result_count});
+        var r = BulkResult{ .action = action, .now_ns = now_ns };
+        const il: u8 = @intCast(@min(job_id.len, r.job_id.len));
+        @memcpy(r.job_id[0..il], job_id[0..il]);
+        r.job_id_len = il;
+        const sl: u8 = @intCast(@min(state.len, r.new_state.len));
+        @memcpy(r.new_state[0..sl], state[0..sl]);
+        r.new_state_len = sl;
+        const ql: u8 = @intCast(@min(queue.len, r.new_queue.len));
+        @memcpy(r.new_queue[0..ql], queue[0..ql]);
+        r.new_queue_len = ql;
+        self.bulk_results[self.bulk_result_count] = r;
+        self.bulk_result_count += 1;
     }
 
     /// Main apply dispatch — the core state machine.

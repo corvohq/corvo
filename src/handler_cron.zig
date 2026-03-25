@@ -153,5 +153,6 @@ pub fn applyTriggerCron(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Trig
         .now_ns = op.now_ns,
     };
 
+    self.recordSideEffect(&enq_job);
     return self.applyEnqueue(b, &enqueue_op);
 }
