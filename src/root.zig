@@ -21,6 +21,7 @@ pub const follower = @import("follower.zig");
 pub const transport = @import("transport.zig");
 pub const tcp_transport = @import("tcp_transport.zig");
 pub const pipeline = @import("pipeline.zig");
+pub const pipeline_v2 = @import("pipeline_v2.zig");
 pub const pending_index = @import("pending_index.zig");
 
 // SQLite mirror modules — exported for downstream use but tests
@@ -72,6 +73,7 @@ test {
     testing.refAllDecls(@import("follower.zig"));
     testing.refAllDecls(@import("transport.zig"));
     testing.refAllDecls(@import("pipeline.zig"));
+    testing.refAllDecls(@import("pipeline_v2.zig"));
     testing.refAllDecls(@import("pending_index.zig"));
     testing.refAllDecls(@import("cluster_sim.zig"));
     testing.refAllDecls(@import("server.zig"));

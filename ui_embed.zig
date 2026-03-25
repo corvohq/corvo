@@ -11,7 +11,7 @@ const std = @import("std");
 const index_html = @embedFile("ui/dist/index.html");
 const favicon_svg = @embedFile("ui/dist/favicon.svg");
 const logo_full_svg = @embedFile("ui/dist/logo-full.svg");
-const index_js = @embedFile("ui/dist/assets/index-Be2C-ojH.js");
+const index_js = @embedFile("ui/dist/assets/index-B_kZ96MS.js");
 const index_css = @embedFile("ui/dist/assets/index-DqOUNrgT.css");
 
 pub const EmbeddedFile = struct {
@@ -31,7 +31,7 @@ pub fn lookup(path: []const u8) ?EmbeddedFile {
     if (eql(path, "/logo-full.svg")) {
         return .{ .data = logo_full_svg, .content_type = "image/svg+xml" };
     }
-    if (eql(path, "/assets/index-Be2C-ojH.js")) {
+    if (eql(path, "/assets/index-B_kZ96MS.js")) {
         return .{ .data = index_js, .content_type = "application/javascript" };
     }
     if (eql(path, "/assets/index-DqOUNrgT.css")) {
