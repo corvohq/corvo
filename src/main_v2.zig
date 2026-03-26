@@ -328,9 +328,10 @@ pub fn main() !void {
     );
     defer pipeline.deinit();
 
-    // Wire cluster ack notification to pipeline's atomic.
+    // Wire cluster ack notification to pipeline's atomic + oplog for retry.
     if (cluster_mode) {
         cluster_mod.g_ack_seq_ptr = pipeline.ackSeqPtr();
+        cluster_node.?.oplog = &oplog;
     }
 
     // --- Signal handling ---

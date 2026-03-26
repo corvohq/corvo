@@ -44,6 +44,7 @@ pub const ClusterNode = struct {
     follower: ?*follower_mod.Follower = null, // heap-allocated for stable pointers
     shards: []kv.Store,
     handler: ?*handler_mod.OpHandler = null, // for rebuild after snapshot
+    oplog: ?*oplog_mod.Log = null, // for sync-repl retry (set by main_v2)
     allocator: std.mem.Allocator,
 
     // Tick loop
@@ -266,6 +267,38 @@ pub const ClusterNode = struct {
         if (now_leader and self.tick_counter % 20 == 0) {
             if (self.replicator) |r| {
                 r.resetUnacked();
+
+                // Re-send unacked entries from the oplog. Without this,
+                // sync-repl hangs if the initial send fails or the ack is
+                // lost — the pipeline defers and never calls replicateImpl
+                // again, so resetUnacked alone is not enough.
+                if (self.oplog) |oplog| {
+                    const min_acked = r.minAcked();
+                    const entries_raw = oplog.readAfter(min_acked, 64);
+                    if (entries_raw.len > 0) {
+                        var repl_entries: [64]repl_mod.Entry = undefined;
+                        for (entries_raw, 0..) |e, ei| {
+                            repl_entries[ei] = .{
+                                .seq = e.seq,
+                                .shard_id = e.shard_id,
+                                .data = e.data,
+                            };
+                        }
+                        const msgs = r.replicate(repl_entries[0..entries_raw.len]);
+                        defer self.allocator.free(msgs);
+                        for (msgs) |m| {
+                            _ = self.transport.send(m.to, .{
+                                .repl = .{
+                                    .type_ = m.type_,
+                                    .epoch = m.epoch,
+                                    .seq = m.seq,
+                                    .shard_id = m.shard_id,
+                                    .data = m.data,
+                                },
+                            });
+                        }
+                    }
+                }
 
                 // Re-send snapshots to followers that still need them.
                 // This handles dropped snapshot messages.

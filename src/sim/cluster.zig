@@ -178,6 +178,7 @@ pub const SimCluster = struct {
     instance_id: u32,
     tick_count: u64 = 0,
     last_leader_idx: ?usize = null,
+    sync_replication: bool = false,
 
     node_ids: [][]const u8,
     peer_lists: [][][]const u8,
@@ -411,6 +412,8 @@ pub const SimCluster = struct {
                     .epoch = rmsg.epoch,
                     .seq = rmsg.seq,
                 });
+                // Update pipeline's sync-repl atomic so deferred responses flush.
+                if (node.pipeline) |p| p.onFollowerAck(rmsg.seq);
             },
             .need_snap => {
                 const r = &(node.replicator orelse return);
@@ -480,6 +483,7 @@ pub const SimCluster = struct {
                         .ptr = @ptrCast(&self.repl_ctxs[leader_idx]),
                         .replicate_fn = @ptrCast(&ReplContext.replicate),
                     },
+                    .sync_replication = self.sync_replication,
                     .promote_interval_ns = 1_000_000_000,
                     .reclaim_interval_ns = 1_000_000_000,
                     .unique_interval_ns = 30_000_000_000,
@@ -748,6 +752,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config, node_count: u8) !void {
         cluster_ptr.repl_ctxs[i].cluster = cluster_ptr;
         cluster_ptr.kv_appliers[i].cluster = cluster_ptr;
     }
+    cluster_ptr.sync_replication = config.sync_replication;
 
     // --- Elect leader ---
     std.debug.assert(cluster_ptr.electLeader(100));
@@ -807,6 +812,13 @@ pub fn run(allocator: std.mem.Allocator, config: Config, node_count: u8) !void {
         // Phase 3: cluster tick — election + replication message delivery.
         cluster_ptr.tick();
 
+        // Phase 3b: sync-repl needs a second cluster tick to deliver follower
+        // acks to the leader, plus a pipeline tick to flush deferred responses.
+        if (config.sync_replication) {
+            cluster_ptr.tick();
+            leader.pipeline.?.tick();
+        }
+
         // Phase 4: clients read responses.
         for (clients[0..num_clients]) |*c| {
             c.processResponse();
@@ -823,7 +835,13 @@ pub fn run(allocator: std.mem.Allocator, config: Config, node_count: u8) !void {
     // --- Final convergence + check ---
     // Run enough ticks for all in-flight entries to replicate + ack.
     // Each round trip is ~2 ticks (send → apply → ack → drain).
-    cluster_ptr.runTicks(500);
+    // Sync-repl also needs pipeline ticks to flush deferred responses.
+    for (0..500) |_| {
+        cluster_ptr.tick();
+        if (config.sync_replication) {
+            if (leader.pipeline) |p| p.tick();
+        }
+    }
 
     try cluster_ptr.checkReplicationConsistency();
 
@@ -878,4 +896,14 @@ test "cluster sim: 5 nodes" {
         .clients = 2,
         .queues = 1,
     }, 5);
+}
+
+test "cluster sim: 3 nodes, sync replication" {
+    try run(std.heap.page_allocator, .{
+        .seed = 42,
+        .ticks = 200,
+        .clients = 2,
+        .queues = 1,
+        .sync_replication = true,
+    }, 3);
 }
