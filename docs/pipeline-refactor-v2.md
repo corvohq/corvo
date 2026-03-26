@@ -325,12 +325,21 @@ Pipeline Config has `max_payload_size` field, used in frame extraction check.
 - All connection buffers — fixed-size (recv_buf, send_buf) ✓
 - All per-tick arrays — compile-time sized (frames, completions, etc.) ✓
 
-### Step 14: SDK verification
+### Step 14: SDK verification — IN PROGRESS
 Verify all SDKs work against pipeline_v2. Check for the two-write TCP bug
 (header + payload as separate writes — fixed in zig-sdk, may exist in others).
 Run each SDK's integration tests / examples against corvo-v2.
 
-SDKs: go-sdk, python-sdk, typescript-sdk, rust-sdk, haskell-sdk, zig-sdk (done).
+**Done:**
+- zig-sdk + bench-rpc verified (e8c5e5b). Three bugs fixed: sync-repl deferred recv
+  lost, lease_token check inverted, bench-rpc protocol mismatches.
+- Sync-repl cluster fix (7ca92c7). Production cluster tick loop missing oplog re-send —
+  if initial TCP send failed or ack lost, pipeline deferred forever. Added oplog retry
+  matching sim cluster. Sim cluster wired onFollowerAck for sync-repl test.
+- Bench results (3-node sync-repl, ReleaseFast, 100k jobs, c=8, batch=64):
+  bench-rpc: 301k enqueue, 200k lifecycle. zig-sdk: 12.7k/3.3k (0 errors).
+
+**Remaining:** go-sdk, python-sdk, typescript-sdk, rust-sdk, haskell-sdk.
 
 ### Step 15: RPC & HTTP consistency audit
 Compare RPC decode (rpc/lifecycle.zig, rpc/management.zig, rpc/bulk.zig) and HTTP decode
