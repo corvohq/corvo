@@ -49,6 +49,8 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{
         .root_module = test_mod,
     });
+    // Pipeline v2 TestContext is ~7MB on the stack (fixed-size OpResult arrays).
+    tests.stack_size = 32 * 1024 * 1024; // 32MB
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
@@ -137,4 +139,22 @@ pub fn build(b: *std.Build) void {
     if (b.args) |a| run_server.addArgs(a);
     const run_step = b.step("run", "Run the Corvo server");
     run_step.dependOn(&run_server.step);
+
+    // --- Corvo v2 server executable (pipeline_v2 + io_uring/kqueue) ---
+    const main_v2_mod = b.createModule(.{
+        .root_source_file = b.path("src/main_v2.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    main_v2_mod.addImport("talon", talon_mod);
+    main_v2_mod.addImport("corvo", corvo_mod);
+    const server_v2_exe = b.addExecutable(.{
+        .name = "corvo-v2",
+        .root_module = main_v2_mod,
+    });
+    b.installArtifact(server_v2_exe);
+    const run_server_v2 = b.addRunArtifact(server_v2_exe);
+    if (b.args) |a| run_server_v2.addArgs(a);
+    const run_v2_step = b.step("run-v2", "Run the Corvo v2 server (pipeline_v2 + io_uring/kqueue)");
+    run_v2_step.dependOn(&run_server_v2.step);
 }

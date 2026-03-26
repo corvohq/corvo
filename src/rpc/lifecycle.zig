@@ -82,6 +82,7 @@ pub fn parseEnqueue(reader: *BufReader, jobs_buf: []ops_mod.EnqueueJob, now_ns: 
         if (flags & FLAG_GROUP != 0) job.group = try reader.readPrefixed();
         if (flags & FLAG_PARENT_ID != 0) job.parent_id = try reader.readPrefixed();
 
+        if (job.scheduled_at_ns > 0) job.state = .scheduled;
         job.created_at_ns = now_ns;
         jobs_buf[i] = job;
     }

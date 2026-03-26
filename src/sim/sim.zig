@@ -95,7 +95,15 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         &notify_inst,
         null, // no SQLite reader in sim
         null, // no mirror in sim
-        .{ .clock_fn = &globalClockNow },
+        .{
+            .clock_fn = &globalClockNow,
+            .promote_interval_ns = 1_000_000_000, // 1s
+            .reclaim_interval_ns = 1_000_000_000, // 1s
+            .unique_interval_ns = 30_000_000_000, // 30s
+            .rate_limit_interval_ns = 30_000_000_000, // 30s
+            .expire_interval_ns = 10_000_000_000, // 10s
+            .purge_interval_ns = 3_600_000_000_000, // 1h
+        },
     );
 
     // --- Queue names ---
@@ -110,6 +118,12 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     const queues = queue_slices[0..num_queues];
 
     // --- Clients (each gets a persistent SimBackend connection) ---
+    // Pipeline handles maintenance internally — clients don't send maintenance frames.
+    // Client-sent maintenance in the same batch as acks causes double-decrement of active counts
+    // (WriteBatch iterator sees base state, not pending writes from other ops in the batch).
+    var client_config = config;
+    client_config.maintenance_rate = 0;
+
     const num_clients: usize = @min(config.clients, max_clients);
     var clients: [max_clients]SimClient = undefined;
 
@@ -120,7 +134,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
             seed +% @as(u64, i) +% 1,
             &backend,
             conn_id,
-            config,
+            client_config,
             queues,
         );
         clients[i].rng = clients[i].prng.random();

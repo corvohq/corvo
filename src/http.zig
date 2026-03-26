@@ -389,6 +389,11 @@ fn decodeEnqueue(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeR
     if (extractJSONInt(body, "retry_max_delay_ms")) |d|
         job.max_delay_ms = @intCast(std.math.clamp(d, 0, 86400_000));
 
+    if (extractJSONInt(body, "scheduled_at_ns")) |ns|
+        job.scheduled_at_ns = @intCast(std.math.clamp(ns, 0, std.math.maxInt(i64)));
+
+    if (job.scheduled_at_ns > 0) job.state = .scheduled;
+
     scratch.jobs[0] = job;
 
     return .{

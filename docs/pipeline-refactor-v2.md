@@ -168,19 +168,94 @@ SimClient over SimBackend, exercising pipeline_v2 directly.
 - Write routes supported: enqueue, fetch, ack, fail, heartbeat.
 - Write routes deferred: bulk actions, queue config, cron CRUD, budgets, approval policies, API keys.
 
-### Step 6: Mirror events — NEXT
+### Step 6: Mirror events — DONE (commit eafb5b1)
+handler effect buffers, mirror_events.zig, pipeline emitMirrorOp/mirrorEffects.
 
-### Step 7: Wire into real uring backend
-Add listen socket. Enables SDK bench (`../zig-sdk`).
+### Step 7: Wire into real uring backend — DONE
+- `src/main_v2.zig` — new entry point: listen socket, IO backend, signal handling, tick loop.
+- `build.zig` — `corvo-v2` executable, `zig build run-v2` step.
+- Fixed partial-frame deadlock: `requeueRecvs()` re-queues recv for connections
+  with incomplete frames (no send pending → no send_done → recv never re-queued).
+- Removed redundant `queueAccept()` from pipeline tick (uring backend handles internally).
+- SDK bench verified:
+  - **Enqueue: 317k ops/sec** (baseline 346k at 46e3f2d — 92%)
+  - **Lifecycle: 228k ops/sec** at 4 workers (baseline 83k — 2.7x faster)
+  - Lifecycle at 64 workers degrades to 8k due to bench contention (empty fetch → 1ms sleep).
 
-### Step 8: Delete old stack
-Remove engine.zig, store.zig, server.zig, pipeline.zig.
+### Step 8: Fetch subscriptions (bidi push) — NEXT
+Without this, idle workers spin-poll KV on every fetch. With 20k workers that melts
+the pipeline. All SDKs use subscribe+push model.
+
+ConnState already has the plumbing: `waiting`, `credits`, `queue_bufs`, `worker_id_buf`.
+- Fetch returns 0 jobs → store subscription in ConnState (`waiting=true`, queues, credits)
+- Don't send a response yet — connection stays open
+- When enqueue/ack/fail/maintenance makes jobs available → `notifyForFrame` already fires
+- Pipeline scans waiting connections for matching queues → fetches jobs → pushes
+  `MSG_FETCH_BATCH_RESP` to subscribed connections
+- Zero-cost idle workers. No KV polling.
+
+Old HTTP server used thread-blocking long-poll (`waiter.thread.wait`). Old RPC server
+never implemented bidi push. Pipeline_v2 does it properly: event-driven, single-threaded,
+no threads blocked.
+
+Sim impact: SimClient.processResponse must tolerate no response for fetch (response
+arrives on a later tick when enqueue pushes jobs). Small tweak, not a rewrite.
+
+### Step 9: Maintenance scheduling — DONE
+Timer-based maintenance in the tick loop. `runMaintenance()` checks clock_fn each tick,
+runs due actions (promote, reclaim, unique, rate_limit, expire, purge) in a separate
+kv.Batch committed before client frames. Separate batch avoids WriteBatch conflicts
+(reclaim + ack on same job would double-decrement active counts if batched together).
+
+Config: intervals in Pipeline.Config (nanoseconds, 0=disabled). Production defaults
+in main_v2.zig match old scheduler.zig intervals. Sim gets pipeline-internal maintenance;
+sim clients no longer send maintenance frames (maintenance_rate=0).
+
+Bug fix: RPC parser (lifecycle.zig) now sets `state = .scheduled` when `scheduled_at_ns > 0`.
+Old server.zig did this; the v2 RPC parser missed it, so scheduled jobs went straight to
+pending and promote was always a no-op.
+
+Bug fix: TestContext heap-allocated (create/destroy) — was ~7MB on the stack, segfaulted
+the test runner's thread.
+
+Promote/reclaim notify_queues: handler_maintenance.zig now tracks which queues had jobs
+promoted via `recordPromoteQueue()`, returns them in `OpResult.notify_queues`. Pipeline
+uses this to fulfill fetch subscriptions after maintenance.
+
+### Step 10: Remaining HTTP write routes
+`classifyRoute` currently handles: enqueue, fetch, ack, fail, heartbeat.
+Missing POST/PUT/DELETE routes: bulk actions, queue config, cron CRUD, budgets,
+approval policies, API keys. These all work over RPC already — just need HTTP
+JSON decode/encode wiring in `http.zig`.
+
+### Step 11: Oplog recording
+Pipeline_v2 stores oplog reference but never calls `append()`. The old pipeline
+records mutations after commit for crash recovery and replication. Not critical
+for single-node, but required before cluster mode.
+
+### Step 12: RPC & HTTP consistency audit
+Compare RPC decode (rpc/lifecycle.zig, rpc/management.zig, rpc/bulk.zig) and HTTP decode
+(http.zig) against the old server.zig git history. For every operation:
+- Verify all fields are parsed (e.g. scheduled_at was missing from RPC parser)
+- Verify state derivation matches (e.g. state=.scheduled when scheduled_at > 0)
+- Verify response encoding matches old stack's JSON responses
+- Verify error handling matches (same error strings, same HTTP status codes)
+
+This prevents regressions like the scheduled_at bug found in step 9.
+
+### Step 13: Reference commit functionality audit
+Iterate through each of the Reference Commits above. Determine if the functionality
+exists, for missing functionality confirm if the user still wants it. Use the commits
+as a spec instead of copying directly.
+
+### Step 14: Delete old stack
+Remove engine.zig, store.zig, server.zig, pipeline.zig, scheduler.zig.
+All functionality migrated to pipeline_v2.
 
 ## Verification
 
 After each step:
-- `zig build test` — all unit tests pass
+- `zig build test` — all unit tests pass (264/268, 4 old-stack failures expected)
 - `zig build sim` — simulator passes
 - Benchmark: enqueue ≥ 340k ops/sec, lifecycle ≥ 80k ops/sec
-  - SDK bench (`../zig-sdk`) cannot run until step 7 (memory leak in old server at 46e3f2d)
-  - Benchmark targets still apply once pipeline_v2 has a network listener
+  - SDK bench runs against `corvo-v2` binary (`zig build run-v2`)

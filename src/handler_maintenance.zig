@@ -65,6 +65,7 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     b.delete(key);
 
                     self.pending.push(job.queue, job.priority, job.created_at_ns, job_id);
+                    self.recordPromoteQueue(job.queue);
 
                     if (job.expire_after_ms > 0) {
                         job.expire_at_ns = now_ns + @as(u64, job.expire_after_ms) * 1_000_000;
@@ -113,6 +114,7 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     b.delete(key);
 
                     self.pending.push(job.queue, job.priority, job.created_at_ns, job_id);
+                    self.recordPromoteQueue(job.queue);
 
                     if (job.expire_after_ms > 0) {
                         job.expire_at_ns = now_ns + @as(u64, job.expire_after_ms) * 1_000_000;
@@ -131,7 +133,10 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
         }
     }
 
-    return .{ .affected = affected };
+    return .{
+        .affected = affected,
+        .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
+    };
 }
 
 // ============================================================================
@@ -237,6 +242,7 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     // Back to pending
                     job.state = .pending;
                     self.pending.push(job.queue, job.priority, job.created_at_ns, job_id);
+                    self.recordPromoteQueue(job.queue);
                     if (job.expire_after_ms > 0) {
                         job.expire_at_ns = now_ns + @as(u64, job.expire_after_ms) * 1_000_000;
                         var xk_buf: keys.KeyBuf = undefined;
@@ -254,7 +260,10 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
         }
     }
 
-    return .{ .affected = affected };
+    return .{
+        .affected = affected,
+        .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
+    };
 }
 
 // ============================================================================

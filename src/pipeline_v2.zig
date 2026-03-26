@@ -89,16 +89,26 @@ pub fn Pipeline(comptime IoBackend: type) type {
         notified_queue_lens: [max_notified_queues]u8 = [_]u8{0} ** max_notified_queues,
         notified_queue_count: u32 = 0,
 
+        // Maintenance scheduling
+        last_promote_ns: u64 = 0,
+        last_reclaim_ns: u64 = 0,
+        last_unique_ns: u64 = 0,
+        last_rate_limit_ns: u64 = 0,
+        last_expire_ns: u64 = 0,
+        last_purge_ns: u64 = 0,
+
         // Stats
         ticks_total: u64 = 0,
         applied_total: u64 = 0,
         subscriptions_fulfilled: u64 = 0,
+        maintenance_runs: u64 = 0,
 
         const max_batch_jobs = rpc.MAX_BATCH_JOBS;
         const max_frames: u32 = 256;
         const max_completions: u32 = 256;
         const max_waiting_conns: u32 = 4096;
         const max_notified_queues: u32 = 64;
+
 
         // ====================================================================
         // Config
@@ -107,6 +117,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
         pub const Config = struct {
             clock_fn: *const fn () i64,
             batch_max: u32 = 256,
+
+            // Maintenance intervals (nanoseconds). 0 = disabled.
+            promote_interval_ns: u64 = 0,
+            reclaim_interval_ns: u64 = 0,
+            unique_interval_ns: u64 = 0,
+            rate_limit_interval_ns: u64 = 0,
+            expire_interval_ns: u64 = 0,
+            purge_interval_ns: u64 = 0,
         };
 
         // ====================================================================
@@ -197,7 +215,17 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 self.extractFrames(conn_id);
             }
 
+            // Run scheduled maintenance in its own batch, committed before client ops.
+            // Maintenance must not share a WriteBatch with client ops: reclaim/ack on the
+            // same job would double-decrement active counts (WriteBatch iterators see base state).
+            self.runMaintenance();
+
             if (self.frame_count == 0) {
+                // No client frames — but maintenance may have made jobs available.
+                if (self.notified_queue_count > 0) {
+                    self.fulfillSubscriptions();
+                    self.flushSends();
+                }
                 self.requeueRecvs(recv_conns[0..recv_conn_count]);
                 self.io.submit();
                 self.ticks_total += 1;
@@ -341,6 +369,60 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 if (param.len > 0) return param;
             }
             return "";
+        }
+
+        // ====================================================================
+        // Maintenance — timer-driven ops, separate batch from client frames
+        // ====================================================================
+
+        fn runMaintenance(self: *Self) void {
+            const now_ns = self.nowNs();
+
+            const intervals = [6]struct { ns: u64, last: *u64, action: ops_mod.MaintenanceAction }{
+                .{ .ns = self.config.promote_interval_ns, .last = &self.last_promote_ns, .action = .promote },
+                .{ .ns = self.config.reclaim_interval_ns, .last = &self.last_reclaim_ns, .action = .reclaim },
+                .{ .ns = self.config.unique_interval_ns, .last = &self.last_unique_ns, .action = .unique },
+                .{ .ns = self.config.rate_limit_interval_ns, .last = &self.last_rate_limit_ns, .action = .rate_limit },
+                .{ .ns = self.config.expire_interval_ns, .last = &self.last_expire_ns, .action = .expire },
+                .{ .ns = self.config.purge_interval_ns, .last = &self.last_purge_ns, .action = .purge },
+            };
+
+            var any_due = false;
+            for (intervals) |iv| {
+                if (iv.ns > 0 and now_ns - iv.last.* >= iv.ns) {
+                    any_due = true;
+                    break;
+                }
+            }
+            if (!any_due) return;
+
+            self.handler.resetEffects();
+            var batch = self.stores[0].newBatch();
+            defer batch.close();
+
+            for (intervals) |iv| {
+                if (iv.ns == 0) continue;
+                if (now_ns - iv.last.* < iv.ns) continue;
+
+                const op_data = ops_mod.OpData{ .maintenance = .{ .action = iv.action, .now_ns = now_ns } };
+                const result = self.handler.apply(&batch, .maintenance, &op_data);
+                self.emitMirrorOp(.maintenance, &op_data, &result);
+
+                if (result.notify_queues) |queues| {
+                    self.notify.notifyQueues(queues);
+                    for (queues) |q| self.recordNotifiedQueue(q);
+                }
+
+                iv.last.* = now_ns;
+                self.maintenance_runs += 1;
+                self.applied_total += 1;
+            }
+
+            batch.commit();
+
+            if (self.mirror) |m| {
+                mirror_events.mirrorEffects(m, self.handler);
+            }
         }
 
         fn recordRecvCompaction(self: *Self, conn_id: u16, consumed: u32) void {
@@ -1094,16 +1176,21 @@ const TestContext = struct {
     pipeline: TestPipeline,
     db_path: [*:0]const u8,
 
-    /// Initialize in-place: allocates DB/handler/backend, then wires pipeline.
-    /// Must be called on an already-placed struct (e.g., `var ctx: TestContext = undefined;`).
-    fn init(self: *TestContext, db_path: [*:0]const u8) !void {
+    /// Heap-allocate and initialize a TestContext. Pipeline + SimBackend are ~7MB,
+    /// too large for the test runner's thread stack.
+    fn create(db_path: [*:0]const u8) !*TestContext {
         const allocator = testing.allocator;
+        const self = try allocator.create(TestContext);
+        self.initInPlace(allocator, db_path);
+        return self;
+    }
 
+    fn initInPlace(self: *TestContext, allocator: std.mem.Allocator, db_path: [*:0]const u8) void {
         @atomicStore(i64, &test_clock_ns, 1_000_000_000_000, .monotonic);
 
         const path_slice = std.mem.span(db_path);
         std.fs.cwd().deleteTree(path_slice) catch {};
-        const db = try talon.DB.open(allocator, path_slice, .{ .sync = false });
+        const db = talon.DB.open(allocator, path_slice, .{ .sync = false }) catch unreachable;
 
         self.db = db;
         self.stores = [1]kv.Store{kv.Store.init(db)};
@@ -1111,12 +1198,12 @@ const TestContext = struct {
         self.handler.rebuildState(&self.stores);
         self.oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &testClockFn }, null);
         self.notify = QueueNotifier.init(allocator);
-        self.backend = try SimBackend.init(allocator, .{
+        self.backend = SimBackend.init(allocator, .{
             .listen_fd = -1,
             .max_conns = 16,
             .recv_buf_size = 65536,
             .send_buf_size = 65536,
-        });
+        }) catch unreachable;
         self.db_path = db_path;
 
         // Wire pipeline with stable pointers (self is already at final location)
@@ -1132,7 +1219,7 @@ const TestContext = struct {
         );
     }
 
-    fn deinit(self: *TestContext) void {
+    fn destroy(self: *TestContext) void {
         const allocator = testing.allocator;
         self.backend.deinit(allocator);
         self.handler.deinit();
@@ -1141,6 +1228,7 @@ const TestContext = struct {
         self.db.close();
         const path_slice = std.mem.span(self.db_path);
         std.fs.cwd().deleteTree(path_slice) catch {};
+        allocator.destroy(self);
     }
 
     /// Inject a raw RPC frame into a connection's recv_buf (single recv event).
@@ -1207,9 +1295,8 @@ const TestContext = struct {
 };
 
 test "ping/pong round-trip" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-ping");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-ping");
+    defer ctx.destroy();
 
     const conn_id = ctx.backend.connect().?;
     ctx.injectFrame(conn_id, rpc.MSG_PING, 42, "");
@@ -1223,9 +1310,8 @@ test "ping/pong round-trip" {
 }
 
 test "enqueue round-trip" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-enqueue");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-enqueue");
+    defer ctx.destroy();
 
     const conn_id = ctx.backend.connect().?;
 
@@ -1269,9 +1355,8 @@ test "enqueue round-trip" {
 }
 
 test "multiple frames in one tick" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-multi");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-multi");
+    defer ctx.destroy();
 
     const conn_id = ctx.backend.connect().?;
 
@@ -1288,9 +1373,8 @@ test "multiple frames in one tick" {
 }
 
 test "enqueue then fetch round-trip" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-fetch");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fetch");
+    defer ctx.destroy();
 
     const conn_enqueue = ctx.backend.connect().?;
 
@@ -1346,9 +1430,8 @@ test "enqueue then fetch round-trip" {
 }
 
 test "partial frame waits for more data" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-partial");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-partial");
+    defer ctx.destroy();
 
     const conn_id = ctx.backend.connect().?;
 
@@ -1369,9 +1452,8 @@ test "partial frame waits for more data" {
 }
 
 test "recv_buf compaction preserves unconsumed data" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-compact");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-compact");
+    defer ctx.destroy();
 
     const conn_id = ctx.backend.connect().?;
 
@@ -1399,9 +1481,8 @@ test "recv_buf compaction preserves unconsumed data" {
 // ============================================================================
 
 test "HTTP GET /api/v1/info returns version" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-http-info");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-http-info");
+    defer ctx.destroy();
 
     const conn_id = ctx.backend.connect().?;
     ctx.injectHttp(conn_id, "GET /api/v1/info HTTP/1.1\r\nHost: localhost\r\n\r\n");
@@ -1416,9 +1497,8 @@ test "HTTP GET /api/v1/info returns version" {
 }
 
 test "HTTP GET unknown route returns 404" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-http-404");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-http-404");
+    defer ctx.destroy();
 
     const conn_id = ctx.backend.connect().?;
     ctx.injectHttp(conn_id, "GET /nonexistent HTTP/1.1\r\nHost: localhost\r\n\r\n");
@@ -1429,9 +1509,8 @@ test "HTTP GET unknown route returns 404" {
 }
 
 test "HTTP POST /api/v1/enqueue creates job" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-http-enq");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-http-enq");
+    defer ctx.destroy();
 
     const conn_id = ctx.backend.connect().?;
     const body = "{\"queue\":\"default\",\"priority\":5}";
@@ -1454,9 +1533,8 @@ test "HTTP POST /api/v1/enqueue creates job" {
 }
 
 test "HTTP protocol detection — same pipeline handles both" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-http-mixed");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-http-mixed");
+    defer ctx.destroy();
 
     // RPC connection: ping
     const rpc_conn = ctx.backend.connect().?;
@@ -1484,9 +1562,8 @@ test "HTTP protocol detection — same pipeline handles both" {
 }
 
 test "HTTP incomplete request waits for more data" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-http-partial");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-http-partial");
+    defer ctx.destroy();
 
     const conn_id = ctx.backend.connect().?;
     // Send partial headers (no \r\n\r\n terminator yet).
@@ -1503,9 +1580,8 @@ test "HTTP incomplete request waits for more data" {
 // ============================================================================
 
 test "fetch with no jobs stores subscription (no response)" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-fetch-sub");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fetch-sub");
+    defer ctx.destroy();
 
     const conn_id = ctx.backend.connect().?;
 
@@ -1537,9 +1613,8 @@ test "fetch with no jobs stores subscription (no response)" {
 }
 
 test "enqueue fulfills waiting fetch subscription" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-fetch-push");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fetch-push");
+    defer ctx.destroy();
 
     const fetch_conn = ctx.backend.connect().?;
     const enq_conn = ctx.backend.connect().?;
@@ -1610,9 +1685,8 @@ test "enqueue fulfills waiting fetch subscription" {
 }
 
 test "fetch subscription not fulfilled for unrelated queue" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-fetch-nomatch");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fetch-nomatch");
+    defer ctx.destroy();
 
     const fetch_conn = ctx.backend.connect().?;
     const enq_conn = ctx.backend.connect().?;
@@ -1660,9 +1734,8 @@ test "fetch subscription not fulfilled for unrelated queue" {
 }
 
 test "subscription cleared on disconnect" {
-    var ctx: TestContext = undefined;
-    try ctx.init("/tmp/corvo-pv2-fetch-disc");
-    defer ctx.deinit();
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fetch-disc");
+    defer ctx.destroy();
 
     const conn_id = ctx.backend.connect().?;
 
@@ -1685,4 +1758,105 @@ test "subscription cleared on disconnect" {
 
     // Waiting list should be cleaned up.
     try testing.expectEqual(@as(u32, 0), ctx.pipeline.waiting_conn_count);
+}
+
+// ============================================================================
+// Maintenance Scheduling Tests
+// ============================================================================
+
+test "maintenance scheduling" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-maint");
+    defer ctx.destroy();
+
+    // --- Idle tick fires maintenance ---
+    ctx.pipeline.config.promote_interval_ns = 1_000_000_000;
+    ctx.pipeline.tick();
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.maintenance_runs);
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.applied_total);
+
+    // --- Same clock → doesn't fire again ---
+    ctx.pipeline.tick();
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.maintenance_runs);
+
+    // --- Advance clock past interval → fires again ---
+    advanceTestClock(2_000_000_000);
+    ctx.pipeline.tick();
+    try testing.expectEqual(@as(u64, 2), ctx.pipeline.maintenance_runs);
+    try testing.expectEqual(@as(u64, 2), ctx.pipeline.applied_total);
+
+    // --- All 6 actions fire in one tick ---
+    ctx.pipeline.config.reclaim_interval_ns = 1_000_000_000;
+    ctx.pipeline.config.unique_interval_ns = 1_000_000_000;
+    ctx.pipeline.config.rate_limit_interval_ns = 1_000_000_000;
+    ctx.pipeline.config.expire_interval_ns = 1_000_000_000;
+    ctx.pipeline.config.purge_interval_ns = 1_000_000_000;
+    advanceTestClock(2_000_000_000);
+    ctx.pipeline.tick();
+    // promote + 5 new actions = 6 in this tick, 8 total
+    try testing.expectEqual(@as(u64, 8), ctx.pipeline.maintenance_runs);
+
+    // --- Coexists with client frames ---
+    advanceTestClock(2_000_000_000);
+    const conn_id = ctx.backend.connect().?;
+    ctx.injectFrame(conn_id, rpc.MSG_PING, 1, "");
+    ctx.pipeline.tick();
+    // Pong response arrives despite maintenance.
+    const resp = ctx.readResponseHeader(conn_id).?;
+    try testing.expectEqual(rpc.MSG_PONG, resp.msg_type);
+    try testing.expect(ctx.pipeline.maintenance_runs > 8);
+}
+
+test "maintenance promote wakes fetch subscription" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-maint-wake");
+    defer ctx.destroy();
+
+    // Enqueue a scheduled job (500ms in the future).
+    const enq_conn = ctx.backend.connect().?;
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("sched-queue");
+    ew.writePrefixed("sched-job-1");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0); // backoff
+    ew.writeU32(0); // base_delay
+    ew.writeU32(0); // max_delay
+    ew.writeU32(0); // unique_period
+    ew.writeU64(@intCast(@as(i64, @atomicLoad(i64, &test_clock_ns, .monotonic)) + 500_000_000)); // scheduled_at_ns
+    ew.writeU32(0); // expire_after
+    ew.writeU16(0); // chain_step
+    ew.writeU16(0); // flags
+
+    ctx.injectFrame(enq_conn, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+    ctx.pipeline.tick();
+
+    // Drain send_done.
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Fetch — job is scheduled (not pending), so 0 jobs → subscription stored.
+    const fetch_conn = ctx.backend.connect().?;
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1); // credits
+    fw.writeU32(30000); // lease_ms
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1); // queue_count
+    fw.writePrefixed("sched-queue");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 5, fw.written());
+    ctx.pipeline.tick();
+    try testing.expect(ctx.backend.conn(fetch_conn).waiting);
+
+    // Advance clock past scheduled time + enable promote.
+    advanceTestClock(2_000_000_000); // +2s (past 500ms schedule)
+    ctx.pipeline.config.promote_interval_ns = 1_000_000_000;
+    ctx.pipeline.tick();
+
+    // Promote should have fired and found the scheduled job.
+    try testing.expect(ctx.pipeline.maintenance_runs >= 1);
+    // Job should now be pending — fetch subscription fulfilled.
+    try testing.expect(!ctx.backend.conn(fetch_conn).waiting);
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.subscriptions_fulfilled);
 }

@@ -45,6 +45,12 @@ pub const OpHandler = struct {
     fail_result_count: u16 = 0,
     bulk_results: [max_bulk_results]BulkResult = undefined,
     bulk_result_count: u16 = 0,
+
+    // Promote/reclaim notification: queues that had jobs promoted to pending.
+    promote_queue_bufs: [max_promote_queues][64]u8 = undefined,
+    promote_queue_lens: [max_promote_queues]u8 = [_]u8{0} ** max_promote_queues,
+    promote_queue_slices: [max_promote_queues][]const u8 = undefined,
+    promote_queue_count: u8 = 0,
     /// Allocator for handler-owned state (maps, etc).
     allocator: Allocator,
 
@@ -53,6 +59,7 @@ pub const OpHandler = struct {
     const max_side_effects = 32;
     const max_fail_results = 256;
     const max_bulk_results = 256;
+    const max_promote_queues = 32;
 
     pub const FailResult = struct {
         job_id: [128]u8 = undefined,
@@ -276,6 +283,30 @@ pub const OpHandler = struct {
         self.side_effect_count = 0;
         self.fail_result_count = 0;
         self.bulk_result_count = 0;
+        self.promote_queue_count = 0;
+    }
+
+    /// Record a queue that had jobs promoted to pending (dedup by name).
+    pub fn recordPromoteQueue(self: *OpHandler, queue: []const u8) void {
+        // Dedup: check if already recorded.
+        for (0..self.promote_queue_count) |i| {
+            const existing = self.promote_queue_bufs[i][0..self.promote_queue_lens[i]];
+            if (std.mem.eql(u8, existing, queue)) return;
+        }
+        if (self.promote_queue_count >= max_promote_queues) return; // saturate
+        const idx = self.promote_queue_count;
+        const len: u8 = @intCast(@min(queue.len, 64));
+        @memcpy(self.promote_queue_bufs[idx][0..len], queue[0..len]);
+        self.promote_queue_lens[idx] = len;
+        self.promote_queue_count += 1;
+    }
+
+    /// Get the promote queue notification slices (valid until next resetEffects).
+    pub fn promoteQueueSlices(self: *OpHandler) []const []const u8 {
+        for (0..self.promote_queue_count) |i| {
+            self.promote_queue_slices[i] = self.promote_queue_bufs[i][0..self.promote_queue_lens[i]];
+        }
+        return self.promote_queue_slices[0..self.promote_queue_count];
     }
 
     pub fn recordSideEffect(self: *OpHandler, job: *const ops.EnqueueJob) void {
