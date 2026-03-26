@@ -88,13 +88,14 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
 
     // --- Pipeline ---
     var pipeline = Pipeline.init(
+        allocator,
         &backend,
         &handler,
         &stores,
         &oplog,
         &notify_inst,
-        null, // no SQLite reader in sim
-        null, // no mirror in sim
+        null,
+        null,
         .{
             .clock_fn = &globalClockNow,
             .promote_interval_ns = 1_000_000_000, // 1s
@@ -105,6 +106,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
             .purge_interval_ns = 3_600_000_000_000, // 1h
         },
     );
+    defer pipeline.deinit();
 
     // --- Queue names ---
     const num_queues: usize = @min(config.queues, max_queues);

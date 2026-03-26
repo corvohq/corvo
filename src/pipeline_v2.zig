@@ -48,6 +48,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
         reader: ?*sqlite_read.Reader,
         mirror: ?*mirror_mod.Mirror,
         config: Config,
+        allocator: std.mem.Allocator,
+        mut_list: std.ArrayList(kv.Mutation) = .{},
 
         // HTTP decode scratch (reused per tick)
         http_scratch: http.DecodeScratch = .{},
@@ -114,17 +116,24 @@ pub fn Pipeline(comptime IoBackend: type) type {
         // Config
         // ====================================================================
 
+        pub const ReplHook = struct {
+            ptr: *anyopaque,
+            replicate_fn: *const fn (ptr: *anyopaque, shard_id: u16, seq: u64, data: []const u8) void,
+            pub fn replicate(self: ReplHook, shard_id: u16, seq: u64, data: []const u8) void {
+                self.replicate_fn(self.ptr, shard_id, seq, data);
+            }
+        };
+
         pub const Config = struct {
             clock_fn: *const fn () i64,
             batch_max: u32 = 256,
-
-            // Maintenance intervals (nanoseconds). 0 = disabled.
             promote_interval_ns: u64 = 0,
             reclaim_interval_ns: u64 = 0,
             unique_interval_ns: u64 = 0,
             rate_limit_interval_ns: u64 = 0,
             expire_interval_ns: u64 = 0,
             purge_interval_ns: u64 = 0,
+            repl_hook: ?ReplHook = null,
         };
 
         // ====================================================================
@@ -152,6 +161,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
         // ====================================================================
 
         pub fn init(
+            allocator: std.mem.Allocator,
             io_backend: *IoBackend,
             handler: *OpHandler,
             stores: []kv.Store,
@@ -170,7 +180,16 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 .reader = reader,
                 .mirror = mirror,
                 .config = config,
+                .allocator = allocator,
             };
+        }
+
+        pub fn deinit(self: *Self) void {
+            for (self.mut_list.items) |m| {
+                if (m.key.len > 0) self.allocator.free(@constCast(m.key));
+                if (m.value.len > 0 and m.op != .delete) self.allocator.free(@constCast(m.value));
+            }
+            self.mut_list.deinit(self.allocator);
         }
 
         // ====================================================================
@@ -402,6 +421,13 @@ pub fn Pipeline(comptime IoBackend: type) type {
             var batch = self.stores[0].newBatch();
             defer batch.close();
 
+            const has_oplog = self.oplog.hasFile();
+            if (has_oplog) {
+                self.mut_list.clearRetainingCapacity();
+                batch.enableRecording(self.allocator, &self.mut_list);
+            }
+            defer if (has_oplog) batch.freeMutations();
+
             for (intervals) |iv| {
                 if (iv.ns == 0) continue;
                 if (now_ns - iv.last.* < iv.ns) continue;
@@ -421,6 +447,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
 
             batch.commit();
+
+            if (has_oplog and self.mut_list.items.len > 0) {
+                self.recordOplog();
+            }
 
             if (self.mirror) |m| {
                 mirror_events.mirrorEffects(m, self.handler);
@@ -450,12 +480,23 @@ pub fn Pipeline(comptime IoBackend: type) type {
             var kv_batch = self.stores[0].newBatch();
             defer kv_batch.close();
 
+            const has_oplog = self.oplog.hasFile();
+            if (has_oplog) {
+                self.mut_list.clearRetainingCapacity();
+                kv_batch.enableRecording(self.allocator, &self.mut_list);
+            }
+            defer if (has_oplog) kv_batch.freeMutations();
+
             for (self.frames[0..self.frame_count], 0..) |*frame, i| {
                 self.results[i] = self.decodeAndApply(&kv_batch, frame, @intCast(i));
             }
 
             kv_batch.commit();
             self.applied_total += self.frame_count;
+
+            if (has_oplog and self.mut_list.items.len > 0) {
+                self.recordOplog();
+            }
 
             // Post-commit: drain handler effect buffers into mirror.
             if (self.mirror) |m| {
@@ -466,6 +507,13 @@ pub fn Pipeline(comptime IoBackend: type) type {
             for (self.frames[0..self.frame_count], 0..) |frame, i| {
                 self.notifyForFrame(&frame, &self.results[i]);
             }
+        }
+
+        fn recordOplog(self: *Self) void {
+            const encoded = oplog_mod.encodeMutations(self.allocator, self.mut_list.items);
+            defer self.allocator.free(encoded);
+            const seq = self.oplog.append(0, encoded);
+            if (self.config.repl_hook) |hook| hook.replicate(0, seq, encoded);
         }
 
         fn decodeAndApply(self: *Self, batch: *kv.WriteBatch, frame: *FrameDesc, frame_idx: u32) ops_mod.OpResult {
@@ -1160,6 +1208,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
         fn requeueRecvs(self: *Self, recv_conns: []const u16) void {
             for (recv_conns) |conn_id| {
                 const c = self.io.conn(conn_id);
+                if (c.waiting) continue;
                 if (c.phase == .ready and c.recv_pos < c.recv_buf.len) {
                     self.io.queueRecv(conn_id);
                 }
@@ -1222,11 +1271,18 @@ const TestContext = struct {
     fn create(db_path: [*:0]const u8) !*TestContext {
         const allocator = testing.allocator;
         const self = try allocator.create(TestContext);
-        self.initInPlace(allocator, db_path);
+        self.initInPlace(allocator, db_path, null);
         return self;
     }
 
-    fn initInPlace(self: *TestContext, allocator: std.mem.Allocator, db_path: [*:0]const u8) void {
+    fn createWithOplog(db_path: [*:0]const u8, oplog_path: [*:0]const u8) !*TestContext {
+        const allocator = testing.allocator;
+        const self = try allocator.create(TestContext);
+        self.initInPlace(allocator, db_path, oplog_path);
+        return self;
+    }
+
+    fn initInPlace(self: *TestContext, allocator: std.mem.Allocator, db_path: [*:0]const u8, oplog_path: ?[*:0]const u8) void {
         @atomicStore(i64, &test_clock_ns, 1_000_000_000_000, .monotonic);
 
         const path_slice = std.mem.span(db_path);
@@ -1237,7 +1293,7 @@ const TestContext = struct {
         self.stores = [1]kv.Store{kv.Store.init(db)};
         self.handler = OpHandler.init(allocator);
         self.handler.rebuildState(&self.stores);
-        self.oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &testClockFn }, null);
+        self.oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &testClockFn }, oplog_path);
         self.notify = QueueNotifier.init(allocator);
         self.backend = SimBackend.init(allocator, .{
             .listen_fd = -1,
@@ -1247,21 +1303,22 @@ const TestContext = struct {
         }) catch unreachable;
         self.db_path = db_path;
 
-        // Wire pipeline with stable pointers (self is already at final location)
         self.pipeline = TestPipeline.init(
+            allocator,
             &self.backend,
             &self.handler,
             &self.stores,
             &self.oplog,
             &self.notify,
-            null, // no SQLite reader in tests
-            null, // no mirror in unit tests
+            null,
+            null,
             .{ .clock_fn = &testClockFn },
         );
     }
 
     fn destroy(self: *TestContext) void {
         const allocator = testing.allocator;
+        self.pipeline.deinit();
         self.backend.deinit(allocator);
         self.handler.deinit();
         self.notify.deinit();

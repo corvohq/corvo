@@ -34,8 +34,7 @@ fn realClock() i64 {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+    const allocator = std.heap.c_allocator;
 
     // --- Parse CLI args ---
     var args = try std.process.argsWithAllocator(allocator);
@@ -91,8 +90,14 @@ pub fn main() !void {
     defer handler.deinit();
     handler.rebuildState(&stores);
 
-    // --- Oplog (no file — pipeline_v2 doesn't persist oplog yet) ---
-    var oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &realClock }, null);
+    // --- Oplog ---
+    var oplog_path_buf: [256]u8 = undefined;
+    const oplog_path_slice = std.fmt.bufPrint(&oplog_path_buf, "{s}/oplog", .{data_dir}) catch unreachable;
+    var oplog_path_z: [257]u8 = undefined;
+    @memcpy(oplog_path_z[0..oplog_path_slice.len], oplog_path_slice);
+    oplog_path_z[oplog_path_slice.len] = 0;
+
+    var oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &realClock }, oplog_path_z[0..oplog_path_slice.len :0]);
     defer oplog.deinit();
 
     // --- QueueNotifier ---
@@ -140,6 +145,7 @@ pub fn main() !void {
 
     // --- Pipeline ---
     var pipeline = RealPipeline.init(
+        allocator,
         &io_backend,
         &handler,
         &stores,
@@ -149,14 +155,15 @@ pub fn main() !void {
         if (mirror) |*m| m else null,
         .{
             .clock_fn = &realClock,
-            .promote_interval_ns = 1_000_000_000, // 1s
-            .reclaim_interval_ns = 1_000_000_000, // 1s
-            .unique_interval_ns = 30_000_000_000, // 30s
-            .rate_limit_interval_ns = 30_000_000_000, // 30s
-            .expire_interval_ns = 10_000_000_000, // 10s
-            .purge_interval_ns = 3_600_000_000_000, // 1h
+            .promote_interval_ns = 1_000_000_000,
+            .reclaim_interval_ns = 1_000_000_000,
+            .unique_interval_ns = 30_000_000_000,
+            .rate_limit_interval_ns = 30_000_000_000,
+            .expire_interval_ns = 10_000_000_000,
+            .purge_interval_ns = 3_600_000_000_000,
         },
     );
+    defer pipeline.deinit();
 
     // --- Signal handling ---
     const sa = std.posix.Sigaction{

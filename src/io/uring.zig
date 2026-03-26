@@ -114,15 +114,23 @@ pub const UringBackend = struct {
 
     /// Block until at least one completion, then drain all available into out buffer.
     /// Returns number of completions. Blocks when idle (no busy-spin).
+    /// Drain completions: submit any pending SQEs and wait for at least 1 CQE.
+    /// Combines submit + wait into a single io_uring_enter syscall when possible.
     pub fn drain(self: *UringBackend, out: []Completion) u32 {
         assert.check(out.len > 0, "drain: output buffer must be non-empty", .{});
 
-        const cqe_count = self.ring.copy_cqes(&self.cqe_buf, 1) catch |err| {
-            switch (err) {
-                error.SignalInterrupt => return 0,
-                else => assert.fail("drain: copy_cqes failed: {}", .{err}),
-            }
-        };
+        // Peek for already-ready CQEs (no syscall).
+        var cqe_count = self.ring.copy_cqes(&self.cqe_buf, 0) catch 0;
+        if (cqe_count == 0) {
+            // Submit pending SQEs and wait for at least 1 CQE — single syscall.
+            _ = self.ring.submit_and_wait(1) catch |err| {
+                switch (err) {
+                    error.SignalInterrupt => return 0,
+                    else => assert.fail("drain: submit_and_wait failed: {}", .{err}),
+                }
+            };
+            cqe_count = self.ring.copy_cqes(&self.cqe_buf, 0) catch 0;
+        }
 
         var out_count: u32 = 0;
         for (self.cqe_buf[0..cqe_count]) |cqe| {
