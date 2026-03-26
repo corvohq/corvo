@@ -338,12 +338,31 @@ Compare RPC decode (rpc/lifecycle.zig, rpc/management.zig, rpc/bulk.zig) and HTT
 
 This prevents regressions like the scheduled_at bug found in step 9.
 
-### Step 16: Reference commit functionality audit
+### Step 16: Configuration file + cluster config consensus
+CLI args are per-node — if nodes disagree on max_payload_size, buffer sizes, or
+maintenance intervals, leadership changes cause silent data corruption or crashes.
+
+**Config file**: TOML or minimal key=value. Loaded from `--config <path>` or
+`{data-dir}/corvo.conf`. CLI args override for dev/testing. Contains:
+- `bind`, `port`, `data_dir`
+- `max_payload_size` (drives recv_buf_size, send_buf_size, MAX_PAYLOAD_SIZE)
+- `max_connections`
+- Maintenance intervals (promote, reclaim, unique, rate_limit, expire, purge)
+- Cluster: `node_id`, `peers`, `sync_replication`
+- Mirror: `enabled`, `path`
+
+**Cluster config assertion**: during election handshake, nodes exchange a config
+hash (or the full config struct). Mismatch = refuse to form cluster, log the
+diff. Params that must match: max_payload_size, maintenance intervals, any param
+that affects data layout or replication semantics. Params that can differ: bind,
+port, data_dir (node-local).
+
+### Step 17: Reference commit functionality audit
 Iterate through each of the Reference Commits above. Determine if the functionality
 exists, for missing functionality confirm if the user still wants it. Use the commits
 as a spec instead of copying directly.
 
-### Step 17: Delete old stack
+### Step 18: Delete old stack
 Remove engine.zig, store.zig, server.zig, pipeline.zig, scheduler.zig.
 All functionality migrated to pipeline_v2.
 
