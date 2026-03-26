@@ -296,14 +296,39 @@ Fixed by enabling mutation recording in fulfillSubscriptions' kv.Batch.
 mutations when `oplog.hasFile()`. In cluster sim (no file, in-memory oplog), mutations
 were never recorded. Fixed: record when `hasFile() or repl_hook != null`.
 
-### Step 13: SDK verification
+### Step 13: Memory allocation audit (TigerStyle)
+All collections must have explicit resource limits — no unbounded growth.
+
+**Oplog**: in-memory entries ArrayList grows without bound. Single-node doesn't need
+oplog at all (Talon is durable, new followers get snapshots). Cluster mode needs a
+bounded ring buffer for replication retries; entries beyond the ring trigger snapshot.
+Current fix: single-node skips oplog recording entirely (`record_mutations` gated on
+`repl_hook != null`). Cluster oplog needs ring buffer conversion.
+
+**Payload / buffer sizing**: `MAX_PAYLOAD_SIZE` is 1MB but `recv_buf_size` is 64KB —
+inconsistent (1MB payload can't fit in 64KB buffer). Make max payload a CLI arg
+(`--max-payload-size`), derive `recv_buf_size` from it, and align `MAX_PAYLOAD_SIZE`
+to match. One knob, everything consistent.
+
+**Audit targets**:
+- `oplog.entries` — unbounded ArrayList → bounded ring (cluster) or skip (single-node)
+- `handler.active_counts` — StringHashMap, grows with unique queue×worker pairs
+- `handler.fairness_*` — StringHashMaps, grows with unique keys
+- `handler.queue_configs` — StringHashMap, grows with unique queues
+- `handler.pending` — PendingIndex, grows with pending job count
+- `notify.QueueNotifier` — internal state
+- `pipeline.mut_list` — ArrayList, but cleared each tick (bounded by batch_max)
+- Verify all connection buffers are fixed-size (recv_buf, send_buf) ✓
+- Verify all per-tick arrays are compile-time sized (frames, completions, etc.) ✓
+
+### Step 14: SDK verification
 Verify all SDKs work against pipeline_v2. Check for the two-write TCP bug
 (header + payload as separate writes — fixed in zig-sdk, may exist in others).
 Run each SDK's integration tests / examples against corvo-v2.
 
 SDKs: go-sdk, python-sdk, typescript-sdk, rust-sdk, haskell-sdk, zig-sdk (done).
 
-### Step 14: RPC & HTTP consistency audit
+### Step 15: RPC & HTTP consistency audit
 Compare RPC decode (rpc/lifecycle.zig, rpc/management.zig, rpc/bulk.zig) and HTTP decode
 (http.zig) against the old server.zig git history. For every operation:
 - Verify all fields are parsed (e.g. scheduled_at was missing from RPC parser)
@@ -313,12 +338,12 @@ Compare RPC decode (rpc/lifecycle.zig, rpc/management.zig, rpc/bulk.zig) and HTT
 
 This prevents regressions like the scheduled_at bug found in step 9.
 
-### Step 15: Reference commit functionality audit
+### Step 16: Reference commit functionality audit
 Iterate through each of the Reference Commits above. Determine if the functionality
 exists, for missing functionality confirm if the user still wants it. Use the commits
 as a spec instead of copying directly.
 
-### Step 16: Delete old stack
+### Step 17: Delete old stack
 Remove engine.zig, store.zig, server.zig, pipeline.zig, scheduler.zig.
 All functionality migrated to pipeline_v2.
 

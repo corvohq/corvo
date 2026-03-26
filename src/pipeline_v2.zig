@@ -502,7 +502,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             var batch = self.stores[0].newBatch();
             defer batch.close();
 
-            const record_mutations = self.oplog.hasFile() or self.config.repl_hook != null;
+            const record_mutations = self.config.repl_hook != null;
             if (record_mutations) {
                 self.mut_list.clearRetainingCapacity();
                 batch.enableRecording(self.allocator, &self.mut_list);
@@ -563,7 +563,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
             // Record mutations if we have a file-backed oplog OR a repl_hook
             // (cluster mode needs mutation recording even without a file).
-            const record_mutations = self.oplog.hasFile() or self.config.repl_hook != null;
+            const record_mutations = self.config.repl_hook != null;
             if (record_mutations) {
                 self.mut_list.clearRetainingCapacity();
                 kv_batch.enableRecording(self.allocator, &self.mut_list);
@@ -1100,7 +1100,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             var did_fulfill = false;
 
             // Enable mutation recording for oplog + replication.
-            const record_mutations = self.oplog.hasFile() or self.config.repl_hook != null;
+            const record_mutations = self.config.repl_hook != null;
             if (record_mutations) {
                 self.mut_list.clearRetainingCapacity();
                 kv_batch.enableRecording(self.allocator, &self.mut_list);
