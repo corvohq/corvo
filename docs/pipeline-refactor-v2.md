@@ -246,14 +246,59 @@ properly wake fetch subscribers).
 Known gap: HTTP enqueue doesn't trigger notifyForFrame because the payload
 is JSON but notifyForFrame re-parses as RPC binary. Pre-existing issue —
 HTTP fetch doesn't use subscriptions anyway (request-response, no push).
-Fix in step 12 (consistency audit).
+Fix in step 14 (consistency audit).
 
-### Step 11: Oplog recording
-Pipeline_v2 stores oplog reference but never calls `append()`. The old pipeline
-records mutations after commit for crash recovery and replication. Not critical
-for single-node, but required before cluster mode.
+### Step 11: Oplog recording — DONE (commit 4dc59e1)
+Pipeline_v2 records mutations via WriteBatch.enableRecording, encodes post-commit,
+appends to oplog. ReplHook vtable on Config for cluster replication callback.
+main_v2 wired to file-backed oplog at `{data-dir}/oplog`.
 
-### Step 12: RPC & HTTP consistency audit
+Also fixed lifecycle stall: SDK client was sending header+payload as two TCP writes.
+With TCP_NODELAY each became a separate TCP segment → server io_uring recv completed
+on 9-byte header alone → partial frame → extra tick per message. Fixed in zig-sdk:
+all methods build header+payload contiguously, single writeAll. io_uring drain()
+optimized to peek CQEs first, then submit_and_wait(1) in single syscall.
+
+Bench (ReleaseFast, concurrency=8): enqueue 633k ops/sec, lifecycle 79k ops/sec.
+
+### Step 12: Cluster replication + sim cluster merge
+All replication infrastructure already exists (`replicator.zig`, `follower.zig`,
+`election.zig`, `cluster.zig`, `transport.zig`, `tcp_transport.zig`, `cluster_sim.zig`).
+The old sim branch unified single-node and multi-node via `Cluster` (commit `1591c18`).
+
+What needs to happen:
+1. **Align ReplHook**: old pipeline.zig has `replFn` + `waitFn`, pipeline_v2 has only
+   `replicate_fn`. Add `wait_fn` for sync replication (block until follower ack).
+2. **Update cluster.zig imports**: currently imports old `pipeline.zig` + `engine.zig`.
+   Needs to work with pipeline_v2. ClusterNode wraps Pipeline_v2 per node.
+3. **Build sim/node.zig for pipeline_v2**: SimNode with DB, Pipeline_v2(SimBackend),
+   Handler, Oplog, Notify, SimBackend per node (replaces old Engine/Store/Server).
+4. **Build sim/cluster.zig**: Cluster manages N SimNodes, InMemTransport, election ticks,
+   replication message delivery. Use `1591c18` as spec but adapted for pipeline_v2.
+5. **Merge into sim/sim.zig**: `config.node_count` param — 1 for single-node (current),
+   N for cluster. Both go through Cluster. Leader election, client retargeting, fault
+   injection (partitions, leader kills, packet loss), convergence window, replication
+   consistency invariant check.
+6. **Cluster CLI in main_v2.zig**: `--node-id`, `--peers` args to start in cluster mode.
+
+Reference commits (spec, not cherry-pick):
+```
+40303f2  Sim cluster config fields
+7576c71  SimNode — full production stack per cluster node
+e52e4b9  Replication consistency invariant
+515f04f  retargetLeader with safe waiter cleanup
+933bab7  Cluster — orchestrates N SimNodes
+1591c18  Unify sim.zig for single-node and multi-node
+```
+
+### Step 13: SDK verification
+Verify all SDKs work against pipeline_v2. Check for the two-write TCP bug
+(header + payload as separate writes — fixed in zig-sdk, may exist in others).
+Run each SDK's integration tests / examples against corvo-v2.
+
+SDKs: go-sdk, python-sdk, typescript-sdk, rust-sdk, haskell-sdk, zig-sdk (done).
+
+### Step 14: RPC & HTTP consistency audit
 Compare RPC decode (rpc/lifecycle.zig, rpc/management.zig, rpc/bulk.zig) and HTTP decode
 (http.zig) against the old server.zig git history. For every operation:
 - Verify all fields are parsed (e.g. scheduled_at was missing from RPC parser)
@@ -263,12 +308,12 @@ Compare RPC decode (rpc/lifecycle.zig, rpc/management.zig, rpc/bulk.zig) and HTT
 
 This prevents regressions like the scheduled_at bug found in step 9.
 
-### Step 13: Reference commit functionality audit
+### Step 15: Reference commit functionality audit
 Iterate through each of the Reference Commits above. Determine if the functionality
 exists, for missing functionality confirm if the user still wants it. Use the commits
 as a spec instead of copying directly.
 
-### Step 14: Delete old stack
+### Step 16: Delete old stack
 Remove engine.zig, store.zig, server.zig, pipeline.zig, scheduler.zig.
 All functionality migrated to pipeline_v2.
 
