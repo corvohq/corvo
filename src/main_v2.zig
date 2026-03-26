@@ -1,12 +1,16 @@
 //! Corvo v2 server — pipeline_v2 over io_uring/kqueue, single-threaded.
 //!
 //! Single port handles both RPC (binary) and HTTP (JSON) via protocol detection.
+//! Supports single-node and cluster mode (PBR with leader election).
 //!
 //! Usage: corvo-v2 [options]
 //!   --bind       Listen address (default: 0.0.0.0)
 //!   --port       Listen port (default: 9878)
 //!   --data-dir   Data directory (default: /tmp/corvo-data)
 //!   --no-mirror  Disable SQLite mirror
+//!   --node-id    Node ID for cluster mode (enables cluster)
+//!   --peers      Comma-separated peer list: id@host:port,id@host:port,...
+//!   --sync-repl  Enable sync replication (wait for follower ack before responding)
 
 const std = @import("std");
 const talon = @import("talon");
@@ -20,6 +24,7 @@ const notify_mod = corvo.notify;
 const mirror_mod = corvo.mirror;
 const sqlite_read = corvo.sqlite_read;
 const pipeline_v2_mod = corvo.pipeline_v2;
+const cluster_mod = corvo.cluster;
 
 const RealPipeline = pipeline_v2_mod.Pipeline(io_mod.Backend);
 
@@ -31,6 +36,50 @@ fn handleSignal(_: c_int) callconv(.c) void {
 
 fn realClock() i64 {
     return @intCast(std.time.nanoTimestamp());
+}
+
+// ============================================================================
+// Peer parsing: "id@host:port"
+// ============================================================================
+
+const PeerSpec = struct {
+    id: []const u8,
+    addr: std.net.Address,
+};
+
+const max_peers = 6;
+
+fn parsePeers(spec: []const u8, ids_out: *[max_peers][]const u8, addrs_out: *[max_peers]std.net.Address) !u8 {
+    var count: u8 = 0;
+    var rest = spec;
+
+    while (rest.len > 0) {
+        // Find end of this peer spec (comma or end of string).
+        const end = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+        const entry = rest[0..end];
+        rest = if (end < rest.len) rest[end + 1 ..] else "";
+
+        if (entry.len == 0) continue;
+
+        // Parse "id@host:port"
+        const at_pos = std.mem.indexOfScalar(u8, entry, '@') orelse return error.InvalidPeerSpec;
+        const id = entry[0..at_pos];
+        const host_port = entry[at_pos + 1 ..];
+
+        const colon_pos = std.mem.lastIndexOfScalar(u8, host_port, ':') orelse return error.InvalidPeerSpec;
+        const host = host_port[0..colon_pos];
+        const port_str = host_port[colon_pos + 1 ..];
+        const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPeerSpec;
+
+        // Cluster transport bind port = server port + 1000 (convention).
+        const cluster_port = port + 1000;
+
+        ids_out[count] = id;
+        addrs_out[count] = try std.net.Address.parseIp(host, cluster_port);
+        count += 1;
+    }
+
+    return count;
 }
 
 pub fn main() !void {
@@ -45,6 +94,9 @@ pub fn main() !void {
     var port: u16 = 9878;
     var data_dir: []const u8 = "/tmp/corvo-data";
     var no_mirror = false;
+    var node_id: ?[]const u8 = null;
+    var peers_spec: ?[]const u8 = null;
+    var sync_repl = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--bind")) {
@@ -68,10 +120,30 @@ pub fn main() !void {
             };
         } else if (std.mem.eql(u8, arg, "--no-mirror")) {
             no_mirror = true;
+        } else if (std.mem.eql(u8, arg, "--node-id")) {
+            node_id = args.next() orelse {
+                std.debug.print("--node-id requires an argument\n", .{});
+                return;
+            };
+        } else if (std.mem.eql(u8, arg, "--peers")) {
+            peers_spec = args.next() orelse {
+                std.debug.print("--peers requires an argument\n", .{});
+                return;
+            };
+        } else if (std.mem.eql(u8, arg, "--sync-repl")) {
+            sync_repl = true;
         }
     }
 
-    std.debug.print("corvo-v2: starting (bind={s}, port={d}, data={s})\n", .{ bind, port, data_dir });
+    const cluster_mode = node_id != null;
+    if (cluster_mode and peers_spec == null) {
+        std.debug.print("--node-id requires --peers\n", .{});
+        return;
+    }
+
+    std.debug.print("corvo-v2: starting (bind={s}, port={d}, data={s}{s})\n", .{
+        bind, port, data_dir, if (cluster_mode) ", cluster" else "",
+    });
 
     // --- Ensure data directory exists ---
     std.fs.cwd().makePath(data_dir) catch {};
@@ -124,6 +196,38 @@ pub fn main() !void {
     }
     defer if (mirror) |*m| m.deinit();
 
+    // --- Cluster setup (optional) ---
+    var cluster_node: ?cluster_mod.ClusterNode = null;
+    var repl_hook: ?pipeline_v2_mod.ReplHook = null;
+
+    if (cluster_mode) {
+        var peer_ids: [max_peers][]const u8 = undefined;
+        var peer_addrs: [max_peers]std.net.Address = undefined;
+        const peer_count = parsePeers(peers_spec.?, &peer_ids, &peer_addrs) catch {
+            std.debug.print("invalid --peers format (expected: id@host:port,...)\n", .{});
+            return;
+        };
+
+        // Cluster transport binds on server port + 1000.
+        const cluster_port: u16 = port + 1000;
+        const cluster_bind_addr = try std.net.Address.parseIp(bind, cluster_port);
+
+        cluster_node = cluster_mod.ClusterNode.init(allocator, &stores, .{
+            .node_id = node_id.?,
+            .peer_ids = peer_ids[0..peer_count],
+            .peer_addrs = peer_addrs[0..peer_count],
+            .bind_addr = cluster_bind_addr,
+        });
+
+        try cluster_node.?.start();
+        repl_hook = cluster_node.?.replHook();
+
+        std.debug.print("corvo-v2: cluster node={s}, peers={d}, transport=:{d}\n", .{
+            node_id.?, peer_count, cluster_port,
+        });
+    }
+    defer if (cluster_node) |*cn| cn.deinit();
+
     // --- Create listen socket ---
     const addr = try std.net.Address.parseIp(bind, port);
     var listener = try addr.listen(.{ .reuse_address = true });
@@ -161,9 +265,16 @@ pub fn main() !void {
             .rate_limit_interval_ns = 30_000_000_000,
             .expire_interval_ns = 10_000_000_000,
             .purge_interval_ns = 3_600_000_000_000,
+            .repl_hook = repl_hook,
+            .sync_replication = sync_repl,
         },
     );
     defer pipeline.deinit();
+
+    // Wire cluster ack notification to pipeline's atomic.
+    if (cluster_mode) {
+        cluster_mod.g_ack_seq_ptr = pipeline.ackSeqPtr();
+    }
 
     // --- Signal handling ---
     const sa = std.posix.Sigaction{
@@ -173,6 +284,19 @@ pub fn main() !void {
     };
     std.posix.sigaction(std.posix.SIG.INT, &sa, null);
     std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+
+    // Wait for leader election if in cluster mode.
+    if (cluster_node) |*cn| {
+        std.debug.print("corvo-v2: waiting for leader election...\n", .{});
+        if (!cn.waitForLeader(30000)) {
+            std.debug.print("corvo-v2: leader election timed out\n", .{});
+            return;
+        }
+        const state = cn.election.currentState();
+        std.debug.print("corvo-v2: leader elected (epoch={d}, leader={s})\n", .{
+            state.epoch, if (state.leader_id.len > 0) state.leader_id else "(self)",
+        });
+    }
 
     std.debug.print("corvo-v2: listening on {s}:{d} (rpc+http)\n", .{ bind, port });
 

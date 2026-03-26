@@ -13,9 +13,10 @@ const repl_mod = @import("replicator.zig");
 const follower_mod = @import("follower.zig");
 const transport_mod = @import("transport.zig");
 const tcp_mod = @import("tcp_transport.zig");
-const pipeline_mod = @import("pipeline.zig");
+const pipeline_v2 = @import("pipeline_v2.zig");
+const pipeline_mod = @import("pipeline.zig"); // legacy — removed in step 16
+const engine_mod = @import("engine.zig"); // legacy — removed in step 16
 const handler_mod = @import("handler.zig");
-const engine_mod = @import("engine.zig");
 
 // ============================================================================
 // Config
@@ -133,12 +134,19 @@ pub const ClusterNode = struct {
         }
     }
 
-    /// Returns a ReplHook for the pipeline to call after oplog append.
-    pub fn replHook(self: *ClusterNode) pipeline_mod.ReplHook {
+    /// Returns a ReplHook for pipeline_v2 to call after oplog append.
+    pub fn replHook(self: *ClusterNode) pipeline_v2.ReplHook {
+        return .{
+            .ptr = @ptrCast(self),
+            .replicate_fn = @ptrCast(&replicateImpl),
+        };
+    }
+
+    /// Legacy ReplHook for old pipeline.zig — removed in step 16.
+    pub fn replHookLegacy(self: *ClusterNode) pipeline_mod.ReplHook {
         return .{
             .ptr = @ptrCast(self),
             .replFn = @ptrCast(&replicateImpl),
-            .waitFn = @ptrCast(&waitForAckImpl),
         };
     }
 
@@ -165,20 +173,17 @@ pub const ClusterNode = struct {
         }
     }
 
-    fn waitForAckImpl(self: *ClusterNode, seq: u64) void {
-        const r = self.replicator orelse return;
-        var event: std.Thread.ResetEvent = .{};
-        r.waitForAck(seq, &event);
-        // Block until at least one follower acks. The tick thread
-        // drains incoming ack messages and calls notifyWaiters.
-        event.wait();
-    }
-
     pub fn isLeader(self: *ClusterNode) bool {
         return self.is_leader_flag.load(.monotonic);
     }
 
-    /// Returns a LeaseCheck callback for the engine to verify lease validity on writes.
+    /// Returns true if this node holds a valid leader lease.
+    pub fn leaseValid(self: *ClusterNode) bool {
+        const now: i64 = @intCast(@as(i128, std.time.nanoTimestamp()));
+        return self.election.leaseValid(now);
+    }
+
+    /// Legacy LeaseCheck for old engine — removed in step 16.
     pub fn leaseCheck(self: *ClusterNode) engine_mod.LeaseCheck {
         return .{
             .ptr = @ptrCast(self),
@@ -187,8 +192,7 @@ pub const ClusterNode = struct {
     }
 
     fn leaseCheckImpl(self: *ClusterNode) bool {
-        const now: i64 = @intCast(@as(i128, std.time.nanoTimestamp()));
-        return self.election.leaseValid(now);
+        return self.leaseValid();
     }
 
     /// Wait for leader election to complete (blocking).
@@ -376,8 +380,11 @@ pub const ClusterNode = struct {
                     .seq = rmsg.seq,
                 };
                 r.step(msg);
-                // Also notify pipeline for non-blocking strong durability.
-                if (g_pipeline_for_ack) |p| p.onFollowerAck(rmsg.seq);
+                // Also notify pipeline's ack atomic for sync replication.
+                if (g_ack_seq_ptr) |ptr| {
+                    const prev = ptr.load(.monotonic);
+                    if (rmsg.seq > prev) ptr.store(rmsg.seq, .release);
+                }
             },
             .snapshot => {
                 // Received a full KV snapshot from the leader.
@@ -537,12 +544,20 @@ fn fastPathAckCallback(from: []const u8, epoch: u64, seq: u64) void {
         .epoch = epoch,
         .seq = seq,
     });
-    // Notify pipeline to unblock clients waiting for this ack.
-    if (g_pipeline_for_ack) |p| {
-        p.onFollowerAck(seq);
+    // Notify pipeline_v2's ack atomic — unblocks deferred responses in sync mode.
+    if (g_ack_seq_ptr) |ptr| {
+        const prev = ptr.load(.monotonic);
+        if (seq > prev) ptr.store(seq, .release);
     }
+    // Legacy: notify old pipeline — removed in step 16.
+    if (g_pipeline_for_ack) |p| p.onFollowerAck(seq);
 }
 
+/// Pointer to the pipeline_v2's last_acked_seq atomic. Set by main_v2.zig
+/// when starting in cluster mode. TCP receive threads write directly.
+pub var g_ack_seq_ptr: ?*std.atomic.Value(u64) = null;
+
+/// Legacy: pointer to old pipeline for onFollowerAck — removed in step 16.
 pub var g_pipeline_for_ack: ?*pipeline_mod.Pipeline = null;
 
 // ============================================================================

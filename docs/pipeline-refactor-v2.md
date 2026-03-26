@@ -261,35 +261,40 @@ optimized to peek CQEs first, then submit_and_wait(1) in single syscall.
 
 Bench (ReleaseFast, concurrency=8): enqueue 633k ops/sec, lifecycle 79k ops/sec.
 
-### Step 12: Cluster replication + sim cluster merge
-All replication infrastructure already exists (`replicator.zig`, `follower.zig`,
-`election.zig`, `cluster.zig`, `transport.zig`, `tcp_transport.zig`, `cluster_sim.zig`).
-The old sim branch unified single-node and multi-node via `Cluster` (commit `1591c18`).
+### Step 12: Cluster replication + sim cluster merge — DONE
+**ReplHook at module level** — moved out of generic `Pipeline(Backend)` so cluster.zig
+can reference it without knowing the backend type. Module-level `pipeline_v2.ReplHook`.
 
-What needs to happen:
-1. **Align ReplHook**: old pipeline.zig has `replFn` + `waitFn`, pipeline_v2 has only
-   `replicate_fn`. Add `wait_fn` for sync replication (block until follower ack).
-2. **Update cluster.zig imports**: currently imports old `pipeline.zig` + `engine.zig`.
-   Needs to work with pipeline_v2. ClusterNode wraps Pipeline_v2 per node.
-3. **Build sim/node.zig for pipeline_v2**: SimNode with DB, Pipeline_v2(SimBackend),
-   Handler, Oplog, Notify, SimBackend per node (replaces old Engine/Store/Server).
-4. **Build sim/cluster.zig**: Cluster manages N SimNodes, InMemTransport, election ticks,
-   replication message delivery. Use `1591c18` as spec but adapted for pipeline_v2.
-5. **Merge into sim/sim.zig**: `config.node_count` param — 1 for single-node (current),
-   N for cluster. Both go through Cluster. Leader election, client retargeting, fault
-   injection (partitions, leader kills, packet loss), convergence window, replication
-   consistency invariant check.
-6. **Cluster CLI in main_v2.zig**: `--node-id`, `--peers` args to start in cluster mode.
+**Sync replication** — pipeline_v2 defers client responses until follower ack arrives.
+Single atomic `last_acked_seq` shared between TCP receive thread and pipeline tick.
+TigerBeetle style: one batch at a time, don't process new frames while waiting for ack.
+When `sync_replication=true` and repl_hook is set: executeBatch → recordOplog → replicate,
+then check atomic. If ack already arrived (fast-path), encode immediately. Otherwise defer
+frames/results until next tick where ack is observed. During wait: drain IO (close/send_done)
+but skip new client frames.
 
-Reference commits (spec, not cherry-pick):
-```
-40303f2  Sim cluster config fields
-7576c71  SimNode — full production stack per cluster node
-e52e4b9  Replication consistency invariant
-515f04f  retargetLeader with safe waiter cleanup
-933bab7  Cluster — orchestrates N SimNodes
-1591c18  Unify sim.zig for single-node and multi-node
-```
+**cluster.zig updated** — imports pipeline_v2.ReplHook, uses g_ack_seq_ptr atomic for
+TCP fast-path ack notification. Legacy compat methods (replHookLegacy, leaseCheck,
+g_pipeline_for_ack) kept for old main.zig, removed in step 16.
+
+**main_v2.zig cluster mode** — `--node-id`, `--peers id@host:port,...`, `--sync-repl`.
+Creates ClusterNode, starts transport, wires replHook into pipeline config, wires
+g_ack_seq_ptr for TCP ack fast-path. Cluster transport binds on server port + 1000.
+
+**sim/cluster.zig** — cluster sim with Pipeline(SimBackend) on the leader. Each node:
+Talon DB, OpHandler, Oplog, QueueNotifier, Election, InMemTransport. Leader runs full
+pipeline (RPC frames → decode → execute → oplog → replicate). Followers apply replicated
+KV mutations via follower.step(). Replication consistency checked mid-sim and at end.
+3 tests: 3-node basic, 3-node multi-queue, 5-node. All pass.
+
+**Bug fix: fulfillSubscriptions oplog recording** — fetch subscription fulfillment
+(push model) was writing to KV without recording mutations to the oplog. Worker
+registration (`w|`) and active count (`a|`) keys were invisible to replication.
+Fixed by enabling mutation recording in fulfillSubscriptions' kv.Batch.
+
+**Bug fix: mutation recording with repl_hook but no file** — pipeline only recorded
+mutations when `oplog.hasFile()`. In cluster sim (no file, in-memory oplog), mutations
+were never recorded. Fixed: record when `hasFile() or repl_hook != null`.
 
 ### Step 13: SDK verification
 Verify all SDKs work against pipeline_v2. Check for the two-write TCP bug

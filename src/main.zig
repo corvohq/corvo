@@ -290,7 +290,7 @@ pub fn main() !void {
             .bind_addr = pbr_addr,
         });
         try cluster_node.?.start();
-        repl_hook = cluster_node.?.replHook();
+        repl_hook = cluster_node.?.replHookLegacy();
     }
     defer if (cluster_node) |*cn| cn.deinit();
 

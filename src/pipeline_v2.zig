@@ -36,6 +36,21 @@ const Completion = io_mod.Completion;
 const BufReader = rpc.BufReader;
 const BufWriter = rpc.BufWriter;
 
+// ========================================================================
+// ReplHook — replication callback vtable (module-level, backend-agnostic)
+// ========================================================================
+
+/// Called after oplog append with encoded mutations. Cluster mode uses this
+/// to fan out mutations to followers via TCP.
+pub const ReplHook = struct {
+    ptr: *anyopaque,
+    replicate_fn: *const fn (ptr: *anyopaque, shard_id: u16, seq: u64, data: []const u8) void,
+
+    pub fn replicate(self: ReplHook, shard_id: u16, seq: u64, data: []const u8) void {
+        self.replicate_fn(self.ptr, shard_id, seq, data);
+    }
+};
+
 pub fn Pipeline(comptime IoBackend: type) type {
     return struct {
         const Self = @This();
@@ -99,6 +114,17 @@ pub fn Pipeline(comptime IoBackend: type) type {
         last_expire_ns: u64 = 0,
         last_purge_ns: u64 = 0,
 
+        // Sync replication — deferred response until follower ack.
+        // last_acked_seq is written by the TCP receive thread (via onFollowerAck),
+        // read by the pipeline tick thread. Single atomic, single shared state.
+        last_acked_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        last_recorded_seq: u64 = 0,
+        pending_ack_seq: u64 = 0,
+        // recv_conns saved from the tick that created the pending batch,
+        // needed for requeueRecvs when the deferred responses are flushed.
+        pending_recv_conns: [max_completions]u16 = undefined,
+        pending_recv_conn_count: u32 = 0,
+
         // Stats
         ticks_total: u64 = 0,
         applied_total: u64 = 0,
@@ -116,14 +142,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
         // Config
         // ====================================================================
 
-        pub const ReplHook = struct {
-            ptr: *anyopaque,
-            replicate_fn: *const fn (ptr: *anyopaque, shard_id: u16, seq: u64, data: []const u8) void,
-            pub fn replicate(self: ReplHook, shard_id: u16, seq: u64, data: []const u8) void {
-                self.replicate_fn(self.ptr, shard_id, seq, data);
-            }
-        };
-
         pub const Config = struct {
             clock_fn: *const fn () i64,
             batch_max: u32 = 256,
@@ -134,6 +152,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             expire_interval_ns: u64 = 0,
             purge_interval_ns: u64 = 0,
             repl_hook: ?ReplHook = null,
+            sync_replication: bool = false,
         };
 
         // ====================================================================
@@ -192,11 +211,56 @@ pub fn Pipeline(comptime IoBackend: type) type {
             self.mut_list.deinit(self.allocator);
         }
 
+        /// Called from TCP receive thread when a follower acks a sequence.
+        /// Thread-safe: single atomic write, no locks.
+        pub fn onFollowerAck(self: *Self, seq: u64) void {
+            const prev = self.last_acked_seq.load(.monotonic);
+            if (seq > prev) self.last_acked_seq.store(seq, .release);
+        }
+
+        /// Returns a pointer to the ack sequence atomic. Cluster mode wires this
+        /// into the TCP fast-path callback for direct atomic updates.
+        pub fn ackSeqPtr(self: *Self) *std.atomic.Value(u64) {
+            return &self.last_acked_seq;
+        }
+
         // ====================================================================
         // Tick — the entire event loop body
         // ====================================================================
 
         pub fn tick(self: *Self) void {
+            // 0. Sync replication: check for deferred ack from a previous tick.
+            //    If ack received, flush the deferred responses now. If still waiting,
+            //    drain IO events (close/send_done) but skip new client frames — one
+            //    batch at a time, TigerBeetle style.
+            if (self.pending_ack_seq > 0) {
+                if (self.last_acked_seq.load(.acquire) >= self.pending_ack_seq) {
+                    self.encodeResponses();
+                    self.fulfillSubscriptions();
+                    self.flushSends();
+                    self.compactRecvBufs();
+                    self.requeueRecvs(self.pending_recv_conns[0..self.pending_recv_conn_count]);
+                    self.pending_ack_seq = 0;
+                    self.pending_recv_conn_count = 0;
+                    self.io.submit();
+                    self.ticks_total += 1;
+                    return;
+                }
+                // Still waiting — drain IO but don't process new frames.
+                const n_pending = self.io.drain(&self.completions);
+                for (self.completions[0..n_pending]) |completion| {
+                    switch (completion.event) {
+                        .recv => {},
+                        .accept => {},
+                        .closed => self.onConnClosed(completion.conn_id),
+                        .send_done => self.io.queueRecv(completion.conn_id),
+                    }
+                }
+                self.io.submit();
+                self.ticks_total += 1;
+                return;
+            }
+
             // 1. Drain IO completions
             const n = self.io.drain(&self.completions);
 
@@ -255,22 +319,39 @@ pub fn Pipeline(comptime IoBackend: type) type {
             // 3. Execute: decode + apply in single kv.Batch
             self.executeBatch();
 
-            // 4. Encode responses into send_bufs (no sends queued yet)
+            // 4. Sync replication: defer responses until follower ack.
+            //    frames[], results[], recv_compactions[] persist in struct fields.
+            //    recv_bufs are NOT compacted — HTTP path_param/sub_action still reference them.
+            if (self.config.sync_replication and self.config.repl_hook != null) {
+                // Check if ack already arrived (fast-path callback can race ahead).
+                if (self.last_acked_seq.load(.acquire) >= self.last_recorded_seq) {
+                    // Already acked — encode immediately, no deferral needed.
+                } else {
+                    self.pending_ack_seq = self.last_recorded_seq;
+                    @memcpy(self.pending_recv_conns[0..recv_conn_count], recv_conns[0..recv_conn_count]);
+                    self.pending_recv_conn_count = recv_conn_count;
+                    self.io.submit();
+                    self.ticks_total += 1;
+                    return;
+                }
+            }
+
+            // 5. Encode responses into send_bufs (no sends queued yet)
             self.encodeResponses();
 
-            // 5. Push jobs to waiting fetch subscribers (appends to send_bufs)
+            // 6. Push jobs to waiting fetch subscribers (appends to send_bufs)
             self.fulfillSubscriptions();
 
-            // 6. Flush all accumulated sends (one queueSend per connection)
+            // 7. Flush all accumulated sends (one queueSend per connection)
             self.flushSends();
 
-            // 7. Compact recv_bufs (payload slices no longer needed)
+            // 8. Compact recv_bufs (payload slices no longer needed)
             self.compactRecvBufs();
 
-            // 8. Re-queue recv for connections with partial frames (no send pending)
+            // 9. Re-queue recv for connections with partial frames (no send pending)
             self.requeueRecvs(recv_conns[0..recv_conn_count]);
 
-            // 9. Submit all queued IO
+            // 10. Submit all queued IO
             self.io.submit();
             self.ticks_total += 1;
         }
@@ -421,12 +502,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
             var batch = self.stores[0].newBatch();
             defer batch.close();
 
-            const has_oplog = self.oplog.hasFile();
-            if (has_oplog) {
+            const record_mutations = self.oplog.hasFile() or self.config.repl_hook != null;
+            if (record_mutations) {
                 self.mut_list.clearRetainingCapacity();
                 batch.enableRecording(self.allocator, &self.mut_list);
             }
-            defer if (has_oplog) batch.freeMutations();
+            defer if (record_mutations) batch.freeMutations();
 
             for (intervals) |iv| {
                 if (iv.ns == 0) continue;
@@ -448,7 +529,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
             batch.commit();
 
-            if (has_oplog and self.mut_list.items.len > 0) {
+            if (record_mutations and self.mut_list.items.len > 0) {
                 self.recordOplog();
             }
 
@@ -480,12 +561,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
             var kv_batch = self.stores[0].newBatch();
             defer kv_batch.close();
 
-            const has_oplog = self.oplog.hasFile();
-            if (has_oplog) {
+            // Record mutations if we have a file-backed oplog OR a repl_hook
+            // (cluster mode needs mutation recording even without a file).
+            const record_mutations = self.oplog.hasFile() or self.config.repl_hook != null;
+            if (record_mutations) {
                 self.mut_list.clearRetainingCapacity();
                 kv_batch.enableRecording(self.allocator, &self.mut_list);
             }
-            defer if (has_oplog) kv_batch.freeMutations();
+            defer if (record_mutations) kv_batch.freeMutations();
 
             for (self.frames[0..self.frame_count], 0..) |*frame, i| {
                 self.results[i] = self.decodeAndApply(&kv_batch, frame, @intCast(i));
@@ -494,7 +577,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             kv_batch.commit();
             self.applied_total += self.frame_count;
 
-            if (has_oplog and self.mut_list.items.len > 0) {
+            if (record_mutations and self.mut_list.items.len > 0) {
                 self.recordOplog();
             }
 
@@ -513,6 +596,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             const encoded = oplog_mod.encodeMutations(self.allocator, self.mut_list.items);
             defer self.allocator.free(encoded);
             const seq = self.oplog.append(0, encoded);
+            self.last_recorded_seq = seq;
             if (self.config.repl_hook) |hook| hook.replicate(0, seq, encoded);
         }
 
@@ -1015,6 +1099,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
             defer kv_batch.close();
             var did_fulfill = false;
 
+            // Enable mutation recording for oplog + replication.
+            const record_mutations = self.oplog.hasFile() or self.config.repl_hook != null;
+            if (record_mutations) {
+                self.mut_list.clearRetainingCapacity();
+                kv_batch.enableRecording(self.allocator, &self.mut_list);
+            }
+            defer if (record_mutations) kv_batch.freeMutations();
+
             for (self.waiting_conns[0..self.waiting_conn_count]) |conn_id| {
                 const c = self.io.conn(conn_id);
                 if (c.phase == .free or !c.waiting) continue;
@@ -1073,7 +1165,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 fulfilled_count += 1;
             }
 
-            if (did_fulfill) kv_batch.commit();
+            if (did_fulfill) {
+                kv_batch.commit();
+                if (record_mutations and self.mut_list.items.len > 0) {
+                    self.recordOplog();
+                }
+            }
 
             // Remove fulfilled connections from waiting list.
             for (fulfilled[0..fulfilled_count]) |conn_id| {
