@@ -49,8 +49,6 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{
         .root_module = test_mod,
     });
-    // Pipeline v2 TestContext is ~7MB on the stack (fixed-size OpResult arrays).
-    tests.stack_size = 32 * 1024 * 1024; // 32MB
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);

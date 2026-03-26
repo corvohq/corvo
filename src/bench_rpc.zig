@@ -72,8 +72,6 @@ const RpcClient = struct {
         // Encode payload.
         var w = rpc.BufWriter{ .buf = &self.send_buf };
         w.writeU16(count);
-        const now_ns: u64 = @intCast(@as(i128, std.time.nanoTimestamp()));
-        w.writeU64(now_ns);
 
         for (0..count) |i| {
             // Queue
@@ -135,8 +133,6 @@ const RpcClient = struct {
         self.req_id +%= 1;
 
         var w = rpc.BufWriter{ .buf = &self.send_buf };
-        const now_ns: u64 = @intCast(@as(i128, std.time.nanoTimestamp()));
-        w.writeU64(now_ns);
         w.writeU16(count);
         w.writeU32(30_000); // lease_ms
         w.writePrefixed("bench-worker"); // worker_id

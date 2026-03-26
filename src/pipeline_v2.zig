@@ -139,6 +139,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             count: u16 = 0,
             protocol: Protocol = .rpc,
             path_param: []const u8 = "",
+            sub_action: []const u8 = "",
         };
 
         const RecvCompaction = struct {
@@ -343,6 +344,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         .payload = req.body,
                         .protocol = .http,
                         .path_param = w.param,
+                        .sub_action = w.sub_action,
                     };
                     self.frame_count += 1;
                     self.recordRecvCompaction(conn_id, req.total_len);
@@ -665,18 +667,34 @@ pub fn Pipeline(comptime IoBackend: type) type {
         fn decodeAndApplyHttp(self: *Self, batch: *kv.WriteBatch, frame: *FrameDesc, frame_idx: u32) ops_mod.OpResult {
             const now_ns = self.nowNs();
 
-            // For enqueue, generate job_id into per-frame buffer before decode.
-            if (frame.msg_type == rpc.MSG_ENQUEUE_BATCH) {
-                self.http_id_counter += 1;
-                const id = http.generateId(&self.http_id_bufs[frame_idx], now_ns, self.http_id_counter);
-                self.http_scratch.jobs[0].job_id = id;
-                frame.path_param = id;
+            // Generate server-side IDs for operations that need them.
+            switch (frame.msg_type) {
+                rpc.MSG_ENQUEUE_BATCH => {
+                    self.http_id_counter += 1;
+                    const id = http.generateId(&self.http_id_bufs[frame_idx], now_ns, self.http_id_counter);
+                    self.http_scratch.jobs[0].job_id = id;
+                    frame.path_param = id;
+                },
+                rpc.MSG_BATCH_CREATE, rpc.MSG_CRON_CREATE, rpc.MSG_SET_BUDGET, rpc.MSG_MODIFY_ENT_SETTING => {
+                    self.http_id_counter += 1;
+                    const id = http.generateId(&self.http_scratch.id_buf2, now_ns, self.http_id_counter);
+                    self.http_scratch.id2_len = @intCast(id.len);
+                    frame.path_param = id;
+                },
+                rpc.MSG_CRON_TRIGGER => {
+                    // Trigger needs a generated job_id, stored in id_buf2
+                    self.http_id_counter += 1;
+                    const id = http.generateId(&self.http_scratch.id_buf2, now_ns, self.http_id_counter);
+                    self.http_scratch.id2_len = @intCast(id.len);
+                },
+                else => {},
             }
 
             const decoded = http.decodeWrite(
                 frame.msg_type,
                 frame.payload,
                 frame.path_param,
+                frame.sub_action,
                 now_ns,
                 &self.http_scratch,
             );
@@ -689,6 +707,19 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 rpc.MSG_ACK_BATCH => .ack,
                 rpc.MSG_FAIL_BATCH => .fail,
                 rpc.MSG_HEARTBEAT => .heartbeat,
+                rpc.MSG_BULK_ACTION => .bulk_action,
+                rpc.MSG_QUEUE_CONFIG => .queue_config,
+                rpc.MSG_CLEAR_QUEUE => .clear_queue,
+                rpc.MSG_DELETE_QUEUE => .delete_queue,
+                rpc.MSG_BATCH_CREATE => .batch_create,
+                rpc.MSG_BATCH_SEAL => .batch_seal,
+                rpc.MSG_CRON_CREATE => .cron_create,
+                rpc.MSG_CRON_UPDATE => .cron_update,
+                rpc.MSG_CRON_DELETE => .cron_delete,
+                rpc.MSG_CRON_TRIGGER => .cron_trigger,
+                rpc.MSG_SET_BUDGET => .set_budget,
+                rpc.MSG_DELETE_BUDGET => .delete_budget,
+                rpc.MSG_MODIFY_ENT_SETTING => .modify_ent_setting,
                 else => return .{ .err = "unsupported http write" },
             };
 
@@ -724,6 +755,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         frame.msg_type,
                         &self.results[i],
                         frame.path_param,
+                        frame.sub_action,
                     );
                     if (resp_len > 0) {
                         self.trackSendConn(frame.conn_id);
@@ -1084,7 +1116,16 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         }
                     }
                 },
-                else => {},
+                else => {
+                    // For any other op (bulk, queue config, cron, etc.):
+                    // if the handler populated notify_queues, honor them.
+                    if (result.notify_queues) |queues| {
+                        self.notify.notifyQueues(queues);
+                        for (queues) |q| {
+                            self.recordNotifiedQueue(q);
+                        }
+                    }
+                },
             }
         }
 

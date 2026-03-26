@@ -212,6 +212,7 @@ pub const RouteAction = union(enum) {
     write: struct {
         msg_type: u8,
         param: []const u8,
+        sub_action: []const u8,
     },
     /// Route not found.
     not_found,
@@ -226,7 +227,6 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
     const clean = if (std.mem.indexOfScalar(u8, path, '?')) |qi| path[0..qi] else path;
 
     if (!std.mem.startsWith(u8, clean, "/api/v1/")) {
-        // Non-API routes: /healthz, /metrics, etc. — all reads.
         if (std.mem.eql(u8, clean, "/healthz")) return .read;
         if (std.mem.eql(u8, clean, "/metrics")) return .read;
         return .not_found;
@@ -234,45 +234,188 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
 
     const api = clean["/api/v1".len..];
 
-    // --- Write routes (POST/PUT/DELETE that mutate state) ---
+    switch (method) {
+        .POST => {
+            // --- Exact path matches ---
+            if (std.mem.eql(u8, api, "/enqueue"))
+                return writeRoute(rpc.MSG_ENQUEUE_BATCH, "", "");
+            if (std.mem.eql(u8, api, "/fetch") or std.mem.eql(u8, api, "/fetch/batch"))
+                return writeRoute(rpc.MSG_FETCH_BATCH, "", "");
+            if (std.mem.eql(u8, api, "/heartbeat"))
+                return writeRoute(rpc.MSG_HEARTBEAT, "", "");
+            if (std.mem.eql(u8, api, "/jobs/bulk"))
+                return writeRoute(rpc.MSG_BULK_ACTION, "", "");
+            if (std.mem.eql(u8, api, "/batch"))
+                return writeRoute(rpc.MSG_BATCH_CREATE, "", "");
+            if (std.mem.eql(u8, api, "/cron-jobs") or std.mem.eql(u8, api, "/crons"))
+                return writeRoute(rpc.MSG_CRON_CREATE, "", "");
+            if (std.mem.eql(u8, api, "/budgets"))
+                return writeRoute(rpc.MSG_SET_BUDGET, "", "");
+            if (std.mem.eql(u8, api, "/approval-policies"))
+                return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, "", "approval_policy");
+            if (std.mem.eql(u8, api, "/auth/keys"))
+                return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, "", "api_key");
 
-    if (method == .POST) {
-        if (std.mem.eql(u8, api, "/enqueue"))
-            return .{ .write = .{ .msg_type = rpc.MSG_ENQUEUE_BATCH, .param = "" } };
+            // POST reads
+            if (std.mem.eql(u8, api, "/jobs/search") or std.mem.eql(u8, api, "/jobs"))
+                return .read;
 
-        if (std.mem.eql(u8, api, "/fetch") or std.mem.eql(u8, api, "/fetch/batch"))
-            return .{ .write = .{ .msg_type = rpc.MSG_FETCH_BATCH, .param = "" } };
+            // --- Prefix matches with path params ---
+            if (std.mem.startsWith(u8, api, "/ack/"))
+                return writeRoute(rpc.MSG_ACK_BATCH, api["/ack/".len..], "");
+            if (std.mem.startsWith(u8, api, "/fail/"))
+                return writeRoute(rpc.MSG_FAIL_BATCH, api["/fail/".len..], "");
 
-        if (std.mem.eql(u8, api, "/heartbeat"))
-            return .{ .write = .{ .msg_type = rpc.MSG_HEARTBEAT, .param = "" } };
+            // /jobs/{id}/{action}
+            if (std.mem.startsWith(u8, api, "/jobs/"))
+                return classifyJobPostAction(api["/jobs/".len..]);
 
-        // POST /api/v1/ack/{job_id}
-        if (std.mem.startsWith(u8, api, "/ack/")) {
-            const param = api["/ack/".len..];
-            if (param.len > 0)
-                return .{ .write = .{ .msg_type = rpc.MSG_ACK_BATCH, .param = param } };
-        }
+            // /queues/{name}/{action}
+            if (std.mem.startsWith(u8, api, "/queues/"))
+                return classifyQueueAction(.POST, api["/queues/".len..]);
 
-        // POST /api/v1/fail/{job_id}
-        if (std.mem.startsWith(u8, api, "/fail/")) {
-            const param = api["/fail/".len..];
-            if (param.len > 0)
-                return .{ .write = .{ .msg_type = rpc.MSG_FAIL_BATCH, .param = param } };
-        }
+            // /batch/{id}/seal
+            if (std.mem.startsWith(u8, api, "/batch/")) {
+                const rest = api["/batch/".len..];
+                if (std.mem.endsWith(u8, rest, "/seal")) {
+                    const id = rest[0 .. rest.len - "/seal".len];
+                    if (id.len > 0) return writeRoute(rpc.MSG_BATCH_SEAL, id, "");
+                }
+            }
 
-        // POST /api/v1/jobs/search is a read (query via POST body)
-        if (std.mem.eql(u8, api, "/jobs/search") or std.mem.eql(u8, api, "/jobs")) {
-            return .read;
-        }
+            // /cron-jobs/{id}/{action} or /crons/{id}/{action}
+            if (std.mem.startsWith(u8, api, "/cron-jobs/"))
+                return classifyCronPostAction(api["/cron-jobs/".len..]);
+            if (std.mem.startsWith(u8, api, "/crons/"))
+                return classifyCronPostAction(api["/crons/".len..]);
+        },
+
+        .PUT => {
+            // PUT /cron-jobs/{id} or /crons/{id}
+            if (std.mem.startsWith(u8, api, "/cron-jobs/")) {
+                const id = api["/cron-jobs/".len..];
+                if (id.len > 0 and std.mem.indexOfScalar(u8, id, '/') == null)
+                    return writeRoute(rpc.MSG_CRON_UPDATE, id, "");
+            }
+            if (std.mem.startsWith(u8, api, "/crons/")) {
+                const id = api["/crons/".len..];
+                if (id.len > 0 and std.mem.indexOfScalar(u8, id, '/') == null)
+                    return writeRoute(rpc.MSG_CRON_UPDATE, id, "");
+            }
+        },
+
+        .DELETE => {
+            // DELETE /jobs/{id}
+            if (std.mem.startsWith(u8, api, "/jobs/")) {
+                const id = api["/jobs/".len..];
+                if (id.len > 0 and std.mem.indexOfScalar(u8, id, '/') == null)
+                    return writeRoute(rpc.MSG_BULK_ACTION, id, "delete");
+            }
+
+            // DELETE /queues/{name}[/{setting}]
+            if (std.mem.startsWith(u8, api, "/queues/"))
+                return classifyQueueAction(.DELETE, api["/queues/".len..]);
+
+            // DELETE /cron-jobs/{id} or /crons/{id}
+            if (std.mem.startsWith(u8, api, "/cron-jobs/")) {
+                const id = api["/cron-jobs/".len..];
+                if (id.len > 0 and std.mem.indexOfScalar(u8, id, '/') == null)
+                    return writeRoute(rpc.MSG_CRON_DELETE, id, "");
+            }
+            if (std.mem.startsWith(u8, api, "/crons/")) {
+                const id = api["/crons/".len..];
+                if (id.len > 0 and std.mem.indexOfScalar(u8, id, '/') == null)
+                    return writeRoute(rpc.MSG_CRON_DELETE, id, "");
+            }
+
+            // DELETE /budgets/{scope}/{target}
+            if (std.mem.startsWith(u8, api, "/budgets/")) {
+                const rest = api["/budgets/".len..];
+                if (std.mem.indexOfScalar(u8, rest, '/')) |s| {
+                    const scope = rest[0..s];
+                    const target = rest[s + 1 ..];
+                    if (scope.len > 0 and target.len > 0)
+                        return writeRoute(rpc.MSG_DELETE_BUDGET, scope, target);
+                }
+            }
+
+            // DELETE /approval-policies/{id}
+            if (std.mem.startsWith(u8, api, "/approval-policies/")) {
+                const id = api["/approval-policies/".len..];
+                if (id.len > 0)
+                    return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, id, "approval_policy_delete");
+            }
+
+            // DELETE /auth/keys
+            if (std.mem.eql(u8, api, "/auth/keys"))
+                return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, "", "api_key_delete");
+        },
+
+        .GET => return .read,
+
+        else => {},
     }
 
-    // --- Read routes (GET, or POST search) ---
+    return .not_found;
+}
 
-    if (method == .GET) {
-        // All GET routes under /api/v1/ are reads.
-        return .read;
+fn writeRoute(msg_type: u8, param: []const u8, sub_action: []const u8) RouteAction {
+    return .{ .write = .{ .msg_type = msg_type, .param = param, .sub_action = sub_action } };
+}
+
+fn classifyJobPostAction(rest: []const u8) RouteAction {
+    // rest = "{id}/{action}"
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return .not_found;
+    const id = rest[0..slash];
+    const action = rest[slash + 1 ..];
+    if (id.len == 0 or action.len == 0) return .not_found;
+
+    // Validate known actions
+    const valid = [_][]const u8{ "requeue", "cancel", "hold", "approve", "reject", "move" };
+    for (valid) |v| {
+        if (std.mem.eql(u8, action, v))
+            return writeRoute(rpc.MSG_BULK_ACTION, id, action);
+    }
+    return .not_found;
+}
+
+fn classifyQueueAction(method: Method, rest: []const u8) RouteAction {
+    // rest = "{name}" or "{name}/{action}"
+    const slash = std.mem.indexOfScalar(u8, rest, '/');
+    const name = if (slash) |s| rest[0..s] else rest;
+    const action = if (slash) |s| rest[s + 1 ..] else "";
+    if (name.len == 0) return .not_found;
+
+    if (method == .DELETE) {
+        if (action.len == 0) return writeRoute(rpc.MSG_DELETE_QUEUE, name, "");
+        // DELETE /queues/{name}/throttle or /fairness → remove setting
+        if (std.mem.eql(u8, action, "throttle")) return writeRoute(rpc.MSG_QUEUE_CONFIG, name, "throttle_remove");
+        if (std.mem.eql(u8, action, "fairness")) return writeRoute(rpc.MSG_QUEUE_CONFIG, name, "fairness_remove");
+        return .not_found;
     }
 
+    // POST
+    if (action.len == 0) return .not_found;
+    if (std.mem.eql(u8, action, "clear")) return writeRoute(rpc.MSG_CLEAR_QUEUE, name, "");
+
+    const valid = [_][]const u8{ "pause", "resume", "concurrency", "throttle", "fairness", "drain" };
+    for (valid) |v| {
+        if (std.mem.eql(u8, action, v))
+            return writeRoute(rpc.MSG_QUEUE_CONFIG, name, action);
+    }
+    return .not_found;
+}
+
+fn classifyCronPostAction(rest: []const u8) RouteAction {
+    // rest = "{id}/{action}"
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return .not_found;
+    const id = rest[0..slash];
+    const action = rest[slash + 1 ..];
+    if (id.len == 0 or action.len == 0) return .not_found;
+
+    if (std.mem.eql(u8, action, "trigger")) return writeRoute(rpc.MSG_CRON_TRIGGER, id, "");
+    if (std.mem.eql(u8, action, "pause")) return writeRoute(rpc.MSG_CRON_UPDATE, id, "pause");
+    if (std.mem.eql(u8, action, "resume")) return writeRoute(rpc.MSG_CRON_UPDATE, id, "resume");
     return .not_found;
 }
 
@@ -297,11 +440,11 @@ pub const DecodeResult = struct {
 
 /// Decode an HTTP write request body into an OpData for the pipeline batch.
 /// `scratch` provides pre-allocated buffers for parsed data.
-/// `id_buf` is filled with a generated job_id when needed.
 pub fn decodeWrite(
     msg_type: u8,
     body: []const u8,
     param: []const u8,
+    sub_action: []const u8,
     now_ns: u64,
     scratch: *DecodeScratch,
 ) DecodeResult {
@@ -311,6 +454,23 @@ pub fn decodeWrite(
         rpc.MSG_ACK_BATCH => return decodeAck(body, param, now_ns, scratch),
         rpc.MSG_FAIL_BATCH => return decodeFail(body, param, now_ns, scratch),
         rpc.MSG_HEARTBEAT => return decodeHeartbeat(body, now_ns, scratch),
+        rpc.MSG_BULK_ACTION => return decodeBulkAction(body, param, sub_action, now_ns, scratch),
+        rpc.MSG_QUEUE_CONFIG => return decodeQueueConfig(body, param, sub_action),
+        rpc.MSG_CLEAR_QUEUE => return .{ .op_data = .{ .clear_queue = .{ .queue = param, .now_ns = now_ns } }, .count = 1 },
+        rpc.MSG_DELETE_QUEUE => return .{ .op_data = .{ .delete_queue = .{ .queue = param, .now_ns = now_ns } }, .count = 1 },
+        rpc.MSG_BATCH_CREATE => return decodeBatchCreate(body, now_ns, scratch),
+        rpc.MSG_BATCH_SEAL => return .{ .op_data = .{ .batch_seal = .{ .batch_id = param, .now_ns = now_ns } }, .count = 1 },
+        rpc.MSG_CRON_CREATE => return decodeCronCreate(body, now_ns, scratch),
+        rpc.MSG_CRON_UPDATE => return decodeCronUpdate(body, param, sub_action, now_ns),
+        rpc.MSG_CRON_DELETE => return .{ .op_data = .{ .cron_delete = .{ .cron_id = param } }, .count = 1 },
+        rpc.MSG_CRON_TRIGGER => return .{ .op_data = .{ .cron_trigger = .{
+            .cron_id = param,
+            .job_id = scratch.id_buf2[0..scratch.id2_len],
+            .now_ns = now_ns,
+        } }, .count = 1 },
+        rpc.MSG_SET_BUDGET => return decodeSetBudget(body, now_ns, scratch),
+        rpc.MSG_DELETE_BUDGET => return .{ .op_data = .{ .delete_budget = .{ .scope = param, .target = sub_action } }, .count = 1 },
+        rpc.MSG_MODIFY_ENT_SETTING => return decodeEntSetting(body, param, sub_action, scratch),
         else => return .{ .op_data = .{ .enqueue = .{} }, .count = 0 },
     }
 }
@@ -323,6 +483,11 @@ pub const DecodeScratch = struct {
     hb_ops: [128]ops_mod.HeartbeatJobOp = undefined,
     queue_slices: [16][]const u8 = undefined,
     id_buf: [64]u8 = undefined,
+    // Bulk action job_ids (parsed from JSON array)
+    bulk_ids: [128][]const u8 = undefined,
+    // Secondary ID buf for generated cron_id, batch_id, budget_id, trigger job_id
+    id_buf2: [64]u8 = undefined,
+    id2_len: u8 = 0,
 };
 
 fn decodeEnqueue(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
@@ -520,6 +685,239 @@ fn decodeHeartbeat(body: []const u8, now_ns: u64, scratch: *DecodeScratch) Decod
     };
 }
 
+fn decodeBulkAction(body: []const u8, param: []const u8, sub_action: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
+    if (sub_action.len > 0) {
+        // Single-job action from URL: /jobs/{id}/{action}
+        scratch.bulk_ids[0] = param;
+        const action = parseBulkAction(sub_action) orelse return .{ .op_data = .{ .bulk_action = .{} }, .count = 0 };
+        var op = ops_mod.BulkActionOp{
+            .job_ids = scratch.bulk_ids[0..1],
+            .action = action,
+            .now_ns = now_ns,
+        };
+        if (action == .move) {
+            op.move_to_queue = extractJSONString(body, "queue") orelse "";
+        }
+        return .{ .op_data = .{ .bulk_action = op }, .count = 1 };
+    }
+
+    // Bulk from body: POST /jobs/bulk
+    const action_str = extractJSONString(body, "action") orelse
+        return .{ .op_data = .{ .bulk_action = .{} }, .count = 0 };
+    const action = parseBulkAction(action_str) orelse
+        return .{ .op_data = .{ .bulk_action = .{} }, .count = 0 };
+    const count = extractJSONStringArray(body, "job_ids", &scratch.bulk_ids);
+    if (count == 0) return .{ .op_data = .{ .bulk_action = .{} }, .count = 0 };
+
+    var op = ops_mod.BulkActionOp{
+        .job_ids = scratch.bulk_ids[0..count],
+        .action = action,
+        .now_ns = now_ns,
+    };
+    if (action == .move)
+        op.move_to_queue = extractJSONString(body, "move_to_queue");
+    if (action == .change_priority) {
+        if (extractJSONInt(body, "priority")) |p|
+            op.priority = @intCast(std.math.clamp(p, 0, 255));
+    }
+    return .{ .op_data = .{ .bulk_action = op }, .count = @intCast(count) };
+}
+
+fn parseBulkAction(s: []const u8) ?ops_mod.BulkAction {
+    if (std.mem.eql(u8, s, "delete")) return .delete;
+    if (std.mem.eql(u8, s, "cancel")) return .cancel;
+    if (std.mem.eql(u8, s, "move")) return .move;
+    if (std.mem.eql(u8, s, "requeue")) return .requeue;
+    if (std.mem.eql(u8, s, "change_priority")) return .change_priority;
+    if (std.mem.eql(u8, s, "hold")) return .hold;
+    if (std.mem.eql(u8, s, "approve")) return .approve;
+    if (std.mem.eql(u8, s, "reject")) return .reject;
+    return null;
+}
+
+fn decodeQueueConfig(body: []const u8, queue: []const u8, sub_action: []const u8) DecodeResult {
+    var op = ops_mod.QueueOp{ .queue = queue };
+
+    if (std.mem.eql(u8, sub_action, "pause") or std.mem.eql(u8, sub_action, "drain")) {
+        op.action = .pause;
+    } else if (std.mem.eql(u8, sub_action, "resume")) {
+        op.action = .@"resume";
+    } else if (std.mem.eql(u8, sub_action, "concurrency")) {
+        op.action = .concurrency;
+        if (extractJSONInt(body, "max")) |m|
+            op.max_concurrency = @intCast(std.math.clamp(m, 0, std.math.maxInt(i32)));
+    } else if (std.mem.eql(u8, sub_action, "throttle")) {
+        op.action = .throttle;
+        if (extractJSONInt(body, "rate")) |r|
+            op.rate_limit = @intCast(std.math.clamp(r, 0, std.math.maxInt(i32)));
+        op.rate_window_ms = if (extractJSONInt(body, "window_ms")) |w|
+            @intCast(std.math.clamp(w, 0, std.math.maxInt(i32)))
+        else
+            1000;
+    } else if (std.mem.eql(u8, sub_action, "fairness")) {
+        op.action = .fairness;
+        op.fairness = true;
+    } else if (std.mem.eql(u8, sub_action, "throttle_remove")) {
+        op.action = .throttle;
+        op.rate_limit = 0;
+        op.rate_window_ms = 0;
+    } else if (std.mem.eql(u8, sub_action, "fairness_remove")) {
+        op.action = .fairness;
+        op.fairness = false;
+    } else {
+        return .{ .op_data = .{ .queue_config = .{} }, .count = 0 };
+    }
+
+    return .{ .op_data = .{ .queue_config = op }, .count = 1 };
+}
+
+fn decodeBatchCreate(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
+    const callback_queue = extractJSONString(body, "callback_queue") orelse "";
+    return .{
+        .op_data = .{ .batch_create = .{
+            .batch_id = scratch.id_buf2[0..scratch.id2_len],
+            .callback_queue = callback_queue,
+            .callback_payload = extractJSONRaw(body, "callback_payload"),
+            .created_at_ns = now_ns,
+        } },
+        .count = 1,
+    };
+}
+
+fn decodeCronCreate(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
+    const name = extractJSONString(body, "name") orelse
+        return .{ .op_data = .{ .cron_create = .{} }, .count = 0 };
+    const queue = extractJSONString(body, "queue") orelse
+        return .{ .op_data = .{ .cron_create = .{} }, .count = 0 };
+    const schedule = extractJSONString(body, "schedule") orelse
+        return .{ .op_data = .{ .cron_create = .{} }, .count = 0 };
+
+    var op = ops_mod.CreateCronOp{
+        .cron_id = scratch.id_buf2[0..scratch.id2_len],
+        .name = name,
+        .queue = queue,
+        .schedule = schedule,
+        .timezone = extractJSONString(body, "timezone") orelse "UTC",
+        .payload = extractJSONRaw(body, "payload"),
+        .unique_key = extractJSONString(body, "unique_key"),
+        .created_at_ns = now_ns,
+        .now_ns = now_ns,
+    };
+    if (extractJSONInt(body, "max_retries")) |mr|
+        op.max_retries = @intCast(std.math.clamp(mr, 0, 100));
+    if (extractJSONBool(body, "enabled")) |e|
+        op.enabled = e;
+
+    return .{ .op_data = .{ .cron_create = op }, .count = 1 };
+}
+
+fn decodeCronUpdate(body: []const u8, cron_id: []const u8, sub_action: []const u8, now_ns: u64) DecodeResult {
+    var op = ops_mod.UpdateCronOp{
+        .cron_id = cron_id,
+        .now_ns = now_ns,
+    };
+
+    if (std.mem.eql(u8, sub_action, "pause")) {
+        op.enabled = false;
+    } else if (std.mem.eql(u8, sub_action, "resume")) {
+        op.enabled = true;
+    } else {
+        // Full update from body
+        op.name = extractJSONString(body, "name");
+        op.queue = extractJSONString(body, "queue");
+        op.schedule = extractJSONString(body, "schedule");
+        op.timezone = extractJSONString(body, "timezone");
+        op.payload = extractJSONRaw(body, "payload");
+        op.unique_key = extractJSONString(body, "unique_key");
+        if (extractJSONInt(body, "max_retries")) |mr|
+            op.max_retries = @intCast(std.math.clamp(mr, 0, 100));
+        if (extractJSONBool(body, "enabled")) |e|
+            op.enabled = e;
+    }
+
+    return .{ .op_data = .{ .cron_update = op }, .count = 1 };
+}
+
+fn decodeSetBudget(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
+    const scope = extractJSONString(body, "scope") orelse "";
+    const target = extractJSONString(body, "target") orelse "";
+
+    var op = ops_mod.SetBudgetOp{
+        .id = scratch.id_buf2[0..scratch.id2_len],
+        .scope = scope,
+        .target = target,
+        .created_at_ns = now_ns,
+    };
+    if (extractJSONFloat(body, "daily_usd")) |d| op.daily_usd = d;
+    if (extractJSONFloat(body, "per_job_usd")) |p| op.per_job_usd = p;
+    if (extractJSONString(body, "on_exceed")) |oe| op.on_exceed = oe;
+
+    return .{ .op_data = .{ .set_budget = op }, .count = 1 };
+}
+
+fn decodeEntSetting(body: []const u8, param: []const u8, sub_action: []const u8, scratch: *DecodeScratch) DecodeResult {
+    if (std.mem.eql(u8, sub_action, "approval_policy")) {
+        return .{ .op_data = .{ .modify_ent_setting = .{
+            .setting = .approval_policy,
+            .id = scratch.id_buf2[0..scratch.id2_len],
+            .data = if (body.len > 0) body else null,
+        } }, .count = 1 };
+    }
+    if (std.mem.eql(u8, sub_action, "approval_policy_delete")) {
+        return .{ .op_data = .{ .modify_ent_setting = .{
+            .setting = .approval_policy,
+            .id = param,
+            .data = null,
+        } }, .count = 1 };
+    }
+    if (std.mem.eql(u8, sub_action, "api_key")) {
+        return .{ .op_data = .{ .modify_ent_setting = .{
+            .setting = .api_key,
+            .id = scratch.id_buf2[0..scratch.id2_len],
+            .data = if (body.len > 0) body else null,
+        } }, .count = 1 };
+    }
+    if (std.mem.eql(u8, sub_action, "api_key_delete")) {
+        // key_hash from body
+        const key_hash = extractJSONString(body, "key_hash") orelse "";
+        return .{ .op_data = .{ .modify_ent_setting = .{
+            .setting = .api_key,
+            .id = key_hash,
+            .data = null,
+        } }, .count = 1 };
+    }
+    return .{ .op_data = .{ .modify_ent_setting = .{} }, .count = 0 };
+}
+
+/// Extract a JSON boolean value: "key":true → true, "key":false → false.
+pub fn extractJSONBool(body: []const u8, key: []const u8) ?bool {
+    var search_buf: [128]u8 = undefined;
+    const search_key = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
+    const start = std.mem.indexOf(u8, body, search_key) orelse return null;
+    var val_start = start + search_key.len;
+    while (val_start < body.len and body[val_start] == ' ') val_start += 1;
+    if (val_start >= body.len) return null;
+    if (val_start + 4 <= body.len and std.mem.eql(u8, body[val_start..][0..4], "true")) return true;
+    if (val_start + 5 <= body.len and std.mem.eql(u8, body[val_start..][0..5], "false")) return false;
+    return null;
+}
+
+/// Extract a JSON float value: "key":1.5 → 1.5.
+pub fn extractJSONFloat(body: []const u8, key: []const u8) ?f64 {
+    var search_buf: [128]u8 = undefined;
+    const search_key = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
+    const start = std.mem.indexOf(u8, body, search_key) orelse return null;
+    var val_start = start + search_key.len;
+    while (val_start < body.len and body[val_start] == ' ') val_start += 1;
+    if (val_start >= body.len) return null;
+    var end = val_start;
+    if (end < body.len and body[end] == '-') end += 1;
+    while (end < body.len and ((body[end] >= '0' and body[end] <= '9') or body[end] == '.'))
+        end += 1;
+    if (end == val_start) return null;
+    return std.fmt.parseFloat(f64, body[val_start..end]) catch null;
+}
+
 fn errResult(comptime op: ops_mod.OpType) DecodeResult {
     return .{
         .op_data = switch (op) {
@@ -543,7 +941,8 @@ pub fn encodeWriteResponse(
     send_buf: []u8,
     msg_type: u8,
     result: *const ops_mod.OpResult,
-    job_id: []const u8,
+    path_param: []const u8,
+    sub_action: []const u8,
 ) u32 {
     if (result.err) |err| {
         if (std.mem.eql(u8, err, "unique_existing")) {
@@ -565,20 +964,61 @@ pub fn encodeWriteResponse(
             var jw = json.JsonWriter.init(&body_buf);
             jw.beginObject();
             jw.beginObjectField("job");
-            jw.fieldStr("id", job_id);
+            jw.fieldStr("id", path_param);
             jw.endObject();
             jw.endObject();
             return writeResponse(send_buf, 201, jw.getWritten());
         },
-        rpc.MSG_FETCH_BATCH => {
-            return encodeFetchResponse(send_buf, result);
+        rpc.MSG_FETCH_BATCH => return encodeFetchResponse(send_buf, result),
+        rpc.MSG_ACK_BATCH, rpc.MSG_FAIL_BATCH, rpc.MSG_HEARTBEAT => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
+        rpc.MSG_BULK_ACTION => return encodeAffectedResponse(send_buf, result.affected, sub_action),
+        rpc.MSG_QUEUE_CONFIG => return encodeQueueConfigResponse(send_buf, sub_action),
+        rpc.MSG_CLEAR_QUEUE => return encodeAffectedResponse(send_buf, result.affected, ""),
+        rpc.MSG_DELETE_QUEUE => return writeResponse(send_buf, 200, "{\"status\":\"deleted\"}"),
+        rpc.MSG_BATCH_CREATE => {
+            var body_buf: [256]u8 = undefined;
+            var jw = json.JsonWriter.init(&body_buf);
+            jw.beginObject();
+            jw.fieldStr("batch_id", path_param);
+            jw.endObject();
+            return writeResponse(send_buf, 201, jw.getWritten());
         },
-        rpc.MSG_ACK_BATCH,
-        rpc.MSG_FAIL_BATCH,
-        => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
-        rpc.MSG_HEARTBEAT => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
+        rpc.MSG_BATCH_SEAL => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
+        rpc.MSG_CRON_CREATE => {
+            var body_buf: [256]u8 = undefined;
+            var jw = json.JsonWriter.init(&body_buf);
+            jw.beginObject();
+            jw.fieldStr("cron_id", path_param);
+            jw.endObject();
+            return writeResponse(send_buf, 201, jw.getWritten());
+        },
+        rpc.MSG_CRON_UPDATE, rpc.MSG_CRON_DELETE, rpc.MSG_CRON_TRIGGER => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
+        rpc.MSG_SET_BUDGET, rpc.MSG_DELETE_BUDGET => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
+        rpc.MSG_MODIFY_ENT_SETTING => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
         else => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
     }
+}
+
+fn encodeAffectedResponse(send_buf: []u8, affected: u32, sub_action: []const u8) u32 {
+    // Single-job actions with a sub_action get a status response
+    if (sub_action.len > 0 and !std.mem.eql(u8, sub_action, "delete")) {
+        if (std.mem.eql(u8, sub_action, "move"))
+            return writeResponse(send_buf, 200, "{\"status\":\"moved\"}");
+        return writeResponse(send_buf, 200, "{\"status\":\"ok\"}");
+    }
+    var body_buf: [128]u8 = undefined;
+    var jw = json.JsonWriter.init(&body_buf);
+    jw.beginObject();
+    jw.fieldInt("affected", affected);
+    jw.endObject();
+    return writeResponse(send_buf, 200, jw.getWritten());
+}
+
+fn encodeQueueConfigResponse(send_buf: []u8, sub_action: []const u8) u32 {
+    if (std.mem.eql(u8, sub_action, "pause")) return writeResponse(send_buf, 200, "{\"status\":\"paused\"}");
+    if (std.mem.eql(u8, sub_action, "resume")) return writeResponse(send_buf, 200, "{\"status\":\"resumed\"}");
+    if (std.mem.eql(u8, sub_action, "drain")) return writeResponse(send_buf, 200, "{\"status\":\"draining\"}");
+    return writeResponse(send_buf, 200, "{\"status\":\"ok\"}");
 }
 
 fn encodeFetchResponse(send_buf: []u8, result: *const ops_mod.OpResult) u32 {
@@ -822,10 +1262,153 @@ test "classifyRoute — writes" {
     const ack = classifyRoute(.POST, "/api/v1/ack/job-123");
     try std.testing.expect(ack == .write);
     try std.testing.expectEqualStrings("job-123", ack.write.param);
+
+    // Bulk
+    const bulk = classifyRoute(.POST, "/api/v1/jobs/bulk");
+    try std.testing.expect(bulk == .write);
+    try std.testing.expectEqual(rpc.MSG_BULK_ACTION, bulk.write.msg_type);
+
+    // Single job action
+    const cancel = classifyRoute(.POST, "/api/v1/jobs/j1/cancel");
+    try std.testing.expect(cancel == .write);
+    try std.testing.expectEqualStrings("j1", cancel.write.param);
+    try std.testing.expectEqualStrings("cancel", cancel.write.sub_action);
+
+    // Queue config
+    const pause = classifyRoute(.POST, "/api/v1/queues/myq/pause");
+    try std.testing.expect(pause == .write);
+    try std.testing.expectEqual(rpc.MSG_QUEUE_CONFIG, pause.write.msg_type);
+    try std.testing.expectEqualStrings("myq", pause.write.param);
+    try std.testing.expectEqualStrings("pause", pause.write.sub_action);
+
+    // Queue clear
+    const clear = classifyRoute(.POST, "/api/v1/queues/q1/clear");
+    try std.testing.expect(clear == .write);
+    try std.testing.expectEqual(rpc.MSG_CLEAR_QUEUE, clear.write.msg_type);
+
+    // Queue delete
+    const qdel = classifyRoute(.DELETE, "/api/v1/queues/q1");
+    try std.testing.expect(qdel == .write);
+    try std.testing.expectEqual(rpc.MSG_DELETE_QUEUE, qdel.write.msg_type);
+    try std.testing.expectEqualStrings("q1", qdel.write.param);
+
+    // Batch
+    const bc = classifyRoute(.POST, "/api/v1/batch");
+    try std.testing.expect(bc == .write);
+    try std.testing.expectEqual(rpc.MSG_BATCH_CREATE, bc.write.msg_type);
+
+    const seal = classifyRoute(.POST, "/api/v1/batch/b1/seal");
+    try std.testing.expect(seal == .write);
+    try std.testing.expectEqualStrings("b1", seal.write.param);
+
+    // Cron
+    const cc = classifyRoute(.POST, "/api/v1/cron-jobs");
+    try std.testing.expect(cc == .write);
+    try std.testing.expectEqual(rpc.MSG_CRON_CREATE, cc.write.msg_type);
+
+    const cu = classifyRoute(.PUT, "/api/v1/cron-jobs/c1");
+    try std.testing.expect(cu == .write);
+    try std.testing.expectEqual(rpc.MSG_CRON_UPDATE, cu.write.msg_type);
+
+    const cd = classifyRoute(.DELETE, "/api/v1/crons/c1");
+    try std.testing.expect(cd == .write);
+    try std.testing.expectEqual(rpc.MSG_CRON_DELETE, cd.write.msg_type);
+
+    const ct = classifyRoute(.POST, "/api/v1/cron-jobs/c1/trigger");
+    try std.testing.expect(ct == .write);
+    try std.testing.expectEqual(rpc.MSG_CRON_TRIGGER, ct.write.msg_type);
+
+    // Budget
+    const bs = classifyRoute(.POST, "/api/v1/budgets");
+    try std.testing.expect(bs == .write);
+    try std.testing.expectEqual(rpc.MSG_SET_BUDGET, bs.write.msg_type);
+
+    const bd = classifyRoute(.DELETE, "/api/v1/budgets/queue/default");
+    try std.testing.expect(bd == .write);
+    try std.testing.expectEqualStrings("queue", bd.write.param);
+    try std.testing.expectEqualStrings("default", bd.write.sub_action);
+
+    // DELETE job
+    const jdel = classifyRoute(.DELETE, "/api/v1/jobs/j1");
+    try std.testing.expect(jdel == .write);
+    try std.testing.expectEqual(rpc.MSG_BULK_ACTION, jdel.write.msg_type);
+    try std.testing.expectEqualStrings("delete", jdel.write.sub_action);
 }
 
 test "classifyRoute — not found" {
     try std.testing.expect(classifyRoute(.GET, "/nonexistent") == .not_found);
+}
+
+test "classifyRoute — queue throttle delete" {
+    const del = classifyRoute(.DELETE, "/api/v1/queues/tq/throttle");
+    try std.testing.expect(del == .write);
+    try std.testing.expectEqual(rpc.MSG_QUEUE_CONFIG, del.write.msg_type);
+    try std.testing.expectEqualStrings("throttle_remove", del.write.sub_action);
+}
+
+test "decodeBulkAction — single job cancel" {
+    var scratch = DecodeScratch{};
+    const result = decodeBulkAction("", "job-1", "cancel", 1000, &scratch);
+    const op = result.op_data.bulk_action;
+    try std.testing.expectEqual(@as(usize, 1), op.job_ids.len);
+    try std.testing.expectEqualStrings("job-1", op.job_ids[0]);
+    try std.testing.expectEqual(ops_mod.BulkAction.cancel, op.action);
+}
+
+test "decodeBulkAction — bulk from body" {
+    var scratch = DecodeScratch{};
+    const body = "{\"action\":\"cancel\",\"job_ids\":[\"j1\",\"j2\"]}";
+    const result = decodeBulkAction(body, "", "", 1000, &scratch);
+    const op = result.op_data.bulk_action;
+    try std.testing.expectEqual(@as(usize, 2), op.job_ids.len);
+    try std.testing.expectEqual(ops_mod.BulkAction.cancel, op.action);
+}
+
+test "decodeQueueConfig — pause" {
+    const result = decodeQueueConfig("", "myq", "pause");
+    const op = result.op_data.queue_config;
+    try std.testing.expectEqualStrings("myq", op.queue);
+    try std.testing.expectEqual(ops_mod.QueueAction.pause, op.action);
+}
+
+test "decodeQueueConfig — concurrency" {
+    const result = decodeQueueConfig("{\"max\":5}", "cq", "concurrency");
+    const op = result.op_data.queue_config;
+    try std.testing.expectEqual(ops_mod.QueueAction.concurrency, op.action);
+    try std.testing.expectEqual(@as(u32, 5), op.max_concurrency);
+}
+
+test "decodeQueueConfig — throttle" {
+    const result = decodeQueueConfig("{\"rate\":10,\"window_ms\":2000}", "tq", "throttle");
+    const op = result.op_data.queue_config;
+    try std.testing.expectEqual(ops_mod.QueueAction.throttle, op.action);
+    try std.testing.expectEqual(@as(u32, 10), op.rate_limit);
+    try std.testing.expectEqual(@as(u32, 2000), op.rate_window_ms);
+}
+
+test "decodeCronCreate" {
+    var scratch = DecodeScratch{};
+    scratch.id2_len = 4;
+    @memcpy(scratch.id_buf2[0..4], "cid1");
+    const body = "{\"name\":\"test\",\"queue\":\"cq\",\"schedule\":\"* * * * *\",\"max_retries\":3}";
+    const result = decodeCronCreate(body, 1000, &scratch);
+    const op = result.op_data.cron_create;
+    try std.testing.expectEqualStrings("test", op.name);
+    try std.testing.expectEqualStrings("cq", op.queue);
+    try std.testing.expectEqualStrings("* * * * *", op.schedule);
+    try std.testing.expectEqual(@as(u16, 3), op.max_retries);
+}
+
+test "extractJSONBool" {
+    try std.testing.expectEqual(@as(?bool, true), extractJSONBool("{\"enabled\":true}", "enabled"));
+    try std.testing.expectEqual(@as(?bool, false), extractJSONBool("{\"enabled\":false}", "enabled"));
+    try std.testing.expect(extractJSONBool("{\"count\":1}", "count") == null);
+}
+
+test "extractJSONFloat" {
+    const v = extractJSONFloat("{\"daily_usd\":100.5}", "daily_usd");
+    try std.testing.expect(v != null);
+    try std.testing.expectApproxEqRel(@as(f64, 100.5), v.?, 0.001);
 }
 
 test "extractJSONString" {

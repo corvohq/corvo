@@ -222,11 +222,31 @@ Promote/reclaim notify_queues: handler_maintenance.zig now tracks which queues h
 promoted via `recordPromoteQueue()`, returns them in `OpResult.notify_queues`. Pipeline
 uses this to fulfill fetch subscriptions after maintenance.
 
-### Step 10: Remaining HTTP write routes
-`classifyRoute` currently handles: enqueue, fetch, ack, fail, heartbeat.
-Missing POST/PUT/DELETE routes: bulk actions, queue config, cron CRUD, budgets,
-approval policies, API keys. These all work over RPC already — just need HTTP
-JSON decode/encode wiring in `http.zig`.
+### Step 10: Remaining HTTP write routes — DONE
+All HTTP write routes wired through pipeline_v2. Added to `classifyRoute`:
+- Bulk actions: POST /jobs/bulk, POST /jobs/{id}/{action}, DELETE /jobs/{id}
+- Queue config: POST /queues/{name}/{pause,resume,concurrency,throttle,fairness,clear,drain},
+  DELETE /queues/{name}[/{throttle,fairness}], DELETE /queues/{name}
+- Batch: POST /batch, POST /batch/{id}/seal
+- Cron: POST /cron-jobs, PUT /cron-jobs/{id}, DELETE /cron-jobs/{id},
+  POST /cron-jobs/{id}/{pause,resume,trigger}
+- Budgets: POST /budgets, DELETE /budgets/{scope}/{target}
+- Approval policies: POST /approval-policies, DELETE /approval-policies/{id}
+- API keys: POST /auth/keys, DELETE /auth/keys
+
+Added `sub_action` to RouteAction.write and FrameDesc for URL-embedded actions.
+Added JSON decode functions for all new op types in http.zig.
+Added `extractJSONBool`, `extractJSONFloat` helpers.
+New MSG_* constants in rpc.zig: SET_BUDGET, DELETE_BUDGET, MODIFY_ENT_SETTING.
+Extended `notifyForFrame` to propagate `notify_queues` from any op (was only
+handling enqueue/ack/fail/maintenance — bulk requeue, queue resume, etc. now
+properly wake fetch subscribers).
+9 new unit tests. 279/283 pass (same 4 old-stack failures).
+
+Known gap: HTTP enqueue doesn't trigger notifyForFrame because the payload
+is JSON but notifyForFrame re-parses as RPC binary. Pre-existing issue —
+HTTP fetch doesn't use subscriptions anyway (request-response, no push).
+Fix in step 12 (consistency audit).
 
 ### Step 11: Oplog recording
 Pipeline_v2 stores oplog reference but never calls `append()`. The old pipeline

@@ -64,6 +64,14 @@ pub const MSG_CRON_UPDATE_RESP: u8 = 0x98;
 pub const MSG_CRON_DELETE_RESP: u8 = 0x99;
 pub const MSG_CRON_TRIGGER_RESP: u8 = 0x9A;
 
+// Budget + enterprise (HTTP-only, no RPC binary encoding yet)
+pub const MSG_SET_BUDGET: u8 = 0x1B;
+pub const MSG_DELETE_BUDGET: u8 = 0x1C;
+pub const MSG_MODIFY_ENT_SETTING: u8 = 0x1D;
+pub const MSG_SET_BUDGET_RESP: u8 = 0x9B;
+pub const MSG_DELETE_BUDGET_RESP: u8 = 0x9C;
+pub const MSG_MODIFY_ENT_SETTING_RESP: u8 = 0x9D;
+
 // Response types (server -> client)
 pub const MSG_ENQUEUE_BATCH_RESP: u8 = 0x81;
 pub const MSG_FETCH_BATCH_RESP: u8 = 0x82;
@@ -306,6 +314,9 @@ pub fn responseType(msg_type: u8) ?u8 {
         MSG_CRON_UPDATE => MSG_CRON_UPDATE_RESP,
         MSG_CRON_DELETE => MSG_CRON_DELETE_RESP,
         MSG_CRON_TRIGGER => MSG_CRON_TRIGGER_RESP,
+        MSG_SET_BUDGET => MSG_SET_BUDGET_RESP,
+        MSG_DELETE_BUDGET => MSG_DELETE_BUDGET_RESP,
+        MSG_MODIFY_ENT_SETTING => MSG_MODIFY_ENT_SETTING_RESP,
         else => null,
     };
 }
