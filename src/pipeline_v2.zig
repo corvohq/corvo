@@ -124,6 +124,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
         // needed for requeueRecvs when the deferred responses are flushed.
         pending_recv_conns: [max_completions]u16 = undefined,
         pending_recv_conn_count: u32 = 0,
+        // Recv connections that arrived during sync-repl wait — CQEs consumed
+        // but data is in recv_buf. Processed after deferred batch flushes.
+        deferred_recv_conns: [max_completions]u16 = undefined,
+        deferred_recv_conn_count: u32 = 0,
 
         // Stats
         ticks_total: u64 = 0,
@@ -231,9 +235,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
         pub fn tick(self: *Self) void {
             // 0. Sync replication: check for deferred ack from a previous tick.
-            //    If ack received, flush the deferred responses now. If still waiting,
-            //    drain IO events (close/send_done) but skip new client frames — one
-            //    batch at a time, TigerBeetle style.
+            //    If ack received, flush the deferred responses and fall through to
+            //    the normal tick — connections that received data during the wait
+            //    need their frames extracted. If still waiting, drain IO events
+            //    (close/send_done) and save recv conn_ids for later.
             if (self.pending_ack_seq > 0) {
                 if (self.last_acked_seq.load(.acquire) >= self.pending_ack_seq) {
                     self.encodeResponses();
@@ -244,23 +249,24 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     self.pending_ack_seq = 0;
                     self.pending_recv_conn_count = 0;
                     self.io.submit();
+                    // Fall through to normal tick — process deferred recv connections.
+                } else {
+                    // Still waiting — non-blocking drain so we don't stall in
+                    // io_uring submit_and_wait while the cluster thread updates the atomic.
+                    // Save recv conn_ids: their CQEs are consumed but data is in recv_buf.
+                    const n_pending = self.io.drainNonBlocking(&self.completions);
+                    for (self.completions[0..n_pending]) |completion| {
+                        switch (completion.event) {
+                            .recv => self.deferRecvConn(completion.conn_id),
+                            .accept => {},
+                            .closed => self.onConnClosed(completion.conn_id),
+                            .send_done => self.io.queueRecv(completion.conn_id),
+                        }
+                    }
+                    self.io.submit();
                     self.ticks_total += 1;
                     return;
                 }
-                // Still waiting — non-blocking drain so we don't stall in
-                // io_uring submit_and_wait while the cluster thread updates the atomic.
-                const n_pending = self.io.drainNonBlocking(&self.completions);
-                for (self.completions[0..n_pending]) |completion| {
-                    switch (completion.event) {
-                        .recv => {},
-                        .accept => {},
-                        .closed => self.onConnClosed(completion.conn_id),
-                        .send_done => self.io.queueRecv(completion.conn_id),
-                    }
-                }
-                self.io.submit();
-                self.ticks_total += 1;
-                return;
             }
 
             // 1. Drain IO completions
@@ -296,6 +302,23 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     .send_done => self.io.queueRecv(completion.conn_id),
                 }
             }
+
+            // Include connections that received data during sync-repl wait.
+            // Their CQEs were consumed but data is already in recv_buf.
+            for (self.deferred_recv_conns[0..self.deferred_recv_conn_count]) |dc| {
+                var dup = false;
+                for (recv_conns[0..recv_conn_count]) |existing| {
+                    if (existing == dc) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    recv_conns[recv_conn_count] = dc;
+                    recv_conn_count += 1;
+                }
+            }
+            self.deferred_recv_conn_count = 0;
 
             for (recv_conns[0..recv_conn_count]) |conn_id| {
                 self.extractFrames(conn_id);
@@ -996,6 +1019,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 writer.writeU16(fetched.max_retries);
 
                 // Checkpoint + tags (not stored in FetchedJob — write empty)
+                // u8 length prefix (0 = empty), matching SDK wire format.
                 writer.writeU8(0);
                 writer.writeU8(0);
 
@@ -1064,6 +1088,22 @@ pub fn Pipeline(comptime IoBackend: type) type {
             );
             self.waiting_conns[self.waiting_conn_count] = conn_id;
             self.waiting_conn_count += 1;
+        }
+
+        /// Save a recv conn_id for processing after deferred batch flushes.
+        /// Called during sync-repl wait when recv CQEs arrive but frames cannot
+        /// be processed yet (one batch at a time, TigerBeetle style).
+        fn deferRecvConn(self: *Self, conn_id: u16) void {
+            for (self.deferred_recv_conns[0..self.deferred_recv_conn_count]) |existing| {
+                if (existing == conn_id) return;
+            }
+            assert.check(
+                self.deferred_recv_conn_count < max_completions,
+                "pipeline: deferred_recv_conns overflow",
+                .{},
+            );
+            self.deferred_recv_conns[self.deferred_recv_conn_count] = conn_id;
+            self.deferred_recv_conn_count += 1;
         }
 
         /// Clean up subscription state when a connection closes.
@@ -2056,4 +2096,88 @@ test "maintenance promote wakes fetch subscription" {
     // Job should now be pending — fetch subscription fulfilled.
     try testing.expect(!ctx.backend.conn(fetch_conn).waiting);
     try testing.expectEqual(@as(u64, 1), ctx.pipeline.subscriptions_fulfilled);
+}
+
+fn testReplNoop(_: *anyopaque, _: u16, _: u64, _: []const u8) void {}
+
+test "sync-repl deferred recv connections are not lost" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-sync-repl-deferred");
+    defer ctx.destroy();
+
+    // Enable sync replication with a no-op repl hook.
+    var repl_ctx: u8 = 0;
+    ctx.pipeline.config.sync_replication = true;
+    ctx.pipeline.config.repl_hook = .{
+        .ptr = @ptrCast(&repl_ctx),
+        .replicate_fn = &testReplNoop,
+    };
+
+    const enq_conn = ctx.backend.connect().?;
+    const fetch_conn = ctx.backend.connect().?;
+
+    // 1. Enqueue a job — response will be deferred until follower ack.
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("sync-queue");
+    ew.writePrefixed("sync-job-1");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0);
+
+    ctx.injectFrame(enq_conn, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+    ctx.pipeline.tick();
+
+    // Enqueue processed but deferred — no response yet.
+    try testing.expect(ctx.pipeline.pending_ack_seq > 0);
+    try testing.expect(ctx.readResponse(enq_conn) == null);
+
+    // 2. Fetch arrives while enqueue ack is pending.
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("sync-queue");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 5, fw.written());
+    ctx.pipeline.tick(); // Still waiting — fetch recv saved, not lost.
+
+    try testing.expect(ctx.pipeline.pending_ack_seq > 0);
+    try testing.expectEqual(@as(u32, 1), ctx.pipeline.deferred_recv_conn_count);
+
+    // 3. Ack the enqueue batch — flush + fall through processes deferred fetch.
+    ctx.pipeline.last_acked_seq.store(ctx.pipeline.pending_ack_seq, .release);
+    ctx.pipeline.tick();
+
+    // Enqueue response available.
+    const enq_resp = ctx.readResponse(enq_conn).?;
+    try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, enq_resp.header.msg_type);
+
+    // Fetch was processed (deferred for its own ack).
+    try testing.expect(ctx.pipeline.pending_ack_seq > 0);
+    try testing.expectEqual(@as(u32, 0), ctx.pipeline.deferred_recv_conn_count);
+
+    // 4. Ack the fetch batch — fetch response delivered.
+    ctx.pipeline.last_acked_seq.store(ctx.pipeline.pending_ack_seq, .release);
+    ctx.pipeline.tick();
+
+    // Fetch response should contain the enqueued job.
+    const fetch_resp = ctx.readResponse(fetch_conn).?;
+    try testing.expectEqual(rpc.MSG_FETCH_BATCH_RESP, fetch_resp.header.msg_type);
+    try testing.expectEqual(@as(u32, 5), fetch_resp.header.req_id);
+
+    var r = BufReader{ .data = fetch_resp.payload };
+    const count = try r.readU16();
+    try testing.expectEqual(@as(u16, 1), count);
+    const job_id = try r.readPrefixed();
+    try testing.expectEqualStrings("sync-job-1", job_id);
 }

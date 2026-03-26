@@ -166,8 +166,10 @@ const RpcClient = struct {
             // Skip per-job metadata: attempt, max_retries, checkpoint, tags, payload.
             _ = r.readU16() catch break; // attempt
             _ = r.readU16() catch break; // max_retries
-            _ = r.readPrefixed() catch break; // checkpoint
-            _ = r.readPrefixed() catch break; // tags
+            const ckpt_len = r.readU8() catch break; // checkpoint (u8 len prefix)
+            r.skip(ckpt_len) catch break;
+            const tags_len = r.readU8() catch break; // tags (u8 len prefix)
+            r.skip(tags_len) catch break;
             const pl = r.readU16() catch break; // payload length
             r.skip(pl) catch break; // payload data
         }
@@ -180,8 +182,7 @@ const RpcClient = struct {
         self.req_id +%= 1;
 
         var w = rpc.BufWriter{ .buf = &self.send_buf };
-        const now_ns: u64 = @intCast(@as(i128, std.time.nanoTimestamp()));
-        w.writeU64(now_ns);
+        // Server sets now_ns from its own clock — don't send it.
         w.writeU16(@intCast(acks.len));
 
         for (acks) |a| {

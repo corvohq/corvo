@@ -259,8 +259,9 @@ pub fn encodeFetchResp(writer: *BufWriter, result: *const ops_mod.OpResult, payl
         writer.writeU16(fetched.attempt);
         writer.writeU16(fetched.max_retries);
 
-        writer.writePrefixed("");
-        writer.writePrefixed("");
+        // Checkpoint + tags: u8 length prefix (0 = empty).
+        writer.writeU8(0);
+        writer.writeU8(0);
 
         var payload_buf: [65536]u8 = undefined;
         const payload = payload_fn(job_id, &payload_buf);
