@@ -70,7 +70,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     handler.rebuildState(&stores);
 
     // --- Oplog ---
-    var oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &globalClockNow }, null);
+    var oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &globalClockNow }, null, 1024);
     defer oplog.deinit();
 
     // --- Notifier ---

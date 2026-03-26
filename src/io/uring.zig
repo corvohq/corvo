@@ -132,6 +132,27 @@ pub const UringBackend = struct {
             cqe_count = self.ring.copy_cqes(&self.cqe_buf, 0) catch 0;
         }
 
+        return self.processCqes(out, cqe_count);
+    }
+
+    /// Non-blocking drain: submit pending SQEs and return any ready CQEs.
+    /// Returns 0 immediately if nothing is ready. Used during sync replication
+    /// ack-wait so the pipeline tick loop doesn't block on io_uring while
+    /// waiting for an atomic update from the cluster thread.
+    pub fn drainNonBlocking(self: *UringBackend, out: []Completion) u32 {
+        assert.check(out.len > 0, "drainNonBlocking: output buffer must be non-empty", .{});
+
+        // Submit any pending SQEs without waiting.
+        _ = self.ring.submit() catch 0;
+
+        // Peek for ready CQEs (no syscall wait).
+        const cqe_count = self.ring.copy_cqes(&self.cqe_buf, 0) catch 0;
+
+        return self.processCqes(out, cqe_count);
+    }
+
+    /// Process CQEs from the cqe_buf into the output completion buffer.
+    fn processCqes(self: *UringBackend, out: []Completion, cqe_count: u32) u32 {
         var out_count: u32 = 0;
         for (self.cqe_buf[0..cqe_count]) |cqe| {
             if (out_count >= out.len) break;

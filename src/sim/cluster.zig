@@ -237,7 +237,7 @@ pub const SimCluster = struct {
                 .store = store,
                 .stores = [1]kv.Store{store},
                 .handler = handler_mod.OpHandler.init(allocator),
-                .oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &globalClockNow }, null),
+                .oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &globalClockNow }, null, 1024),
                 .notify = notify_mod.QueueNotifier.init(allocator),
                 .election = election_mod.Election.init(allocator, node_ids[i], peer_lists[i], election_config),
                 .transport = network.newTransport(node_ids[i]),

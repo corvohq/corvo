@@ -70,17 +70,22 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
             std.mem.eql(u8, last_queue_buf[0..last_queue_len], enq.queue);
 
         if (!same_queue) {
-            var qn_buf: keys.KeyBuf = undefined;
-            b.set(keys.queueNameKey(&qn_buf, enq.queue), "");
-
             var qc_buf: keys.KeyBuf = undefined;
             var qc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
             if (b.getInto(keys.queueConfigKey(&qc_buf, enq.queue), &qc_val_buf) == null) {
+                // New queue — enforce resource limit.
+                if (self.queue_configs.count() >= self.max_queues) {
+                    return .{ .err = "max queues exceeded" };
+                }
                 var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
                 const default_q = types.Queue{ .name = enq.queue };
                 const qc_data = codec.encodeQueue(&qc_enc_buf, &default_q);
                 b.set(keys.queueConfigKey(&qc_buf, enq.queue), qc_data);
+                _ = self.putQueueConfig(enq.queue, default_q);
             }
+
+            var qn_buf: keys.KeyBuf = undefined;
+            b.set(keys.queueNameKey(&qn_buf, enq.queue), "");
 
             const ql = @min(enq.queue.len, last_queue_buf.len);
             @memcpy(last_queue_buf[0..ql], enq.queue[0..ql]);

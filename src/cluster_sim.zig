@@ -277,7 +277,7 @@ pub const Cluster = struct {
                 .db = db,
                 .store = store,
                 .handler = handler_mod.OpHandler.init(allocator),
-                .oplog = oplog_mod.Log.init(allocator, .{ .now_fn = simClockNow }, null),
+                .oplog = oplog_mod.Log.init(allocator, .{ .now_fn = simClockNow }, null, 1024),
                 .election = election_mod.Election.init(allocator, id, peers, election_config),
                 .transport = network.newTransport(id),
                 .runner = undefined, // set below

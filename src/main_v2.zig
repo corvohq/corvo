@@ -11,6 +11,10 @@
 //!   --node-id    Node ID for cluster mode (enables cluster)
 //!   --peers      Comma-separated peer list: id@host:port,id@host:port,...
 //!   --sync-repl  Enable sync replication (wait for follower ack before responding)
+//!   --max-payload-size  Max payload size in bytes (default: 65536, max: 262144)
+//!   --max-conns         Max concurrent connections (default: 4096)
+//!   --max-queues        Max number of queues (default: 100)
+//!   --max-tags-per-queue  Max fairness tags per queue (default: 1000)
 
 const std = @import("std");
 const talon = @import("talon");
@@ -18,6 +22,7 @@ const corvo = @import("corvo");
 
 const io_mod = corvo.io;
 const kv = corvo.kv;
+const rpc = corvo.rpc;
 const handler_mod = corvo.handler;
 const oplog_mod = corvo.oplog;
 const notify_mod = corvo.notify;
@@ -97,6 +102,10 @@ pub fn main() !void {
     var node_id: ?[]const u8 = null;
     var peers_spec: ?[]const u8 = null;
     var sync_repl = false;
+    var max_payload_size: u32 = 64 * 1024;
+    var max_conns: u16 = 4096;
+    var max_queues: u32 = 100;
+    var max_tags_per_queue: u32 = 1000;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--bind")) {
@@ -132,7 +141,49 @@ pub fn main() !void {
             };
         } else if (std.mem.eql(u8, arg, "--sync-repl")) {
             sync_repl = true;
+        } else if (std.mem.eql(u8, arg, "--max-payload-size")) {
+            const size_str = args.next() orelse {
+                std.debug.print("--max-payload-size requires an argument\n", .{});
+                return;
+            };
+            max_payload_size = std.fmt.parseInt(u32, size_str, 10) catch {
+                std.debug.print("invalid max-payload-size: {s}\n", .{size_str});
+                return;
+            };
+        } else if (std.mem.eql(u8, arg, "--max-conns")) {
+            const val = args.next() orelse {
+                std.debug.print("--max-conns requires an argument\n", .{});
+                return;
+            };
+            max_conns = std.fmt.parseInt(u16, val, 10) catch {
+                std.debug.print("invalid max-conns: {s}\n", .{val});
+                return;
+            };
+        } else if (std.mem.eql(u8, arg, "--max-queues")) {
+            const val = args.next() orelse {
+                std.debug.print("--max-queues requires an argument\n", .{});
+                return;
+            };
+            max_queues = std.fmt.parseInt(u32, val, 10) catch {
+                std.debug.print("invalid max-queues: {s}\n", .{val});
+                return;
+            };
+        } else if (std.mem.eql(u8, arg, "--max-tags-per-queue")) {
+            const val = args.next() orelse {
+                std.debug.print("--max-tags-per-queue requires an argument\n", .{});
+                return;
+            };
+            max_tags_per_queue = std.fmt.parseInt(u32, val, 10) catch {
+                std.debug.print("invalid max-tags-per-queue: {s}\n", .{val});
+                return;
+            };
         }
+    }
+
+    // Validate max_payload_size against protocol ceiling.
+    if (max_payload_size > rpc.MAX_PAYLOAD_SIZE) {
+        std.debug.print("max-payload-size {d} exceeds protocol max {d}\n", .{ max_payload_size, rpc.MAX_PAYLOAD_SIZE });
+        return;
     }
 
     const cluster_mode = node_id != null;
@@ -159,6 +210,8 @@ pub fn main() !void {
 
     // --- OpHandler ---
     var handler = handler_mod.OpHandler.init(allocator);
+    handler.max_queues = max_queues;
+    handler.max_tags_per_queue = max_tags_per_queue;
     defer handler.deinit();
     handler.rebuildState(&stores);
 
@@ -169,7 +222,7 @@ pub fn main() !void {
     @memcpy(oplog_path_z[0..oplog_path_slice.len], oplog_path_slice);
     oplog_path_z[oplog_path_slice.len] = 0;
 
-    var oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &realClock }, oplog_path_z[0..oplog_path_slice.len :0]);
+    var oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &realClock }, oplog_path_z[0..oplog_path_slice.len :0], 8192);
     defer oplog.deinit();
 
     // --- QueueNotifier ---
@@ -235,11 +288,14 @@ pub fn main() !void {
     const listen_fd = listener.stream.handle;
 
     // --- IO backend ---
+    // Buffer sizes derived from max_payload_size: must fit a complete frame
+    // (header + payload) plus headroom for protocol framing.
+    const buf_size: u32 = max_payload_size + @as(u32, rpc.FRAME_HEADER_SIZE) + 1024;
     var io_backend = try io_mod.Backend.init(allocator, .{
         .listen_fd = listen_fd,
-        .max_conns = 4096,
-        .recv_buf_size = 65536,
-        .send_buf_size = 65536,
+        .max_conns = max_conns,
+        .recv_buf_size = buf_size,
+        .send_buf_size = buf_size,
     });
     defer io_backend.deinit(allocator);
 
@@ -259,6 +315,7 @@ pub fn main() !void {
         if (mirror) |*m| m else null,
         .{
             .clock_fn = &realClock,
+            .max_payload_size = max_payload_size,
             .promote_interval_ns = 1_000_000_000,
             .reclaim_interval_ns = 1_000_000_000,
             .unique_interval_ns = 30_000_000_000,

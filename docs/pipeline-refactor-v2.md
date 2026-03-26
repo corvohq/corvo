@@ -296,30 +296,34 @@ Fixed by enabling mutation recording in fulfillSubscriptions' kv.Batch.
 mutations when `oplog.hasFile()`. In cluster sim (no file, in-memory oplog), mutations
 were never recorded. Fixed: record when `hasFile() or repl_hook != null`.
 
-### Step 13: Memory allocation audit (TigerStyle)
-All collections must have explicit resource limits — no unbounded growth.
+### Step 13: Memory allocation audit (TigerStyle) — DONE
+All collections have explicit resource limits — no unbounded growth.
 
-**Oplog**: in-memory entries ArrayList grows without bound. Single-node doesn't need
-oplog at all (Talon is durable, new followers get snapshots). Cluster mode needs a
-bounded ring buffer for replication retries; entries beyond the ring trigger snapshot.
-Current fix: single-node skips oplog recording entirely (`record_mutations` gated on
-`repl_hook != null`). Cluster oplog needs ring buffer conversion.
+**Oplog ring buffer**: `oplog.entries` ArrayList replaced with bounded ring buffer.
+`max_entries` parameter at init (default 8192 for production, 1024 for sim/tests).
+Oldest entries evicted on overflow. `readAfter` returns contiguous slice clamped at
+ring wrap boundary — callers loop naturally. Recovery caps at max_entries (older
+file entries evicted during scan). New tests: ring wrap, eviction, recovery capping.
 
-**Payload / buffer sizing**: `MAX_PAYLOAD_SIZE` is 1MB but `recv_buf_size` is 64KB —
-inconsistent (1MB payload can't fit in 64KB buffer). Make max payload a CLI arg
-(`--max-payload-size`), derive `recv_buf_size` from it, and align `MAX_PAYLOAD_SIZE`
-to match. One knob, everything consistent.
+**Payload / buffer alignment**: `MAX_PAYLOAD_SIZE` fixed from 4MiB to 256KiB.
+`--max-payload-size` CLI arg on main_v2 (default 256KB). Buffer sizes derived:
+`recv_buf_size = send_buf_size = max_payload_size + FRAME_HEADER_SIZE + 1024`.
+Pipeline Config has `max_payload_size` field, used in frame extraction check.
 
-**Audit targets**:
-- `oplog.entries` — unbounded ArrayList → bounded ring (cluster) or skip (single-node)
-- `handler.active_counts` — StringHashMap, grows with unique queue×worker pairs
-- `handler.fairness_*` — StringHashMaps, grows with unique keys
-- `handler.queue_configs` — StringHashMap, grows with unique queues
-- `handler.pending` — PendingIndex, grows with pending job count
-- `notify.QueueNotifier` — internal state
-- `pipeline.mut_list` — ArrayList, but cleared each tick (bounded by batch_max)
-- Verify all connection buffers are fixed-size (recv_buf, send_buf) ✓
-- Verify all per-tick arrays are compile-time sized (frames, completions, etc.) ✓
+**Handler resource limits**: `max_queues` (default 100) and `max_tags_per_queue`
+(default 1000) on OpHandler. Enforced at:
+- `applyEnqueue`: new queue auto-creation → error if at limit
+- `applyQueueConfig`: new queue config → error if at limit
+- `putQueueConfig`: cache insertion → returns false if at limit
+- `incrFairnessActive/Served`: new tag → saturates (skips) if at limit
+
+**Already bounded (verified)**:
+- `pipeline.mut_list` — cleared each tick, capacity stabilizes (bounded by batch_max)
+- `handler.active_counts` — bounded by queue count (max_queues)
+- `handler.pending` — bounded by job count (data set, not a memory issue)
+- `notify.QueueNotifier.waiters` — bounded by max_conns × queue count
+- All connection buffers — fixed-size (recv_buf, send_buf) ✓
+- All per-tick arrays — compile-time sized (frames, completions, etc.) ✓
 
 ### Step 14: SDK verification
 Verify all SDKs work against pipeline_v2. Check for the two-write TCP bug

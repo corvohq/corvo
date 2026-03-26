@@ -87,7 +87,7 @@ pub const Engine = struct {
             .shards = shards,
             .handler = OpHandler.init(allocator),
             .notify = QueueNotifier.init(allocator),
-            .oplog = Log.init(allocator, .{ .now_fn = clock_fn }, config.oplog_path),
+            .oplog = Log.init(allocator, .{ .now_fn = clock_fn }, config.oplog_path, 8192),
             .allocator = allocator,
         };
     }

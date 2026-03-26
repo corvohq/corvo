@@ -145,6 +145,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
         pub const Config = struct {
             clock_fn: *const fn () i64,
             batch_max: u32 = 256,
+            max_payload_size: u32 = 64 * 1024,
             promote_interval_ns: u64 = 0,
             reclaim_interval_ns: u64 = 0,
             unique_interval_ns: u64 = 0,
@@ -246,8 +247,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     self.ticks_total += 1;
                     return;
                 }
-                // Still waiting — drain IO but don't process new frames.
-                const n_pending = self.io.drain(&self.completions);
+                // Still waiting — non-blocking drain so we don't stall in
+                // io_uring submit_and_wait while the cluster thread updates the atomic.
+                const n_pending = self.io.drainNonBlocking(&self.completions);
                 for (self.completions[0..n_pending]) |completion| {
                     switch (completion.event) {
                         .recv => {},
@@ -384,7 +386,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             while (pos + @as(u32, rpc.FRAME_HEADER_SIZE) <= data_end) {
                 const hdr = rpc.readFrameHeader(c.recv_buf[pos..data_end]) orelse break;
 
-                if (hdr.payload_len > rpc.MAX_PAYLOAD_SIZE) {
+                if (hdr.payload_len > self.config.max_payload_size) {
                     self.io.queueClose(conn_id);
                     return;
                 }
@@ -1390,7 +1392,7 @@ const TestContext = struct {
         self.stores = [1]kv.Store{kv.Store.init(db)};
         self.handler = OpHandler.init(allocator);
         self.handler.rebuildState(&self.stores);
-        self.oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &testClockFn }, oplog_path);
+        self.oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &testClockFn }, oplog_path, 1024);
         self.notify = QueueNotifier.init(allocator);
         self.backend = SimBackend.init(allocator, .{
             .listen_fd = -1,

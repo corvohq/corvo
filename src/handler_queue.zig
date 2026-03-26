@@ -12,16 +12,23 @@ const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
 
 pub fn applyQueueConfig(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.QueueOp) ops.OpResult {
-    // Auto-create the queue if it doesn't exist yet.
     var qn_buf: keys.KeyBuf = undefined;
+    var qc_buf: keys.KeyBuf = undefined;
+    const qc_key = keys.queueConfigKey(&qc_buf, op.queue);
+    const qc_bytes = b.get(qc_key);
+    const is_new = qc_bytes == null;
+
+    // New queue — enforce resource limit.
+    if (is_new and self.queue_configs.count() >= self.max_queues) {
+        return .{ .err = "max queues exceeded" };
+    }
+
+    // Auto-create the queue name key if it doesn't exist yet.
     if (b.get(keys.queueNameKey(&qn_buf, op.queue)) == null) {
         b.set(keys.queueNameKey(&qn_buf, op.queue), "");
     }
 
-    var qc_buf: keys.KeyBuf = undefined;
-    const qc_key = keys.queueConfigKey(&qc_buf, op.queue);
-    const qc_bytes = b.get(qc_key);
-    var queue = if (qc_bytes != null) codec.decodeQueue(qc_bytes.?) else types.Queue{};
+    var queue = if (!is_new) codec.decodeQueue(qc_bytes.?) else types.Queue{};
     queue.name = op.queue;
 
     switch (op.action) {
@@ -50,7 +57,7 @@ pub fn applyQueueConfig(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Queu
     b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &queue));
 
     // Update in-memory cache.
-    self.putQueueConfig(op.queue, queue);
+    _ = self.putQueueConfig(op.queue, queue);
     return .{ .affected = 1 };
 }
 

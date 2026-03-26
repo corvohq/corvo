@@ -54,6 +54,10 @@ pub const OpHandler = struct {
     /// Allocator for handler-owned state (maps, etc).
     allocator: Allocator,
 
+    // Explicit resource limits (TigerStyle: all collections must have bounds).
+    max_queues: u32 = 100,
+    max_tags_per_queue: u32 = 1000,
+
     const mirror_mod = @import("mirror.zig");
 
     const max_side_effects = 32;
@@ -265,7 +269,7 @@ pub const OpHandler = struct {
                     const qc_val = qc_iter.value();
                     const queue = codec.decodeQueue(qc_val);
                     if (queue.name.len > 0) {
-                        self.putQueueConfig(queue.name, queue);
+                        _ = self.putQueueConfig(queue.name, queue);
                     }
                     if (!qc_iter.next()) break;
                 }
@@ -452,6 +456,10 @@ pub const OpHandler = struct {
             qmap.key_ptr.* = self.allocator.dupe(u8, queue) catch unreachable;
             qmap.value_ptr.* = std.StringHashMap(i32).init(self.allocator);
         }
+        // Check tag limit before inserting new tag.
+        if (qmap.value_ptr.get(group) == null and qmap.value_ptr.count() >= self.max_tags_per_queue) {
+            return; // saturate — new tag won't get fairness tracking
+        }
         const entry = qmap.value_ptr.getOrPut(group) catch unreachable;
         if (!entry.found_existing) {
             entry.key_ptr.* = self.allocator.dupe(u8, group) catch unreachable;
@@ -475,6 +483,10 @@ pub const OpHandler = struct {
         if (!qmap.found_existing) {
             qmap.key_ptr.* = self.allocator.dupe(u8, queue) catch unreachable;
             qmap.value_ptr.* = std.StringHashMap(i32).init(self.allocator);
+        }
+        // Check tag limit before inserting new tag.
+        if (qmap.value_ptr.get(group) == null and qmap.value_ptr.count() >= self.max_tags_per_queue) {
+            return; // saturate — new tag won't get fairness scoring
         }
         const entry = qmap.value_ptr.getOrPut(group) catch unreachable;
         if (!entry.found_existing) {
@@ -501,17 +513,23 @@ pub const OpHandler = struct {
         if (qc_bytes == null) return null;
 
         const queue = codec.decodeQueue(qc_bytes.?);
-        self.putQueueConfig(queue_name, queue);
+        _ = self.putQueueConfig(queue_name, queue);
         return queue;
     }
 
     /// Update cache after a queue config change.
-    pub fn putQueueConfig(self: *OpHandler, queue_name: []const u8, queue: types.Queue) void {
-        const entry = self.queue_configs.getOrPut(queue_name) catch return;
+    /// Returns false if a new queue would exceed max_queues.
+    pub fn putQueueConfig(self: *OpHandler, queue_name: []const u8, queue: types.Queue) bool {
+        // Check limit before inserting a new key.
+        if (self.queue_configs.get(queue_name) == null and self.queue_configs.count() >= self.max_queues) {
+            return false;
+        }
+        const entry = self.queue_configs.getOrPut(queue_name) catch return false;
         if (!entry.found_existing) {
-            entry.key_ptr.* = self.allocator.dupe(u8, queue_name) catch return;
+            entry.key_ptr.* = self.allocator.dupe(u8, queue_name) catch return false;
         }
         entry.value_ptr.* = queue;
+        return true;
     }
 
     /// Remove from cache (on queue delete).

@@ -115,6 +115,11 @@ pub const SimBackend = struct {
         return n;
     }
 
+    /// Non-blocking drain — same as drain for SimBackend (already non-blocking).
+    pub fn drainNonBlocking(self: *SimBackend, out: []Completion) u32 {
+        return self.drain(out);
+    }
+
     /// Mark a send as pending. submit() will convert to send_done completion.
     pub fn queueSend(self: *SimBackend, conn_id: u16, len: u32) void {
         assert.check(conn_id < self.max_conns, "SimBackend.queueSend: conn_id out of range", .{});

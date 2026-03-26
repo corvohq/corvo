@@ -27,7 +27,7 @@ const codec = @import("codec.zig");
 // ============================================================================
 
 pub const FRAME_HEADER_SIZE: usize = 9;
-pub const MAX_PAYLOAD_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB
+pub const MAX_PAYLOAD_SIZE: u32 = 256 * 1024; // 256 KiB
 pub const MAX_BATCH_JOBS: u16 = 256;
 
 // Request types (client -> server)
