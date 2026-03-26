@@ -76,13 +76,29 @@ pub fn Pipeline(comptime IoBackend: type) type {
         hb_ops_buf: [max_batch_jobs]ops_mod.HeartbeatJobOp = undefined,
         bulk_ids_buf: [max_batch_jobs][]const u8 = undefined,
 
+        // Send tracking: connections with data to flush (populated by encode + fulfill)
+        send_conns: [max_frames + max_waiting_conns]u16 = undefined,
+        send_conn_count: u32 = 0,
+
+        // Fetch subscription tracking
+        waiting_conns: [max_waiting_conns]u16 = [_]u16{0} ** max_waiting_conns,
+        waiting_conn_count: u32 = 0,
+
+        // Notified queues this tick (collected during notifyForFrame)
+        notified_queue_bufs: [max_notified_queues][64]u8 = undefined,
+        notified_queue_lens: [max_notified_queues]u8 = [_]u8{0} ** max_notified_queues,
+        notified_queue_count: u32 = 0,
+
         // Stats
         ticks_total: u64 = 0,
         applied_total: u64 = 0,
+        subscriptions_fulfilled: u64 = 0,
 
         const max_batch_jobs = rpc.MAX_BATCH_JOBS;
         const max_frames: u32 = 256;
         const max_completions: u32 = 256;
+        const max_waiting_conns: u32 = 4096;
+        const max_notified_queues: u32 = 64;
 
         // ====================================================================
         // Config
@@ -146,10 +162,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
             // 1. Drain IO completions
             const n = self.io.drain(&self.completions);
 
-            // 2. Process completions — collect unique recv conn_ids
+            // Reset per-tick state.
             self.frame_count = 0;
             self.recv_compaction_count = 0;
+            self.notified_queue_count = 0;
 
+            // 2. Process completions — collect unique recv conn_ids
             var recv_conns: [max_completions]u16 = undefined;
             var recv_conn_count: u32 = 0;
 
@@ -169,8 +187,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
                             recv_conn_count += 1;
                         }
                     },
-                    .accept => self.io.queueAccept(),
-                    .closed => {},
+                    .accept => {},
+                    .closed => self.onConnClosed(completion.conn_id),
                     .send_done => self.io.queueRecv(completion.conn_id),
                 }
             }
@@ -180,6 +198,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
 
             if (self.frame_count == 0) {
+                self.requeueRecvs(recv_conns[0..recv_conn_count]);
                 self.io.submit();
                 self.ticks_total += 1;
                 return;
@@ -188,13 +207,22 @@ pub fn Pipeline(comptime IoBackend: type) type {
             // 3. Execute: decode + apply in single kv.Batch
             self.executeBatch();
 
-            // 4. Encode responses into send_bufs, queue sends
+            // 4. Encode responses into send_bufs (no sends queued yet)
             self.encodeResponses();
 
-            // 5. Compact recv_bufs (payload slices no longer needed)
+            // 5. Push jobs to waiting fetch subscribers (appends to send_bufs)
+            self.fulfillSubscriptions();
+
+            // 6. Flush all accumulated sends (one queueSend per connection)
+            self.flushSends();
+
+            // 7. Compact recv_bufs (payload slices no longer needed)
             self.compactRecvBufs();
 
-            // 6. Submit all queued IO
+            // 8. Re-queue recv for connections with partial frames (no send pending)
+            self.requeueRecvs(recv_conns[0..recv_conn_count]);
+
+            // 9. Submit all queued IO
             self.io.submit();
             self.ticks_total += 1;
         }
@@ -591,18 +619,24 @@ pub fn Pipeline(comptime IoBackend: type) type {
         // Encode — write responses into send_bufs
         // ====================================================================
 
+        /// Encode responses into send_bufs. Does NOT queue sends — call flushSends after.
         fn encodeResponses(self: *Self) void {
-            // Track which connections have response data to send.
-            var send_conns: [max_frames]u16 = undefined;
-            var send_conn_count: u32 = 0;
+            self.send_conn_count = 0;
 
             for (self.frames[0..self.frame_count], 0..) |frame, i| {
                 const c = self.io.conn(frame.conn_id);
                 if (c.phase == .free) continue;
 
+                // RPC fetch with 0 jobs: store subscription, skip response.
+                // HTTP fetch returns empty immediately (request-response protocol).
+                if (frame.msg_type == rpc.MSG_FETCH_BATCH and frame.protocol == .rpc and
+                    self.results[i].affected == 0 and self.results[i].err == null)
+                {
+                    self.storeSubscription(frame.conn_id, &frame);
+                    continue;
+                }
+
                 if (frame.protocol == .http) {
-                    // HTTP: delegate response encoding to http module.
-                    // For enqueue, path_param holds the generated job_id.
                     const resp_len = http.encodeWriteResponse(
                         c.send_buf,
                         frame.msg_type,
@@ -610,10 +644,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         frame.path_param,
                     );
                     if (resp_len > 0) {
-                        if (c.send_len == 0) {
-                            send_conns[send_conn_count] = frame.conn_id;
-                            send_conn_count += 1;
-                        }
+                        self.trackSendConn(frame.conn_id);
                         c.send_len = resp_len;
                     }
                     continue;
@@ -624,11 +655,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     else => rpc.responseType(frame.msg_type) orelse continue,
                 };
 
-                // Track first write to this conn
-                if (c.send_len == 0) {
-                    send_conns[send_conn_count] = frame.conn_id;
-                    send_conn_count += 1;
-                }
+                self.trackSendConn(frame.conn_id);
 
                 // Append response after any previous responses for this conn
                 const write_start = c.send_len;
@@ -647,9 +674,25 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
                 c.send_len += @intCast(writer.pos);
             }
+        }
 
-            // Queue one send per connection with accumulated data
-            for (send_conns[0..send_conn_count]) |conn_id| {
+        /// Record a connection that needs a send flushed (dedup).
+        fn trackSendConn(self: *Self, conn_id: u16) void {
+            for (self.send_conns[0..self.send_conn_count]) |existing| {
+                if (existing == conn_id) return;
+            }
+            assert.check(
+                self.send_conn_count < self.send_conns.len,
+                "pipeline: send_conns overflow",
+                .{},
+            );
+            self.send_conns[self.send_conn_count] = conn_id;
+            self.send_conn_count += 1;
+        }
+
+        /// Queue one send per connection that has accumulated response data.
+        fn flushSends(self: *Self) void {
+            for (self.send_conns[0..self.send_conn_count]) |conn_id| {
                 const c = self.io.conn(conn_id);
                 if (c.send_len > 0) {
                     self.io.queueSend(conn_id, c.send_len);
@@ -726,6 +769,184 @@ pub fn Pipeline(comptime IoBackend: type) type {
         }
 
         // ====================================================================
+        // Fetch subscriptions — store and fulfill
+        // ====================================================================
+
+        /// Store a fetch subscription in ConnState when fetch returned 0 jobs.
+        /// Re-parses the subscription from the frame payload (still valid before compaction).
+        fn storeSubscription(self: *Self, conn_id: u16, frame: *const FrameDesc) void {
+            const c = self.io.conn(conn_id);
+            if (c.phase == .free) return;
+
+            // HTTP: don't subscribe. HTTP is request-response — return empty result immediately.
+            // The client will retry (long-poll behavior is handled at a higher level).
+            if (frame.protocol == .http) return;
+
+            // Re-parse subscription from frame payload.
+            var reader = BufReader{ .data = frame.payload };
+            const sub = rpc.parseFetchSubscribe(&reader) catch return;
+
+            // Copy queue names into ConnState fixed buffers.
+            c.queue_count = sub.queue_count;
+            for (0..sub.queue_count) |qi| {
+                const qname = sub.queues[qi];
+                const qlen: u8 = @intCast(@min(qname.len, c.queue_bufs[qi].len));
+                @memcpy(c.queue_bufs[qi][0..qlen], qname[0..qlen]);
+                c.queue_lens[qi] = qlen;
+            }
+
+            // Copy worker_id.
+            const wlen: u8 = @intCast(@min(sub.worker_id.len, c.worker_id_buf.len));
+            @memcpy(c.worker_id_buf[0..wlen], sub.worker_id[0..wlen]);
+            c.worker_id_len = wlen;
+
+            c.credits = sub.credits;
+            c.lease_ms = sub.lease_ms;
+            c.last_req_id = frame.req_id;
+            c.waiting = true;
+
+            // Add to waiting list (skip if already present).
+            for (self.waiting_conns[0..self.waiting_conn_count]) |wc| {
+                if (wc == conn_id) return;
+            }
+            assert.check(
+                self.waiting_conn_count < max_waiting_conns,
+                "pipeline: waiting_conns overflow",
+                .{},
+            );
+            self.waiting_conns[self.waiting_conn_count] = conn_id;
+            self.waiting_conn_count += 1;
+        }
+
+        /// Clean up subscription state when a connection closes.
+        /// ConnState may already be reset by the IO backend, so we can't check c.waiting.
+        /// Unconditionally try to remove from waiting list.
+        fn onConnClosed(self: *Self, conn_id: u16) void {
+            self.removeWaitingConn(conn_id);
+        }
+
+        /// Remove a connection from the waiting list (e.g., on disconnect or fulfillment).
+        fn removeWaitingConn(self: *Self, conn_id: u16) void {
+            var i: u32 = 0;
+            while (i < self.waiting_conn_count) {
+                if (self.waiting_conns[i] == conn_id) {
+                    // Swap-remove.
+                    self.waiting_conn_count -= 1;
+                    self.waiting_conns[i] = self.waiting_conns[self.waiting_conn_count];
+                    return;
+                }
+                i += 1;
+            }
+        }
+
+        /// After commit+encode, scan waiting connections and push jobs if notified queues match.
+        fn fulfillSubscriptions(self: *Self) void {
+            if (self.notified_queue_count == 0) return;
+            if (self.waiting_conn_count == 0) return;
+
+            // We may modify waiting_conns during iteration (removeWaitingConn uses swap-remove),
+            // so iterate by index and handle carefully.
+            var fulfilled: [max_waiting_conns]u16 = undefined;
+            var fulfilled_count: u32 = 0;
+
+            var kv_batch = self.stores[0].newBatch();
+            defer kv_batch.close();
+            var did_fulfill = false;
+
+            for (self.waiting_conns[0..self.waiting_conn_count]) |conn_id| {
+                const c = self.io.conn(conn_id);
+                if (c.phase == .free or !c.waiting) continue;
+
+                // Check if any subscribed queue was notified this tick.
+                if (!self.hasQueueOverlap(c)) continue;
+
+                // Try to fetch jobs for this subscription.
+                var queue_slices: [16][]const u8 = undefined;
+                for (0..c.queue_count) |qi| {
+                    queue_slices[qi] = c.queue_bufs[qi][0..c.queue_lens[qi]];
+                }
+
+                const op_data = ops_mod.OpData{ .fetch = .{
+                    .queues = queue_slices[0..c.queue_count],
+                    .worker_id = c.worker_id_buf[0..c.worker_id_len],
+                    .lease_duration_ms = c.lease_ms,
+                    .count = c.credits,
+                    .now_ns = self.nowNs(),
+                } };
+
+                const result = self.handler.apply(&kv_batch, .fetch, &op_data);
+
+                if (result.affected == 0) continue; // jobs taken by someone else
+
+                did_fulfill = true;
+                self.emitMirrorOp(.fetch, &op_data, &result);
+
+                // Encode MSG_FETCH_BATCH_RESP into send_buf.
+                const write_start = c.send_len;
+                var writer = BufWriter{ .buf = c.send_buf[write_start..] };
+                writer.pos = rpc.FRAME_HEADER_SIZE;
+
+                self.encodeFetchResult(&writer, &result);
+
+                const payload_len: u32 = @intCast(writer.pos - rpc.FRAME_HEADER_SIZE);
+                rpc.writeFrameHeader(
+                    c.send_buf[write_start..][0..rpc.FRAME_HEADER_SIZE],
+                    rpc.MSG_FETCH_BATCH_RESP,
+                    c.last_req_id,
+                    payload_len,
+                );
+
+                c.send_len += @intCast(writer.pos);
+                self.trackSendConn(conn_id);
+
+                // Clear subscription.
+                c.waiting = false;
+                c.queue_count = 0;
+                c.credits = 0;
+                self.subscriptions_fulfilled += 1;
+
+                // Mark for removal from waiting list.
+                assert.check(fulfilled_count < max_waiting_conns, "pipeline: fulfilled overflow", .{});
+                fulfilled[fulfilled_count] = conn_id;
+                fulfilled_count += 1;
+            }
+
+            if (did_fulfill) kv_batch.commit();
+
+            // Remove fulfilled connections from waiting list.
+            for (fulfilled[0..fulfilled_count]) |conn_id| {
+                self.removeWaitingConn(conn_id);
+            }
+        }
+
+        /// Check if any of the connection's subscribed queues were notified this tick.
+        fn hasQueueOverlap(self: *const Self, c: *const ConnState) bool {
+            for (0..c.queue_count) |qi| {
+                const sub_queue = c.queue_bufs[qi][0..c.queue_lens[qi]];
+                for (0..self.notified_queue_count) |ni| {
+                    const notified = self.notified_queue_bufs[ni][0..self.notified_queue_lens[ni]];
+                    if (std.mem.eql(u8, sub_queue, notified)) return true;
+                }
+            }
+            return false;
+        }
+
+        /// Record a queue name as notified this tick (deduped).
+        fn recordNotifiedQueue(self: *Self, queue: []const u8) void {
+            // Deduplicate.
+            for (0..self.notified_queue_count) |i| {
+                const existing = self.notified_queue_bufs[i][0..self.notified_queue_lens[i]];
+                if (std.mem.eql(u8, existing, queue)) return;
+            }
+            if (self.notified_queue_count >= max_notified_queues) return; // saturate, don't crash
+            const idx = self.notified_queue_count;
+            const qlen: u8 = @intCast(@min(queue.len, 64));
+            @memcpy(self.notified_queue_bufs[idx][0..qlen], queue[0..qlen]);
+            self.notified_queue_lens[idx] = qlen;
+            self.notified_queue_count += 1;
+        }
+
+        // ====================================================================
         // Notify — wake queue waiters post-commit
         // ====================================================================
 
@@ -739,6 +960,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     const parsed = rpc.parseEnqueue(&reader, &self.jobs_buf, 0) catch return;
                     for (parsed.op.jobs) |job| {
                         self.notify.notify(job.queue);
+                        self.recordNotifiedQueue(job.queue);
                     }
                 },
                 rpc.MSG_ACK_BATCH,
@@ -751,12 +973,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         const parsed = rpc.parseAck(&reader, &self.acks_buf) catch return;
                         for (parsed.op.acks) |ack| {
                             self.notify.notify(ack.queue);
+                            self.recordNotifiedQueue(ack.queue);
                         }
                     } else {
                         var reader = BufReader{ .data = frame.payload };
                         const parsed = rpc.parseFail(&reader, &self.fails_buf) catch return;
                         for (parsed.op.jobs) |job| {
                             self.notify.notify(job.queue);
+                            self.recordNotifiedQueue(job.queue);
                         }
                     }
                 },
@@ -767,10 +991,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         const parsed = rpc.management.parseMaintenance(&reader) catch return;
                         switch (parsed.action) {
                             .promote, .reclaim => {
-                                // We don't know which queues were affected.
-                                // The old code used notifyFromOp which checks result.notify_queues.
                                 if (result.notify_queues) |queues| {
                                     self.notify.notifyQueues(queues);
+                                    for (queues) |q| {
+                                        self.recordNotifiedQueue(q);
+                                    }
                                 }
                             },
                             else => {},
@@ -800,6 +1025,22 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 std.mem.copyForwards(u8, c.recv_buf[0..remaining], c.recv_buf[consumed..c.recv_pos]);
             }
             c.recv_pos = @intCast(remaining);
+        }
+
+        // ====================================================================
+        // Recv re-queue — connections with partial frames need more data
+        // ====================================================================
+
+        /// After frame extraction, connections that received data but produced
+        /// no complete response (partial frame) need recv re-queued. Connections
+        /// with a pending send will get recv re-queued via the send_done path.
+        fn requeueRecvs(self: *Self, recv_conns: []const u16) void {
+            for (recv_conns) |conn_id| {
+                const c = self.io.conn(conn_id);
+                if (c.phase == .ready and c.recv_pos < c.recv_buf.len) {
+                    self.io.queueRecv(conn_id);
+                }
+            }
         }
 
         // ====================================================================
@@ -1255,4 +1496,193 @@ test "HTTP incomplete request waits for more data" {
     // No response yet.
     try testing.expect(ctx.readHttpResponse(conn_id) == null);
     try testing.expectEqual(@as(u64, 0), ctx.pipeline.applied_total);
+}
+
+// ============================================================================
+// Fetch Subscription Tests
+// ============================================================================
+
+test "fetch with no jobs stores subscription (no response)" {
+    var ctx: TestContext = undefined;
+    try ctx.init("/tmp/corvo-pv2-fetch-sub");
+    defer ctx.deinit();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Fetch on empty queue — should subscribe, not respond.
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1); // credits
+    fw.writeU32(30000); // lease_ms
+    fw.writePrefixed("worker-1"); // worker_id
+    fw.writeU8(1); // queue_count
+    fw.writePrefixed("empty-queue");
+
+    ctx.injectFrame(conn_id, rpc.MSG_FETCH_BATCH, 10, fw.written());
+    ctx.pipeline.tick();
+
+    // No response — connection is subscribed.
+    try testing.expect(ctx.readResponseHeader(conn_id) == null);
+
+    // ConnState should be marked as waiting.
+    const c = ctx.backend.conn(conn_id);
+    try testing.expect(c.waiting);
+    try testing.expectEqual(@as(u8, 1), c.queue_count);
+    try testing.expectEqualStrings("empty-queue", c.queue_bufs[0][0..c.queue_lens[0]]);
+    try testing.expectEqual(@as(u32, 1), c.credits);
+    try testing.expectEqual(@as(u32, 10), c.last_req_id);
+
+    // Pipeline should track the waiting connection.
+    try testing.expectEqual(@as(u32, 1), ctx.pipeline.waiting_conn_count);
+}
+
+test "enqueue fulfills waiting fetch subscription" {
+    var ctx: TestContext = undefined;
+    try ctx.init("/tmp/corvo-pv2-fetch-push");
+    defer ctx.deinit();
+
+    const fetch_conn = ctx.backend.connect().?;
+    const enq_conn = ctx.backend.connect().?;
+
+    // 1. Fetch on empty queue — subscribes.
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("push-queue");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 5, fw.written());
+    ctx.pipeline.tick();
+
+    try testing.expect(ctx.readResponseHeader(fetch_conn) == null);
+    try testing.expect(ctx.backend.conn(fetch_conn).waiting);
+
+    // Drain send_done so enqueue conn can be used.
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // 2. Enqueue a job to the subscribed queue.
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("push-queue");
+    ew.writePrefixed("pushed-job-1");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0); // flags
+
+    ctx.injectFrame(enq_conn, rpc.MSG_ENQUEUE_BATCH, 6, ew.written());
+    ctx.pipeline.tick();
+
+    // Enqueue conn should have its response.
+    const enq_resp = ctx.readResponseHeader(enq_conn).?;
+    try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, enq_resp.msg_type);
+
+    // Fetch conn should have received a pushed MSG_FETCH_BATCH_RESP.
+    const fetch_c = ctx.backend.conn(fetch_conn);
+    try testing.expect(fetch_c.send_len > 0);
+    const fetch_resp_data = fetch_c.send_buf[0..fetch_c.send_len];
+    const fetch_hdr = rpc.readFrameHeader(fetch_resp_data).?;
+    try testing.expectEqual(rpc.MSG_FETCH_BATCH_RESP, fetch_hdr.msg_type);
+    try testing.expectEqual(@as(u32, 5), fetch_hdr.req_id); // matches original fetch req_id
+
+    // Parse the pushed fetch response.
+    const payload = fetch_resp_data[rpc.FRAME_HEADER_SIZE .. rpc.FRAME_HEADER_SIZE + fetch_hdr.payload_len];
+    var r = BufReader{ .data = payload };
+    const count = try r.readU16();
+    try testing.expectEqual(@as(u16, 1), count);
+    const job_id = try r.readPrefixed();
+    try testing.expectEqualStrings("pushed-job-1", job_id);
+
+    // Subscription should be cleared.
+    try testing.expect(!fetch_c.waiting);
+    try testing.expectEqual(@as(u32, 0), ctx.pipeline.waiting_conn_count);
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.subscriptions_fulfilled);
+}
+
+test "fetch subscription not fulfilled for unrelated queue" {
+    var ctx: TestContext = undefined;
+    try ctx.init("/tmp/corvo-pv2-fetch-nomatch");
+    defer ctx.deinit();
+
+    const fetch_conn = ctx.backend.connect().?;
+    const enq_conn = ctx.backend.connect().?;
+
+    // Subscribe to "queue-a".
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("queue-a");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 1, fw.written());
+    ctx.pipeline.tick();
+    try testing.expect(ctx.backend.conn(fetch_conn).waiting);
+
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Enqueue to "queue-b" — should NOT fulfill the subscription.
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("queue-b");
+    ew.writePrefixed("unrelated-job");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0);
+
+    ctx.injectFrame(enq_conn, rpc.MSG_ENQUEUE_BATCH, 2, ew.written());
+    ctx.pipeline.tick();
+
+    // Fetch conn should still be waiting — no push.
+    try testing.expect(ctx.backend.conn(fetch_conn).waiting);
+    try testing.expectEqual(@as(u32, 1), ctx.pipeline.waiting_conn_count);
+    try testing.expectEqual(@as(u64, 0), ctx.pipeline.subscriptions_fulfilled);
+}
+
+test "subscription cleared on disconnect" {
+    var ctx: TestContext = undefined;
+    try ctx.init("/tmp/corvo-pv2-fetch-disc");
+    defer ctx.deinit();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Subscribe.
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("disc-queue");
+
+    ctx.injectFrame(conn_id, rpc.MSG_FETCH_BATCH, 1, fw.written());
+    ctx.pipeline.tick();
+    try testing.expectEqual(@as(u32, 1), ctx.pipeline.waiting_conn_count);
+
+    // Disconnect.
+    ctx.backend.disconnect(conn_id);
+    ctx.pipeline.tick();
+
+    // Waiting list should be cleaned up.
+    try testing.expectEqual(@as(u32, 0), ctx.pipeline.waiting_conn_count);
 }

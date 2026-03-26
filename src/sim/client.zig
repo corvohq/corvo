@@ -68,6 +68,10 @@ pub const SimClient = struct {
     double_acks: u32 = 0,
     clear_queues: u32 = 0,
 
+    // Fetch subscription: true when we sent a fetch that got no immediate response.
+    // The pipeline will push MSG_FETCH_BATCH_RESP when jobs become available.
+    fetch_subscribed: bool = false,
+
     // Scratch buffer for building RPC frames.
     // Layout: [frame_header:9][payload...]
     frame_buf: [8192]u8 = undefined,
@@ -178,13 +182,13 @@ pub const SimClient = struct {
 
         // Core: complete, fetch, or enqueue
         if (self.active_count == 0) {
-            if (self.chance(0.6)) self.doEnqueue() else self.doFetch();
+            if (self.fetch_subscribed or self.chance(0.6)) self.doEnqueue() else self.doFetch();
         } else {
             const r2 = self.rng.float(f64);
             if (r2 < 0.30) {
                 self.doComplete();
             } else if (r2 < 0.50) {
-                self.doFetch();
+                if (!self.fetch_subscribed) self.doFetch() else self.doEnqueue();
             } else {
                 self.doEnqueue();
             }
@@ -196,17 +200,36 @@ pub const SimClient = struct {
     // ====================================================================
 
     pub fn processResponse(self: *SimClient) void {
-        if (self.pending_msg_type == 0) return;
-
         const resp_data = self.backend.readResponse(self.conn_id) orelse {
+            // No response. If we sent a fetch, we're now subscribed (pipeline holds it).
+            if (self.pending_msg_type == rpc.MSG_FETCH_BATCH) {
+                self.fetch_subscribed = true;
+            }
             self.pending_msg_type = 0;
             return;
         };
 
-        switch (self.pending_msg_type) {
-            rpc.MSG_ENQUEUE_BATCH => self.parseEnqueueResponse(resp_data),
-            rpc.MSG_FETCH_BATCH => self.parseFetchResponse(resp_data),
-            else => {},
+        // Parse ALL frames in the response. There may be multiple:
+        // - The direct response to pending_msg_type
+        // - A pushed MSG_FETCH_BATCH_RESP from a fulfilled subscription
+        var pos: usize = 0;
+        while (pos + rpc.FRAME_HEADER_SIZE <= resp_data.len) {
+            const hdr = rpc.readFrameHeader(resp_data[pos..]) orelse break;
+            const frame_end = pos + rpc.FRAME_HEADER_SIZE + hdr.payload_len;
+            if (frame_end > resp_data.len) break;
+
+            const payload = resp_data[pos + rpc.FRAME_HEADER_SIZE .. frame_end];
+
+            switch (hdr.msg_type) {
+                rpc.MSG_ENQUEUE_BATCH_RESP => self.parseEnqueuePayload(payload),
+                rpc.MSG_FETCH_BATCH_RESP => {
+                    self.parseFetchPayload(payload);
+                    self.fetch_subscribed = false;
+                },
+                else => {},
+            }
+
+            pos = frame_end;
         }
 
         self.pending_msg_type = 0;
@@ -276,14 +299,8 @@ pub const SimClient = struct {
         self.sendFrame(rpc.MSG_ENQUEUE_BATCH, w.pos);
     }
 
-    fn parseEnqueueResponse(self: *SimClient, resp_data: []const u8) void {
-        const header = rpc.readFrameHeader(resp_data) orelse return;
-        if (header.payload_len == 0) return;
-        const payload_start = rpc.FRAME_HEADER_SIZE;
-        const payload_end = payload_start + header.payload_len;
-        if (payload_end > resp_data.len) return;
-        const payload = resp_data[payload_start..payload_end];
-
+    fn parseEnqueuePayload(self: *SimClient, payload: []const u8) void {
+        if (payload.len == 0) return;
         var r = BufReader{ .data = payload };
         _ = r.readU16() catch return; // count
         const err_byte = r.readU8() catch return;
@@ -313,14 +330,8 @@ pub const SimClient = struct {
         self.sendFrame(rpc.MSG_FETCH_BATCH, w.pos);
     }
 
-    fn parseFetchResponse(self: *SimClient, resp_data: []const u8) void {
-        const header = rpc.readFrameHeader(resp_data) orelse return;
-        if (header.payload_len == 0) return;
-        const payload_start = rpc.FRAME_HEADER_SIZE;
-        const payload_end = payload_start + header.payload_len;
-        if (payload_end > resp_data.len) return;
-        const payload = resp_data[payload_start..payload_end];
-
+    fn parseFetchPayload(self: *SimClient, payload: []const u8) void {
+        if (payload.len == 0) return;
         var r = BufReader{ .data = payload };
         const count = r.readU16() catch return;
         if (count == 0) return;
