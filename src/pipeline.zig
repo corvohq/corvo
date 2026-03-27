@@ -157,6 +157,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
             purge_interval_ns: u64 = 0,
             repl_hook: ?ReplHook = null,
             sync_replication: bool = false,
+            /// Adaptive batch coalescing window for sync replication (nanoseconds).
+            /// When sync_replication is on and a drain yields fewer than max_frames,
+            /// the pipeline continues collecting frames via non-blocking drains until
+            /// the batch is full or this window elapses. Zero disables coalescing.
+            /// Only applies when sync_replication is true.
+            coalesce_window_ns: u64 = 0, // set by main.zig for production
         };
 
         // ====================================================================
@@ -370,6 +376,85 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
             for (recv_conns[0..recv_conn_count]) |conn_id| {
                 self.extractFrames(conn_id);
+            }
+
+            // Adaptive batch coalescing: when sync replication is on and the batch
+            // isn't full, keep draining non-blocking to accumulate more frames before
+            // committing. This amortizes the replication RTT over a larger batch.
+            // Under high load the batch fills immediately (zero extra latency).
+            // Under low load we wait up to coalesce_window_ns.
+            if (self.config.sync_replication and self.config.repl_hook != null and
+                self.config.coalesce_window_ns > 0 and
+                self.frame_count > 0 and self.frame_count < max_frames)
+            {
+                const deadline: u64 = @intCast(self.config.clock_fn());
+                const window = self.config.coalesce_window_ns + deadline;
+                while (self.frame_count < max_frames) {
+                    const now: u64 = @intCast(self.config.clock_fn());
+                    if (now >= window) break;
+
+                    const n_extra = self.io.drainNonBlocking(&self.completions);
+                    if (n_extra == 0) continue;
+
+                    // Track only connections with NEW data in this drain pass.
+                    var new_conns: [max_completions]u16 = undefined;
+                    var new_conn_count: u32 = 0;
+
+                    for (self.completions[0..n_extra]) |completion| {
+                        switch (completion.event) {
+                            .recv => {
+                                // Add to recv_conns (global list) for requeueRecvs later.
+                                var dup = false;
+                                for (recv_conns[0..recv_conn_count]) |existing| {
+                                    if (existing == completion.conn_id) { dup = true; break; }
+                                }
+                                if (!dup) {
+                                    recv_conns[recv_conn_count] = completion.conn_id;
+                                    recv_conn_count += 1;
+                                }
+                                // Track as new for frame extraction.
+                                var new_dup = false;
+                                for (new_conns[0..new_conn_count]) |existing| {
+                                    if (existing == completion.conn_id) { new_dup = true; break; }
+                                }
+                                if (!new_dup) {
+                                    new_conns[new_conn_count] = completion.conn_id;
+                                    new_conn_count += 1;
+                                }
+                            },
+                            .accept => {},
+                            .closed => self.onConnClosed(completion.conn_id),
+                            .send_done => {
+                                const c = self.io.conn(completion.conn_id);
+                                if (c.recv_pos > 0) {
+                                    var dup = false;
+                                    for (recv_conns[0..recv_conn_count]) |existing| {
+                                        if (existing == completion.conn_id) { dup = true; break; }
+                                    }
+                                    if (!dup) {
+                                        recv_conns[recv_conn_count] = completion.conn_id;
+                                        recv_conn_count += 1;
+                                    }
+                                    var new_dup = false;
+                                    for (new_conns[0..new_conn_count]) |existing| {
+                                        if (existing == completion.conn_id) { new_dup = true; break; }
+                                    }
+                                    if (!new_dup) {
+                                        new_conns[new_conn_count] = completion.conn_id;
+                                        new_conn_count += 1;
+                                    }
+                                } else {
+                                    self.io.queueRecv(completion.conn_id);
+                                }
+                            },
+                        }
+                    }
+
+                    // Extract frames only from connections with new data.
+                    for (new_conns[0..new_conn_count]) |conn_id| {
+                        self.extractFrames(conn_id);
+                    }
+                }
             }
 
             // Run scheduled maintenance in its own batch, committed before client ops.

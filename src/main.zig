@@ -404,6 +404,7 @@ pub fn main() !void {
             .purge_interval_ns = config.purge_interval_ns,
             .repl_hook = repl_hook,
             .sync_replication = config.sync_replication,
+            .coalesce_window_ns = if (config.sync_replication) 200_000 else 0,
         },
     );
     defer pipeline.destroyHeap();
