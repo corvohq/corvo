@@ -798,24 +798,13 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 },
 
                 rpc.MSG_FETCH_BATCH => {
+                    // Subscribe-only: RPC fetch never polls KV directly.
+                    // Validate frame, then return empty — encodeResponses stores
+                    // the subscription, fulfillSubscriptions serves pending jobs.
                     var reader = BufReader{ .data = frame.payload };
-                    const sub = rpc.parseFetchSubscribe(&reader) catch
+                    _ = rpc.parseFetchSubscribe(&reader) catch
                         return .{ .err = "parse error" };
-                    const now_ns = self.nowNs();
-                    var queue_slices: [16][]const u8 = undefined;
-                    for (0..sub.queue_count) |i| {
-                        queue_slices[i] = sub.queues[i];
-                    }
-                    const op_data = ops_mod.OpData{ .fetch = .{
-                        .queues = queue_slices[0..sub.queue_count],
-                        .worker_id = sub.worker_id,
-                        .lease_duration_ms = sub.lease_ms,
-                        .count = sub.credits,
-                        .now_ns = now_ns,
-                    } };
-                    const result = self.handler.apply(batch, .fetch, &op_data);
-                    self.emitMirrorOp(.fetch, &op_data, &result);
-                    return result;
+                    return .{};
                 },
 
                 rpc.MSG_MAINTENANCE => {
@@ -1032,10 +1021,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 const c = self.io.conn(frame.conn_id);
                 if (c.phase == .free) continue;
 
-                // RPC fetch with 0 jobs: store subscription, skip response.
+                // RPC fetch: always subscribe. fulfillSubscriptions serves jobs.
                 // HTTP fetch returns empty immediately (request-response protocol).
                 if (frame.msg_type == rpc.MSG_FETCH_BATCH and frame.protocol == .rpc and
-                    self.results[i].affected == 0 and self.results[i].err == null)
+                    self.results[i].err == null)
                 {
                     self.storeSubscription(frame.conn_id, &frame);
                     continue;
@@ -1183,7 +1172,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
         // Fetch subscriptions — store and fulfill
         // ====================================================================
 
-        /// Store a fetch subscription in ConnState when fetch returned 0 jobs.
+        /// Store a fetch subscription in ConnState. Subscribe-only: RPC fetch
+        /// always subscribes — fulfillSubscriptions serves pending jobs.
         /// Re-parses the subscription from the frame payload (still valid before compaction).
         fn storeSubscription(self: *Self, conn_id: u16, frame: *const FrameDesc) void {
             const c = self.io.conn(conn_id);
@@ -1215,6 +1205,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
             c.lease_ms = sub.lease_ms;
             c.last_req_id = frame.req_id;
             c.waiting = true;
+
+            // Record subscribed queues as notified so fulfillSubscriptions
+            // checks for pending jobs on the same tick (subscribe-only fetch).
+            for (0..sub.queue_count) |qi| {
+                self.recordNotifiedQueue(sub.queues[qi]);
+            }
 
             // Add to waiting list (skip if already present).
             for (self.waiting_conns[0..self.waiting_conn_count]) |wc| {
@@ -2309,15 +2305,11 @@ test "sync-repl deferred recv connections are not lost" {
     const enq_resp = ctx.readResponse(enq_conn).?;
     try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, enq_resp.header.msg_type);
 
-    // Fetch was processed (deferred for its own ack).
-    try testing.expect(ctx.pipeline.pending_ack_seq > 0);
+    // Subscribe-only fetch: no executeBatch mutations, fulfilled immediately
+    // via fulfillSubscriptions on the same tick.
     try testing.expectEqual(@as(u32, 0), ctx.pipeline.deferred_recv_conn_count);
 
-    // 4. Ack the fetch batch — fetch response delivered.
-    ctx.pipeline.last_acked_seq.store(ctx.pipeline.pending_ack_seq, .release);
-    ctx.pipeline.tick();
-
-    // Fetch response should contain the enqueued job.
+    // Fetch response available (fulfilled on same tick as enqueue ack).
     const fetch_resp = ctx.readResponse(fetch_conn).?;
     try testing.expectEqual(rpc.MSG_FETCH_BATCH_RESP, fetch_resp.header.msg_type);
     try testing.expectEqual(@as(u32, 5), fetch_resp.header.req_id);
