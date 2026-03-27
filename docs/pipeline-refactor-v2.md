@@ -527,6 +527,17 @@ max_frames (256) — not needed yet.
 talon memcpy when the job existed. Changed from assert to error return (client-provided
 IDs are external input, not an internal invariant). Moved check before KV writes.
 
+### Step 19: Subscribe-only fetch (remove poll path)
+RPC fetch currently does a KV lookup (poll) on every fetch frame, then subscribes only
+if 0 jobs found. This allows clients to DoS the server by spamming fetch requests.
+
+Change: RPC fetch skips handler.apply(.fetch) entirely. Instead, store the subscription
+immediately via storeSubscription(). Add subscribed queues to notified_queue_count so
+fulfillSubscriptions() serves pending jobs at the end of the same tick. One path, one
+model — subscribe and get pushed, no polling.
+
+HTTP fetch stays request-response (returns empty immediately, client retries).
+
 ## Verification
 
 After each step:
