@@ -91,7 +91,10 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                     .jobs = &jobs_arr,
                     .now_ns = op.now_ns,
                 };
-                _ = self.applyEnqueue(b, &enqueue_op);
+                const enq_result = self.applyEnqueue(b, &enqueue_op);
+                if (enq_result.err == null) {
+                    self.recordSideEffect(&enq_job);
+                }
 
                 // Old job stays terminal — don't modify it.
                 affected += 1;
@@ -395,8 +398,10 @@ fn applyBatchMods(self: *OpHandler, b: *kv.WriteBatch, mods: []const BatchMod, c
                         .jobs = &jobs_arr,
                         .now_ns = now_ns,
                     };
-                    _ = self.applyEnqueue(b, &enqueue_op);
-                    self.recordSideEffect(&cb_job);
+                    const enq_result2 = self.applyEnqueue(b, &enqueue_op);
+                    if (enq_result2.err == null) {
+                        self.recordSideEffect(&cb_job);
+                    }
                 }
             }
         }

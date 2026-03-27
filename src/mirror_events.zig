@@ -81,9 +81,7 @@ pub fn mirrorFromOp(m: *Mirror, op_type: ops.OpType, data: *const ops.OpData, re
                 m.enqueueHeartbeatJob(hb.job_ids[i], hb.job_ops[i].progress, hb.job_ops[i].checkpoint, lease_ns);
             }
         },
-        .maintenance => {
-            m.enqueueMaintenance(data.maintenance.action, data.maintenance.now_ns);
-        },
+        .maintenance => {}, // All maintenance flows through mirrorEffects via per-job BulkResults.
         .queue_config => {
             const qc = &data.queue_config;
             var p = MirrorOp.QueueConfigPayload{

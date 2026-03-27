@@ -61,14 +61,14 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
         // Fairness path: score candidates by served+active, pick lowest score.
         // Separate from the normal pop loop to avoid any overhead on non-fairness queues.
         if (queue.fairness) {
-            var fairness_budget: u32 = (@min(op.count, ops.OpResult.max_inline_fetch) - result.affected) * 2;
+            var fairness_budget: u32 = @max((@min(op.count, ops.OpResult.max_inline_fetch) - result.affected) * 2, 64);
             fetchWithFairness(self, b, &result, queue_name, &fairness_budget, max_fetch, lease_expires_ns, lease_duration_ms, op, has_rl);
             continue; // next queue
         }
 
         // Non-fairness path: pop in priority order (hot path, unchanged).
         const remaining = max_fetch - result.affected;
-        var pop_budget: u32 = remaining * 2; // Extra budget for stale entries.
+        var pop_budget: u32 = @max(remaining * 2, 64); // Min budget for skipping stale entries.
         while (pop_budget > 0 and result.affected < max_fetch) {
             const entry = self.pending.pop(queue_name) orelse break;
             pop_budget -= 1;

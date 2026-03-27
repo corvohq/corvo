@@ -21,6 +21,7 @@ const kv = corvo.kv;
 const handler_mod = corvo.handler;
 const oplog_mod = corvo.oplog;
 const notify_mod = corvo.notify;
+const mirror_mod = corvo.mirror;
 const pipeline_v2 = corvo.pipeline_v2;
 const io_mod = corvo.io;
 
@@ -77,6 +78,10 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     var notify_inst = notify_mod.QueueNotifier.init(allocator);
     defer notify_inst.deinit();
 
+    // --- Mirror (in-memory SQLite for invariant checking) ---
+    var mirror = try mirror_mod.Mirror.initInMemory(allocator);
+    defer mirror.deinit();
+
     // --- SimBackend ---
     var backend = try SimBackend.init(allocator, .{
         .listen_fd = -1,
@@ -95,7 +100,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         &oplog,
         &notify_inst,
         null,
-        null,
+        &mirror,
         .{
             .clock_fn = &globalClockNow,
             .promote_interval_ns = 1_000_000_000, // 1s
@@ -162,6 +167,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         // Phase 2: pipeline processes all frames in one batch
         pipeline.tick();
 
+        // Flush mirror synchronously (no background thread in sim).
+        mirror.flushAll();
+
         // Phase 3: each client reads its response
         for (clients[0..num_clients]) |*c| {
             c.processResponse();
@@ -172,6 +180,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
             const result = invariants.checkAll(
                 &stores[0],
                 &handler,
+                &mirror,
                 tick,
                 seed,
             );
@@ -190,6 +199,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         const result = invariants.checkAll(
             &stores[0],
             &handler,
+            &mirror,
             config.ticks,
             seed,
         );

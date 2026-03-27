@@ -205,6 +205,8 @@ pub fn fireChainOnFailure(self: *OpHandler, b: *kv.WriteBatch, job: *const types
         .jobs = &jobs,
         .now_ns = now_ns,
     };
-    _ = self.applyEnqueue(b, &enqueue_op);
-    self.recordSideEffect(&chain_job);
+    const enq_result = self.applyEnqueue(b, &enqueue_op);
+    if (enq_result.err == null) {
+        self.recordSideEffect(&chain_job);
+    }
 }

@@ -17,6 +17,8 @@ const types = corvo.types;
 const kv = corvo.kv;
 const OpHandler = corvo.handler.OpHandler;
 const PendingIndex = corvo.pending_index.PendingIndex;
+const Mirror = corvo.mirror.Mirror;
+const sqlite = corvo.sqlite;
 
 /// Error returned when an invariant is violated.
 pub const InvariantError = struct {
@@ -37,6 +39,7 @@ pub const CheckResult = ?InvariantError;
 pub fn checkAll(
     store: *kv.Store,
     handler: *OpHandler,
+    mirror: *Mirror,
     tick: u32,
     seed: u64,
 ) CheckResult {
@@ -74,6 +77,9 @@ pub fn checkAll(
 
     // Pending jobs in KV are in the PendingIndex (no orphaned pending jobs).
     if (checkPendingIndexCompleteness(store, &handler.pending, tick, seed)) |err| return err;
+
+    // Mirror sync: every job in KV has matching state in SQLite mirror.
+    if (checkMirrorSync(store, mirror, tick, seed)) |err| return err;
 
     return null;
 }
@@ -646,6 +652,83 @@ fn findOrAddQueue(
     lens[idx] = @intCast(len);
     count.* += 1;
     return idx;
+}
+
+// ============================================================================
+// Mirror sync — every job in KV must have matching state in SQLite mirror
+// ============================================================================
+
+fn checkMirrorSync(store: *kv.Store, mirror: *Mirror, tick: u32, seed: u64) CheckResult {
+    const db = mirror.getDB();
+
+    // Count jobs in KV.
+    var kv_count: u32 = 0;
+    {
+        var batch = store.newBatch();
+        defer batch.close();
+
+        var upper_buf: keys.KeyBuf = undefined;
+        const upper = keys.prefixEnd(&upper_buf, keys.prefix_job) orelse return null;
+
+        var iter = batch.newIter(keys.prefix_job, upper);
+        defer iter.close();
+
+        if (iter.first()) {
+            while (true) {
+                const key = iter.key();
+                // Only j| keys (not jp|, je|, etc.)
+                if (key.len > 2 and key[0] == 'j' and key[1] == '|') {
+                    const val = iter.value();
+                    if (val.len > 0) {
+                        kv_count += 1;
+
+                        // Check state matches mirror.
+                        const job = codec.decodeJob(val);
+                        const job_id = key[keys.prefix_job.len..];
+
+                        var stmt = db.prepare(
+                            "SELECT state FROM jobs WHERE id = ?",
+                        ) catch return makeError("mirror-sync", "failed to prepare stmt", tick, seed);
+                        defer stmt.finalize();
+                        stmt.bindText(1, job_id);
+
+                        const has_row = stmt.step() catch return makeError("mirror-sync", "failed to step stmt", tick, seed);
+                        if (!has_row) {
+                            return makeErrorFmt("mirror-sync", tick, seed,
+                                "job {s} state={s} in KV but missing from mirror",
+                                .{ job_id, job.state.toString() });
+                        }
+
+                        const mirror_state = stmt.columnText(0) orelse "NULL";
+                        const kv_state = job.state.toString();
+                        if (!std.mem.eql(u8, mirror_state, kv_state)) {
+                            return makeErrorFmt("mirror-sync", tick, seed,
+                                "job {s} state mismatch: KV={s} mirror={s}",
+                                .{ job_id, kv_state, mirror_state });
+                        }
+                    }
+                }
+
+                if (!iter.next()) break;
+            }
+        }
+    }
+
+    // Count jobs in mirror — should not have more than KV (no phantom rows).
+    var stmt = db.prepare("SELECT COUNT(*) FROM jobs") catch return makeError("mirror-sync", "count prepare failed", tick, seed);
+    defer stmt.finalize();
+    const has_row = stmt.step() catch return makeError("mirror-sync", "count step failed", tick, seed);
+    if (has_row) {
+        const mirror_count: u32 = @intCast(stmt.columnInt(0));
+        // Mirror should not have more jobs than KV (no phantom rows).
+        if (mirror_count > kv_count) {
+            return makeErrorFmt("mirror-sync", tick, seed,
+                "mirror has {d} jobs but KV only has {d} — phantom rows",
+                .{ mirror_count, kv_count });
+        }
+    }
+
+    return null;
 }
 
 // ============================================================================

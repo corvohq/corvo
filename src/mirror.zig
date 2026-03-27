@@ -1005,27 +1005,24 @@ pub const Mirror = struct {
     /// CASCADE handles job_payloads and job_errors. We manually delete
     /// jobs_fts (contentless FTS5).
     pub fn purgeTerminalJobs(self: *Mirror, cutoff_ns: u64) void {
-        var ts_buf: [32]u8 = undefined;
-        const cutoff_str = std.fmt.bufPrint(&ts_buf, "{d}", .{cutoff_ns}) catch return;
-
         // Delete FTS entries for jobs being purged (contentless FTS5, no CASCADE).
         var del_fts = self.db.prepare(
             "DELETE FROM jobs_fts WHERE job_id IN " ++
                 "(SELECT id FROM jobs WHERE state IN ('completed','dead','cancelled') " ++
-                "AND completed_at IS NOT NULL AND completed_at < ?)",
+                "AND completed_at IS NOT NULL AND CAST(completed_at AS INTEGER) < ?)",
         ) catch return;
         defer del_fts.finalize();
-        del_fts.bindText(1, cutoff_str);
+        del_fts.bindInt64(1, @intCast(cutoff_ns));
         del_fts.exec() catch {};
         del_fts.reset();
 
         // Delete jobs (CASCADE deletes job_payloads and job_errors).
         var del_jobs = self.db.prepare(
             "DELETE FROM jobs WHERE state IN ('completed','dead','cancelled') " ++
-                "AND completed_at IS NOT NULL AND completed_at < ?",
+                "AND completed_at IS NOT NULL AND CAST(completed_at AS INTEGER) < ?",
         ) catch return;
         defer del_jobs.finalize();
-        del_jobs.bindText(1, cutoff_str);
+        del_jobs.bindInt64(1, @intCast(cutoff_ns));
         del_jobs.exec() catch {};
         del_jobs.reset();
     }
@@ -1038,57 +1035,67 @@ pub const Mirror = struct {
 
     /// Promote scheduled jobs whose scheduled_at has passed.
     pub fn promoteScheduled(self: *Mirror, now_ns: u64) void {
-        var ts_buf: [32]u8 = undefined;
-        const now_str = std.fmt.bufPrint(&ts_buf, "{d}", .{now_ns}) catch return;
-        var stmt = self.db.prepare(
-            "UPDATE jobs SET state = 'pending', scheduled_at = NULL" ++
-                " WHERE state = 'scheduled' AND scheduled_at IS NOT NULL AND scheduled_at <= ?",
-        ) catch return;
-        defer stmt.finalize();
-        stmt.bindText(1, now_str);
-        stmt.exec() catch {};
+        // Promote scheduled → pending.
+        {
+            var stmt = self.db.prepare(
+                "UPDATE jobs SET state = 'pending', scheduled_at = NULL" ++
+                    " WHERE state = 'scheduled' AND scheduled_at IS NOT NULL AND CAST(scheduled_at AS INTEGER) <= ?",
+            ) catch return;
+            defer stmt.finalize();
+            stmt.bindInt64(1, @intCast(now_ns));
+            stmt.exec() catch {};
+        }
+        // Promote retrying → pending (KV handler promotes both in applyPromote).
+        {
+            var stmt = self.db.prepare(
+                "UPDATE jobs SET state = 'pending', scheduled_at = NULL" ++
+                    " WHERE state = 'retrying' AND scheduled_at IS NOT NULL AND CAST(scheduled_at AS INTEGER) <= ?",
+            ) catch return;
+            defer stmt.finalize();
+            stmt.bindInt64(1, @intCast(now_ns));
+            stmt.exec() catch {};
+        }
     }
 
     /// Reclaim jobs with expired leases — return to pending or move to dead.
     pub fn reclaimLeases(self: *Mirror, now_ns: u64) void {
-        var ts_buf: [32]u8 = undefined;
-        const now_str = std.fmt.bufPrint(&ts_buf, "{d}", .{now_ns}) catch return;
-        // Reclaim active jobs with expired leases back to pending.
         var stmt = self.db.prepare(
             "UPDATE jobs SET state = 'pending', worker_id = NULL, hostname = NULL, lease_expires_at = NULL" ++
-                " WHERE state = 'active' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
+                " WHERE state = 'active' AND lease_expires_at IS NOT NULL AND CAST(lease_expires_at AS INTEGER) <= ?",
         ) catch return;
         defer stmt.finalize();
-        stmt.bindText(1, now_str);
+        stmt.bindInt64(1, @intCast(now_ns));
         stmt.exec() catch {};
     }
 
     /// Expire jobs whose expire_at has passed.
     pub fn expireJobs(self: *Mirror, now_ns: u64) void {
-        var ts_buf: [32]u8 = undefined;
-        const now_str = std.fmt.bufPrint(&ts_buf, "{d}", .{now_ns}) catch return;
         var stmt = self.db.prepare(
             "UPDATE jobs SET state = 'dead', failed_at = ?" ++
-                " WHERE state = 'active' AND expire_at IS NOT NULL AND expire_at <= ?",
+                " WHERE state = 'pending' AND expire_at IS NOT NULL AND CAST(expire_at AS INTEGER) <= ?",
         ) catch return;
         defer stmt.finalize();
-        stmt.bindText(1, now_str);
-        stmt.bindText(2, now_str);
+        var ts_buf: [32]u8 = undefined;
+        stmt.bindText(1, std.fmt.bufPrint(&ts_buf, "{d}", .{now_ns}) catch return);
+        stmt.bindInt64(2, @intCast(now_ns));
         stmt.exec() catch {};
     }
 
     /// Clear all jobs from a queue in the mirror.
     pub fn clearQueueJobs(self: *Mirror, queue_name: []const u8) void {
-        // Delete FTS entries (contentless, no CASCADE).
+        // Only clear pending/scheduled/retrying jobs — active/held/terminal stay.
         var del_fts = self.db.prepare(
-            "DELETE FROM jobs_fts WHERE job_id IN (SELECT id FROM jobs WHERE queue = ?)",
+            "DELETE FROM jobs_fts WHERE job_id IN " ++
+                "(SELECT id FROM jobs WHERE queue = ? AND state IN ('pending', 'scheduled', 'retrying'))",
         ) catch return;
         defer del_fts.finalize();
         del_fts.bindText(1, queue_name);
         del_fts.exec() catch {};
 
         // Delete jobs (CASCADE handles payloads + errors).
-        var del_jobs = self.db.prepare("DELETE FROM jobs WHERE queue = ?") catch return;
+        var del_jobs = self.db.prepare(
+            "DELETE FROM jobs WHERE queue = ? AND state IN ('pending', 'scheduled', 'retrying')",
+        ) catch return;
         defer del_jobs.finalize();
         del_jobs.bindText(1, queue_name);
         del_jobs.exec() catch {};
@@ -1096,7 +1103,19 @@ pub const Mirror = struct {
 
     /// Delete a queue record and all its jobs from the mirror.
     pub fn deleteQueueRecord(self: *Mirror, queue_name: []const u8) void {
-        self.clearQueueJobs(queue_name);
+        // Delete ALL jobs for this queue (not just clearable ones).
+        var del_fts = self.db.prepare(
+            "DELETE FROM jobs_fts WHERE job_id IN (SELECT id FROM jobs WHERE queue = ?)",
+        ) catch return;
+        defer del_fts.finalize();
+        del_fts.bindText(1, queue_name);
+        del_fts.exec() catch {};
+
+        var del_jobs = self.db.prepare("DELETE FROM jobs WHERE queue = ?") catch return;
+        defer del_jobs.finalize();
+        del_jobs.bindText(1, queue_name);
+        del_jobs.exec() catch {};
+
         var stmt = self.db.prepare("DELETE FROM queues WHERE name = ?") catch return;
         defer stmt.finalize();
         stmt.bindText(1, queue_name);
@@ -1374,7 +1393,7 @@ const MirrorStmts = struct {
             .ack_job = try db.prepare(
                 "UPDATE jobs SET state = 'completed', completed_at = ?," ++
                     " result = ?, hold_reason = ?," ++
-                    " worker_id = NULL, lease_expires_at = NULL WHERE id = ?",
+                    " worker_id = NULL, lease_expires_at = NULL WHERE id = ? AND state = 'active'",
             ),
             .fail_job = try db.prepare(
                 "UPDATE jobs SET state = ?, failed_at = ?, scheduled_at = ? WHERE id = ?",
@@ -1712,7 +1731,7 @@ test "mirror expire jobs" {
     // Insert an active job with expired expire_at.
     {
         var stmt = try mirror.db.prepare(
-            "INSERT INTO jobs (id, queue, state, expire_at, created_at) VALUES ('ej-1', 'q1', 'active', '2000000000', '500000000')",
+            "INSERT INTO jobs (id, queue, state, expire_at, created_at) VALUES ('ej-1', 'q1', 'pending', '2000000000', '500000000')",
         );
         defer stmt.finalize();
         try stmt.exec();
@@ -1720,7 +1739,7 @@ test "mirror expire jobs" {
     // Insert an active job with future expire_at.
     {
         var stmt = try mirror.db.prepare(
-            "INSERT INTO jobs (id, queue, state, expire_at, created_at) VALUES ('ej-2', 'q1', 'active', '9000000000', '500000000')",
+            "INSERT INTO jobs (id, queue, state, expire_at, created_at) VALUES ('ej-2', 'q1', 'pending', '9000000000', '500000000')",
         );
         defer stmt.finalize();
         try stmt.exec();
@@ -1731,8 +1750,8 @@ test "mirror expire jobs" {
     // ej-1 should be dead with failed_at set.
     try std.testing.expectEqual(@as(i64, 1), testQueryCountBind(&mirror, "SELECT COUNT(*) FROM jobs WHERE id = ? AND state = 'dead'", "ej-1"));
     try std.testing.expectEqual(@as(i64, 1), testQueryCountBind(&mirror, "SELECT COUNT(*) FROM jobs WHERE id = ? AND failed_at IS NOT NULL", "ej-1"));
-    // ej-2 should remain active.
-    try std.testing.expectEqual(@as(i64, 1), testQueryCountBind(&mirror, "SELECT COUNT(*) FROM jobs WHERE id = ? AND state = 'active'", "ej-2"));
+    // ej-2 should remain pending (expire_at in the future).
+    try std.testing.expectEqual(@as(i64, 1), testQueryCountBind(&mirror, "SELECT COUNT(*) FROM jobs WHERE id = ? AND state = 'pending'", "ej-2"));
 }
 
 test "mirror clear queue jobs" {

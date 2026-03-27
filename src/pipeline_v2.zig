@@ -608,7 +608,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 if (iv.ns == 0) continue;
                 if (now_ns - iv.last.* < iv.ns) continue;
 
-                const op_data = ops_mod.OpData{ .maintenance = .{ .action = iv.action, .now_ns = now_ns } };
+                const op_data = ops_mod.OpData{ .maintenance = .{ .action = iv.action, .now_ns = now_ns, .cutoff_ns = now_ns } };
                 const result = self.handler.apply(&batch, .maintenance, &op_data);
                 self.emitMirrorOp(.maintenance, &op_data, &result);
 
@@ -1461,6 +1461,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
         /// fields into fixed-size MirrorOp payloads, so no dangling pointers.
         fn emitMirrorOp(self: *Self, op_type: ops_mod.OpType, op_data: *const ops_mod.OpData, result: *const ops_mod.OpResult) void {
             if (self.mirror) |m| {
+                // Drain handler effects BEFORE the primary op's mirror event.
+                // This ensures side-effect enqueues (chain jobs, batch callbacks,
+                // requeued jobs) are inserted into the mirror before any subsequent
+                // operation (e.g., fetch) tries to update them.
+                if (self.handler.side_effect_count > 0 or self.handler.bulk_result_count > 0 or self.handler.fail_result_count > 0) {
+                    mirror_events.mirrorEffects(m, self.handler);
+                    self.handler.resetEffects();
+                }
                 mirror_events.mirrorFromOp(m, op_type, op_data, result);
             }
         }

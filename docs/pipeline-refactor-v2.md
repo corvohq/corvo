@@ -437,10 +437,30 @@ now configurable (were hardcoded). Config hash passed to ClusterNode.
 
 All tests pass. Sim passes. 13 new tests (config + election).
 
-### Step 17: Reference commit functionality audit
-Iterate through each of the Reference Commits above. Determine if the functionality
-exists, for missing functionality confirm if the user still wants it. Use the commits
-as a spec instead of copying directly.
+### Step 17: Reference commit functionality audit — IN PROGRESS
+
+Audited all reference commits against v2. IO+Pipeline (10 commits): all present.
+Sim cluster (6 commits): all present (different architecture, Pipeline_v2-based).
+
+**Correctness fixes applied (step 17a):**
+- PendingIndex pop budget: `@max(remaining * 2, 64)` in handler_fetch.zig
+- Mirror effect ordering: `emitMirrorOp` now drains handler effects BEFORE
+  the primary op's mirror event, preventing insert-after-update races
+- Mirror per-job effects for maintenance: promote, reclaim, expire, purge all
+  record BulkResults instead of relying on bulk SQL. Single path through mirrorEffects.
+- Side effect guards: `recordSideEffect` only called when `applyEnqueue` succeeds
+  (prevents phantom mirror rows from failed unique/batch constraints)
+- Mirror SQL fixes: CAST(col AS INTEGER) for timestamp comparisons (4 functions),
+  `AND state = 'active'` on ack SQL, expire uses `state = 'pending'` (not active),
+  clearQueueJobs filters by state (pending/scheduled/retrying only)
+- Sim mirror invariant: in-memory Mirror passed to pipeline, `checkMirrorSync`
+  verifies every KV job has matching state in SQLite mirror
+- max_bulk_results increased to 4096 (purge can delete hundreds per tick)
+
+**Remaining (step 17b):**
+- Deep replication consistency check (key-value comparison, not just count)
+- Enrich HTTP response fields (job detail, queue list, queue detail endpoint)
+- corvo-inspect CLI, CLI Client + integration tests, Dockerfile, CI/release workflows
 
 ### Step 18: Delete old stack
 Remove engine.zig, store.zig, server.zig, pipeline.zig, scheduler.zig.

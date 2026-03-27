@@ -72,7 +72,10 @@ pub fn applySealBatch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.SealBa
                     .jobs = &jobs,
                     .now_ns = op.now_ns,
                 };
-                _ = self.applyEnqueue(b, &enqueue_op);
+                const enq_result = self.applyEnqueue(b, &enqueue_op);
+                if (enq_result.err == null) {
+                    self.recordSideEffect(&callback_job);
+                }
             }
         }
     }

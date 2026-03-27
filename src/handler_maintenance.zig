@@ -20,7 +20,7 @@ pub fn applyMaintenance(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Main
         .promote => applyPromote(self, b, op.now_ns),
         .reclaim => applyReclaim(self, b, op.now_ns),
         .expire => applyExpire(self, b, op.now_ns),
-        .purge => applyPurge(b, op.cutoff_ns),
+        .purge => applyPurge(self, b, op.cutoff_ns),
         .unique => applyCleanUnique(b, op.now_ns),
         .rate_limit => applyCleanRateLimit(b, op.cutoff_ns),
         .workers => applyCleanWorkers(b, op.cutoff_ns),
@@ -76,6 +76,7 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
                     b.set(keys.jobKey(&jk_buf, job_id), codec.encodeJob(&job_enc_buf, &job));
                     self.verifyJobIndexes(b, &job, "promote-scheduled");
+                    self.recordBulkResult(job_id, .update_state, "pending", "", now_ns);
                     affected += 1;
 
                     if (!iter.next()) break;
@@ -125,6 +126,7 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
                     b.set(keys.jobKey(&jk_buf, job_id), codec.encodeJob(&job_enc_buf, &job));
                     self.verifyJobIndexes(b, &job, "promote-retrying");
+                    self.recordBulkResult(job_id, .update_state, "pending", "", now_ns);
                     affected += 1;
 
                     if (!iter.next()) break;
@@ -238,6 +240,7 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
                     b.set(keys.jobKey(&jk_buf, job_id), codec.encodeJob(&job_enc_buf, &job));
                     self.verifyJobIndexes(b, &job, "reclaim-dead");
+                    self.recordBulkResult(job_id, .update_state, "dead", "", now_ns);
                 } else {
                     // Back to pending
                     job.state = .pending;
@@ -252,6 +255,7 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
                     b.set(keys.jobKey(&jk_buf, job_id), codec.encodeJob(&job_enc_buf, &job));
                     self.verifyJobIndexes(b, &job, "reclaim-pending");
+                    self.recordBulkResult(job_id, .update_state, "pending", "", now_ns);
                 }
 
                 affected += 1;
@@ -340,6 +344,7 @@ fn applyExpire(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                 self.verifyJobIndexes(b, &job, "expire");
                 var dk_buf: keys.KeyBuf = undefined;
                 b.set(keys.deadKey(&dk_buf, now_ns, job_id), "");
+                self.recordBulkResult(job_id, .update_state, "dead", "", now_ns);
 
                 affected += 1;
                 if (!iter.next()) break;
@@ -354,7 +359,7 @@ fn applyExpire(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 // Purge: delete terminal jobs older than cutoff
 // ============================================================================
 
-fn applyPurge(b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult {
+fn applyPurge(self: *OpHandler, b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult {
     var affected: u32 = 0;
 
     var dp_buf: keys.KeyBuf = undefined;
@@ -399,9 +404,8 @@ fn applyPurge(b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult {
                     b.deleteRange(err_prefix, err_end);
                 }
 
-
-
                 b.delete(key); // d| key
+                self.recordBulkResult(job_id, .delete, "", "", 0);
                 affected += 1;
 
                 if (!iter.next()) break;
