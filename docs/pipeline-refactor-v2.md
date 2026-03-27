@@ -538,6 +538,20 @@ model — subscribe and get pushed, no polling.
 
 HTTP fetch stays request-response (returns empty immediately, client retries).
 
+### Step 20: Pipelined prepares for sync replication
+With 20k connections, drain() returns max 256 completions per batch. The remaining
+connections have data waiting in recv_bufs. Currently the pipeline blocks on ack after
+each batch — 19,744 connections sit idle.
+
+Pipelined prepares: allow N batches in-flight (e.g. 4). Execute batch 1 → replicate →
+execute batch 2 → replicate → ... only block when all N slots full. Each in-flight
+batch needs its own frames[], results[], recv_compactions[], recv_conns[]. ~288KB per
+slot × 4 = ~1.1MB additional memory. recv_buf compaction deferred until oldest batch
+acked (HTTP frames hold slices into recv_buf).
+
+With 4 in-flight slots: 4 × 256 = 1024 frames per ack cycle instead of 256.
+At 20k connections this 4x's throughput vs current single-batch approach.
+
 ## Verification
 
 After each step:
