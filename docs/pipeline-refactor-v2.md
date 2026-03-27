@@ -468,11 +468,13 @@ Sim cluster (6 commits): all present (different architecture, Pipeline_v2-based)
 - `src/inspect.zig` + build target: corvo-inspect CLI for reading KV data. Commands:
   get, scan, job, count. Auto-decodes all known key prefixes (jobs, queues, workers,
   crons, batches, budgets).
-- `src/cli.zig` + build target: standalone CLI client (corvo-cli). HTTP-based, no
-  corvo module dependency. Testable Client struct + cmd* wrappers for all operations
-  (enqueue, inspect, retry, cancel, delete, move, bulk, queues, search, cron CRUD).
+- `src/cli.zig` wired into corvo-v2 binary: first non-flag arg dispatches to CLI
+  (enqueue, inspect, search, queues, cron CRUD, etc.). Testable Client struct,
+  pure HTTP, no corvo module dependencies beyond std.
+- Pipeline `initHeap`/`destroyHeap`: struct is ~5MB (inline scratch buffers), must
+  be heap-allocated. TigerBeetle pattern — one alloc at startup, zero on hot path.
 - Dockerfile: multi-stage build (Debian bookworm + Zig 0.15.2). Copies corvo-v2,
-  corvo-cli, corvo-inspect. Supports amd64/arm64 via TARGETARCH.
+  corvo-inspect. Supports amd64/arm64 via TARGETARCH.
 - CI/release workflows: `.github/workflows/ci.yml` (build + test + sim + docker smoke),
   `.github/workflows/release.yml` (4-platform matrix build, GitHub Release, Docker push).
 
