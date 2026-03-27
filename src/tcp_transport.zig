@@ -24,8 +24,8 @@ const ReplMsg = transport.ReplMsg;
 // fewer TCP segments. TCP_CORK takes precedence over TCP_NODELAY while set.
 const TCP_CORK = 3;
 
-/// Threshold below which we apply TCP_CORK. Election messages are 23 bytes
-/// (4-byte frame header + 19-byte payload), acks are 28 bytes. Anything
+/// Threshold below which we apply TCP_CORK. Election messages are 31 bytes
+/// (4-byte frame header + 27-byte payload), acks are 28 bytes. Anything
 /// under 128 bytes is a "small" control message worth coalescing.
 const CORK_THRESHOLD: usize = 128;
 
@@ -198,7 +198,7 @@ pub const TcpTransport = struct {
     fn sendOnStream(self: *TcpTransport, stream: net.Stream, to: []const u8, msg: Msg) bool {
 
         const frame_size: usize = 4 + switch (msg) {
-            .election => @as(usize, 19),
+            .election => @as(usize, 27),
             .repl => |r| @as(usize, 24) + r.data.len,
         };
 
@@ -402,6 +402,8 @@ pub const TcpTransport = struct {
                 pos += 1;
                 std.mem.writeInt(u64, buf[pos..][0..8], e.last_log_seq, .little);
                 pos += 8;
+                std.mem.writeInt(u64, buf[pos..][0..8], e.config_hash, .little);
+                pos += 8;
             },
             .repl => |r| {
                 buf[pos] = MSG_REPL;
@@ -435,7 +437,7 @@ pub const TcpTransport = struct {
 
         switch (msg_type) {
             MSG_ELECTION => {
-                if (data.len < 19) return null;
+                if (data.len < 27) return null;
                 const raw_type = data[pos];
                 if (raw_type < 1 or raw_type > 4) return null; // propose=1, vote=2, heartbeat=3, heartbeat_ack=4
                 const type_: election_mod.MessageType = @enumFromInt(raw_type);
@@ -445,8 +447,16 @@ pub const TcpTransport = struct {
                 const granted = data[pos] != 0;
                 pos += 1;
                 const last_log_seq = std.mem.readInt(u64, data[pos..][0..8], .little);
+                pos += 8;
+                const config_hash = std.mem.readInt(u64, data[pos..][0..8], .little);
                 return .{
-                    .msg = .{ .election = .{ .type_ = type_, .epoch = epoch, .granted = granted, .last_log_seq = last_log_seq } },
+                    .msg = .{ .election = .{
+                        .type_ = type_,
+                        .epoch = epoch,
+                        .granted = granted,
+                        .last_log_seq = last_log_seq,
+                        .config_hash = config_hash,
+                    } },
                     .data = null,
                 };
             },

@@ -29,6 +29,9 @@ pub const ClusterConfig = struct {
     bind_addr: std.net.Address,
     max_lag: u64 = 10000,
     tick_interval_ms: u32 = 50,
+    /// Cluster config hash — exchanged during election. Nodes with
+    /// different configs refuse to form a cluster.
+    config_hash: u64 = 0,
 };
 
 // ============================================================================
@@ -69,7 +72,7 @@ pub const ClusterNode = struct {
             transport.addPeer(pid, config.peer_addrs[i]);
         }
 
-        const election = election_mod.Election.init(
+        var election = election_mod.Election.init(
             allocator,
             config.node_id,
             config.peer_ids,
@@ -79,6 +82,7 @@ pub const ClusterNode = struct {
                 .election_timeout = 3_000_000_000, // 3s
             },
         );
+        election.config_hash = config.config_hash;
 
         return .{
             .config = config,
@@ -382,6 +386,8 @@ pub const ClusterNode = struct {
             .to = self.config.node_id,
             .epoch = emsg.epoch,
             .granted = emsg.granted,
+            .last_log_seq = emsg.last_log_seq,
+            .config_hash = emsg.config_hash,
         };
         const replies = self.election.step(lmsg, now);
         self.sendElectionMsgs(replies);
@@ -542,6 +548,7 @@ pub const ClusterNode = struct {
                 .epoch = m.epoch,
                 .granted = m.granted,
                 .last_log_seq = m.last_log_seq,
+                .config_hash = m.config_hash,
             };
             _ = self.transport.send(m.to, .{ .election = emsg });
         }

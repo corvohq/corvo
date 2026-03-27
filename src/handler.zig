@@ -38,6 +38,7 @@ pub const OpHandler = struct {
     verify_indexes: bool = false,
     /// Monotonic counter for lease tokens. Unique per fetch claim.
     lease_counter: u64 = 0,
+    requeue_counter: u64 = 0,
     // Effect buffers — accumulated during apply, drained by pipeline after commit.
     side_effects: [max_side_effects]mirror_mod.MirrorOp.EnqueuePayload = undefined,
     side_effect_count: u8 = 0,
@@ -424,21 +425,20 @@ pub const OpHandler = struct {
     // Active count helpers
     // ========================================================================
 
-    pub fn incrActiveCount(self: *OpHandler, queue: []const u8) void {
-        const entry = self.active_counts.getOrPut(queue) catch unreachable;
-        if (!entry.found_existing) {
-            // Own the key — source may point into KV batch memory that gets freed.
-            entry.key_ptr.* = self.allocator.dupe(u8, queue) catch unreachable;
-            entry.value_ptr.* = 0;
-        }
-        entry.value_ptr.* += 1;
-    }
-
     pub fn decrActiveCount(self: *OpHandler, queue: []const u8) void {
         if (self.active_counts.getPtr(queue)) |count| {
             count.* -= 1;
             assert.check(count.* >= 0, "active count negative for queue", .{});
         }
+    }
+
+    pub fn incrActiveCount(self: *OpHandler, queue: []const u8) void {
+        const entry = self.active_counts.getOrPut(queue) catch unreachable;
+        if (!entry.found_existing) {
+            entry.key_ptr.* = self.allocator.dupe(u8, queue) catch unreachable;
+            entry.value_ptr.* = 0;
+        }
+        entry.value_ptr.* += 1;
     }
 
     pub fn getActiveCount(self: *OpHandler, queue: []const u8) i32 {

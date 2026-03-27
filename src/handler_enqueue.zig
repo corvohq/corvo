@@ -100,9 +100,15 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
             b.set(keys.expireKey(&xk_buf, job.expire_at_ns, job.id), "");
         }
 
+        // Assert job doesn't already exist — catches ID collisions (e.g., bulk requeue
+        // generating duplicate IDs when multiple operations share the same timestamp).
+        var jk_buf: keys.KeyBuf = undefined;
+        var existing_buf: [1]u8 = undefined;
+        assert.check(b.getInto(keys.jobKey(&jk_buf, job.id), &existing_buf) == null,
+            "enqueue: job already exists: {s}", .{job.id});
+
         // Write job header
         var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
-        var jk_buf: keys.KeyBuf = undefined;
         b.set(keys.jobKey(&jk_buf, job.id), codec.encodeJob(&job_enc_buf, &job));
 
         // Write payload separately (skip empty payloads — saves a KV set per job).

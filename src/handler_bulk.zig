@@ -32,7 +32,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
     var batch_mods: [max_batch_mods]BatchMod = undefined;
     var batch_mod_count: u32 = 0;
 
-    for (op.job_ids, 0..) |job_id, job_idx| {
+    for (op.job_ids) |job_id| {
         var jk_buf: keys.KeyBuf = undefined;
 
         // For requeue: copy job data to stack buffer since applyEnqueue writes
@@ -55,9 +55,11 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 var jpk_buf: keys.KeyBuf = undefined;
                 const payload = b.getInto(keys.jobPayloadKey(&jpk_buf, job_id), &payload_buf);
 
-                // Generate new job ID: rq_{now_ns_hex}_{index_hex}
+                // Generate new job ID using a global counter to avoid collisions
+                // when multiple bulk requeue operations share the same tick timestamp.
+                self.requeue_counter += 1;
                 var new_id_buf: [64]u8 = undefined;
-                const new_id = std.fmt.bufPrint(&new_id_buf, "rq_{x}_{x}", .{ op.now_ns, job_idx }) catch "rq_err";
+                const new_id = std.fmt.bufPrint(&new_id_buf, "rq_{x}_{x}", .{ op.now_ns, self.requeue_counter }) catch "rq_err";
 
                 // Build enqueue op from old job's config.
                 const enq_job = ops.EnqueueJob{

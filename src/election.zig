@@ -45,6 +45,9 @@ pub const Message = struct {
     /// Oplog sequence — included in proposals so voters can reject
     /// candidates with stale data (Kafka ISR-style).
     last_log_seq: u64 = 0,
+    /// Cluster config hash — included in proposals and heartbeats.
+    /// Nodes with mismatched configs refuse to form a cluster.
+    config_hash: u64 = 0,
 };
 
 /// Election timing configuration. All durations in nanoseconds.
@@ -90,6 +93,11 @@ pub const Election = struct {
 
     /// Current node's oplog sequence. Set by caller before tick().
     last_log_seq: u64 = 0,
+
+    /// Cluster config hash. Set by caller after init(). Included in all
+    /// outgoing messages. Proposals/heartbeats from nodes with a different
+    /// config_hash are rejected (prevents misconfigured clusters).
+    config_hash: u64 = 0,
 
     /// Earliest time this node will propose (randomized to prevent livelock).
     next_election_at: i64 = 0,
@@ -298,6 +306,7 @@ pub const Election = struct {
                 .to = peer,
                 .epoch = self.epoch,
                 .last_log_seq = self.last_log_seq,
+                .config_hash = self.config_hash,
             };
         }
         return self.out_buf[0..self.peers.len];
@@ -343,6 +352,7 @@ pub const Election = struct {
                 .from = self.node_id,
                 .to = peer,
                 .epoch = self.epoch,
+                .config_hash = self.config_hash,
             };
         }
         return self.out_buf[0..self.peers.len];
@@ -351,6 +361,21 @@ pub const Election = struct {
     // --- Message handlers ---
 
     fn handlePropose(self: *Election, msg: Message) []const Message {
+        // Config hash mismatch — reject without advancing epoch.
+        // Nodes with different configs cannot form a cluster.
+        if (self.config_hash != 0 and msg.config_hash != 0 and
+            self.config_hash != msg.config_hash)
+        {
+            return self.emitOne(.{
+                .type_ = .vote,
+                .from = self.node_id,
+                .to = msg.from,
+                .epoch = msg.epoch,
+                .granted = false,
+                .config_hash = self.config_hash,
+            });
+        }
+
         // Stale epoch — reject.
         if (msg.epoch < self.epoch) {
             return self.emitOne(.{
@@ -359,6 +384,7 @@ pub const Election = struct {
                 .to = msg.from,
                 .epoch = msg.epoch,
                 .granted = false,
+                .config_hash = self.config_hash,
             });
         }
 
@@ -383,6 +409,7 @@ pub const Election = struct {
                 .to = msg.from,
                 .epoch = msg.epoch,
                 .granted = log_ok,
+                .config_hash = self.config_hash,
             });
         }
 
@@ -396,6 +423,7 @@ pub const Election = struct {
                 .to = msg.from,
                 .epoch = msg.epoch,
                 .granted = false,
+                .config_hash = self.config_hash,
             });
         }
 
@@ -408,6 +436,7 @@ pub const Election = struct {
                 .to = msg.from,
                 .epoch = msg.epoch,
                 .granted = false,
+                .config_hash = self.config_hash,
             });
         }
 
@@ -426,6 +455,7 @@ pub const Election = struct {
             .to = msg.from,
             .epoch = msg.epoch,
             .granted = true,
+            .config_hash = self.config_hash,
         });
     }
 
@@ -448,6 +478,14 @@ pub const Election = struct {
     }
 
     fn handleHeartbeat(self: *Election, msg: Message, now: i64) []const Message {
+        // Config hash mismatch — ignore heartbeat, don't extend lease.
+        // Leader has different config; let its lease expire.
+        if (self.config_hash != 0 and msg.config_hash != 0 and
+            self.config_hash != msg.config_hash)
+        {
+            return self.out_buf[0..0];
+        }
+
         // Stale heartbeat — ignore.
         if (msg.epoch < self.epoch) {
             return self.out_buf[0..0];
@@ -461,6 +499,7 @@ pub const Election = struct {
                 .from = self.node_id,
                 .to = msg.from,
                 .epoch = msg.epoch,
+                .config_hash = self.config_hash,
             });
         }
 
@@ -487,6 +526,7 @@ pub const Election = struct {
             .from = self.node_id,
             .to = msg.from,
             .epoch = msg.epoch,
+            .config_hash = self.config_hash,
         });
     }
 
@@ -635,4 +675,77 @@ test "epoch fencing rejects stale proposals" {
     }, 600);
     try testing.expectEqual(@as(usize, 1), replies.len);
     try testing.expect(!replies[0].granted);
+}
+
+test "config hash mismatch rejects proposal" {
+    const allocator = testing.allocator;
+    const peers = [_][]const u8{"node-2"};
+
+    var e1 = Election.init(allocator, "node-1", &peers, testConfig());
+    defer e1.deinit();
+    e1.config_hash = 0xAAAA;
+
+    // Receive a proposal from node-2 with a different config_hash.
+    const replies = e1.step(.{
+        .type_ = .propose,
+        .from = "node-2",
+        .to = "node-1",
+        .epoch = 1,
+        .config_hash = 0xBBBB,
+    }, 100);
+    try testing.expectEqual(@as(usize, 1), replies.len);
+    try testing.expect(!replies[0].granted);
+
+    // Node-1's epoch should NOT advance (config mismatch is pre-epoch check).
+    try testing.expectEqual(@as(u64, 0), e1.currentState().epoch);
+}
+
+test "config hash mismatch ignores heartbeat" {
+    const allocator = testing.allocator;
+    const peers = [_][]const u8{"node-2"};
+
+    var e = Election.init(allocator, "node-1", &peers, testConfig());
+    defer e.deinit();
+    e.config_hash = 0xAAAA;
+
+    // Receive a heartbeat from a leader with different config hash.
+    const replies = e.step(.{
+        .type_ = .heartbeat,
+        .from = "node-2",
+        .to = "node-1",
+        .epoch = 5,
+        .config_hash = 0xCCCC,
+    }, 100);
+    // Should return no messages (ignored).
+    try testing.expectEqual(@as(usize, 0), replies.len);
+    // Node should still be follower with no leader.
+    try testing.expectEqual(State.follower, e.currentState().state);
+    try testing.expectEqualStrings("", e.currentState().leader_id);
+}
+
+test "matching config hash allows election" {
+    const allocator = testing.allocator;
+    const peers_1 = [_][]const u8{"node-2"};
+    const peers_2 = [_][]const u8{"node-1"};
+
+    var e1 = Election.init(allocator, "node-1", &peers_1, testConfig());
+    defer e1.deinit();
+    e1.config_hash = 0xDEAD;
+
+    var e2 = Election.init(allocator, "node-2", &peers_2, testConfig());
+    defer e2.deinit();
+    e2.config_hash = 0xDEAD; // same hash
+
+    // node-1 proposes.
+    const proposals = e1.tick(100);
+    try testing.expectEqual(@as(usize, 1), proposals.len);
+
+    // node-2 grants vote (config hashes match).
+    const votes = e2.step(proposals[0], 100);
+    try testing.expectEqual(@as(usize, 1), votes.len);
+    try testing.expect(votes[0].granted);
+
+    // node-1 becomes leader.
+    _ = e1.step(votes[0], 100);
+    try testing.expect(e1.isLeader());
 }

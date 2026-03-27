@@ -52,6 +52,9 @@ pub const poller = @import("poller.zig");
 // Cluster mode (PBR)
 pub const cluster = @import("cluster.zig");
 
+// Server configuration
+pub const server_config = @import("config.zig");
+
 // Cluster simulator
 pub const cluster_sim = @import("cluster_sim.zig");
 
@@ -81,5 +84,6 @@ test {
     testing.refAllDecls(@import("rate_limiter.zig"));
     testing.refAllDecls(@import("poller.zig"));
     testing.refAllDecls(@import("io.zig"));
+    testing.refAllDecls(@import("config.zig"));
     // sqlite, schema, mirror, sqlite_read — tested via `zig build test-sqlite`
 }

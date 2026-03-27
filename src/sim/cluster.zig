@@ -343,6 +343,7 @@ pub const SimCluster = struct {
                             .epoch = emsg.epoch,
                             .granted = emsg.granted,
                             .last_log_seq = emsg.last_log_seq,
+                            .config_hash = emsg.config_hash,
                         };
                         const replies = n.election.step(lmsg, now);
                         for (replies) |r| {
@@ -352,6 +353,7 @@ pub const SimCluster = struct {
                                     .epoch = r.epoch,
                                     .granted = r.granted,
                                     .last_log_seq = r.last_log_seq,
+                                    .config_hash = r.config_hash,
                                 },
                             });
                         }
@@ -371,6 +373,7 @@ pub const SimCluster = struct {
                         .epoch = m.epoch,
                         .granted = m.granted,
                         .last_log_seq = m.last_log_seq,
+                        .config_hash = m.config_hash,
                     },
                 });
             }

@@ -31,6 +31,7 @@ pub const ElectionMsg = struct {
     epoch: u64,
     granted: bool = false,
     last_log_seq: u64 = 0,
+    config_hash: u64 = 0,
 };
 
 /// Replication message for transport.
@@ -347,6 +348,7 @@ pub const Runner = struct {
             .epoch = emsg.epoch,
             .granted = emsg.granted,
             .last_log_seq = emsg.last_log_seq,
+            .config_hash = emsg.config_hash,
         };
 
         const replies = self.config.election.step(lmsg, now);
@@ -431,6 +433,7 @@ pub const Runner = struct {
                 .epoch = m.epoch,
                 .granted = m.granted,
                 .last_log_seq = m.last_log_seq,
+                .config_hash = m.config_hash,
             };
             _ = self.config.transport.send(m.to, .{ .election = emsg });
         }

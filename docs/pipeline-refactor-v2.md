@@ -407,24 +407,35 @@ HTTP decode (http.zig) and response encoding. All discrepancies identified and f
 
 All tests pass. Sim passes. No regressions.
 
-### Step 16: Configuration file + cluster config consensus
-CLI args are per-node — if nodes disagree on max_payload_size, buffer sizes, or
-maintenance intervals, leadership changes cause silent data corruption or crashes.
+### Step 16: Configuration file + cluster config consensus — DONE
 
-**Config file**: TOML or minimal key=value. Loaded from `--config <path>` or
-`{data-dir}/corvo.conf`. CLI args override for dev/testing. Contains:
-- `bind`, `port`, `data_dir`
-- `max_payload_size` (drives recv_buf_size, send_buf_size, MAX_PAYLOAD_SIZE)
-- `max_connections`
-- Maintenance intervals (promote, reclaim, unique, rate_limit, expire, purge)
-- Cluster: `node_id`, `peers`, `sync_replication`
-- Mirror: `enabled`, `path`
+**`src/config.zig`** — ServerConfig struct with all server parameters. Simple
+key=value file parser (`--config <path>`). Load order: defaults → file → CLI args.
+`clusterHash()` computes FNV-1a over shared params that must match across nodes.
+`validate()` checks invariants (payload size, cluster peer requirements).
 
-**Cluster config assertion**: during election handshake, nodes exchange a config
-hash (or the full config struct). Mismatch = refuse to form cluster, log the
-diff. Params that must match: max_payload_size, maintenance intervals, any param
-that affects data layout or replication semantics. Params that can differ: bind,
-port, data_dir (node-local).
+**Config file format**: `key = value`, `#` comments, blank lines. Unknown keys
+are errors (catch typos). Supported keys: bind, port, data-dir, mirror, max-conns,
+max-payload-size, max-queues, max-tags-per-queue, promote-interval, reclaim-interval,
+unique-interval, rate-limit-interval, expire-interval, purge-interval,
+sync-replication, node-id, peers.
+
+**Cluster config consensus**: Election messages now carry `config_hash` (u64).
+Added to `Election.Message`, `ElectionMsg` transport struct, and TCP wire format
+(election frame: 19 → 27 bytes). Validation in election state machine:
+- `handlePropose`: config hash mismatch → reject vote without advancing epoch
+- `handleHeartbeat`: config hash mismatch → ignore (don't extend lease)
+- All outgoing messages include sender's config_hash
+
+**Shared params** (included in hash): max_payload_size, max_queues,
+max_tags_per_queue, all maintenance intervals, sync_replication.
+**Node-local** (excluded): bind, port, data_dir, mirror, max_conns, node_id, peers.
+
+**main_v2.zig** refactored: uses ServerConfig, two-pass CLI parsing (find --config
+first, load file, then apply all CLI overrides). Added --help. Maintenance intervals
+now configurable (were hardcoded). Config hash passed to ClusterNode.
+
+All tests pass. Sim passes. 13 new tests (config + election).
 
 ### Step 17: Reference commit functionality audit
 Iterate through each of the Reference Commits above. Determine if the functionality
