@@ -511,13 +511,21 @@ Sync repl uses adaptive batch coalescing (commit c88338c): pipeline accumulates 
 up to 200µs (`coalesce_window_ns`) before executing when batch is not full. Under high load
 the batch fills instantly (zero extra latency). Coalescing disabled for non-sync modes.
 
-| Config | Enqueue | Lifecycle | Notes |
-|--------|---------|-----------|-------|
-| 1-node | 559k | 253k | baseline |
-| 3-node async | 420k | 181k | ~12% overhead |
-| 3-node sync | 15.9k | 9.8k | RTT-bound, 2.3x vs pre-coalescing |
+| Config | Conns | Enqueue | Lifecycle | Notes |
+|--------|-------|---------|-----------|-------|
+| 1-node | 8 | 559k | 253k | baseline |
+| 3-node async | 8 | 420k | 181k | ~12% overhead |
+| 3-node sync | 8 | 15.9k | 9.8k | RTT-bound |
+| 3-node sync | 64 | 71k | 30k | scales with conns |
 
-Further sync-repl optimization: pipelined acks (allow N batches in-flight).
+Sync repl throughput is proportional to frames-per-drain / RTT. With request-response
+clients, each connection contributes one frame per drain. More connections = bigger batches
+per RTT. Pipelined prepares (N in-flight batches) only helps when connections exceed
+max_frames (256) — not needed yet.
+
+**Bug fix (3abb446):** Duplicate job ID check used a 1-byte getInto buffer — crashed in
+talon memcpy when the job existed. Changed from assert to error return (client-provided
+IDs are external input, not an internal invariant). Moved check before KV writes.
 
 ## Verification
 
