@@ -233,7 +233,8 @@ fn enqueueWorker(config: BenchConfig, worker_id: u16, jobs_per_worker: u32) Work
     defer client.close();
 
     var prefix_buf: [32]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&prefix_buf, "w{d}", .{worker_id}) catch "w";
+    const ts: u32 = @truncate(@as(u64, @intCast(std.time.milliTimestamp())));
+    const prefix = std.fmt.bufPrint(&prefix_buf, "{d}w{d}", .{ ts, worker_id }) catch "w";
 
     var total_enqueued: u64 = 0;
     var total_errors: u64 = 0;

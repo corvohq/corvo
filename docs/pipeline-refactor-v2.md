@@ -527,30 +527,61 @@ max_frames (256) — not needed yet.
 talon memcpy when the job existed. Changed from assert to error return (client-provided
 IDs are external input, not an internal invariant). Moved check before KV writes.
 
-### Step 19: Subscribe-only fetch (remove poll path)
-RPC fetch currently does a KV lookup (poll) on every fetch frame, then subscribes only
-if 0 jobs found. This allows clients to DoS the server by spamming fetch requests.
+### Step 19: Subscribe-only fetch (remove poll path) — DONE (commit 1c76a53)
+RPC fetch no longer polls KV via handler.apply in executeBatch. Every RPC fetch
+subscribes immediately — fulfillSubscriptions serves pending jobs on the same tick.
 
-Change: RPC fetch skips handler.apply(.fetch) entirely. Instead, store the subscription
-immediately via storeSubscription(). Add subscribed queues to notified_queue_count so
-fulfillSubscriptions() serves pending jobs at the end of the same tick. One path, one
-model — subscribe and get pushed, no polling.
+Changes:
+- `decodeAndApply` MSG_FETCH_BATCH: validate frame, return empty (no handler.apply)
+- `storeSubscription`: record subscribed queues as notified via recordNotifiedQueue
+- `encodeResponses`: always subscribe RPC fetch (removed affected==0 guard)
+- Sync-repl test updated: fetch no longer produces executeBatch mutations
 
-HTTP fetch stays request-response (returns empty immediately, client retries).
+HTTP fetch unchanged (request-response through decodeAndApplyHttp).
+Prevents DoS via fetch spam (subscribe is O(1), no disk I/O).
 
-### Step 20: Pipelined prepares for sync replication
-With 20k connections, drain() returns max 256 completions per batch. The remaining
-connections have data waiting in recv_bufs. Currently the pipeline blocks on ack after
-each batch — 19,744 connections sit idle.
+Bench (ReleaseFast, 200k jobs, batch-64):
 
-Pipelined prepares: allow N batches in-flight (e.g. 4). Execute batch 1 → replicate →
-execute batch 2 → replicate → ... only block when all N slots full. Each in-flight
-batch needs its own frames[], results[], recv_compactions[], recv_conns[]. ~288KB per
-slot × 4 = ~1.1MB additional memory. recv_buf compaction deferred until oldest batch
-acked (HTTP frames hold slices into recv_buf).
+| Config | Conns | Enqueue | Lifecycle |
+|--------|-------|---------|-----------|
+| 1-node | 8 | 540k | 271k |
+| 3-node async | 8 | 478k | 210k |
+| 3-node sync | 8 | 15.5k | 18.9k |
+| 3-node sync | 64 | 48.9k | 32.7k |
+| 3-node sync | 128 | 120k | 43.3k |
+| 3-node sync | 256 | 84.7k | 25.6k |
+
+Sync-repl lifecycle nearly doubled at low conn counts (9.8k → 18.9k at 8 conns)
+because fetch no longer produces executeBatch mutations needing replication deferral.
+
+### Step 20: Pipelined prepares for sync replication — DONE
+With 20k connections, drain() returns max 256 completions per batch. Previously the
+pipeline blocked on ack after each batch — 19,744 connections sat idle.
+
+**Pipelined prepares:** up to 4 batches in-flight (compile-time `max_prepare_slots`).
+Each tick: execute batch → replicate → encode responses → compact recv_bufs → save
+to prepare slot (sends deferred). When follower ack arrives, flush sends + requeue
+recvs from the slot. Only blocks when all 4 slots are full.
+
+Key design: responses are encoded on the SAME tick as executeBatch (while recv_buf
+slices are still valid), then recv_bufs are compacted immediately. Only the flush
+(queueSend) and recv requeue are deferred. Each slot stores ~9KB (send_conns +
+recv_conns + ack_seq), not full frame/result arrays.
+
+**Optimization:** batches with no oplog mutations (e.g. subscribe-only fetch) bypass
+deferral entirely — no replication needed, flush immediately.
+
+**Three-phase tick loop:**
+1. Flush acked prepare slots (FIFO order)
+2. If all slots full: drain non-blocking, save deferred recv conns, return
+3. Normal: drain → extract → maintenance → executeBatch → encode → fulfill →
+   compact → save to slot (sync-repl) or flush (non-sync)
 
 With 4 in-flight slots: 4 × 256 = 1024 frames per ack cycle instead of 256.
-At 20k connections this 4x's throughput vs current single-batch approach.
+At 20k connections this 4x's throughput vs single-batch approach.
+
+3 new tests: enqueue deferred + fetch fulfilled immediately, multiple batches
+in flight, fast path when ack races ahead. All existing tests + sim pass.
 
 ## Verification
 

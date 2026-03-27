@@ -113,18 +113,19 @@ pub fn Pipeline(comptime IoBackend: type) type {
         last_expire_ns: u64 = 0,
         last_purge_ns: u64 = 0,
 
-        // Sync replication — deferred response until follower ack.
+        // Sync replication — pipelined prepares.
+        // Up to max_prepare_slots batches can be in-flight. Each slot holds
+        // deferred sends + recv requeues until replication ack arrives.
         // last_acked_seq is written by the TCP receive thread (via onFollowerAck),
         // read by the pipeline tick thread. Single atomic, single shared state.
         last_acked_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         last_recorded_seq: u64 = 0,
-        pending_ack_seq: u64 = 0,
-        // recv_conns saved from the tick that created the pending batch,
-        // needed for requeueRecvs when the deferred responses are flushed.
-        pending_recv_conns: [max_completions]u16 = undefined,
-        pending_recv_conn_count: u32 = 0,
-        // Recv connections that arrived during sync-repl wait — CQEs consumed
-        // but data is in recv_buf. Processed after deferred batch flushes.
+        prepare_slots: [max_prepare_slots]PrepareSlot = [_]PrepareSlot{.{}} ** max_prepare_slots,
+        prepare_head: u32 = 0,
+        prepare_tail: u32 = 0,
+        prepare_count: u32 = 0,
+        // Recv connections that arrived while all prepare slots were full.
+        // CQEs consumed but data is in recv_buf. Processed when a slot frees up.
         deferred_recv_conns: [max_completions]u16 = undefined,
         deferred_recv_conn_count: u32 = 0,
 
@@ -139,6 +140,17 @@ pub fn Pipeline(comptime IoBackend: type) type {
         const max_completions: u32 = 256;
         const max_waiting_conns: u32 = 4096;
         const max_notified_queues: u32 = 64;
+        const max_prepare_slots: u32 = 4;
+
+        /// Pipelined prepare slot for sync replication. Holds deferred
+        /// sends and recv requeues until replication ack arrives.
+        const PrepareSlot = struct {
+            send_conns: [max_frames + max_waiting_conns]u16 = undefined,
+            send_conn_count: u32 = 0,
+            recv_conns: [max_completions]u16 = undefined,
+            recv_conn_count: u32 = 0,
+            ack_seq: u64 = 0,
+        };
 
 
         // ====================================================================
@@ -264,55 +276,62 @@ pub fn Pipeline(comptime IoBackend: type) type {
         // ====================================================================
 
         pub fn tick(self: *Self) void {
-            // 0. Sync replication: check for deferred ack from a previous tick.
-            //    If ack received, flush the deferred responses and fall through to
-            //    the normal tick — connections that received data during the wait
-            //    need their frames extracted. If still waiting, drain IO events
-            //    (close/send_done) and save recv conn_ids for later.
-            if (self.pending_ack_seq > 0) {
-                if (self.last_acked_seq.load(.acquire) >= self.pending_ack_seq) {
-                    self.encodeResponses();
-                    self.fulfillSubscriptions();
-                    self.flushSends();
-                    self.compactRecvBufs();
-                    self.requeueRecvs(self.pending_recv_conns[0..self.pending_recv_conn_count]);
-                    self.pending_ack_seq = 0;
-                    self.pending_recv_conn_count = 0;
-                    self.io.submit();
-                    // Fall through to normal tick — process deferred recv connections.
+            // ---- Phase 1: Flush acked prepare slots (FIFO order) ----
+            // Pipelined prepares: up to max_prepare_slots batches in-flight
+            // for sync replication. Each slot holds deferred sends + recv
+            // requeues until replication ack arrives.
+            while (self.prepare_count > 0) {
+                const slot = &self.prepare_slots[self.prepare_head];
+                if (self.last_acked_seq.load(.acquire) >= slot.ack_seq) {
+                    self.flushPrepareSlot(slot);
+                    slot.ack_seq = 0;
+                    self.prepare_head = (self.prepare_head + 1) % max_prepare_slots;
+                    self.prepare_count -= 1;
                 } else {
-                    // Still waiting — non-blocking drain so we don't stall in
-                    // io_uring submit_and_wait while the cluster thread updates the atomic.
-                    // Save recv conn_ids: their CQEs are consumed but data is in recv_buf.
-                    const n_pending = self.io.drainNonBlocking(&self.completions);
-                    for (self.completions[0..n_pending]) |completion| {
-                        switch (completion.event) {
-                            .recv => self.deferRecvConn(completion.conn_id),
-                            .accept => {},
-                            .closed => self.onConnClosed(completion.conn_id),
-                            .send_done => {
-                                const sc = self.io.conn(completion.conn_id);
-                                if (sc.recv_pos > 0) {
-                                    self.deferRecvConn(completion.conn_id);
-                                } else {
-                                    self.io.queueRecv(completion.conn_id);
-                                }
-                            },
-                        }
-                    }
-                    self.io.submit();
-                    self.ticks_total += 1;
-                    return;
+                    break;
                 }
             }
 
+            // ---- Phase 2: All slots full — back-pressure ----
+            if (self.prepare_count >= max_prepare_slots) {
+                // Cannot execute a new batch until a slot frees up.
+                // Drain IO non-blocking: handle close/send_done, save recv data.
+                const n_full = self.io.drainNonBlocking(&self.completions);
+                for (self.completions[0..n_full]) |completion| {
+                    switch (completion.event) {
+                        .recv => self.deferRecvConn(completion.conn_id),
+                        .accept => {},
+                        .closed => self.onConnClosed(completion.conn_id),
+                        .send_done => {
+                            const sc = self.io.conn(completion.conn_id);
+                            if (sc.recv_pos > 0) {
+                                self.deferRecvConn(completion.conn_id);
+                            } else {
+                                self.io.queueRecv(completion.conn_id);
+                            }
+                        },
+                    }
+                }
+                self.io.submit();
+                self.ticks_total += 1;
+                return;
+            }
+
+            // ---- Phase 3: Normal batch processing ----
+
             // 1. Drain IO completions.
-            //    With sync replication + coalescing, the IO layer collects CQEs
-            //    for up to coalesce_window_ns to build a larger batch. Adaptive:
-            //    returns immediately when the buffer fills (high load = zero extra latency).
-            const coalesce = self.config.sync_replication and self.config.repl_hook != null and
-                self.config.coalesce_window_ns > 0;
-            const n = if (coalesce)
+            //    When prepare slots are pending (waiting for follower ack), use
+            //    non-blocking drain: the ack arrives via atomic (TCP thread), not
+            //    via io_uring CQE, so blocking drain would stall forever when no
+            //    other SQEs are in-flight.
+            //    With coalescing (sync-repl + no pending slots), the IO layer
+            //    collects CQEs for up to coalesce_window_ns to build a larger batch.
+            const has_pending = self.prepare_count > 0;
+            const coalesce = !has_pending and self.config.sync_replication and
+                self.config.repl_hook != null and self.config.coalesce_window_ns > 0;
+            const n = if (has_pending)
+                self.io.drainNonBlocking(&self.completions)
+            else if (coalesce)
                 self.io.drainCoalescing(
                     &self.completions,
                     self.config.clock_fn,
@@ -326,14 +345,13 @@ pub fn Pipeline(comptime IoBackend: type) type {
             self.recv_compaction_count = 0;
             self.notified_queue_count = 0;
 
-            // 2. Process completions — collect unique recv conn_ids
+            // 2. Process completions — collect unique recv conn_ids.
             var recv_conns: [max_completions]u16 = undefined;
             var recv_conn_count: u32 = 0;
 
             for (self.completions[0..n]) |completion| {
                 switch (completion.event) {
                     .recv => {
-                        // Deduplicate: only process each conn once per tick
                         var dup = false;
                         for (recv_conns[0..recv_conn_count]) |existing| {
                             if (existing == completion.conn_id) {
@@ -349,9 +367,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     .accept => {},
                     .closed => self.onConnClosed(completion.conn_id),
                     .send_done => {
-                        // After send completes, check if recv buffer already has
-                        // data (HTTP pipelining / keep-alive). If so, process it
-                        // this tick instead of waiting for a new recv completion.
                         const c = self.io.conn(completion.conn_id);
                         if (c.recv_pos > 0) {
                             var dup = false;
@@ -369,8 +384,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 }
             }
 
-            // Include connections that received data during sync-repl wait.
-            // Their CQEs were consumed but data is already in recv_buf.
+            // Include connections that received data while all prepare slots were full.
             for (self.deferred_recv_conns[0..self.deferred_recv_conn_count]) |dc| {
                 var dup = false;
                 for (recv_conns[0..recv_conn_count]) |existing| {
@@ -391,18 +405,13 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
 
             // Run scheduled maintenance in its own batch, committed before client ops.
-            // Maintenance must not share a WriteBatch with client ops: reclaim/ack on the
-            // same job would double-decrement active counts (WriteBatch iterators see base state).
             self.runMaintenance();
 
             if (self.frame_count == 0) {
-                // No client frames — but maintenance may have made jobs available.
                 if (self.notified_queue_count > 0) {
                     self.fulfillSubscriptions();
                     self.flushSends();
                 }
-                // HTTP reads are handled inline in extractFrames (no frames produced)
-                // but still record recv compactions that must be applied.
                 self.compactRecvBufs();
                 self.requeueRecvs(recv_conns[0..recv_conn_count]);
                 self.io.submit();
@@ -410,42 +419,53 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 return;
             }
 
-            // 3. Execute: decode + apply in single kv.Batch
+            // 3. Execute: decode + apply in single kv.Batch.
+            const seq_before = self.last_recorded_seq;
             self.executeBatch();
+            const has_new_mutations = self.last_recorded_seq > seq_before;
 
-            // 4. Sync replication: defer responses until follower ack.
-            //    frames[], results[], recv_compactions[] persist in struct fields.
-            //    recv_bufs are NOT compacted — HTTP path_param/sub_action still reference them.
-            if (self.config.sync_replication and self.config.repl_hook != null) {
-                // Check if ack already arrived (fast-path callback can race ahead).
-                if (self.last_acked_seq.load(.acquire) >= self.last_recorded_seq) {
-                    // Already acked — encode immediately, no deferral needed.
+            // 4. Sync replication with mutations: encode responses now (while
+            //    recv_buf slices are still valid), compact recv_bufs, then defer
+            //    sends until follower ack. No mutations = no replication needed.
+            if (self.config.sync_replication and self.config.repl_hook != null and has_new_mutations) {
+                // Capture ack_seq from executeBatch BEFORE fulfillSubscriptions,
+                // which may produce additional oplog entries for worker registration.
+                // Those entries are replicated but not waited for (matches old behavior
+                // where fulfillSubscriptions ran after the ack arrived).
+                const batch_ack_seq = self.last_recorded_seq;
+
+                self.encodeResponses();
+                self.fulfillSubscriptions();
+                self.compactRecvBufs();
+
+                // Fast path: ack already arrived (TCP thread can race ahead).
+                if (self.last_acked_seq.load(.acquire) >= batch_ack_seq) {
+                    self.flushSends();
+                    self.requeueRecvs(recv_conns[0..recv_conn_count]);
                 } else {
-                    self.pending_ack_seq = self.last_recorded_seq;
-                    @memcpy(self.pending_recv_conns[0..recv_conn_count], recv_conns[0..recv_conn_count]);
-                    self.pending_recv_conn_count = recv_conn_count;
-                    self.io.submit();
-                    self.ticks_total += 1;
-                    return;
+                    // Save to prepare slot — sends deferred until follower ack.
+                    assert.check(
+                        self.prepare_count < max_prepare_slots,
+                        "pipeline: prepare slot overflow",
+                        .{},
+                    );
+                    const slot = &self.prepare_slots[self.prepare_tail];
+                    slot.ack_seq = batch_ack_seq;
+                    @memcpy(slot.send_conns[0..self.send_conn_count], self.send_conns[0..self.send_conn_count]);
+                    slot.send_conn_count = self.send_conn_count;
+                    @memcpy(slot.recv_conns[0..recv_conn_count], recv_conns[0..recv_conn_count]);
+                    slot.recv_conn_count = recv_conn_count;
+                    self.prepare_tail = (self.prepare_tail + 1) % max_prepare_slots;
+                    self.prepare_count += 1;
                 }
+            } else {
+                self.encodeResponses();
+                self.fulfillSubscriptions();
+                self.flushSends();
+                self.compactRecvBufs();
+                self.requeueRecvs(recv_conns[0..recv_conn_count]);
             }
 
-            // 5. Encode responses into send_bufs (no sends queued yet)
-            self.encodeResponses();
-
-            // 6. Push jobs to waiting fetch subscribers (appends to send_bufs)
-            self.fulfillSubscriptions();
-
-            // 7. Flush all accumulated sends (one queueSend per connection)
-            self.flushSends();
-
-            // 8. Compact recv_bufs (payload slices no longer needed)
-            self.compactRecvBufs();
-
-            // 9. Re-queue recv for connections with partial frames (no send pending)
-            self.requeueRecvs(recv_conns[0..recv_conn_count]);
-
-            // 10. Submit all queued IO
             self.io.submit();
             self.ticks_total += 1;
         }
@@ -1225,9 +1245,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
             self.waiting_conn_count += 1;
         }
 
-        /// Save a recv conn_id for processing after deferred batch flushes.
-        /// Called during sync-repl wait when recv CQEs arrive but frames cannot
-        /// be processed yet (one batch at a time, TigerBeetle style).
+        /// Save a recv conn_id for processing when a prepare slot frees up.
+        /// Called when all prepare slots are full and recv CQEs arrive but
+        /// frames cannot be processed yet (no free slot for a new batch).
         fn deferRecvConn(self: *Self, conn_id: u16) void {
             for (self.deferred_recv_conns[0..self.deferred_recv_conn_count]) |existing| {
                 if (existing == conn_id) return;
@@ -1481,6 +1501,29 @@ pub fn Pipeline(comptime IoBackend: type) type {
         /// with a pending send will get recv re-queued via the send_done path.
         fn requeueRecvs(self: *Self, recv_conns: []const u16) void {
             for (recv_conns) |conn_id| {
+                const c = self.io.conn(conn_id);
+                if (c.waiting) continue;
+                if (c.phase == .ready and c.recv_pos < c.recv_buf.len) {
+                    self.io.queueRecv(conn_id);
+                }
+            }
+        }
+
+        // ====================================================================
+        // Pipelined prepare — flush an acked slot
+        // ====================================================================
+
+        /// Flush sends and requeue recvs for an acked prepare slot.
+        /// Called at the top of tick() when a follower ack arrives.
+        fn flushPrepareSlot(self: *Self, slot: *const PrepareSlot) void {
+            for (slot.send_conns[0..slot.send_conn_count]) |conn_id| {
+                const c = self.io.conn(conn_id);
+                if (c.phase == .free) continue;
+                if (c.send_len > 0) {
+                    self.io.queueSend(conn_id, c.send_len);
+                }
+            }
+            for (slot.recv_conns[0..slot.recv_conn_count]) |conn_id| {
                 const c = self.io.conn(conn_id);
                 if (c.waiting) continue;
                 if (c.phase == .ready and c.recv_pos < c.recv_buf.len) {
@@ -2243,11 +2286,10 @@ test "maintenance promote wakes fetch subscription" {
 
 fn testReplNoop(_: *anyopaque, _: u16, _: u64, _: []const u8) void {}
 
-test "sync-repl deferred recv connections are not lost" {
-    const ctx = try TestContext.create("/tmp/corvo-pv2-sync-repl-deferred");
+test "sync-repl pipelined prepares — enqueue deferred, fetch fulfilled immediately" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-sync-repl-pipeline");
     defer ctx.destroy();
 
-    // Enable sync replication with a no-op repl hook.
     var repl_ctx: u8 = 0;
     ctx.pipeline.config.sync_replication = true;
     ctx.pipeline.config.repl_hook = .{
@@ -2258,7 +2300,7 @@ test "sync-repl deferred recv connections are not lost" {
     const enq_conn = ctx.backend.connect().?;
     const fetch_conn = ctx.backend.connect().?;
 
-    // 1. Enqueue a job — response will be deferred until follower ack.
+    // 1. Enqueue a job — response encoded but deferred in prepare slot.
     var enq_buf: [512]u8 = undefined;
     var ew = BufWriter{ .buf = &enq_buf };
     ew.writeU16(1);
@@ -2278,11 +2320,12 @@ test "sync-repl deferred recv connections are not lost" {
     ctx.injectFrame(enq_conn, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
     ctx.pipeline.tick();
 
-    // Enqueue processed but deferred — no response yet.
-    try testing.expect(ctx.pipeline.pending_ack_seq > 0);
-    try testing.expect(ctx.readResponse(enq_conn) == null);
+    try testing.expectEqual(@as(u32, 1), ctx.pipeline.prepare_count);
+    // Response encoded in send_buf but send not queued.
+    try testing.expect(ctx.backend.conn(enq_conn).send_len > 0);
 
-    // 2. Fetch arrives while enqueue ack is pending.
+    // 2. Fetch arrives — subscribe-only, no mutations, flush immediately.
+    //    Job is committed to KV from step 1, so fulfillSubscriptions finds it.
     var fetch_buf: [256]u8 = undefined;
     var fw = BufWriter{ .buf = &fetch_buf };
     fw.writeU16(1);
@@ -2292,31 +2335,145 @@ test "sync-repl deferred recv connections are not lost" {
     fw.writePrefixed("sync-queue");
 
     ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 5, fw.written());
-    ctx.pipeline.tick(); // Still waiting — fetch recv saved, not lost.
-
-    try testing.expect(ctx.pipeline.pending_ack_seq > 0);
-    try testing.expectEqual(@as(u32, 1), ctx.pipeline.deferred_recv_conn_count);
-
-    // 3. Ack the enqueue batch — flush + fall through processes deferred fetch.
-    ctx.pipeline.last_acked_seq.store(ctx.pipeline.pending_ack_seq, .release);
     ctx.pipeline.tick();
 
-    // Enqueue response available.
+    // Fetch fulfilled immediately.
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.subscriptions_fulfilled);
+    // Enqueue still deferred.
+    try testing.expectEqual(@as(u32, 1), ctx.pipeline.prepare_count);
+
+    // 3. Ack the enqueue — flush prepare slot.
+    ctx.pipeline.last_acked_seq.store(
+        ctx.pipeline.prepare_slots[ctx.pipeline.prepare_head].ack_seq,
+        .release,
+    );
+    ctx.pipeline.tick();
+
+    try testing.expectEqual(@as(u32, 0), ctx.pipeline.prepare_count);
+
+    // Enqueue response sent after ack.
     const enq_resp = ctx.readResponse(enq_conn).?;
     try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, enq_resp.header.msg_type);
+    try testing.expectEqual(@as(u32, 1), enq_resp.header.req_id);
+}
 
-    // Subscribe-only fetch: no executeBatch mutations, fulfilled immediately
-    // via fulfillSubscriptions on the same tick.
-    try testing.expectEqual(@as(u32, 0), ctx.pipeline.deferred_recv_conn_count);
+test "sync-repl pipelined prepares — multiple batches in flight" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-sync-repl-multi-slot");
+    defer ctx.destroy();
 
-    // Fetch response available (fulfilled on same tick as enqueue ack).
-    const fetch_resp = ctx.readResponse(fetch_conn).?;
-    try testing.expectEqual(rpc.MSG_FETCH_BATCH_RESP, fetch_resp.header.msg_type);
-    try testing.expectEqual(@as(u32, 5), fetch_resp.header.req_id);
+    var repl_ctx: u8 = 0;
+    ctx.pipeline.config.sync_replication = true;
+    ctx.pipeline.config.repl_hook = .{
+        .ptr = @ptrCast(&repl_ctx),
+        .replicate_fn = &testReplNoop,
+    };
 
-    var r = BufReader{ .data = fetch_resp.payload };
-    const count = try r.readU16();
-    try testing.expectEqual(@as(u16, 1), count);
-    const job_id = try r.readPrefixed();
-    try testing.expectEqualStrings("sync-job-1", job_id);
+    const conn1 = ctx.backend.connect().?;
+    const conn2 = ctx.backend.connect().?;
+
+    // 1. Enqueue job-1 — deferred in slot 0.
+    var enq1_buf: [512]u8 = undefined;
+    var ew1 = BufWriter{ .buf = &enq1_buf };
+    ew1.writeU16(1);
+    ew1.writePrefixed("pipe-queue");
+    ew1.writePrefixed("pipe-job-1");
+    ew1.writeU8(128);
+    ew1.writeU16(3);
+    ew1.writeU8(0);
+    ew1.writeU32(0);
+    ew1.writeU32(0);
+    ew1.writeU32(0);
+    ew1.writeU64(0);
+    ew1.writeU32(0);
+    ew1.writeU16(0);
+    ew1.writeU16(0);
+
+    ctx.injectFrame(conn1, rpc.MSG_ENQUEUE_BATCH, 1, ew1.written());
+    ctx.pipeline.tick();
+
+    try testing.expectEqual(@as(u32, 1), ctx.pipeline.prepare_count);
+    const slot0_seq = ctx.pipeline.prepare_slots[0].ack_seq;
+    try testing.expect(slot0_seq > 0);
+
+    // 2. Enqueue job-2 — deferred in slot 1.
+    var enq2_buf: [512]u8 = undefined;
+    var ew2 = BufWriter{ .buf = &enq2_buf };
+    ew2.writeU16(1);
+    ew2.writePrefixed("pipe-queue");
+    ew2.writePrefixed("pipe-job-2");
+    ew2.writeU8(128);
+    ew2.writeU16(3);
+    ew2.writeU8(0);
+    ew2.writeU32(0);
+    ew2.writeU32(0);
+    ew2.writeU32(0);
+    ew2.writeU64(0);
+    ew2.writeU32(0);
+    ew2.writeU16(0);
+    ew2.writeU16(0);
+
+    ctx.injectFrame(conn2, rpc.MSG_ENQUEUE_BATCH, 2, ew2.written());
+    ctx.pipeline.tick();
+
+    try testing.expectEqual(@as(u32, 2), ctx.pipeline.prepare_count);
+    const slot1_seq = ctx.pipeline.prepare_slots[1].ack_seq;
+    try testing.expect(slot1_seq > slot0_seq);
+
+    // 3. Ack all — both slots flushed in one tick.
+    ctx.pipeline.last_acked_seq.store(slot1_seq, .release);
+    ctx.pipeline.tick();
+
+    try testing.expectEqual(@as(u32, 0), ctx.pipeline.prepare_count);
+
+    // Both responses available.
+    const resp1 = ctx.readResponse(conn1).?;
+    try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, resp1.header.msg_type);
+    try testing.expectEqual(@as(u32, 1), resp1.header.req_id);
+
+    const resp2 = ctx.readResponse(conn2).?;
+    try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, resp2.header.msg_type);
+    try testing.expectEqual(@as(u32, 2), resp2.header.req_id);
+}
+
+test "sync-repl pipelined prepares — fast path when ack races ahead" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-sync-repl-fastpath");
+    defer ctx.destroy();
+
+    var repl_ctx: u8 = 0;
+    ctx.pipeline.config.sync_replication = true;
+    ctx.pipeline.config.repl_hook = .{
+        .ptr = @ptrCast(&repl_ctx),
+        .replicate_fn = &testReplNoop,
+    };
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Pre-ack a high sequence — simulates follower being ahead.
+    ctx.pipeline.last_acked_seq.store(100, .release);
+
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("fast-queue");
+    ew.writePrefixed("fast-job-1");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0);
+
+    ctx.injectFrame(conn_id, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+    ctx.pipeline.tick();
+
+    // Fast path: ack already high enough, no prepare slot used.
+    try testing.expectEqual(@as(u32, 0), ctx.pipeline.prepare_count);
+
+    // Response sent immediately.
+    const resp = ctx.readResponse(conn_id).?;
+    try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, resp.header.msg_type);
 }
