@@ -507,11 +507,17 @@ the 4096-entry buffer (assert panic). Remaining work is done on subsequent ticks
 | 3-node async repl | 420k | 181k |
 | 3-node sync repl | 6.9k (50k jobs) | 5.0k (50k jobs) |
 
-Sync repl is slow by design: pipeline serializes on replication RTT (one batch at a time,
-TigerBeetle pattern). With localhost TCP round-trip ~100-200µs and small batches (~8 frames
-per drain), throughput is RTT-bound. Production with higher latency clients would see larger
-batches per tick, partially offsetting the per-batch ack cost. Possible future optimizations:
-batch accumulation window or pipelined acks (N batches in-flight).
+Sync repl uses adaptive batch coalescing (commit c88338c): pipeline accumulates frames for
+up to 200µs (`coalesce_window_ns`) before executing when batch is not full. Under high load
+the batch fills instantly (zero extra latency). Coalescing disabled for non-sync modes.
+
+| Config | Enqueue | Lifecycle | Notes |
+|--------|---------|-----------|-------|
+| 1-node | 559k | 253k | baseline |
+| 3-node async | 420k | 181k | ~12% overhead |
+| 3-node sync | 15.9k | 9.8k | RTT-bound, 2.3x vs pre-coalescing |
+
+Further sync-repl optimization: pipelined acks (allow N batches in-flight).
 
 ## Verification
 

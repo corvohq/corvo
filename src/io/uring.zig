@@ -135,6 +135,28 @@ pub const UringBackend = struct {
         return self.processCqes(out, cqe_count);
     }
 
+    /// Coalescing drain: like drain(), but after the first batch of CQEs,
+    /// keeps collecting non-blocking until the output buffer is full or the
+    /// clock exceeds deadline_ns. Used for sync replication batch accumulation.
+    pub fn drainCoalescing(self: *UringBackend, out: []Completion, clock_fn: *const fn () i64, deadline_ns: u64) u32 {
+        // First: blocking drain to get at least one CQE.
+        var total = self.drain(out);
+        if (total >= out.len) return total;
+
+        // Then: keep peeking for more CQEs until deadline or buffer full.
+        while (total < out.len) {
+            const now: u64 = @intCast(clock_fn());
+            if (now >= deadline_ns) break;
+
+            _ = self.ring.submit() catch 0;
+            const cqe_count = self.ring.copy_cqes(&self.cqe_buf, 0) catch 0;
+            if (cqe_count == 0) continue;
+
+            total += self.processCqes(out[total..], cqe_count);
+        }
+        return total;
+    }
+
     /// Non-blocking drain: submit pending SQEs and return any ready CQEs.
     /// Returns 0 immediately if nothing is ready. Used during sync replication
     /// ack-wait so the pipeline tick loop doesn't block on io_uring while

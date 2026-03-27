@@ -115,6 +115,11 @@ pub const SimBackend = struct {
         return n;
     }
 
+    /// Coalescing drain — sim has no real IO, just returns what's staged.
+    pub fn drainCoalescing(self: *SimBackend, out: []Completion, _: *const fn () i64, _: u64) u32 {
+        return self.drain(out);
+    }
+
     /// Non-blocking drain — same as drain for SimBackend (already non-blocking).
     pub fn drainNonBlocking(self: *SimBackend, out: []Completion) u32 {
         return self.drain(out);
