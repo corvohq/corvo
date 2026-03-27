@@ -155,4 +155,22 @@ pub fn build(b: *std.Build) void {
     if (b.args) |a| run_server_v2.addArgs(a);
     const run_v2_step = b.step("run-v2", "Run the Corvo v2 server (pipeline_v2 + io_uring/kqueue)");
     run_v2_step.dependOn(&run_server_v2.step);
+
+    // --- corvo-inspect CLI ---
+    const inspect_mod = b.createModule(.{
+        .root_source_file = b.path("src/inspect.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inspect_mod.addImport("talon", talon_mod);
+    inspect_mod.addImport("corvo", corvo_mod);
+    const inspect_exe = b.addExecutable(.{
+        .name = "corvo-inspect",
+        .root_module = inspect_mod,
+    });
+    b.installArtifact(inspect_exe);
+    const run_inspect = b.addRunArtifact(inspect_exe);
+    if (b.args) |a| run_inspect.addArgs(a);
+    const inspect_step = b.step("inspect", "Run corvo-inspect CLI");
+    inspect_step.dependOn(&run_inspect.step);
 }

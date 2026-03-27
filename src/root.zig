@@ -55,6 +55,9 @@ pub const cluster = @import("cluster.zig");
 // Server configuration
 pub const server_config = @import("config.zig");
 
+// CLI client
+pub const cli = @import("cli.zig");
+
 // Cluster simulator
 pub const cluster_sim = @import("cluster_sim.zig");
 

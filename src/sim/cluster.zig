@@ -689,37 +689,87 @@ pub const SimCluster = struct {
         for (self.nodes, 0..) |*node, i| {
             if (i == leader_idx) continue;
 
-            var leader_count: u32 = 0;
-            var follower_count: u32 = 0;
+            var lb = leader.store.newBatch();
+            defer lb.close();
+            var fb = node.store.newBatch();
+            defer fb.close();
 
-            {
-                var lb = leader.store.newBatch();
-                defer lb.close();
-                var iter = lb.newIter("", "\xff");
-                defer iter.close();
-                if (iter.first()) {
-                    leader_count += 1;
-                    while (iter.next()) leader_count += 1;
+            var l_iter = lb.newIter("\x00", "\xff");
+            defer l_iter.close();
+            var f_iter = fb.newIter("\x00", "\xff");
+            defer f_iter.close();
+
+            var l_valid = l_iter.first();
+            var f_valid = f_iter.first();
+            var key_count: u32 = 0;
+
+            while (l_valid and f_valid) {
+                const l_key = l_iter.key();
+                const f_key = f_iter.key();
+
+                if (!std.mem.eql(u8, l_key, f_key)) {
+                    // Key mismatch — one side has a key the other doesn't.
+                    // Print both keys for debugging, then fail hard.
+                    std.debug.print(
+                        "REPLICATION KEY MISMATCH at position {d}: leader({s}) key[{d}]=\"",
+                        .{ key_count, leader.id, l_key.len },
+                    );
+                    printKey(l_key);
+                    std.debug.print("\", follower({s}) key[{d}]=\"", .{ node.id, f_key.len });
+                    printKey(f_key);
+                    std.debug.print("\"\n", .{});
+                    return error.ReplicationMismatch;
                 }
+
+                const l_val = l_iter.value();
+                const f_val = f_iter.value();
+
+                if (!std.mem.eql(u8, l_val, f_val)) {
+                    std.debug.print(
+                        "REPLICATION VALUE MISMATCH at key \"",
+                        .{},
+                    );
+                    printKey(l_key);
+                    std.debug.print(
+                        "\": leader({s}) {d} bytes, follower({s}) {d} bytes\n",
+                        .{ leader.id, l_val.len, node.id, f_val.len },
+                    );
+                    return error.ReplicationMismatch;
+                }
+
+                key_count += 1;
+                l_valid = l_iter.next();
+                f_valid = f_iter.next();
             }
 
-            {
-                var fb = node.store.newBatch();
-                defer fb.close();
-                var iter = fb.newIter("", "\xff");
-                defer iter.close();
-                if (iter.first()) {
-                    follower_count += 1;
-                    while (iter.next()) follower_count += 1;
-                }
-            }
-
-            if (leader_count != follower_count) {
+            // Both iterators must exhaust at the same time.
+            if (l_valid) {
                 std.debug.print(
-                    "CLUSTER SIM REPLICATION MISMATCH: leader({s}) {d} keys, follower({s}) {d} keys\n",
-                    .{ leader.id, leader_count, node.id, follower_count },
+                    "REPLICATION EXTRA LEADER KEY at position {d}: leader({s}) has key \"",
+                    .{ key_count, leader.id },
                 );
+                printKey(l_iter.key());
+                std.debug.print("\" but follower({s}) exhausted\n", .{node.id});
                 return error.ReplicationMismatch;
+            }
+            if (f_valid) {
+                std.debug.print(
+                    "REPLICATION EXTRA FOLLOWER KEY at position {d}: follower({s}) has key \"",
+                    .{ key_count, node.id },
+                );
+                printKey(f_iter.key());
+                std.debug.print("\" but leader({s}) exhausted\n", .{leader.id});
+                return error.ReplicationMismatch;
+            }
+        }
+    }
+
+    fn printKey(key: []const u8) void {
+        for (key) |b| {
+            if (b >= 0x20 and b <= 0x7e) {
+                std.debug.print("{c}", .{b});
+            } else {
+                std.debug.print("\\x{x:0>2}", .{b});
             }
         }
     }

@@ -58,6 +58,14 @@ pub const JobRow = struct {
     scheduled_at_len: u8 = 0,
     lease_expires_at: [32]u8 = undefined,
     lease_expires_at_len: u8 = 0,
+    retry_backoff: [16]u8 = undefined,
+    retry_backoff_len: u8 = 0,
+    retry_base_delay_ms: i32 = 0,
+    retry_max_delay_ms: i32 = 0,
+    progress: [4096]u8 = undefined,
+    progress_len: u16 = 0,
+    expire_at: [32]u8 = undefined,
+    expire_at_len: u8 = 0,
 
     pub fn idSlice(self: *const JobRow) []const u8 {
         return self.id[0..self.id_len];
@@ -122,6 +130,15 @@ pub const JobRow = struct {
     pub fn leaseExpiresAtSlice(self: *const JobRow) []const u8 {
         return self.lease_expires_at[0..self.lease_expires_at_len];
     }
+    pub fn retryBackoffSlice(self: *const JobRow) []const u8 {
+        return self.retry_backoff[0..self.retry_backoff_len];
+    }
+    pub fn progressSlice(self: *const JobRow) []const u8 {
+        return self.progress[0..self.progress_len];
+    }
+    pub fn expireAtSlice(self: *const JobRow) []const u8 {
+        return self.expire_at[0..self.expire_at_len];
+    }
 };
 
 pub const QueueRow = struct {
@@ -145,10 +162,16 @@ pub const QueueStats = struct {
     scheduled: i32 = 0,
     completed: i32 = 0,
     dead: i32 = 0,
+    held: i32 = 0,
     paused: bool = false,
+    oldest_pending_at: [32]u8 = undefined,
+    oldest_pending_at_len: u8 = 0,
 
     pub fn nameSlice(self: *const QueueStats) []const u8 {
         return self.name[0..self.name_len];
+    }
+    pub fn oldestPendingAtSlice(self: *const QueueStats) []const u8 {
+        return self.oldest_pending_at[0..self.oldest_pending_at_len];
     }
 };
 
@@ -337,7 +360,8 @@ pub const Reader = struct {
         " worker_id, hostname, tags, checkpoint, result," ++
         " hold_reason, error_msg, batch_id, unique_key," ++
         " parent_id, chain_id, chain_step, group_key," ++
-        " created_at, started_at, completed_at, failed_at, scheduled_at, lease_expires_at";
+        " created_at, started_at, completed_at, failed_at, scheduled_at, lease_expires_at," ++
+        " retry_backoff, retry_base_delay_ms, retry_max_delay_ms, progress, expire_at";
 
     // Full column list for cron queries — indices must match readCronRow.
     const cron_cols =
@@ -435,6 +459,21 @@ pub const Reader = struct {
         return count;
     }
 
+    /// Get the payload for a job from the job_payloads table.
+    pub fn getJobPayload(self: *Reader, job_id: []const u8, out: []u8) !?[]const u8 {
+        var stmt = try self.db.prepare(
+            "SELECT payload FROM job_payloads WHERE job_id = ?",
+        );
+        defer stmt.finalize();
+
+        stmt.bindText(1, job_id);
+        if (!(try stmt.step())) return null;
+        const payload = stmt.columnText(0) orelse return null;
+        const len = @min(payload.len, out.len);
+        @memcpy(out[0..len], payload[0..len]);
+        return out[0..len];
+    }
+
     // ====================================================================
     // Queues
     // ====================================================================
@@ -474,7 +513,9 @@ pub const Reader = struct {
             \\  COALESCE(SUM(CASE WHEN j.state = 'retrying' THEN 1 ELSE 0 END), 0),
             \\  COALESCE(SUM(CASE WHEN j.state = 'scheduled' THEN 1 ELSE 0 END), 0),
             \\  COALESCE(SUM(CASE WHEN j.state = 'completed' THEN 1 ELSE 0 END), 0),
-            \\  COALESCE(SUM(CASE WHEN j.state = 'dead' THEN 1 ELSE 0 END), 0)
+            \\  COALESCE(SUM(CASE WHEN j.state = 'dead' THEN 1 ELSE 0 END), 0),
+            \\  COALESCE(SUM(CASE WHEN j.state = 'held' THEN 1 ELSE 0 END), 0),
+            \\  MIN(CASE WHEN j.state = 'pending' THEN j.created_at END)
             \\FROM queues q LEFT JOIN jobs j ON j.queue = q.name
             \\GROUP BY q.name ORDER BY q.name
         );
@@ -491,11 +532,17 @@ pub const Reader = struct {
                 .scheduled = stmt.columnInt(5),
                 .completed = stmt.columnInt(6),
                 .dead = stmt.columnInt(7),
+                .held = stmt.columnInt(8),
             };
             if (stmt.columnText(0)) |name| {
                 const len = @min(name.len, row.name.len);
                 @memcpy(row.name[0..len], name[0..len]);
                 row.name_len = @intCast(len);
+            }
+            if (stmt.columnText(9)) |ts| {
+                const len = @min(ts.len, row.oldest_pending_at.len);
+                @memcpy(row.oldest_pending_at[0..len], ts[0..len]);
+                row.oldest_pending_at_len = @intCast(len);
             }
             results[count] = row;
             count += 1;
@@ -1144,13 +1191,17 @@ pub const Reader = struct {
     /// 11:hold_reason, 12:error_msg, 13:batch_id, 14:unique_key,
     /// 15:parent_id, 16:chain_id, 17:chain_step, 18:group_key,
     /// 19:created_at, 20:started_at, 21:completed_at, 22:failed_at,
-    /// 23:scheduled_at, 24:lease_expires_at.
+    /// 23:scheduled_at, 24:lease_expires_at,
+    /// 25:retry_backoff, 26:retry_base_delay_ms, 27:retry_max_delay_ms,
+    /// 28:progress, 29:expire_at.
     fn readJobRow(stmt: *sqlite.Stmt) JobRow {
         var row = JobRow{
             .priority = stmt.columnInt(3),
             .attempt = stmt.columnInt(4),
             .max_retries = stmt.columnInt(5),
             .chain_step = stmt.columnInt(17),
+            .retry_base_delay_ms = stmt.columnInt(26),
+            .retry_max_delay_ms = stmt.columnInt(27),
         };
         // Text columns — small fixed buffers (u8 len).
         inline for (.{
@@ -1171,6 +1222,8 @@ pub const Reader = struct {
             .{ @as(c_int, 22), &row.failed_at, &row.failed_at_len },
             .{ @as(c_int, 23), &row.scheduled_at, &row.scheduled_at_len },
             .{ @as(c_int, 24), &row.lease_expires_at, &row.lease_expires_at_len },
+            .{ @as(c_int, 25), &row.retry_backoff, &row.retry_backoff_len },
+            .{ @as(c_int, 29), &row.expire_at, &row.expire_at_len },
         }) |col| {
             if (stmt.columnText(col[0])) |v| {
                 const len = @min(v.len, col[1].len);
@@ -1184,6 +1237,7 @@ pub const Reader = struct {
             .{ @as(c_int, 9), &row.checkpoint, &row.checkpoint_len },
             .{ @as(c_int, 10), &row.result, &row.result_len },
             .{ @as(c_int, 12), &row.error_msg, &row.error_msg_len },
+            .{ @as(c_int, 28), &row.progress, &row.progress_len },
         }) |col| {
             if (stmt.columnText(col[0])) |v| {
                 const len: u16 = @intCast(@min(v.len, col[1].len));

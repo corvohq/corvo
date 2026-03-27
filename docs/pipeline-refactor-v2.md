@@ -457,10 +457,24 @@ Sim cluster (6 commits): all present (different architecture, Pipeline_v2-based)
   verifies every KV job has matching state in SQLite mirror
 - max_bulk_results increased to 4096 (purge can delete hundreds per tick)
 
-**Remaining (step 17b):**
-- Deep replication consistency check (key-value comparison, not just count)
-- Enrich HTTP response fields (job detail, queue list, queue detail endpoint)
-- corvo-inspect CLI, CLI Client + integration tests, Dockerfile, CI/release workflows
+**Step 17b complete (2026-03-27):**
+- Deep replication consistency: `checkReplicationConsistency` in sim/cluster.zig now
+  compares every key-value pair byte-for-byte between leader and each follower in
+  lockstep iteration. Detects key mismatches, value corruption, and extra keys on
+  either side. Diagnostic output prints exact key names on mismatch.
+- HTTP response enrichment: job detail now includes `retry_backoff`, `retry_base_delay_ms`,
+  `retry_max_delay_ms`, `progress`, `expire_at`, and `payload` (from job_payloads table).
+  Queue list includes `held` count and `oldest_pending_at`. Metrics include held state.
+- `src/inspect.zig` + build target: corvo-inspect CLI for reading KV data. Commands:
+  get, scan, job, count. Auto-decodes all known key prefixes (jobs, queues, workers,
+  crons, batches, budgets).
+- `src/cli.zig` + build target: standalone CLI client (corvo-cli). HTTP-based, no
+  corvo module dependency. Testable Client struct + cmd* wrappers for all operations
+  (enqueue, inspect, retry, cancel, delete, move, bulk, queues, search, cron CRUD).
+- Dockerfile: multi-stage build (Debian bookworm + Zig 0.15.2). Copies corvo-v2,
+  corvo-cli, corvo-inspect. Supports amd64/arm64 via TARGETARCH.
+- CI/release workflows: `.github/workflows/ci.yml` (build + test + sim + docker smoke),
+  `.github/workflows/release.yml` (4-platform matrix build, GitHub Release, Docker push).
 
 ### Step 18: Delete old stack
 Remove engine.zig, store.zig, server.zig, pipeline.zig, scheduler.zig.

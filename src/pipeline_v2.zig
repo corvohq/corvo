@@ -209,12 +209,36 @@ pub fn Pipeline(comptime IoBackend: type) type {
             };
         }
 
+        /// Heap-allocate the pipeline. The struct is ~5MB due to inline
+        /// scratch buffers — too large for the default 8MB thread stack.
+        pub fn initHeap(
+            allocator: std.mem.Allocator,
+            io_backend: *IoBackend,
+            handler: *OpHandler,
+            stores: []kv.Store,
+            oplog: *oplog_mod.Log,
+            notify: *QueueNotifier,
+            reader: ?*sqlite_read.Reader,
+            mirror: ?*mirror_mod.Mirror,
+            config: Config,
+        ) *Self {
+            const self = allocator.create(Self) catch unreachable;
+            self.* = init(allocator, io_backend, handler, stores, oplog, notify, reader, mirror, config);
+            return self;
+        }
+
         pub fn deinit(self: *Self) void {
             for (self.mut_list.items) |m| {
                 if (m.key.len > 0) self.allocator.free(@constCast(m.key));
                 if (m.value.len > 0 and m.op != .delete) self.allocator.free(@constCast(m.value));
             }
             self.mut_list.deinit(self.allocator);
+        }
+
+        pub fn destroyHeap(self: *Self) void {
+            const alloc = self.allocator;
+            self.deinit();
+            alloc.destroy(self);
         }
 
         /// Called from TCP receive thread when a follower acks a sequence.

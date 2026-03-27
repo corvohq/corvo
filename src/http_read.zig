@@ -115,6 +115,7 @@ pub fn metrics(send_buf: []u8, mirror_stats: ?MirrorStats, reader: ?*sqlite_read
                     .{ "scheduled", q.scheduled },
                     .{ "completed", q.completed },
                     .{ "dead", q.dead },
+                    .{ "held", q.held },
                 }) |pair| {
                     pos += (std.fmt.bufPrint(
                         body_buf[pos..],
@@ -165,7 +166,9 @@ fn queues(send_buf: []u8, reader: *sqlite_read.Reader) u32 {
         jw.fieldInt("dead", q.dead);
         jw.fieldInt("completed", q.completed);
         jw.fieldInt("scheduled", q.scheduled);
+        jw.fieldInt("held", q.held);
         jw.fieldBool("paused", q.paused);
+        if (q.oldest_pending_at_len > 0) jw.fieldStr("oldest_pending_at", q.oldestPendingAtSlice());
         jw.endObject();
     }
     jw.endArray();
@@ -245,6 +248,9 @@ fn job(send_buf: []u8, reader: *sqlite_read.Reader, job_id: []const u8) u32 {
     jw.fieldInt("attempt", j.attempt);
     jw.fieldInt("max_retries", j.max_retries);
 
+    if (j.retry_backoff_len > 0) jw.fieldStr("retry_backoff", j.retryBackoffSlice());
+    if (j.retry_base_delay_ms != 0) jw.fieldInt("retry_base_delay_ms", j.retry_base_delay_ms);
+    if (j.retry_max_delay_ms != 0) jw.fieldInt("retry_max_delay_ms", j.retry_max_delay_ms);
 
     if (j.worker_id_len > 0) jw.fieldStr("worker_id", j.workerIdSlice());
     if (j.hostname_len > 0) jw.fieldStr("hostname", j.hostnameSlice());
@@ -260,6 +266,13 @@ fn job(send_buf: []u8, reader: *sqlite_read.Reader, job_id: []const u8) u32 {
     if (j.tags_len > 0) jw.fieldRaw("tags", j.tagsSlice());
     if (j.checkpoint_len > 0) jw.fieldRaw("checkpoint", j.checkpointSlice());
     if (j.result_len > 0) jw.fieldRaw("result", j.resultSlice());
+    if (j.progress_len > 0) jw.fieldRaw("progress", j.progressSlice());
+
+    // Payload from separate table.
+    var payload_buf: [65536]u8 = undefined;
+    if (reader.getJobPayload(job_id, &payload_buf) catch null) |payload| {
+        jw.fieldRaw("payload", payload);
+    }
 
     if (j.created_at_len > 0) jw.fieldStr("created_at", j.createdAtSlice());
     if (j.started_at_len > 0) jw.fieldStr("started_at", j.startedAtSlice());
@@ -267,6 +280,7 @@ fn job(send_buf: []u8, reader: *sqlite_read.Reader, job_id: []const u8) u32 {
     if (j.failed_at_len > 0) jw.fieldStr("failed_at", j.failedAtSlice());
     if (j.scheduled_at_len > 0) jw.fieldStr("scheduled_at", j.scheduledAtSlice());
     if (j.lease_expires_at_len > 0) jw.fieldStr("lease_expires_at", j.leaseExpiresAtSlice());
+    if (j.expire_at_len > 0) jw.fieldStr("expire_at", j.expireAtSlice());
 
     var err_buf: [32]sqlite_read.JobError = undefined;
     const err_count = reader.getJobErrors(job_id, &err_buf) catch 0;

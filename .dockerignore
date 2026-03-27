@@ -1,0 +1,11 @@
+.zig-cache/
+zig-out/
+zig-cache/
+.git/
+docs/
+*.md
+bench-*.json
+bench-results/
+data/
+bin/
+check_size

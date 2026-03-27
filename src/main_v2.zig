@@ -127,6 +127,19 @@ fn printHelp() void {
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
 
+    // --- Check for CLI subcommands before server startup ---
+    {
+        var peek = try std.process.argsWithAllocator(allocator);
+        defer peek.deinit();
+        _ = peek.next(); // skip program name
+        if (peek.next()) |first_arg| {
+            if (first_arg.len > 0 and first_arg[0] != '-') {
+                corvo.cli.dispatch(first_arg, &peek);
+                return;
+            }
+        }
+    }
+
     var config = ServerConfig{};
 
     // --- First pass: find --config path ---
@@ -370,8 +383,8 @@ pub fn main() !void {
     io_backend.queueAccept();
     io_backend.submit();
 
-    // --- Pipeline ---
-    var pipeline = RealPipeline.init(
+    // --- Pipeline (heap-allocated: ~5MB struct, too large for thread stack) ---
+    var pipeline = RealPipeline.initHeap(
         allocator,
         &io_backend,
         &handler,
@@ -393,7 +406,7 @@ pub fn main() !void {
             .sync_replication = config.sync_replication,
         },
     );
-    defer pipeline.deinit();
+    defer pipeline.destroyHeap();
 
     // Wire cluster ack notification to pipeline's atomic + oplog for retry.
     if (cluster_mode) {
