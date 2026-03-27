@@ -37,6 +37,7 @@ pub const HttpRequest = struct {
     path: []const u8,
     body: []const u8,
     total_len: u32,
+    api_key: ?[]const u8 = null,
 };
 
 // ============================================================================
@@ -71,11 +72,15 @@ pub fn parseRequest(data: []const u8) ?HttpRequest {
 
     const body = if (content_length > 0) data[body_start..total_len] else "";
 
+    // Extract API key from X-API-Key or Authorization: Bearer headers.
+    const api_key = extractApiKey(header_section);
+
     return .{
         .method = method,
         .path = path,
         .body = body,
         .total_len = total_len,
+        .api_key = api_key,
     };
 }
 
@@ -120,6 +125,31 @@ fn extractContentLength(headers: []const u8) u32 {
     return 0;
 }
 
+fn extractApiKey(headers: []const u8) ?[]const u8 {
+    // Scan headers line by line.
+    var start: usize = 0;
+    while (start < headers.len) {
+        const end = std.mem.indexOf(u8, headers[start..], "\r\n") orelse headers.len - start;
+        const line = headers[start..][0..end];
+        start += end + 2;
+
+        // X-API-Key: {key}
+        if (line.len > 11 and (line[0] == 'X' or line[0] == 'x') and eqlIgnoreCase(line[0..11], "x-api-key: ")) {
+            const val = std.mem.trimLeft(u8, line[11..], " \t");
+            if (val.len > 0) return val;
+        }
+        // Authorization: Bearer {key}
+        if (line.len > 14 and (line[0] == 'A' or line[0] == 'a') and eqlIgnoreCase(line[0..15], "authorization: ")) {
+            const val = std.mem.trimLeft(u8, line[15..], " \t");
+            if (val.len > 7 and eqlIgnoreCase(val[0..7], "bearer ")) {
+                const key = std.mem.trimLeft(u8, val[7..], " \t");
+                if (key.len > 0) return key;
+            }
+        }
+    }
+    return null;
+}
+
 fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |ac, bc| {
@@ -159,12 +189,28 @@ fn writeResponseInner(send_buf: []u8, status: u16, content_type: []const u8, bod
     return @intCast(stream.pos);
 }
 
+/// Write CORS preflight response (204 No Content with CORS headers).
+pub fn writeCorsPreflightResponse(send_buf: []u8) u32 {
+    var stream = std.io.fixedBufferStream(send_buf);
+    const w = stream.writer();
+    w.writeAll("HTTP/1.1 204 No Content\r\n") catch return 0;
+    w.writeAll("Access-Control-Allow-Origin: *\r\n") catch return 0;
+    w.writeAll("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n") catch return 0;
+    w.writeAll("Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key\r\n") catch return 0;
+    w.writeAll("Access-Control-Max-Age: 86400\r\n") catch return 0;
+    w.writeAll("Connection: keep-alive\r\n") catch return 0;
+    w.writeAll("\r\n") catch return 0;
+    return @intCast(stream.pos);
+}
+
 fn statusText(code: u16) []const u8 {
     return switch (code) {
         200 => "OK",
         201 => "Created",
         204 => "No Content",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
@@ -244,6 +290,8 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
                 return writeRoute(rpc.MSG_ENQUEUE_BATCH, "", "");
             if (std.mem.eql(u8, api, "/fetch"))
                 return writeRoute(rpc.MSG_FETCH_BATCH, "", "");
+            if (std.mem.eql(u8, api, "/ack"))
+                return writeRoute(rpc.MSG_ACK_BATCH, "", "");
             if (std.mem.eql(u8, api, "/heartbeat"))
                 return writeRoute(rpc.MSG_HEARTBEAT, "", "");
             if (std.mem.eql(u8, api, "/jobs/bulk"))
@@ -258,6 +306,9 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
                 return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, "", "approval_policy");
             if (std.mem.eql(u8, api, "/auth/keys"))
                 return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, "", "api_key");
+
+            if (std.mem.eql(u8, api, "/jobs/bulk-get"))
+                return .read;
 
             // POST reads
             if (std.mem.eql(u8, api, "/jobs/search") or std.mem.eql(u8, api, "/jobs"))
@@ -291,6 +342,12 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
                 return classifyCronPostAction(api["/cron-jobs/".len..]);
             if (std.mem.startsWith(u8, api, "/crons/"))
                 return classifyCronPostAction(api["/crons/".len..]);
+
+            // Webhooks: POST /webhooks/{queue}
+            if (std.mem.startsWith(u8, api, "/webhooks/")) {
+                const queue = api["/webhooks/".len..];
+                if (queue.len > 0) return writeRoute(rpc.MSG_ENQUEUE_BATCH, queue, "webhook");
+            }
         },
 
         .PUT => {
@@ -355,6 +412,8 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
         },
 
         .GET => return .read,
+
+        .OPTIONS => return .read, // CORS preflight handled inline
 
         else => {},
     }
@@ -423,6 +482,66 @@ fn classifyCronPostAction(rest: []const u8) RouteAction {
 }
 
 // ============================================================================
+// Auth — API key validation
+// ============================================================================
+
+pub const AuthResult = enum {
+    ok,
+    unauthorized,
+    forbidden,
+};
+
+/// Hash an API key with SHA256, return hex string in `out`.
+pub fn hashApiKey(key: []const u8, out: *[64]u8) []const u8 {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key, &hash, .{});
+    const hex_chars = "0123456789abcdef";
+    for (hash, 0..) |byte, i| {
+        out[i * 2] = hex_chars[byte >> 4];
+        out[i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+    return out[0..64];
+}
+
+/// Check auth for an HTTP request. Returns ok if no auth is configured,
+/// unauthorized if auth is required but missing/invalid, forbidden if role insufficient.
+pub fn checkAuth(
+    api_key: ?[]const u8,
+    method: Method,
+    reader: ?*sqlite_read.Reader,
+) AuthResult {
+    const rdr = reader orelse return .ok; // no mirror = no auth checking
+    const key_count = rdr.countEnabledApiKeys() catch return .ok;
+    if (key_count == 0) return .ok; // no keys configured = auth disabled
+
+    const raw_key = api_key orelse return .unauthorized;
+    if (raw_key.len == 0) return .unauthorized;
+
+    var hash_buf: [64]u8 = undefined;
+    const key_hash = hashApiKey(raw_key, &hash_buf);
+
+    const row = rdr.getApiKeyByHash(key_hash) catch return .unauthorized;
+    if (row == null) return .unauthorized;
+    const r = row.?;
+    if (!r.enabled) return .unauthorized;
+
+    // Role-based access: readonly can only GET, worker can't manage.
+    const role = r.roleSlice();
+    if (std.mem.eql(u8, role, "readonly") and method != .GET) return .forbidden;
+
+    return .ok;
+}
+
+/// Write a 401 or 403 response.
+pub fn writeAuthError(send_buf: []u8, auth_result: AuthResult) u32 {
+    return switch (auth_result) {
+        .unauthorized => writeResponse(send_buf, 401, "{\"error\":\"unauthorized\"}"),
+        .forbidden => writeResponse(send_buf, 403, "{\"error\":\"forbidden\"}"),
+        .ok => 0,
+    };
+}
+
+// ============================================================================
 // Protocol Detection
 // ============================================================================
 
@@ -450,9 +569,14 @@ pub fn decodeWrite(
     sub_action: []const u8,
     now_ns: u64,
     scratch: *DecodeScratch,
+    http_path: []const u8,
 ) DecodeResult {
     switch (msg_type) {
-        rpc.MSG_ENQUEUE_BATCH => return decodeEnqueue(body, now_ns, scratch),
+        rpc.MSG_ENQUEUE_BATCH => {
+            if (std.mem.eql(u8, sub_action, "webhook"))
+                return decodeWebhook(body, param, http_path, now_ns, scratch);
+            return decodeEnqueue(body, now_ns, scratch);
+        },
         rpc.MSG_FETCH_BATCH => return decodeFetch(body, now_ns, scratch),
         rpc.MSG_ACK_BATCH => return decodeAck(body, param, now_ns, scratch),
         rpc.MSG_FAIL_BATCH => return decodeFail(body, param, now_ns, scratch),
@@ -480,7 +604,7 @@ pub fn decodeWrite(
 
 pub const DecodeScratch = struct {
     jobs: [64]ops_mod.EnqueueJob = undefined,
-    acks: [1]ops_mod.AckJob = undefined,
+    acks: [128]ops_mod.AckJob = undefined,
     fails: [1]ops_mod.FailJob = undefined,
     hb_ids: [128][]const u8 = undefined,
     hb_ops: [128]ops_mod.HeartbeatJobOp = undefined,
@@ -508,6 +632,10 @@ fn decodeEnqueue(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeR
         .job_id = preset_id,
         .queue = queue,
         .created_at_ns = now_ns,
+        .max_retries = 3,
+        .backoff = .exponential,
+        .base_delay_ms = 5_000,
+        .max_delay_ms = 600_000,
     };
     // Priority: integer or named string ("critical"=100, "high"=75, "normal"=50, "low"=25)
     if (extractJSONInt(body, "priority")) |p| {
@@ -564,8 +692,16 @@ fn decodeEnqueue(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeR
     if (extractJSONInt(body, "retry_max_delay_ms")) |d|
         job.max_delay_ms = @intCast(std.math.clamp(d, 0, 86400_000));
 
-    if (extractJSONInt(body, "scheduled_at_ns")) |ns|
-        job.scheduled_at_ns = @intCast(std.math.clamp(ns, 0, std.math.maxInt(i64)));
+    if (extractJSONString(body, "scheduled_at")) |sat| {
+        job.scheduled_at_ns = parseRfc3339Ns(sat) orelse 0;
+    }
+
+    if (extractJSONRaw(body, "chain_config")) |cc| job.chain_config = cc;
+    if (extractJSONString(body, "chain")) |_| {
+        // "chain" as object — extractJSONRaw gives us the raw JSON
+        if (extractJSONRaw(body, "chain")) |cv| job.chain_config = cv;
+    }
+    if (job.chain_config != null and job.chain_id == null) job.chain_id = job.job_id;
 
     if (job.scheduled_at_ns > 0) job.state = .scheduled;
 
@@ -630,6 +766,10 @@ fn decodeSingleJob(body: []const u8, job_id: []const u8, now_ns: u64) ops_mod.En
         .job_id = job_id,
         .queue = extractJSONString(body, "queue") orelse "",
         .created_at_ns = now_ns,
+        .max_retries = 3,
+        .backoff = .exponential,
+        .base_delay_ms = 5_000,
+        .max_delay_ms = 600_000,
     };
     if (extractJSONInt(body, "priority")) |p| {
         job.priority = @intCast(std.math.clamp(p, 0, 100));
@@ -643,10 +783,66 @@ fn decodeSingleJob(body: []const u8, job_id: []const u8, now_ns: u64) ops_mod.En
     if (extractJSONRaw(body, "tags")) |t| job.tags = t;
     if (extractJSONString(body, "group")) |g| job.group = g;
     if (extractJSONString(body, "batch_id")) |bid| job.batch_id = bid;
-    if (extractJSONInt(body, "scheduled_at_ns")) |ns|
-        job.scheduled_at_ns = @intCast(std.math.clamp(ns, 0, std.math.maxInt(i64)));
+    if (extractJSONString(body, "parent_id")) |pid| job.parent_id = pid;
+    if (extractJSONString(body, "chain_id")) |cid| job.chain_id = cid;
+    if (extractJSONInt(body, "chain_step")) |cs|
+        job.chain_step = @intCast(std.math.clamp(cs, 0, 65535));
+    if (extractJSONRaw(body, "chain_config")) |cc| job.chain_config = cc;
+    if (extractJSONString(body, "chain")) |_| {
+        if (extractJSONRaw(body, "chain")) |cv| job.chain_config = cv;
+    }
+    if (job.chain_config != null and job.chain_id == null) job.chain_id = job.job_id;
+    if (extractJSONString(body, "scheduled_at")) |sat| {
+        job.scheduled_at_ns = parseRfc3339Ns(sat) orelse 0;
+    }
+    if (extractJSONInt(body, "expire_after_ms")) |e|
+        job.expire_after_ms = @intCast(std.math.clamp(e, 0, 86400_000 * 30));
+    if (extractJSONString(body, "retry_backoff")) |rb| {
+        if (std.mem.eql(u8, rb, "exponential")) job.backoff = .exponential
+        else if (std.mem.eql(u8, rb, "linear")) job.backoff = .linear;
+    }
+    if (extractJSONInt(body, "retry_base_delay_ms")) |d|
+        job.base_delay_ms = @intCast(std.math.clamp(d, 0, 3600_000));
+    if (extractJSONInt(body, "retry_max_delay_ms")) |d|
+        job.max_delay_ms = @intCast(std.math.clamp(d, 0, 86400_000));
     if (job.scheduled_at_ns > 0) job.state = .scheduled;
     return job;
+}
+
+fn decodeWebhook(body: []const u8, queue: []const u8, path: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
+    const preset_id = scratch.jobs[0].job_id;
+    var job = ops_mod.EnqueueJob{
+        .job_id = preset_id,
+        .queue = queue,
+        .created_at_ns = now_ns,
+        .max_retries = 3,
+        .backoff = .exponential,
+        .base_delay_ms = 5_000,
+        .max_delay_ms = 600_000,
+    };
+
+    // Body becomes payload (raw JSON or empty object).
+    job.payload = if (body.len > 0) body else "{}";
+
+    // Query params override defaults.
+    if (extractQueryParam(path, "priority")) |p| {
+        job.priority = parsePriorityString(p);
+    }
+    if (extractQueryParam(path, "unique_key")) |uk| job.unique_key = uk;
+    if (extractQueryParam(path, "max_retries")) |mr| {
+        const v = std.fmt.parseInt(i64, mr, 10) catch 3;
+        job.max_retries = @intCast(std.math.clamp(v, 0, 100));
+    }
+    if (extractQueryParam(path, "scheduled_at")) |sat| {
+        job.scheduled_at_ns = parseRfc3339Ns(sat) orelse 0;
+    }
+    if (job.scheduled_at_ns > 0) job.state = .scheduled;
+
+    scratch.jobs[0] = job;
+    return .{
+        .op_data = .{ .enqueue = .{ .jobs = scratch.jobs[0..1], .now_ns = now_ns } },
+        .count = 1,
+    };
 }
 
 fn decodeFetch(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
@@ -655,6 +851,7 @@ fn decodeFetch(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeRes
     if (queue_count == 0) return errResult(.fetch);
 
     const worker_id = extractJSONString(body, "worker_id") orelse "";
+    const hostname = extractJSONString(body, "hostname") orelse "";
     const count_val = extractJSONInt(body, "count");
     const count: u32 = if (count_val) |c| @intCast(std.math.clamp(c, 1, 512)) else 1;
 
@@ -662,6 +859,7 @@ fn decodeFetch(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeRes
         .op_data = .{ .fetch = .{
             .queues = scratch.queue_slices[0..queue_count],
             .worker_id = worker_id,
+            .hostname = hostname,
             .count = count,
             .lease_duration_ms = 30_000,
             .now_ns = now_ns,
@@ -670,7 +868,15 @@ fn decodeFetch(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeRes
     };
 }
 
-fn decodeAck(body: []const u8, job_id: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
+fn decodeAck(body: []const u8, job_id_param: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
+    // Batch format: {"acks":[{"job_id":"..."},...]} or {"job_ids":["...",...]}
+    if (job_id_param.len == 0 and body.len > 0) {
+        return decodeAckBatch(body, now_ns, scratch);
+    }
+
+    // Single ack: job_id from URL param or body
+    const job_id = if (job_id_param.len > 0) job_id_param else (extractJSONString(body, "job_id") orelse "");
+
     var ack = ops_mod.AckJob{
         .job_id = job_id,
     };
@@ -680,6 +886,9 @@ fn decodeAck(body: []const u8, job_id: []const u8, now_ns: u64, scratch: *Decode
         if (extractJSONRaw(body, "checkpoint")) |cp| ack.checkpoint = cp;
         if (extractJSONString(body, "hold_reason")) |hr| ack.hold_reason = hr;
         if (extractJSONInt(body, "lease_token")) |lt| ack.lease_token = @intCast(lt);
+        if (extractJSONString(body, "ack_status")) |as_str| {
+            if (std.mem.eql(u8, as_str, "hold")) ack.ack_status = .hold;
+        }
     }
 
     scratch.acks[0] = ack;
@@ -691,6 +900,65 @@ fn decodeAck(body: []const u8, job_id: []const u8, now_ns: u64, scratch: *Decode
         } },
         .count = 1,
     };
+}
+
+fn decodeAckBatch(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
+    // Format 1: {"acks":[{"job_id":"...","result":"..."},...]}
+    if (extractJSONRaw(body, "acks")) |acks_raw| {
+        if (acks_raw.len >= 2 and acks_raw[0] == '[') {
+            const inner = acks_raw[1 .. acks_raw.len - 1];
+            var count: u16 = 0;
+            var pos: usize = 0;
+            while (pos < inner.len and count < 128) {
+                while (pos < inner.len and (inner[pos] == ' ' or inner[pos] == ',' or
+                    inner[pos] == '\n' or inner[pos] == '\r' or inner[pos] == '\t')) pos += 1;
+                if (pos >= inner.len) break;
+                if (inner[pos] != '{') break;
+                var depth: u32 = 0;
+                var end = pos;
+                while (end < inner.len) : (end += 1) {
+                    if (inner[end] == '{') depth += 1
+                    else if (inner[end] == '}') {
+                        depth -= 1;
+                        if (depth == 0) { end += 1; break; }
+                    }
+                }
+                const obj = inner[pos..end];
+                pos = end;
+
+                const jid = extractJSONString(obj, "job_id") orelse continue;
+                var ack = ops_mod.AckJob{ .job_id = jid };
+                if (extractJSONRaw(obj, "result")) |r| ack.result = r;
+                if (extractJSONRaw(obj, "checkpoint")) |cp| ack.checkpoint = cp;
+                if (extractJSONString(obj, "hold_reason")) |hr| ack.hold_reason = hr;
+                if (extractJSONString(obj, "ack_status")) |as_str| {
+                    if (std.mem.eql(u8, as_str, "hold")) ack.ack_status = .hold;
+                }
+                scratch.acks[count] = ack;
+                count += 1;
+            }
+            if (count > 0) return .{
+                .op_data = .{ .ack = .{ .acks = scratch.acks[0..count], .now_ns = now_ns } },
+                .count = count,
+            };
+        }
+    }
+
+    // Format 2: {"job_ids":["id1","id2",...]}
+    var id_buf: [128][]const u8 = undefined;
+    const id_count = extractJSONStringArray(body, "job_ids", &id_buf);
+    if (id_count > 0) {
+        const count: u16 = @intCast(@min(id_count, 128));
+        for (0..count) |i| {
+            scratch.acks[i] = ops_mod.AckJob{ .job_id = id_buf[i] };
+        }
+        return .{
+            .op_data = .{ .ack = .{ .acks = scratch.acks[0..count], .now_ns = now_ns } },
+            .count = count,
+        };
+    }
+
+    return errResult(.ack);
 }
 
 fn decodeFail(body: []const u8, job_id: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
@@ -1024,6 +1292,7 @@ pub fn encodeWriteResponse(
     path_param: []const u8,
     sub_action: []const u8,
     store: ?*kv.Store,
+    request_body: []const u8,
 ) u32 {
     if (result.err) |err| {
         if (std.mem.eql(u8, err, "unique_existing")) {
@@ -1065,7 +1334,19 @@ pub fn encodeWriteResponse(
             return writeResponse(send_buf, 201, jw.getWritten());
         },
         rpc.MSG_FETCH_BATCH => return encodeFetchResponse(send_buf, result, store),
-        rpc.MSG_ACK_BATCH, rpc.MSG_FAIL_BATCH, rpc.MSG_HEARTBEAT => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
+        rpc.MSG_ACK_BATCH => {
+            if (result.affected > 1) {
+                var body_buf: [128]u8 = undefined;
+                var jw = json.JsonWriter.init(&body_buf);
+                jw.beginObject();
+                jw.fieldInt("acked", result.affected);
+                jw.endObject();
+                return writeResponse(send_buf, 200, jw.getWritten());
+            }
+            return writeResponse(send_buf, 200, "{\"status\":\"ok\"}");
+        },
+        rpc.MSG_FAIL_BATCH => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
+        rpc.MSG_HEARTBEAT => return encodeHeartbeatResponse(send_buf, request_body, store),
         rpc.MSG_BULK_ACTION => return encodeAffectedResponse(send_buf, result.affected, sub_action),
         rpc.MSG_QUEUE_CONFIG => return encodeQueueConfigResponse(send_buf, sub_action),
         rpc.MSG_CLEAR_QUEUE => return encodeAffectedResponse(send_buf, result.affected, ""),
@@ -1171,6 +1452,50 @@ fn encodeFetchResponse(send_buf: []u8, result: *const ops_mod.OpResult, store: ?
     return writeResponse(send_buf, 200, jw.getWritten());
 }
 
+fn encodeHeartbeatResponse(send_buf: []u8, request_body: []const u8, store: ?*kv.Store) u32 {
+    // Re-parse job IDs from the request body to build per-job status map.
+    const jobs_raw = extractJSONRaw(request_body, "jobs") orelse
+        return writeResponse(send_buf, 200, "{\"status\":\"ok\"}");
+
+    var body_buf: [8192]u8 = undefined;
+    var jw = json.JsonWriter.init(&body_buf);
+    jw.beginObject();
+    jw.beginObjectField("jobs");
+
+    var pos: usize = 0;
+    while (pos < jobs_raw.len) {
+        const obj_start = std.mem.indexOfScalar(u8, jobs_raw[pos..], '{') orelse break;
+        const obj_end = std.mem.indexOfScalar(u8, jobs_raw[pos + obj_start..], '}') orelse break;
+        const obj = jobs_raw[pos + obj_start .. pos + obj_start + obj_end + 1];
+
+        const jid = extractJSONString(obj, "job_id") orelse {
+            pos = pos + obj_start + obj_end + 1;
+            continue;
+        };
+
+        // Check if job exists in KV (zero-alloc via getInto).
+        const status: []const u8 = if (store) |s| blk: {
+            var batch = s.newBatch();
+            defer batch.close();
+            var jk_buf: keys.KeyBuf = undefined;
+            const job_key = keys.jobKey(&jk_buf, jid);
+            var val_buf: [4096]u8 = undefined;
+            break :blk if (batch.getInto(job_key, &val_buf) != null) "ok" else "cancel";
+        } else "ok";
+
+        jw.beginObjectField(jid);
+        jw.beginObject();
+        jw.fieldStr("status", status);
+        jw.endObject();
+
+        pos = pos + obj_start + obj_end + 1;
+    }
+
+    jw.endObject(); // close "jobs"
+    jw.endObject(); // close root
+    return writeResponse(send_buf, 200, jw.getWritten());
+}
+
 fn writeErrorResponse(send_buf: []u8, status: u16, msg: []const u8) u32 {
     var body_buf: [256]u8 = undefined;
     var jw = json.JsonWriter.init(&body_buf);
@@ -1178,6 +1503,53 @@ fn writeErrorResponse(send_buf: []u8, status: u16, msg: []const u8) u32 {
     jw.fieldStr("error", msg);
     jw.endObject();
     return writeResponse(send_buf, status, jw.getWritten());
+}
+
+/// Parse RFC3339 timestamp to nanoseconds since epoch.
+/// Supports: "2024-01-15T10:30:00Z" and "2024-01-15T10:30:00+05:00"
+pub fn parseRfc3339Ns(s: []const u8) ?u64 {
+    if (s.len < 20) return null;
+    const year = std.fmt.parseInt(u32, s[0..4], 10) catch return null;
+    if (s[4] != '-') return null;
+    const month = std.fmt.parseInt(u32, s[5..7], 10) catch return null;
+    if (s[7] != '-') return null;
+    const day = std.fmt.parseInt(u32, s[8..10], 10) catch return null;
+    if (s[10] != 'T' and s[10] != 't') return null;
+    const hour = std.fmt.parseInt(u32, s[11..13], 10) catch return null;
+    if (s[13] != ':') return null;
+    const minute = std.fmt.parseInt(u32, s[14..16], 10) catch return null;
+    if (s[16] != ':') return null;
+    const second = std.fmt.parseInt(u32, s[17..19], 10) catch return null;
+
+    if (month < 1 or month > 12 or day < 1 or day > 31) return null;
+    if (hour > 23 or minute > 59 or second > 60) return null;
+
+    const epoch_days: i64 = 719528;
+    const y: i64 = @intCast(year);
+    const m: i64 = @intCast(month);
+    const d: i64 = @intCast(day);
+    const adj_m = if (m > 2) m - 3 else m + 9;
+    const adj_y = if (m <= 2) y - 1 else y;
+    const total_days = adj_y * 365 + @divFloor(adj_y, 4) - @divFloor(adj_y, 100) + @divFloor(adj_y, 400) +
+        @divFloor(adj_m * 306 + 5, 10) + d - 1 - epoch_days + 60;
+
+    var offset_seconds: i64 = 0;
+    if (s.len > 19) {
+        if (s[19] == 'Z' or s[19] == 'z') {
+            // UTC
+        } else if ((s[19] == '+' or s[19] == '-') and s.len >= 25) {
+            const oh = std.fmt.parseInt(i64, s[20..22], 10) catch return null;
+            const om = std.fmt.parseInt(i64, s[23..25], 10) catch return null;
+            offset_seconds = (oh * 3600 + om * 60);
+            if (s[19] == '+') offset_seconds = -offset_seconds;
+        }
+    }
+
+    const total_seconds = total_days * 86400 + @as(i64, @intCast(hour)) * 3600 +
+        @as(i64, @intCast(minute)) * 60 + @as(i64, @intCast(second)) + offset_seconds;
+
+    if (total_seconds < 0) return null;
+    return @intCast(total_seconds * 1_000_000_000);
 }
 
 fn parsePriorityString(s: []const u8) u8 {

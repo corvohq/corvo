@@ -173,6 +173,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             protocol: Protocol = .rpc,
             path_param: []const u8 = "",
             sub_action: []const u8 = "",
+            http_path: []const u8 = "", // full path including query string (for webhook query params)
         };
 
         const RecvCompaction = struct {
@@ -466,6 +467,35 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
             const route = http.classifyRoute(req.method, req.path);
 
+            // CORS preflight — return immediately, no auth, no batch.
+            if (req.method == .OPTIONS) {
+                const resp_len = http.writeCorsPreflightResponse(c.send_buf);
+                if (resp_len > 0) {
+                    c.send_len = resp_len;
+                    self.io.queueSend(conn_id, resp_len);
+                }
+                self.recordRecvCompaction(conn_id, req.total_len);
+                return;
+            }
+
+            // Auth check (skipped for healthz and auth/status).
+            const clean_path = if (std.mem.indexOfScalar(u8, req.path, '?')) |qi| req.path[0..qi] else req.path;
+            const skip_auth = std.mem.eql(u8, clean_path, "/healthz") or
+                std.mem.eql(u8, clean_path, "/api/v1/auth/status") or
+                std.mem.eql(u8, clean_path, "/metrics");
+            if (!skip_auth) {
+                const auth_result = http.checkAuth(req.api_key, req.method, self.reader);
+                if (auth_result != .ok) {
+                    const resp_len = http.writeAuthError(c.send_buf, auth_result);
+                    if (resp_len > 0) {
+                        c.send_len = resp_len;
+                        self.io.queueSend(conn_id, resp_len);
+                    }
+                    self.recordRecvCompaction(conn_id, req.total_len);
+                    return;
+                }
+            }
+
             switch (route) {
                 .read => {
                     // Flush mirror so HTTP reads see latest state.
@@ -492,6 +522,15 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 .write => |w| {
                     if (self.frame_count >= max_frames) return; // back-pressure
 
+                    // Payload size validation — return 413 instead of asserting.
+                    if (req.body.len > self.config.max_payload_size) {
+                        const resp_len = http.writeResponse(c.send_buf, 413, "{\"error\":\"payload too large\"}");
+                        c.send_len = resp_len;
+                        self.io.queueSend(conn_id, resp_len);
+                        self.recordRecvCompaction(conn_id, req.total_len);
+                        return;
+                    }
+
                     self.frames[self.frame_count] = .{
                         .conn_id = conn_id,
                         .req_id = 0,
@@ -500,6 +539,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         .protocol = .http,
                         .path_param = w.param,
                         .sub_action = w.sub_action,
+                        .http_path = req.path,
                     };
                     self.frame_count += 1;
                     self.recordRecvCompaction(conn_id, req.total_len);
@@ -884,6 +924,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 frame.sub_action,
                 now_ns,
                 &self.http_scratch,
+                frame.http_path,
             );
 
             // Batch enqueue: generate remaining IDs (first was pre-generated above).
@@ -967,6 +1008,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         frame.path_param,
                         frame.sub_action,
                         &self.stores[0],
+                        frame.payload,
                     );
                     if (resp_len > 0) {
                         self.trackSendConn(frame.conn_id);

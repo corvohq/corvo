@@ -25,6 +25,10 @@ pub fn dispatch(
     // Strip query string for route matching.
     const clean = if (std.mem.indexOfScalar(u8, path, '?')) |qi| path[0..qi] else path;
 
+    // Health check (outside /api/v1/).
+    if (std.mem.eql(u8, clean, "/healthz"))
+        return http.writeResponse(send_buf, 200, "{\"status\":\"ok\"}");
+
     if (!std.mem.startsWith(u8, clean, "/api/v1/")) return 0;
     const api = clean["/api/v1".len..];
 
@@ -34,9 +38,12 @@ pub fn dispatch(
     if (std.mem.eql(u8, api, "/debug/runtime")) return debugRuntime(send_buf);
     if (std.mem.eql(u8, api, "/cluster/status"))
         return http.writeResponse(send_buf, 200, "{\"mode\":\"standalone\",\"status\":\"healthy\",\"state\":\"leader\",\"node_id\":\"node-1\",\"leader\":\"node-1\"}");
+    if (std.mem.eql(u8, api, "/auth/status"))
+        return http.writeResponse(send_buf, 200, "{\"admin_password_set\":false}");
 
     const rdr = reader orelse return writeError(send_buf, 503, "no_mirror");
 
+    if (std.mem.eql(u8, api, "/jobs/bulk-get") and method == .POST) return bulkGetJobs(send_buf, rdr, body);
     if (std.mem.eql(u8, api, "/jobs") or std.mem.eql(u8, api, "/jobs/search")) {
         if (method == .POST) return jobSearchPost(send_buf, rdr, body);
         return jobSearch(send_buf, rdr, path);
@@ -50,6 +57,12 @@ pub fn dispatch(
     if (std.mem.eql(u8, api, "/budgets")) return budgets(send_buf, rdr);
     if (std.mem.eql(u8, api, "/api-keys")) return apiKeys(send_buf, rdr);
     if (std.mem.eql(u8, api, "/approval-policies")) return approvalPolicies(send_buf, rdr);
+    if (std.mem.eql(u8, api, "/cluster/events"))
+        return http.writeResponse(send_buf, 200, "{\"events\":[]}");
+    if (std.mem.eql(u8, api, "/metrics/throughput"))
+        return http.writeResponse(send_buf, 200, "{\"enqueued\":0,\"completed\":0,\"failed\":0}");
+    if (std.mem.eql(u8, api, "/events"))
+        return http.writeResponse(send_buf, 200, "{\"error\":\"SSE not yet supported on pipeline_v2\"}");
 
     return writeError(send_buf, 404, "not found");
 }
@@ -351,6 +364,33 @@ fn jobSearchPost(send_buf: []u8, reader: *sqlite_read.Reader, body_input: []cons
     jw.endArray();
     jw.fieldInt("total", count);
     jw.fieldBool("has_more", false);
+    jw.endObject();
+    return http.writeResponse(send_buf, 200, jw.getWritten());
+}
+
+fn bulkGetJobs(send_buf: []u8, reader: *sqlite_read.Reader, body: []const u8) u32 {
+    var id_buf: [100][]const u8 = undefined;
+    const id_count = extractJSONStringArray(body, "job_ids", &id_buf);
+    if (id_count == 0) return writeError(send_buf, 400, "job_ids required");
+
+    var body_buf: [32768]u8 = undefined;
+    var jw = json.JsonWriter.init(&body_buf);
+    jw.beginObject();
+    jw.beginArrayField("jobs");
+
+    for (0..@min(id_count, 100)) |i| {
+        const j = (reader.getJob(id_buf[i]) catch continue) orelse continue;
+        jw.beginObject();
+        jw.fieldStr("id", j.idSlice());
+        jw.fieldStr("queue", j.queueSlice());
+        jw.fieldStr("state", j.stateSlice());
+        jw.fieldInt("priority", j.priority);
+        jw.fieldInt("attempt", j.attempt);
+        jw.fieldInt("max_retries", j.max_retries);
+        jw.endObject();
+    }
+
+    jw.endArray();
     jw.endObject();
     return http.writeResponse(send_buf, 200, jw.getWritten());
 }

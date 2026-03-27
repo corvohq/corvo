@@ -325,31 +325,87 @@ Pipeline Config has `max_payload_size` field, used in frame extraction check.
 - All connection buffers — fixed-size (recv_buf, send_buf) ✓
 - All per-tick arrays — compile-time sized (frames, completions, etc.) ✓
 
-### Step 14: SDK verification — IN PROGRESS
-Verify all SDKs work against pipeline_v2. Check for the two-write TCP bug
-(header + payload as separate writes — fixed in zig-sdk, may exist in others).
-Run each SDK's integration tests / examples against corvo-v2.
+### Step 14: SDK verification — DONE (570d8dd)
+All 5 SDKs verified against pipeline_v2. Results: go 18/18, python 6/6,
+typescript 6/6, rust 5/5, haskell 4/4.
 
-**Done:**
-- zig-sdk + bench-rpc verified (e8c5e5b). Three bugs fixed: sync-repl deferred recv
-  lost, lease_token check inverted, bench-rpc protocol mismatches.
-- Sync-repl cluster fix (7ca92c7). Production cluster tick loop missing oplog re-send —
-  if initial TCP send failed or ack lost, pipeline deferred forever. Added oplog retry
-  matching sim cluster. Sim cluster wired onFollowerAck for sync-repl test.
-- Bench results (3-node sync-repl, ReleaseFast, 100k jobs, c=8, batch=64):
-  bench-rpc: 301k enqueue, 200k lifecycle. zig-sdk: 12.7k/3.3k (0 errors).
+**Bugs fixed (570d8dd):**
+- HTTP fetch response: flat `{"job_id","payload",...}` matching old server format.
+  Payload/checkpoint/tags loaded from KV via `*kv.Store` passed to http.zig.
+- HTTP keep-alive: (a) compactRecvBufs missing from early-return path when frame_count==0
+  (HTTP reads record compactions but early return skipped applying them — second request
+  on same connection got stale data). (b) send_done: check recv_pos > 0 before queueRecv
+  (pipelined data already in buffer needs processing this tick, not next recv).
+- JSON whitespace: extractJSONString/extractJSONStringArray now handle spaces after `:`.
+- Priority string parsing: "high"=75, "critical"=100, "low"=25 in http.zig.
+- Search route: `/jobs/search` checked before `/jobs/{param}` wildcard in http_read.zig.
+- Batch enqueue: `/enqueue` handles both single and `{"jobs":[...]}` format. JSON array
+  parsing in http.zig decodeEnqueueBatch (not pipeline). Response `{"job_ids":[...]}`.
+- Mirror flushAll before HTTP read dispatch (matches old server's flushMirror).
+- Rust SDK: two-write TCP bug — contiguous frame buffer, single write_all.
 
-**Remaining:** go-sdk, python-sdk, typescript-sdk, rust-sdk, haskell-sdk.
+**SDK endpoint consolidation:**
+- Removed /enqueue/batch (all 5 SDKs updated to use /enqueue)
+- Removed /fetch/batch (unused by any SDK)
 
-### Step 15: RPC & HTTP consistency audit
-Compare RPC decode (rpc/lifecycle.zig, rpc/management.zig, rpc/bulk.zig) and HTTP decode
-(http.zig) against the old server.zig git history. For every operation:
-- Verify all fields are parsed (e.g. scheduled_at was missing from RPC parser)
-- Verify state derivation matches (e.g. state=.scheduled when scheduled_at > 0)
-- Verify response encoding matches old stack's JSON responses
-- Verify error handling matches (same error strings, same HTTP status codes)
+**Build:**
+- preferred_optimize_mode=.ReleaseSafe — prevents 25GB Debug-mode spikes from `zig build run-v2`.
+  Use `-Drelease` for release builds, `-Doptimize=ReleaseFast` no longer works (Zig 0.15 API change).
 
-This prevents regressions like the scheduled_at bug found in step 9.
+**Earlier (e8c5e5b, 7ca92c7):**
+- zig-sdk + bench-rpc verified. sync-repl deferred recv, lease_token check, bench-rpc protocol.
+- Sync-repl cluster fix: oplog re-send in production cluster tick.
+- Memory stability: 1.8GB stable after 7.2M ops (ReleaseSafe, default max-conns=4096).
+
+### Step 15: RPC & HTTP consistency audit — DONE
+Systematic audit of all operations comparing old server.zig against pipeline_v2's
+HTTP decode (http.zig) and response encoding. All discrepancies identified and fixed.
+
+**Field parsing fixes (http.zig):**
+- `scheduled_at` now accepts RFC3339 strings (was `scheduled_at_ns` integer — broken for
+  all HTTP SDKs). Added `parseRfc3339Ns()` ported from server.zig.
+- `ack_status` field parsed on ack (`"hold"` sets `.hold` status)
+- `chain_config` and `chain` (object) parsed on enqueue, auto-sets chain_id = job_id
+- `hostname` parsed on fetch requests
+- Enqueue defaults match old server: max_retries=3, backoff=exponential,
+  base_delay_ms=5000, max_delay_ms=600000 (were all 0)
+- `decodeSingleJob` (batch enqueue) now parses all fields: parent_id, chain_id,
+  chain_step, chain_config, expire_after_ms, retry_backoff, retry delays
+
+**Route consolidation:**
+- `POST /ack` added — handles single `{"job_id":"..."}` and batch
+  `{"acks":[...]}` / `{"job_ids":[...]}`. Response: `{"status":"ok"}` for single,
+  `{"acked":N}` for batch. SDKs to be updated from /ack/batch.
+- Replay route intentionally skipped (no SDK uses it, UI doesn't have it)
+
+**New routes added:**
+- `POST /webhooks/{queue}` — enqueue via webhook, body = payload, query params
+  for priority/unique_key/max_retries/scheduled_at (RFC3339)
+- `OPTIONS *` — CORS preflight with Access-Control-Allow-Methods/Headers/Max-Age
+- `GET /healthz` — returns `{"status":"ok"}`
+- `POST /jobs/bulk-get` — get multiple jobs by ID, max 100
+- `GET /auth/status` — returns `{"admin_password_set":false}`
+- `GET /cluster/events`, `GET /metrics/throughput` — stub responses
+- `GET /events` — SSE stub (needs pipeline-level streaming, deferred)
+
+**Response format fixes:**
+- Heartbeat returns per-job status map: `{"jobs":{"id":{"status":"ok|cancel"}}}`
+  with KV lookup per job (zero-alloc via getInto)
+
+**Middleware:**
+- Auth: extracts X-API-Key / Authorization: Bearer from HTTP headers, SHA256 hash
+  → SQLite lookup. Role-based: readonly can only GET. Skips /healthz, /auth/status,
+  /metrics. When no API keys configured, auth is disabled.
+- Payload size validation: returns 413 for bodies exceeding config.max_payload_size
+  (error return, not assert — external input boundary)
+- CORS: Access-Control-Allow-Origin: * on all responses, full preflight on OPTIONS
+
+**Intentionally deferred:**
+- Rate limiting (needs token bucket module, production hardening)
+- SSE streaming (needs pipeline-level connection tracking)
+- Throughput metrics (needs throughput ring buffer)
+
+All tests pass. Sim passes. No regressions.
 
 ### Step 16: Configuration file + cluster config consensus
 CLI args are per-node — if nodes disagree on max_payload_size, buffer sizes, or
