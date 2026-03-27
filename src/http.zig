@@ -14,6 +14,9 @@ const rpc = @import("rpc.zig");
 const http_read = @import("http_read.zig");
 const sqlite_read = @import("sqlite_read.zig");
 const json = @import("json_writer.zig");
+const kv = @import("kv.zig");
+const keys = @import("keys.zig");
+const codec = @import("codec.zig");
 
 // ============================================================================
 // Types
@@ -239,7 +242,7 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
             // --- Exact path matches ---
             if (std.mem.eql(u8, api, "/enqueue"))
                 return writeRoute(rpc.MSG_ENQUEUE_BATCH, "", "");
-            if (std.mem.eql(u8, api, "/fetch") or std.mem.eql(u8, api, "/fetch/batch"))
+            if (std.mem.eql(u8, api, "/fetch"))
                 return writeRoute(rpc.MSG_FETCH_BATCH, "", "");
             if (std.mem.eql(u8, api, "/heartbeat"))
                 return writeRoute(rpc.MSG_HEARTBEAT, "", "");
@@ -476,7 +479,7 @@ pub fn decodeWrite(
 }
 
 pub const DecodeScratch = struct {
-    jobs: [1]ops_mod.EnqueueJob = undefined,
+    jobs: [64]ops_mod.EnqueueJob = undefined,
     acks: [1]ops_mod.AckJob = undefined,
     fails: [1]ops_mod.FailJob = undefined,
     hb_ids: [128][]const u8 = undefined,
@@ -491,6 +494,10 @@ pub const DecodeScratch = struct {
 };
 
 fn decodeEnqueue(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
+    // Batch format: {"jobs":[{...},{...},...]}
+    if (extractJSONRaw(body, "jobs") != null)
+        return decodeEnqueueBatch(body, now_ns, scratch);
+
     const queue = extractJSONString(body, "queue") orelse
         return errResult(.enqueue);
 
@@ -502,9 +509,12 @@ fn decodeEnqueue(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeR
         .queue = queue,
         .created_at_ns = now_ns,
     };
-    // Priority: default 128
-    if (extractJSONInt(body, "priority")) |p|
-        job.priority = @intCast(std.math.clamp(p, 0, 255));
+    // Priority: integer or named string ("critical"=100, "high"=75, "normal"=50, "low"=25)
+    if (extractJSONInt(body, "priority")) |p| {
+        job.priority = @intCast(std.math.clamp(p, 0, 100));
+    } else if (extractJSONString(body, "priority")) |s| {
+        job.priority = parsePriorityString(s);
+    }
 
     if (extractJSONInt(body, "max_retries")) |mr|
         job.max_retries = @intCast(std.math.clamp(mr, 0, 100));
@@ -568,6 +578,75 @@ fn decodeEnqueue(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeR
         } },
         .count = 1,
     };
+}
+
+fn decodeEnqueueBatch(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
+    const jobs_raw = extractJSONRaw(body, "jobs") orelse return errResult(.enqueue);
+    if (jobs_raw.len < 2 or jobs_raw[0] != '[') return errResult(.enqueue);
+    const inner = jobs_raw[1 .. jobs_raw.len - 1];
+
+    var count: u16 = 0;
+    var pos: usize = 0;
+    while (pos < inner.len and count < 64) {
+        // Skip whitespace and commas
+        while (pos < inner.len and (inner[pos] == ' ' or inner[pos] == ',' or
+            inner[pos] == '\n' or inner[pos] == '\r' or inner[pos] == '\t')) pos += 1;
+        if (pos >= inner.len) break;
+        if (inner[pos] != '{') break;
+
+        // Find matching closing brace
+        var depth: u32 = 0;
+        var end = pos;
+        while (end < inner.len) : (end += 1) {
+            if (inner[end] == '{') depth += 1
+            else if (inner[end] == '}') {
+                depth -= 1;
+                if (depth == 0) { end += 1; break; }
+            }
+        }
+
+        const job_json = inner[pos..end];
+        pos = end;
+
+        // Job ID is pre-set by pipeline before decode.
+        const preset_id = scratch.jobs[count].job_id;
+        scratch.jobs[count] = decodeSingleJob(job_json, preset_id, now_ns);
+        count += 1;
+    }
+
+    if (count == 0) return errResult(.enqueue);
+
+    return .{
+        .op_data = .{ .enqueue = .{
+            .jobs = scratch.jobs[0..count],
+            .now_ns = now_ns,
+        } },
+        .count = count,
+    };
+}
+
+fn decodeSingleJob(body: []const u8, job_id: []const u8, now_ns: u64) ops_mod.EnqueueJob {
+    var job = ops_mod.EnqueueJob{
+        .job_id = job_id,
+        .queue = extractJSONString(body, "queue") orelse "",
+        .created_at_ns = now_ns,
+    };
+    if (extractJSONInt(body, "priority")) |p| {
+        job.priority = @intCast(std.math.clamp(p, 0, 100));
+    } else if (extractJSONString(body, "priority")) |s| {
+        job.priority = parsePriorityString(s);
+    }
+    if (extractJSONInt(body, "max_retries")) |mr|
+        job.max_retries = @intCast(std.math.clamp(mr, 0, 100));
+    if (extractJSONRaw(body, "payload")) |pl| job.payload = pl;
+    if (extractJSONString(body, "unique_key")) |uk| job.unique_key = uk;
+    if (extractJSONRaw(body, "tags")) |t| job.tags = t;
+    if (extractJSONString(body, "group")) |g| job.group = g;
+    if (extractJSONString(body, "batch_id")) |bid| job.batch_id = bid;
+    if (extractJSONInt(body, "scheduled_at_ns")) |ns|
+        job.scheduled_at_ns = @intCast(std.math.clamp(ns, 0, std.math.maxInt(i64)));
+    if (job.scheduled_at_ns > 0) job.state = .scheduled;
+    return job;
 }
 
 fn decodeFetch(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
@@ -937,12 +1016,14 @@ fn errResult(comptime op: ops_mod.OpType) DecodeResult {
 // ============================================================================
 
 /// Encode an OpResult as a JSON HTTP response. Returns bytes written to send_buf.
+/// `store` is used by fetch responses to load payload/checkpoint/tags from KV.
 pub fn encodeWriteResponse(
     send_buf: []u8,
     msg_type: u8,
     result: *const ops_mod.OpResult,
     path_param: []const u8,
     sub_action: []const u8,
+    store: ?*kv.Store,
 ) u32 {
     if (result.err) |err| {
         if (std.mem.eql(u8, err, "unique_existing")) {
@@ -960,6 +1041,20 @@ pub fn encodeWriteResponse(
 
     switch (msg_type) {
         rpc.MSG_ENQUEUE_BATCH => {
+            // Batch enqueue: result.affected > 1, job_ids in fetched array
+            if (result.affected > 1) {
+                var body_buf: [8192]u8 = undefined;
+                var jw = json.JsonWriter.init(&body_buf);
+                jw.beginObject();
+                jw.beginArrayField("job_ids");
+                for (0..result.affected) |i| {
+                    jw.elemStr(result.fetched[i].id_buf[0..result.fetched[i].id_len]);
+                }
+                jw.endArray();
+                jw.endObject();
+                return writeResponse(send_buf, 201, jw.getWritten());
+            }
+            // Single enqueue
             var body_buf: [512]u8 = undefined;
             var jw = json.JsonWriter.init(&body_buf);
             jw.beginObject();
@@ -969,7 +1064,7 @@ pub fn encodeWriteResponse(
             jw.endObject();
             return writeResponse(send_buf, 201, jw.getWritten());
         },
-        rpc.MSG_FETCH_BATCH => return encodeFetchResponse(send_buf, result),
+        rpc.MSG_FETCH_BATCH => return encodeFetchResponse(send_buf, result, store),
         rpc.MSG_ACK_BATCH, rpc.MSG_FAIL_BATCH, rpc.MSG_HEARTBEAT => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
         rpc.MSG_BULK_ACTION => return encodeAffectedResponse(send_buf, result.affected, sub_action),
         rpc.MSG_QUEUE_CONFIG => return encodeQueueConfigResponse(send_buf, sub_action),
@@ -1021,28 +1116,57 @@ fn encodeQueueConfigResponse(send_buf: []u8, sub_action: []const u8) u32 {
     return writeResponse(send_buf, 200, "{\"status\":\"ok\"}");
 }
 
-fn encodeFetchResponse(send_buf: []u8, result: *const ops_mod.OpResult) u32 {
+fn encodeFetchResponse(send_buf: []u8, result: *const ops_mod.OpResult, store: ?*kv.Store) u32 {
+    const count = result.affected;
+    if (count == 0) {
+        return writeResponse(send_buf, 200, "{\"job_id\":\"\",\"queue\":\"\",\"payload\":null,\"attempt\":0,\"max_retries\":0,\"lease_duration\":0}");
+    }
+
     var body_buf: [32768]u8 = undefined;
     var jw = json.JsonWriter.init(&body_buf);
 
-    const count = result.affected;
-    if (count == 0) {
-        return writeResponse(send_buf, 200, "{\"jobs\":[]}");
-    }
+    const f = &result.fetched[0];
+    const job_id = f.id_buf[0..f.id_len];
 
     jw.beginObject();
-    jw.beginArrayField("jobs");
-    for (0..count) |i| {
-        const f = &result.fetched[i];
-        jw.beginObject();
-        jw.fieldStr("id", f.id_buf[0..f.id_len]);
-        jw.fieldStr("queue", f.queue_buf[0..f.queue_len]);
-        jw.fieldInt("attempt", f.attempt);
-        jw.fieldInt("max_retries", f.max_retries);
-        jw.fieldInt("lease_token", f.lease_token);
-        jw.endObject();
+    jw.fieldStr("job_id", job_id);
+    jw.fieldStr("queue", f.queue_buf[0..f.queue_len]);
+    jw.fieldInt("attempt", f.attempt);
+    jw.fieldInt("max_retries", f.max_retries);
+    jw.fieldInt("lease_duration", f.lease_duration_ms / 1000);
+    jw.fieldInt("lease_token", f.lease_token);
+
+    if (store) |s| {
+        var batch = s.newBatch();
+        defer batch.close();
+
+        // Load payload from KV
+        var payload_buf: [32768]u8 = undefined;
+        var jpk_buf: keys.KeyBuf = undefined;
+        const payload_key = keys.jobPayloadKey(&jpk_buf, job_id);
+        if (batch.getInto(payload_key, &payload_buf)) |payload_bytes| {
+            jw.fieldRaw("payload", payload_bytes);
+        } else {
+            jw.fieldRaw("payload", "null");
+        }
+
+        // Load checkpoint and tags from job header
+        var header_buf: [4096]u8 = undefined;
+        var jk_buf: keys.KeyBuf = undefined;
+        const job_key = keys.jobKey(&jk_buf, job_id);
+        if (batch.getInto(job_key, &header_buf)) |job_bytes| {
+            const job_decoded = codec.decodeJob(job_bytes);
+            if (job_decoded.checkpoint) |cp| {
+                if (cp.len > 0) jw.fieldRaw("checkpoint", cp);
+            }
+            if (job_decoded.tags) |tags| {
+                if (tags.len > 0) jw.fieldRaw("tags", tags);
+            }
+        }
+    } else {
+        jw.fieldRaw("payload", "null");
     }
-    jw.endArray();
+
     jw.endObject();
     return writeResponse(send_buf, 200, jw.getWritten());
 }
@@ -1056,17 +1180,29 @@ fn writeErrorResponse(send_buf: []u8, status: u16, msg: []const u8) u32 {
     return writeResponse(send_buf, status, jw.getWritten());
 }
 
+fn parsePriorityString(s: []const u8) u8 {
+    if (std.mem.eql(u8, s, "critical")) return types.priority_critical;
+    if (std.mem.eql(u8, s, "high")) return types.priority_high;
+    if (std.mem.eql(u8, s, "normal")) return types.priority_default;
+    if (std.mem.eql(u8, s, "low")) return types.priority_low;
+    const n = std.fmt.parseInt(i64, s, 10) catch return types.priority_default;
+    return @intCast(std.math.clamp(n, 0, 100));
+}
+
 // ============================================================================
 // JSON Extraction Helpers — zero-alloc parsing from raw JSON bytes
 // ============================================================================
 
-/// Extract a JSON string value: "key":"value" → value.
+/// Extract a JSON string value: "key":"value" or "key": "value" → value.
 pub fn extractJSONString(body: []const u8, key: []const u8) ?[]const u8 {
     var search_buf: [128]u8 = undefined;
-    const search_key = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;
+    const search_key = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
     const start = std.mem.indexOf(u8, body, search_key) orelse return null;
-    const val_start = start + search_key.len;
-    if (val_start >= body.len) return null;
+    var val_start = start + search_key.len;
+    // Skip whitespace between : and opening quote.
+    while (val_start < body.len and (body[val_start] == ' ' or body[val_start] == '\t')) val_start += 1;
+    if (val_start >= body.len or body[val_start] != '"') return null;
+    val_start += 1; // skip opening quote
     // Find closing quote, handling escaped quotes.
     var i = val_start;
     while (i < body.len) : (i += 1) {
@@ -1163,10 +1299,13 @@ fn extractPrimitive(body: []const u8, start: usize) ?[]const u8 {
 /// Extract a JSON array of strings: "key":["a","b"] → fills out with slices.
 pub fn extractJSONStringArray(body: []const u8, key: []const u8, out: [][]const u8) usize {
     var search_buf: [128]u8 = undefined;
-    const search_key = std.fmt.bufPrint(&search_buf, "\"{s}\":[", .{key}) catch return 0;
+    const search_key = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return 0;
     const start = std.mem.indexOf(u8, body, search_key) orelse return 0;
-    const arr_start = start + search_key.len;
-    if (arr_start >= body.len) return 0;
+    var arr_start = start + search_key.len;
+    // Skip whitespace between : and [
+    while (arr_start < body.len and (body[arr_start] == ' ' or body[arr_start] == '\t')) arr_start += 1;
+    if (arr_start >= body.len or body[arr_start] != '[') return 0;
+    arr_start += 1; // skip [
 
     var count: usize = 0;
     var i = arr_start;

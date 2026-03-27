@@ -260,7 +260,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
                             .recv => self.deferRecvConn(completion.conn_id),
                             .accept => {},
                             .closed => self.onConnClosed(completion.conn_id),
-                            .send_done => self.io.queueRecv(completion.conn_id),
+                            .send_done => {
+                                const sc = self.io.conn(completion.conn_id);
+                                if (sc.recv_pos > 0) {
+                                    self.deferRecvConn(completion.conn_id);
+                                } else {
+                                    self.io.queueRecv(completion.conn_id);
+                                }
+                            },
                         }
                     }
                     self.io.submit();
@@ -299,7 +306,24 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     },
                     .accept => {},
                     .closed => self.onConnClosed(completion.conn_id),
-                    .send_done => self.io.queueRecv(completion.conn_id),
+                    .send_done => {
+                        // After send completes, check if recv buffer already has
+                        // data (HTTP pipelining / keep-alive). If so, process it
+                        // this tick instead of waiting for a new recv completion.
+                        const c = self.io.conn(completion.conn_id);
+                        if (c.recv_pos > 0) {
+                            var dup = false;
+                            for (recv_conns[0..recv_conn_count]) |existing| {
+                                if (existing == completion.conn_id) { dup = true; break; }
+                            }
+                            if (!dup) {
+                                recv_conns[recv_conn_count] = completion.conn_id;
+                                recv_conn_count += 1;
+                            }
+                        } else {
+                            self.io.queueRecv(completion.conn_id);
+                        }
+                    },
                 }
             }
 
@@ -335,6 +359,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     self.fulfillSubscriptions();
                     self.flushSends();
                 }
+                // HTTP reads are handled inline in extractFrames (no frames produced)
+                // but still record recv compactions that must be applied.
+                self.compactRecvBufs();
                 self.requeueRecvs(recv_conns[0..recv_conn_count]);
                 self.io.submit();
                 self.ticks_total += 1;
@@ -441,6 +468,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
             switch (route) {
                 .read => {
+                    // Flush mirror so HTTP reads see latest state.
+                    if (self.mirror) |m| m.flushAll();
+
                     // Handle inline — write response directly, bypass batch.
                     const clean = if (std.mem.indexOfScalar(u8, req.path, '?')) |qi| req.path[0..qi] else req.path;
                     const api = if (std.mem.startsWith(u8, clean, "/api/v1/")) clean["/api/v1".len..] else clean;
@@ -847,7 +877,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 else => {},
             }
 
-            const decoded = http.decodeWrite(
+            var decoded = http.decodeWrite(
                 frame.msg_type,
                 frame.payload,
                 frame.path_param,
@@ -855,6 +885,17 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 now_ns,
                 &self.http_scratch,
             );
+
+            // Batch enqueue: generate remaining IDs (first was pre-generated above).
+            if (frame.msg_type == rpc.MSG_ENQUEUE_BATCH and decoded.count > 1) {
+                for (1..decoded.count) |j| {
+                    self.http_id_counter += 1;
+                    const jid = http.generateId(&self.http_id_bufs[j], now_ns, self.http_id_counter);
+                    self.http_scratch.jobs[j].job_id = jid;
+                }
+                // Re-point the slice in op_data to include updated IDs.
+                decoded.op_data.enqueue.jobs = self.http_scratch.jobs[0..decoded.count];
+            }
 
             frame.count = decoded.count;
 
@@ -880,10 +921,22 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 else => return .{ .err = "unsupported http write" },
             };
 
-            const result = self.handler.apply(batch, op_type, &decoded.op_data);
+            var result = self.handler.apply(batch, op_type, &decoded.op_data);
             self.emitMirrorOp(op_type, &decoded.op_data, &result);
+
+            // Batch enqueue: copy job_ids into result.fetched for response encoding.
+            if (frame.msg_type == rpc.MSG_ENQUEUE_BATCH and decoded.count > 1) {
+                for (0..decoded.count) |j| {
+                    const jid = self.http_scratch.jobs[j].job_id;
+                    @memcpy(result.fetched[j].id_buf[0..jid.len], jid);
+                    result.fetched[j].id_len = @intCast(jid.len);
+                }
+                result.affected = decoded.count;
+            }
+
             return result;
         }
+
 
         // ====================================================================
         // Encode — write responses into send_bufs
@@ -913,6 +966,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         &self.results[i],
                         frame.path_param,
                         frame.sub_action,
+                        &self.stores[0],
                     );
                     if (resp_len > 0) {
                         self.trackSendConn(frame.conn_id);
@@ -1039,6 +1093,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 }
             }
         }
+
+
 
         // ====================================================================
         // Fetch subscriptions — store and fulfill

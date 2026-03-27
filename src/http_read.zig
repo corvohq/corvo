@@ -37,11 +37,11 @@ pub fn dispatch(
 
     const rdr = reader orelse return writeError(send_buf, 503, "no_mirror");
 
-    if (std.mem.startsWith(u8, api, "/jobs/") and param.len > 0) return job(send_buf, rdr, param);
     if (std.mem.eql(u8, api, "/jobs") or std.mem.eql(u8, api, "/jobs/search")) {
         if (method == .POST) return jobSearchPost(send_buf, rdr, body);
         return jobSearch(send_buf, rdr, path);
     }
+    if (std.mem.startsWith(u8, api, "/jobs/") and param.len > 0) return job(send_buf, rdr, param);
     if (std.mem.eql(u8, api, "/search")) return search(send_buf, rdr, path);
     if (std.mem.eql(u8, api, "/queues")) return queues(send_buf, rdr);
     if (std.mem.eql(u8, api, "/workers")) return workers(send_buf, rdr);
