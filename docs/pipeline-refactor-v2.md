@@ -478,14 +478,45 @@ Sim cluster (6 commits): all present (different architecture, Pipeline_v2-based)
 - CI/release workflows: `.github/workflows/ci.yml` (build + test + sim + docker smoke),
   `.github/workflows/release.yml` (4-platform matrix build, GitHub Release, Docker push).
 
-### Step 18: Delete old stack
-Remove engine.zig, store.zig, server.zig, pipeline.zig, scheduler.zig.
-All functionality migrated to pipeline_v2.
+### Step 18: Delete old stack, rename v2 → corvo — DONE (commit 9f2d2ca)
+
+**Deleted (11 files, ~10,700 lines):**
+- engine.zig, store.zig, server.zig, pipeline.zig (old), scheduler.zig, main.zig (old)
+- rpc_uring.zig, poller.zig, request_metrics.zig, rate_limiter.zig, bench.zig
+
+**Renamed:** pipeline_v2→pipeline, main_v2→main, corvo-v2→corvo (build targets,
+Dockerfile, CI/release workflows).
+
+**Cleaned up:**
+- root.zig: removed all old exports + test refs, removed ui_mod dependency
+- rpc.zig: removed legacy RpcServer + 5 process* handler functions
+- cluster.zig: removed replHookLegacy, leaseCheck, g_pipeline_for_ack
+- build.zig: single `corvo` server target, single `bench-rpc` bench target
+
+**Bug fix:** Maintenance bulk_results overflow. Purge/reclaim/expire loops now cap at
+max_bulk_results per tick. Previously, purging 200k+ expired jobs in one tick overflowed
+the 4096-entry buffer (assert panic). Remaining work is done on subsequent ticks.
+
+**Results:** 203/203 tests pass, sim passes.
+
+**Benchmarks (ReleaseFast, 8 conns, batch-64, 200k jobs):**
+
+| Config | Enqueue (ops/sec) | Lifecycle (ops/sec) |
+|--------|------------------|---------------------|
+| 1-node | 478k | 245k |
+| 3-node async repl | 420k | 181k |
+| 3-node sync repl | 6.9k (50k jobs) | 5.0k (50k jobs) |
+
+Sync repl is slow by design: pipeline serializes on replication RTT (one batch at a time,
+TigerBeetle pattern). With localhost TCP round-trip ~100-200µs and small batches (~8 frames
+per drain), throughput is RTT-bound. Production with higher latency clients would see larger
+batches per tick, partially offsetting the per-batch ack cost. Possible future optimizations:
+batch accumulation window or pipelined acks (N batches in-flight).
 
 ## Verification
 
 After each step:
-- `zig build test` — all unit tests pass (264/268, 4 old-stack failures expected)
+- `zig build test` — all unit tests pass (203/203 after old stack deletion)
 - `zig build sim` — simulator passes
-- Benchmark: enqueue ≥ 340k ops/sec, lifecycle ≥ 80k ops/sec
-  - SDK bench runs against `corvo-v2` binary (`zig build run-v2`)
+- Benchmark: enqueue ≥ 340k ops/sec, lifecycle ≥ 80k ops/sec (single-node)
+  - `zig build --release=fast` then run `./zig-out/bin/corvo` + `./zig-out/bin/bench-rpc`
