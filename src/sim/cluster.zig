@@ -1,4 +1,4 @@
-//! Cluster simulator — multi-node PBR with Pipeline_v2(SimBackend) on the leader.
+//! Cluster simulator — multi-node PBR with Pipeline(SimBackend) on the leader.
 //!
 //! Each node has:
 //!   - Talon DB + KV store
@@ -30,7 +30,7 @@ const kv = corvo.kv;
 const handler_mod = corvo.handler;
 const oplog_mod = corvo.oplog;
 const notify_mod = corvo.notify;
-const pipeline_v2 = corvo.pipeline_v2;
+const pipeline_mod = corvo.pipeline;
 const io_mod = corvo.io;
 const election_mod = corvo.election;
 const repl_mod = corvo.replicator;
@@ -45,8 +45,8 @@ const SimClient = @import("client.zig").SimClient;
 const invariants = @import("invariants.zig");
 
 const SimBackend = io_mod.SimBackend;
-const Pipeline = pipeline_v2.Pipeline(SimBackend);
-const ReplHook = pipeline_v2.ReplHook;
+const Pipeline = pipeline_mod.Pipeline(SimBackend);
+const ReplHook = pipeline_mod.ReplHook;
 
 const max_nodes = 7;
 const max_queues = 8;

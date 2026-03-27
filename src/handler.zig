@@ -63,7 +63,7 @@ pub const OpHandler = struct {
 
     const max_side_effects = 32;
     const max_fail_results = 256;
-    const max_bulk_results = 4096;
+    pub const max_bulk_results = 4096;
     const max_promote_queues = 32;
 
     pub const FailResult = struct {

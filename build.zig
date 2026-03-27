@@ -11,13 +11,6 @@ pub fn build(b: *std.Build) void {
     });
     const talon_mod = talon_dep.module("talon");
 
-    // --- UI embed module (lives at project root so @embedFile reaches ui/dist/) ---
-    const ui_mod = b.addModule("ui", .{
-        .root_source_file = b.path("ui_embed.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     // --- Corvo library module ---
     const corvo_mod = b.addModule("corvo", .{
         .root_source_file = b.path("src/root.zig"),
@@ -25,7 +18,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     corvo_mod.addImport("talon", talon_mod);
-    corvo_mod.addImport("ui", ui_mod);
     corvo_mod.link_libc = true;
     corvo_mod.linkSystemLibrary("sqlite3", .{});
 
@@ -43,7 +35,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_mod.addImport("talon", talon_mod);
-    test_mod.addImport("ui", ui_mod);
     test_mod.link_libc = true;
     test_mod.linkSystemLibrary("sqlite3", .{});
     const tests = b.addTest(.{
@@ -83,25 +74,6 @@ pub fn build(b: *std.Build) void {
     const sim_step = b.step("sim", "Run VOPR simulator");
     sim_step.dependOn(&run_sim_tests.step);
 
-    // --- Benchmark executable ---
-    const bench_mod = b.createModule(.{
-        .root_source_file = b.path("src/bench.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    bench_mod.addImport("talon", talon_mod);
-    // bench.zig imports corvo modules directly (same src/ tree), but needs talon
-    // for the DB. Add corvo's source files as imports so it resolves.
-    bench_mod.addImport("corvo", corvo_mod);
-    const bench_exe = b.addExecutable(.{
-        .name = "bench",
-        .root_module = bench_mod,
-    });
-    b.installArtifact(bench_exe);
-    const run_bench = b.addRunArtifact(bench_exe);
-    const bench_step = b.step("bench", "Run benchmarks");
-    bench_step.dependOn(&run_bench.step);
-
     // --- RPC Benchmark executable ---
     const bench_rpc_mod = b.createModule(.{
         .root_source_file = b.path("src/bench_rpc.zig"),
@@ -127,7 +99,6 @@ pub fn build(b: *std.Build) void {
     });
     main_mod.addImport("talon", talon_mod);
     main_mod.addImport("corvo", corvo_mod);
-    main_mod.addImport("ui", ui_mod);
     const server_exe = b.addExecutable(.{
         .name = "corvo",
         .root_module = main_mod,
@@ -137,24 +108,6 @@ pub fn build(b: *std.Build) void {
     if (b.args) |a| run_server.addArgs(a);
     const run_step = b.step("run", "Run the Corvo server");
     run_step.dependOn(&run_server.step);
-
-    // --- Corvo v2 server executable (pipeline_v2 + io_uring/kqueue) ---
-    const main_v2_mod = b.createModule(.{
-        .root_source_file = b.path("src/main_v2.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    main_v2_mod.addImport("talon", talon_mod);
-    main_v2_mod.addImport("corvo", corvo_mod);
-    const server_v2_exe = b.addExecutable(.{
-        .name = "corvo-v2",
-        .root_module = main_v2_mod,
-    });
-    b.installArtifact(server_v2_exe);
-    const run_server_v2 = b.addRunArtifact(server_v2_exe);
-    if (b.args) |a| run_server_v2.addArgs(a);
-    const run_v2_step = b.step("run-v2", "Run the Corvo v2 server (pipeline_v2 + io_uring/kqueue)");
-    run_v2_step.dependOn(&run_server_v2.step);
 
     // --- corvo-inspect CLI ---
     const inspect_mod = b.createModule(.{

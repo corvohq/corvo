@@ -1,700 +1,2312 @@
-//! Pipeline — async apply pipeline with MPSC batching.
+//! Pipeline — single-threaded tick loop, generic over IoBackend.
 //!
-//! Ported from Go internal/engine/node.go.
-//! Multiple producer threads submit ops via submit().
-//! Single consumer thread (applyLoop) batches and executes.
-//! Per-request completion signaling via ResetEvent.
+//! THE write path. One thread, one event loop, zero synchronization.
+//!
+//! Tick loop:
+//!   io.drain()         → completions
+//!   extractFrames()    → FrameDesc[]
+//!   executeBatch()     → results[]   (single kv.Batch commit)
+//!   encodeResponses()  → send_bufs
+//!   io.submit()
 
 const std = @import("std");
+const io_mod = @import("io.zig");
+const rpc = @import("rpc.zig");
+const http = @import("http.zig");
+const http_read = @import("http_read.zig");
+const sqlite_read = @import("sqlite_read.zig");
 const ops_mod = @import("ops.zig");
 const kv = @import("kv.zig");
 const handler_mod = @import("handler.zig");
 const oplog_mod = @import("oplog.zig");
 const notify_mod = @import("notify.zig");
-const shard_mod = @import("shard.zig");
+const mirror_mod = @import("mirror.zig");
+const mirror_events = @import("mirror_events.zig");
 const assert = @import("assert.zig");
+const keys = @import("keys.zig");
+const codec = @import("codec.zig");
+const types = @import("types.zig");
 
 const OpHandler = handler_mod.OpHandler;
 const QueueNotifier = notify_mod.QueueNotifier;
+const ConnState = io_mod.ConnState;
+const Protocol = ConnState.Protocol;
+const Completion = io_mod.Completion;
+const BufReader = rpc.BufReader;
+const BufWriter = rpc.BufWriter;
 
-// ============================================================================
-// CPU Pinning (Linux sched_setaffinity)
-// ============================================================================
+// ========================================================================
+// ReplHook — replication callback vtable (module-level, backend-agnostic)
+// ========================================================================
 
-/// Pin the calling thread to a specific CPU core via sched_setaffinity(2).
-/// Uses tid=0 to target the current thread.
-pub fn pinCurrentThread(core: usize) void {
-    if (comptime @import("builtin").os.tag != .linux) return;
-    var mask: [16]u64 = [_]u64{0} ** 16; // cpu_set_t (1024 bits)
-    mask[core / 64] = @as(u64, 1) << @intCast(core % 64);
-    _ = std.os.linux.syscall3(.sched_setaffinity, 0, @sizeOf(@TypeOf(mask)), @intFromPtr(&mask));
+/// Called after oplog append with encoded mutations. Cluster mode uses this
+/// to fan out mutations to followers via TCP.
+pub const ReplHook = struct {
+    ptr: *anyopaque,
+    replicate_fn: *const fn (ptr: *anyopaque, shard_id: u16, seq: u64, data: []const u8) void,
+
+    pub fn replicate(self: ReplHook, shard_id: u16, seq: u64, data: []const u8) void {
+        self.replicate_fn(self.ptr, shard_id, seq, data);
+    }
+};
+
+pub fn Pipeline(comptime IoBackend: type) type {
+    return struct {
+        const Self = @This();
+
+        io: *IoBackend,
+        handler: *OpHandler,
+        stores: []kv.Store,
+        oplog: *oplog_mod.Log,
+        notify: *QueueNotifier,
+        reader: ?*sqlite_read.Reader,
+        mirror: ?*mirror_mod.Mirror,
+        config: Config,
+        allocator: std.mem.Allocator,
+        mut_list: std.ArrayList(kv.Mutation) = .{},
+
+        // HTTP decode scratch (reused per tick)
+        http_scratch: http.DecodeScratch = .{},
+        http_id_counter: u64 = 0,
+        http_id_bufs: [max_frames][64]u8 = undefined,
+
+        // Frame tracking for current tick
+        frames: [max_frames]FrameDesc = undefined,
+        frame_count: u32 = 0,
+
+        // Results from execute stage
+        results: [max_frames]ops_mod.OpResult = undefined,
+
+        // Recv compaction tracking: (conn_id, consumed_bytes) pairs
+        recv_compactions: [max_completions]RecvCompaction = undefined,
+        recv_compaction_count: u32 = 0,
+
+        // Completion buffer for io.drain()
+        completions: [max_completions]Completion = undefined,
+
+        // Pre-allocated scratch buffers for RPC decode (reused per frame)
+        jobs_buf: [max_batch_jobs]ops_mod.EnqueueJob = undefined,
+        acks_buf: [max_batch_jobs]ops_mod.AckJob = undefined,
+        fails_buf: [max_batch_jobs]ops_mod.FailJob = undefined,
+        hb_ids_buf: [max_batch_jobs][]const u8 = undefined,
+        hb_ops_buf: [max_batch_jobs]ops_mod.HeartbeatJobOp = undefined,
+        bulk_ids_buf: [max_batch_jobs][]const u8 = undefined,
+
+        // Send tracking: connections with data to flush (populated by encode + fulfill)
+        send_conns: [max_frames + max_waiting_conns]u16 = undefined,
+        send_conn_count: u32 = 0,
+
+        // Fetch subscription tracking
+        waiting_conns: [max_waiting_conns]u16 = [_]u16{0} ** max_waiting_conns,
+        waiting_conn_count: u32 = 0,
+
+        // Notified queues this tick (collected during notifyForFrame)
+        notified_queue_bufs: [max_notified_queues][64]u8 = undefined,
+        notified_queue_lens: [max_notified_queues]u8 = [_]u8{0} ** max_notified_queues,
+        notified_queue_count: u32 = 0,
+
+        // Maintenance scheduling
+        last_promote_ns: u64 = 0,
+        last_reclaim_ns: u64 = 0,
+        last_unique_ns: u64 = 0,
+        last_rate_limit_ns: u64 = 0,
+        last_expire_ns: u64 = 0,
+        last_purge_ns: u64 = 0,
+
+        // Sync replication — deferred response until follower ack.
+        // last_acked_seq is written by the TCP receive thread (via onFollowerAck),
+        // read by the pipeline tick thread. Single atomic, single shared state.
+        last_acked_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        last_recorded_seq: u64 = 0,
+        pending_ack_seq: u64 = 0,
+        // recv_conns saved from the tick that created the pending batch,
+        // needed for requeueRecvs when the deferred responses are flushed.
+        pending_recv_conns: [max_completions]u16 = undefined,
+        pending_recv_conn_count: u32 = 0,
+        // Recv connections that arrived during sync-repl wait — CQEs consumed
+        // but data is in recv_buf. Processed after deferred batch flushes.
+        deferred_recv_conns: [max_completions]u16 = undefined,
+        deferred_recv_conn_count: u32 = 0,
+
+        // Stats
+        ticks_total: u64 = 0,
+        applied_total: u64 = 0,
+        subscriptions_fulfilled: u64 = 0,
+        maintenance_runs: u64 = 0,
+
+        const max_batch_jobs = rpc.MAX_BATCH_JOBS;
+        const max_frames: u32 = 256;
+        const max_completions: u32 = 256;
+        const max_waiting_conns: u32 = 4096;
+        const max_notified_queues: u32 = 64;
+
+
+        // ====================================================================
+        // Config
+        // ====================================================================
+
+        pub const Config = struct {
+            clock_fn: *const fn () i64,
+            batch_max: u32 = 256,
+            max_payload_size: u32 = 64 * 1024,
+            promote_interval_ns: u64 = 0,
+            reclaim_interval_ns: u64 = 0,
+            unique_interval_ns: u64 = 0,
+            rate_limit_interval_ns: u64 = 0,
+            expire_interval_ns: u64 = 0,
+            purge_interval_ns: u64 = 0,
+            repl_hook: ?ReplHook = null,
+            sync_replication: bool = false,
+        };
+
+        // ====================================================================
+        // Internal types
+        // ====================================================================
+
+        const FrameDesc = struct {
+            conn_id: u16,
+            req_id: u32,
+            msg_type: u8,
+            payload: []const u8,
+            count: u16 = 0,
+            protocol: Protocol = .rpc,
+            path_param: []const u8 = "",
+            sub_action: []const u8 = "",
+            http_path: []const u8 = "", // full path including query string (for webhook query params)
+        };
+
+        const RecvCompaction = struct {
+            conn_id: u16,
+            consumed: u32,
+        };
+
+        // ====================================================================
+        // Lifecycle
+        // ====================================================================
+
+        pub fn init(
+            allocator: std.mem.Allocator,
+            io_backend: *IoBackend,
+            handler: *OpHandler,
+            stores: []kv.Store,
+            oplog: *oplog_mod.Log,
+            notify: *QueueNotifier,
+            reader: ?*sqlite_read.Reader,
+            mirror: ?*mirror_mod.Mirror,
+            config: Config,
+        ) Self {
+            return .{
+                .io = io_backend,
+                .handler = handler,
+                .stores = stores,
+                .oplog = oplog,
+                .notify = notify,
+                .reader = reader,
+                .mirror = mirror,
+                .config = config,
+                .allocator = allocator,
+            };
+        }
+
+        /// Heap-allocate the pipeline. The struct is ~5MB due to inline
+        /// scratch buffers — too large for the default 8MB thread stack.
+        pub fn initHeap(
+            allocator: std.mem.Allocator,
+            io_backend: *IoBackend,
+            handler: *OpHandler,
+            stores: []kv.Store,
+            oplog: *oplog_mod.Log,
+            notify: *QueueNotifier,
+            reader: ?*sqlite_read.Reader,
+            mirror: ?*mirror_mod.Mirror,
+            config: Config,
+        ) *Self {
+            const self = allocator.create(Self) catch unreachable;
+            self.* = init(allocator, io_backend, handler, stores, oplog, notify, reader, mirror, config);
+            return self;
+        }
+
+        pub fn deinit(self: *Self) void {
+            for (self.mut_list.items) |m| {
+                if (m.key.len > 0) self.allocator.free(@constCast(m.key));
+                if (m.value.len > 0 and m.op != .delete) self.allocator.free(@constCast(m.value));
+            }
+            self.mut_list.deinit(self.allocator);
+        }
+
+        pub fn destroyHeap(self: *Self) void {
+            const alloc = self.allocator;
+            self.deinit();
+            alloc.destroy(self);
+        }
+
+        /// Called from TCP receive thread when a follower acks a sequence.
+        /// Thread-safe: single atomic write, no locks.
+        pub fn onFollowerAck(self: *Self, seq: u64) void {
+            const prev = self.last_acked_seq.load(.monotonic);
+            if (seq > prev) self.last_acked_seq.store(seq, .release);
+        }
+
+        /// Returns a pointer to the ack sequence atomic. Cluster mode wires this
+        /// into the TCP fast-path callback for direct atomic updates.
+        pub fn ackSeqPtr(self: *Self) *std.atomic.Value(u64) {
+            return &self.last_acked_seq;
+        }
+
+        // ====================================================================
+        // Tick — the entire event loop body
+        // ====================================================================
+
+        pub fn tick(self: *Self) void {
+            // 0. Sync replication: check for deferred ack from a previous tick.
+            //    If ack received, flush the deferred responses and fall through to
+            //    the normal tick — connections that received data during the wait
+            //    need their frames extracted. If still waiting, drain IO events
+            //    (close/send_done) and save recv conn_ids for later.
+            if (self.pending_ack_seq > 0) {
+                if (self.last_acked_seq.load(.acquire) >= self.pending_ack_seq) {
+                    self.encodeResponses();
+                    self.fulfillSubscriptions();
+                    self.flushSends();
+                    self.compactRecvBufs();
+                    self.requeueRecvs(self.pending_recv_conns[0..self.pending_recv_conn_count]);
+                    self.pending_ack_seq = 0;
+                    self.pending_recv_conn_count = 0;
+                    self.io.submit();
+                    // Fall through to normal tick — process deferred recv connections.
+                } else {
+                    // Still waiting — non-blocking drain so we don't stall in
+                    // io_uring submit_and_wait while the cluster thread updates the atomic.
+                    // Save recv conn_ids: their CQEs are consumed but data is in recv_buf.
+                    const n_pending = self.io.drainNonBlocking(&self.completions);
+                    for (self.completions[0..n_pending]) |completion| {
+                        switch (completion.event) {
+                            .recv => self.deferRecvConn(completion.conn_id),
+                            .accept => {},
+                            .closed => self.onConnClosed(completion.conn_id),
+                            .send_done => {
+                                const sc = self.io.conn(completion.conn_id);
+                                if (sc.recv_pos > 0) {
+                                    self.deferRecvConn(completion.conn_id);
+                                } else {
+                                    self.io.queueRecv(completion.conn_id);
+                                }
+                            },
+                        }
+                    }
+                    self.io.submit();
+                    self.ticks_total += 1;
+                    return;
+                }
+            }
+
+            // 1. Drain IO completions
+            const n = self.io.drain(&self.completions);
+
+            // Reset per-tick state.
+            self.frame_count = 0;
+            self.recv_compaction_count = 0;
+            self.notified_queue_count = 0;
+
+            // 2. Process completions — collect unique recv conn_ids
+            var recv_conns: [max_completions]u16 = undefined;
+            var recv_conn_count: u32 = 0;
+
+            for (self.completions[0..n]) |completion| {
+                switch (completion.event) {
+                    .recv => {
+                        // Deduplicate: only process each conn once per tick
+                        var dup = false;
+                        for (recv_conns[0..recv_conn_count]) |existing| {
+                            if (existing == completion.conn_id) {
+                                dup = true;
+                                break;
+                            }
+                        }
+                        if (!dup) {
+                            recv_conns[recv_conn_count] = completion.conn_id;
+                            recv_conn_count += 1;
+                        }
+                    },
+                    .accept => {},
+                    .closed => self.onConnClosed(completion.conn_id),
+                    .send_done => {
+                        // After send completes, check if recv buffer already has
+                        // data (HTTP pipelining / keep-alive). If so, process it
+                        // this tick instead of waiting for a new recv completion.
+                        const c = self.io.conn(completion.conn_id);
+                        if (c.recv_pos > 0) {
+                            var dup = false;
+                            for (recv_conns[0..recv_conn_count]) |existing| {
+                                if (existing == completion.conn_id) { dup = true; break; }
+                            }
+                            if (!dup) {
+                                recv_conns[recv_conn_count] = completion.conn_id;
+                                recv_conn_count += 1;
+                            }
+                        } else {
+                            self.io.queueRecv(completion.conn_id);
+                        }
+                    },
+                }
+            }
+
+            // Include connections that received data during sync-repl wait.
+            // Their CQEs were consumed but data is already in recv_buf.
+            for (self.deferred_recv_conns[0..self.deferred_recv_conn_count]) |dc| {
+                var dup = false;
+                for (recv_conns[0..recv_conn_count]) |existing| {
+                    if (existing == dc) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    recv_conns[recv_conn_count] = dc;
+                    recv_conn_count += 1;
+                }
+            }
+            self.deferred_recv_conn_count = 0;
+
+            for (recv_conns[0..recv_conn_count]) |conn_id| {
+                self.extractFrames(conn_id);
+            }
+
+            // Run scheduled maintenance in its own batch, committed before client ops.
+            // Maintenance must not share a WriteBatch with client ops: reclaim/ack on the
+            // same job would double-decrement active counts (WriteBatch iterators see base state).
+            self.runMaintenance();
+
+            if (self.frame_count == 0) {
+                // No client frames — but maintenance may have made jobs available.
+                if (self.notified_queue_count > 0) {
+                    self.fulfillSubscriptions();
+                    self.flushSends();
+                }
+                // HTTP reads are handled inline in extractFrames (no frames produced)
+                // but still record recv compactions that must be applied.
+                self.compactRecvBufs();
+                self.requeueRecvs(recv_conns[0..recv_conn_count]);
+                self.io.submit();
+                self.ticks_total += 1;
+                return;
+            }
+
+            // 3. Execute: decode + apply in single kv.Batch
+            self.executeBatch();
+
+            // 4. Sync replication: defer responses until follower ack.
+            //    frames[], results[], recv_compactions[] persist in struct fields.
+            //    recv_bufs are NOT compacted — HTTP path_param/sub_action still reference them.
+            if (self.config.sync_replication and self.config.repl_hook != null) {
+                // Check if ack already arrived (fast-path callback can race ahead).
+                if (self.last_acked_seq.load(.acquire) >= self.last_recorded_seq) {
+                    // Already acked — encode immediately, no deferral needed.
+                } else {
+                    self.pending_ack_seq = self.last_recorded_seq;
+                    @memcpy(self.pending_recv_conns[0..recv_conn_count], recv_conns[0..recv_conn_count]);
+                    self.pending_recv_conn_count = recv_conn_count;
+                    self.io.submit();
+                    self.ticks_total += 1;
+                    return;
+                }
+            }
+
+            // 5. Encode responses into send_bufs (no sends queued yet)
+            self.encodeResponses();
+
+            // 6. Push jobs to waiting fetch subscribers (appends to send_bufs)
+            self.fulfillSubscriptions();
+
+            // 7. Flush all accumulated sends (one queueSend per connection)
+            self.flushSends();
+
+            // 8. Compact recv_bufs (payload slices no longer needed)
+            self.compactRecvBufs();
+
+            // 9. Re-queue recv for connections with partial frames (no send pending)
+            self.requeueRecvs(recv_conns[0..recv_conn_count]);
+
+            // 10. Submit all queued IO
+            self.io.submit();
+            self.ticks_total += 1;
+        }
+
+        // ====================================================================
+        // Frame extraction — parse RPC frames from recv_bufs
+        // ====================================================================
+
+        fn extractFrames(self: *Self, conn_id: u16) void {
+            const c = self.io.conn(conn_id);
+            if (c.phase == .free) return;
+            if (c.recv_pos == 0) return;
+
+            // Detect protocol on first data.
+            if (c.protocol == .unknown) {
+                c.protocol = if (http.isHttpByte(c.recv_buf[0])) .http else .rpc;
+            }
+
+            switch (c.protocol) {
+                .rpc => self.extractRpcFrames(conn_id, c),
+                .http => self.extractHttpFrames(conn_id, c),
+                .unknown => unreachable,
+            }
+        }
+
+        fn extractRpcFrames(self: *Self, conn_id: u16, c: *ConnState) void {
+            var pos: u32 = 0;
+            const data_end = c.recv_pos;
+
+            while (pos + @as(u32, rpc.FRAME_HEADER_SIZE) <= data_end) {
+                const hdr = rpc.readFrameHeader(c.recv_buf[pos..data_end]) orelse break;
+
+                if (hdr.payload_len > self.config.max_payload_size) {
+                    self.io.queueClose(conn_id);
+                    return;
+                }
+
+                const payload_start = pos + @as(u32, rpc.FRAME_HEADER_SIZE);
+                const frame_end = payload_start + hdr.payload_len;
+                if (frame_end > data_end) break; // partial frame, wait for more data
+
+                if (self.frame_count >= max_frames) break; // back-pressure
+
+                self.frames[self.frame_count] = .{
+                    .conn_id = conn_id,
+                    .req_id = hdr.req_id,
+                    .msg_type = hdr.msg_type,
+                    .payload = c.recv_buf[payload_start..frame_end],
+                };
+                self.frame_count += 1;
+                pos = @intCast(frame_end);
+            }
+
+            self.recordRecvCompaction(conn_id, pos);
+        }
+
+        fn extractHttpFrames(self: *Self, conn_id: u16, c: *ConnState) void {
+            const data = c.recv_buf[0..c.recv_pos];
+            const req = http.parseRequest(data) orelse return; // incomplete, wait
+
+            const route = http.classifyRoute(req.method, req.path);
+
+            // CORS preflight — return immediately, no auth, no batch.
+            if (req.method == .OPTIONS) {
+                const resp_len = http.writeCorsPreflightResponse(c.send_buf);
+                if (resp_len > 0) {
+                    c.send_len = resp_len;
+                    self.io.queueSend(conn_id, resp_len);
+                }
+                self.recordRecvCompaction(conn_id, req.total_len);
+                return;
+            }
+
+            // Auth check (skipped for healthz and auth/status).
+            const clean_path = if (std.mem.indexOfScalar(u8, req.path, '?')) |qi| req.path[0..qi] else req.path;
+            const skip_auth = std.mem.eql(u8, clean_path, "/healthz") or
+                std.mem.eql(u8, clean_path, "/api/v1/auth/status") or
+                std.mem.eql(u8, clean_path, "/metrics");
+            if (!skip_auth) {
+                const auth_result = http.checkAuth(req.api_key, req.method, self.reader);
+                if (auth_result != .ok) {
+                    const resp_len = http.writeAuthError(c.send_buf, auth_result);
+                    if (resp_len > 0) {
+                        c.send_len = resp_len;
+                        self.io.queueSend(conn_id, resp_len);
+                    }
+                    self.recordRecvCompaction(conn_id, req.total_len);
+                    return;
+                }
+            }
+
+            switch (route) {
+                .read => {
+                    // Flush mirror so HTTP reads see latest state.
+                    if (self.mirror) |m| m.flushAll();
+
+                    // Handle inline — write response directly, bypass batch.
+                    const clean = if (std.mem.indexOfScalar(u8, req.path, '?')) |qi| req.path[0..qi] else req.path;
+                    const api = if (std.mem.startsWith(u8, clean, "/api/v1/")) clean["/api/v1".len..] else clean;
+                    const param = extractPathParam(api);
+                    const resp_len = http_read.dispatch(
+                        req.method,
+                        req.path,
+                        param,
+                        req.body,
+                        c.send_buf,
+                        self.reader,
+                    );
+                    if (resp_len > 0) {
+                        c.send_len = resp_len;
+                        self.io.queueSend(conn_id, resp_len);
+                    }
+                    self.recordRecvCompaction(conn_id, req.total_len);
+                },
+                .write => |w| {
+                    if (self.frame_count >= max_frames) return; // back-pressure
+
+                    // Payload size validation — return 413 instead of asserting.
+                    if (req.body.len > self.config.max_payload_size) {
+                        const resp_len = http.writeResponse(c.send_buf, 413, "{\"error\":\"payload too large\"}");
+                        c.send_len = resp_len;
+                        self.io.queueSend(conn_id, resp_len);
+                        self.recordRecvCompaction(conn_id, req.total_len);
+                        return;
+                    }
+
+                    self.frames[self.frame_count] = .{
+                        .conn_id = conn_id,
+                        .req_id = 0,
+                        .msg_type = w.msg_type,
+                        .payload = req.body,
+                        .protocol = .http,
+                        .path_param = w.param,
+                        .sub_action = w.sub_action,
+                        .http_path = req.path,
+                    };
+                    self.frame_count += 1;
+                    self.recordRecvCompaction(conn_id, req.total_len);
+                },
+                .not_found => {
+                    const resp_len = http.writeResponse(c.send_buf, 404, "{\"error\":\"not found\"}");
+                    c.send_len = resp_len;
+                    self.io.queueSend(conn_id, resp_len);
+                    self.recordRecvCompaction(conn_id, req.total_len);
+                },
+                .method_not_allowed => {
+                    const resp_len = http.writeResponse(c.send_buf, 405, "{\"error\":\"method not allowed\"}");
+                    c.send_len = resp_len;
+                    self.io.queueSend(conn_id, resp_len);
+                    self.recordRecvCompaction(conn_id, req.total_len);
+                },
+            }
+        }
+
+        fn extractPathParam(api_path: []const u8) []const u8 {
+            // Extract trailing segment: /jobs/{id} → {id}, /ack/{id} → {id}
+            if (std.mem.lastIndexOfScalar(u8, api_path, '/')) |last_slash| {
+                const param = api_path[last_slash + 1 ..];
+                if (param.len > 0) return param;
+            }
+            return "";
+        }
+
+        // ====================================================================
+        // Maintenance — timer-driven ops, separate batch from client frames
+        // ====================================================================
+
+        fn runMaintenance(self: *Self) void {
+            const now_ns = self.nowNs();
+
+            const intervals = [6]struct { ns: u64, last: *u64, action: ops_mod.MaintenanceAction }{
+                .{ .ns = self.config.promote_interval_ns, .last = &self.last_promote_ns, .action = .promote },
+                .{ .ns = self.config.reclaim_interval_ns, .last = &self.last_reclaim_ns, .action = .reclaim },
+                .{ .ns = self.config.unique_interval_ns, .last = &self.last_unique_ns, .action = .unique },
+                .{ .ns = self.config.rate_limit_interval_ns, .last = &self.last_rate_limit_ns, .action = .rate_limit },
+                .{ .ns = self.config.expire_interval_ns, .last = &self.last_expire_ns, .action = .expire },
+                .{ .ns = self.config.purge_interval_ns, .last = &self.last_purge_ns, .action = .purge },
+            };
+
+            var any_due = false;
+            for (intervals) |iv| {
+                if (iv.ns > 0 and now_ns - iv.last.* >= iv.ns) {
+                    any_due = true;
+                    break;
+                }
+            }
+            if (!any_due) return;
+
+            self.handler.resetEffects();
+            var batch = self.stores[0].newBatch();
+            defer batch.close();
+
+            const record_mutations = self.config.repl_hook != null;
+            if (record_mutations) {
+                self.mut_list.clearRetainingCapacity();
+                batch.enableRecording(self.allocator, &self.mut_list);
+            }
+            defer if (record_mutations) batch.freeMutations();
+
+            for (intervals) |iv| {
+                if (iv.ns == 0) continue;
+                if (now_ns - iv.last.* < iv.ns) continue;
+
+                const op_data = ops_mod.OpData{ .maintenance = .{ .action = iv.action, .now_ns = now_ns, .cutoff_ns = now_ns } };
+                const result = self.handler.apply(&batch, .maintenance, &op_data);
+                self.emitMirrorOp(.maintenance, &op_data, &result);
+
+                if (result.notify_queues) |queues| {
+                    self.notify.notifyQueues(queues);
+                    for (queues) |q| self.recordNotifiedQueue(q);
+                }
+
+                iv.last.* = now_ns;
+                self.maintenance_runs += 1;
+                self.applied_total += 1;
+            }
+
+            batch.commit();
+
+            if (record_mutations and self.mut_list.items.len > 0) {
+                self.recordOplog();
+            }
+
+            if (self.mirror) |m| {
+                mirror_events.mirrorEffects(m, self.handler);
+            }
+        }
+
+        fn recordRecvCompaction(self: *Self, conn_id: u16, consumed: u32) void {
+            if (consumed == 0) return;
+            assert.check(
+                self.recv_compaction_count < max_completions,
+                "pipeline: recv_compaction overflow",
+                .{},
+            );
+            self.recv_compactions[self.recv_compaction_count] = .{
+                .conn_id = conn_id,
+                .consumed = consumed,
+            };
+            self.recv_compaction_count += 1;
+        }
+
+        // ====================================================================
+        // Execute — decode + apply in a single kv.Batch
+        // ====================================================================
+
+        fn executeBatch(self: *Self) void {
+            self.handler.resetEffects();
+            var kv_batch = self.stores[0].newBatch();
+            defer kv_batch.close();
+
+            // Record mutations if we have a file-backed oplog OR a repl_hook
+            // (cluster mode needs mutation recording even without a file).
+            const record_mutations = self.config.repl_hook != null;
+            if (record_mutations) {
+                self.mut_list.clearRetainingCapacity();
+                kv_batch.enableRecording(self.allocator, &self.mut_list);
+            }
+            defer if (record_mutations) kv_batch.freeMutations();
+
+            for (self.frames[0..self.frame_count], 0..) |*frame, i| {
+                self.results[i] = self.decodeAndApply(&kv_batch, frame, @intCast(i));
+            }
+
+            kv_batch.commit();
+            self.applied_total += self.frame_count;
+
+            if (record_mutations and self.mut_list.items.len > 0) {
+                self.recordOplog();
+            }
+
+            // Post-commit: drain handler effect buffers into mirror.
+            if (self.mirror) |m| {
+                mirror_events.mirrorEffects(m, self.handler);
+            }
+
+            // Post-commit: notify queue waiters
+            for (self.frames[0..self.frame_count], 0..) |frame, i| {
+                self.notifyForFrame(&frame, &self.results[i]);
+            }
+        }
+
+        fn recordOplog(self: *Self) void {
+            const encoded = oplog_mod.encodeMutations(self.allocator, self.mut_list.items);
+            defer self.allocator.free(encoded);
+            const seq = self.oplog.append(0, encoded);
+            self.last_recorded_seq = seq;
+            if (self.config.repl_hook) |hook| hook.replicate(0, seq, encoded);
+        }
+
+        fn decodeAndApply(self: *Self, batch: *kv.WriteBatch, frame: *FrameDesc, frame_idx: u32) ops_mod.OpResult {
+            // HTTP writes use JSON decode; RPC uses binary decode.
+            if (frame.protocol == .http)
+                return self.decodeAndApplyHttp(batch, frame, frame_idx);
+
+            switch (frame.msg_type) {
+                rpc.MSG_PING => return .{},
+
+                rpc.MSG_ENQUEUE_BATCH => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const now_ns = self.nowNs();
+                    const parsed = rpc.parseEnqueue(&reader, &self.jobs_buf, now_ns) catch
+                        return .{ .err = "parse error" };
+                    frame.count = parsed.count;
+                    const op_data = ops_mod.OpData{ .enqueue = parsed.op };
+                    const result = self.handler.apply(batch, .enqueue, &op_data);
+                    self.emitMirrorOp(.enqueue, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_ACK_BATCH => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.parseAck(&reader, &self.acks_buf) catch
+                        return .{ .err = "parse error" };
+                    frame.count = parsed.count;
+                    var op = parsed.op;
+                    op.now_ns = self.nowNs();
+                    const op_data = ops_mod.OpData{ .ack = op };
+                    const result = self.handler.apply(batch, .ack, &op_data);
+                    self.emitMirrorOp(.ack, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_FAIL_BATCH => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.parseFail(&reader, &self.fails_buf) catch
+                        return .{ .err = "parse error" };
+                    frame.count = parsed.count;
+                    var op = parsed.op;
+                    op.now_ns = self.nowNs();
+                    const op_data = ops_mod.OpData{ .fail = op };
+                    const result = self.handler.apply(batch, .fail, &op_data);
+                    self.emitMirrorOp(.fail, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_HEARTBEAT => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.parseHeartbeat(
+                        &reader,
+                        &self.hb_ids_buf,
+                        &self.hb_ops_buf,
+                    ) catch return .{ .err = "parse error" };
+                    var op = parsed;
+                    op.now_ns = self.nowNs();
+                    const op_data = ops_mod.OpData{ .heartbeat = op };
+                    const result = self.handler.apply(batch, .heartbeat, &op_data);
+                    self.emitMirrorOp(.heartbeat, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_FETCH_BATCH => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const sub = rpc.parseFetchSubscribe(&reader) catch
+                        return .{ .err = "parse error" };
+                    const now_ns = self.nowNs();
+                    var queue_slices: [16][]const u8 = undefined;
+                    for (0..sub.queue_count) |i| {
+                        queue_slices[i] = sub.queues[i];
+                    }
+                    const op_data = ops_mod.OpData{ .fetch = .{
+                        .queues = queue_slices[0..sub.queue_count],
+                        .worker_id = sub.worker_id,
+                        .lease_duration_ms = sub.lease_ms,
+                        .count = sub.credits,
+                        .now_ns = now_ns,
+                    } };
+                    const result = self.handler.apply(batch, .fetch, &op_data);
+                    self.emitMirrorOp(.fetch, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_MAINTENANCE => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.management.parseMaintenance(&reader) catch
+                        return .{ .err = "parse error" };
+                    const op_data = ops_mod.OpData{ .maintenance = parsed };
+                    const result = self.handler.apply(batch, .maintenance, &op_data);
+                    self.emitMirrorOp(.maintenance, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_QUEUE_CONFIG => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.management.parseQueueConfig(&reader) catch
+                        return .{ .err = "parse error" };
+                    const op_data = ops_mod.OpData{ .queue_config = parsed };
+                    const result = self.handler.apply(batch, .queue_config, &op_data);
+                    self.emitMirrorOp(.queue_config, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_CLEAR_QUEUE => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.management.parseClearQueue(&reader) catch
+                        return .{ .err = "parse error" };
+                    const op_data = ops_mod.OpData{ .clear_queue = parsed };
+                    const result = self.handler.apply(batch, .clear_queue, &op_data);
+                    self.emitMirrorOp(.clear_queue, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_DELETE_QUEUE => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.management.parseDeleteQueue(&reader) catch
+                        return .{ .err = "parse error" };
+                    const op_data = ops_mod.OpData{ .delete_queue = parsed };
+                    const result = self.handler.apply(batch, .delete_queue, &op_data);
+                    self.emitMirrorOp(.delete_queue, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_BULK_ACTION => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.bulk.parseBulkAction(&reader, &self.bulk_ids_buf) catch
+                        return .{ .err = "parse error" };
+                    const op_data = ops_mod.OpData{ .bulk_action = parsed };
+                    const result = self.handler.apply(batch, .bulk_action, &op_data);
+                    self.emitMirrorOp(.bulk_action, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_BATCH_CREATE => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.batch.parseBatchCreate(&reader) catch
+                        return .{ .err = "parse error" };
+                    const op_data = ops_mod.OpData{ .batch_create = parsed };
+                    const result = self.handler.apply(batch, .batch_create, &op_data);
+                    self.emitMirrorOp(.batch_create, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_BATCH_SEAL => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.batch.parseBatchSeal(&reader) catch
+                        return .{ .err = "parse error" };
+                    const op_data = ops_mod.OpData{ .batch_seal = parsed };
+                    const result = self.handler.apply(batch, .batch_seal, &op_data);
+                    self.emitMirrorOp(.batch_seal, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_CRON_CREATE => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.cron.parseCronCreate(&reader) catch
+                        return .{ .err = "parse error" };
+                    const op_data = ops_mod.OpData{ .cron_create = parsed };
+                    const result = self.handler.apply(batch, .cron_create, &op_data);
+                    self.emitMirrorOp(.cron_create, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_CRON_UPDATE => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.cron.parseCronUpdate(&reader) catch
+                        return .{ .err = "parse error" };
+                    const op_data = ops_mod.OpData{ .cron_update = parsed };
+                    const result = self.handler.apply(batch, .cron_update, &op_data);
+                    self.emitMirrorOp(.cron_update, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_CRON_DELETE => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.cron.parseCronDelete(&reader) catch
+                        return .{ .err = "parse error" };
+                    const op_data = ops_mod.OpData{ .cron_delete = parsed };
+                    const result = self.handler.apply(batch, .cron_delete, &op_data);
+                    self.emitMirrorOp(.cron_delete, &op_data, &result);
+                    return result;
+                },
+
+                rpc.MSG_CRON_TRIGGER => {
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.cron.parseCronTrigger(&reader) catch
+                        return .{ .err = "parse error" };
+                    const op_data = ops_mod.OpData{ .cron_trigger = parsed };
+                    const result = self.handler.apply(batch, .cron_trigger, &op_data);
+                    self.emitMirrorOp(.cron_trigger, &op_data, &result);
+                    return result;
+                },
+
+                else => return .{ .err = "unknown message type" },
+            }
+        }
+
+        fn decodeAndApplyHttp(self: *Self, batch: *kv.WriteBatch, frame: *FrameDesc, frame_idx: u32) ops_mod.OpResult {
+            const now_ns = self.nowNs();
+
+            // Generate server-side IDs for operations that need them.
+            switch (frame.msg_type) {
+                rpc.MSG_ENQUEUE_BATCH => {
+                    self.http_id_counter += 1;
+                    const id = http.generateId(&self.http_id_bufs[frame_idx], now_ns, self.http_id_counter);
+                    self.http_scratch.jobs[0].job_id = id;
+                    frame.path_param = id;
+                },
+                rpc.MSG_BATCH_CREATE, rpc.MSG_CRON_CREATE, rpc.MSG_SET_BUDGET, rpc.MSG_MODIFY_ENT_SETTING => {
+                    self.http_id_counter += 1;
+                    const id = http.generateId(&self.http_scratch.id_buf2, now_ns, self.http_id_counter);
+                    self.http_scratch.id2_len = @intCast(id.len);
+                    frame.path_param = id;
+                },
+                rpc.MSG_CRON_TRIGGER => {
+                    // Trigger needs a generated job_id, stored in id_buf2
+                    self.http_id_counter += 1;
+                    const id = http.generateId(&self.http_scratch.id_buf2, now_ns, self.http_id_counter);
+                    self.http_scratch.id2_len = @intCast(id.len);
+                },
+                else => {},
+            }
+
+            var decoded = http.decodeWrite(
+                frame.msg_type,
+                frame.payload,
+                frame.path_param,
+                frame.sub_action,
+                now_ns,
+                &self.http_scratch,
+                frame.http_path,
+            );
+
+            // Batch enqueue: generate remaining IDs (first was pre-generated above).
+            if (frame.msg_type == rpc.MSG_ENQUEUE_BATCH and decoded.count > 1) {
+                for (1..decoded.count) |j| {
+                    self.http_id_counter += 1;
+                    const jid = http.generateId(&self.http_id_bufs[j], now_ns, self.http_id_counter);
+                    self.http_scratch.jobs[j].job_id = jid;
+                }
+                // Re-point the slice in op_data to include updated IDs.
+                decoded.op_data.enqueue.jobs = self.http_scratch.jobs[0..decoded.count];
+            }
+
+            frame.count = decoded.count;
+
+            const op_type: ops_mod.OpType = switch (frame.msg_type) {
+                rpc.MSG_ENQUEUE_BATCH => .enqueue,
+                rpc.MSG_FETCH_BATCH => .fetch,
+                rpc.MSG_ACK_BATCH => .ack,
+                rpc.MSG_FAIL_BATCH => .fail,
+                rpc.MSG_HEARTBEAT => .heartbeat,
+                rpc.MSG_BULK_ACTION => .bulk_action,
+                rpc.MSG_QUEUE_CONFIG => .queue_config,
+                rpc.MSG_CLEAR_QUEUE => .clear_queue,
+                rpc.MSG_DELETE_QUEUE => .delete_queue,
+                rpc.MSG_BATCH_CREATE => .batch_create,
+                rpc.MSG_BATCH_SEAL => .batch_seal,
+                rpc.MSG_CRON_CREATE => .cron_create,
+                rpc.MSG_CRON_UPDATE => .cron_update,
+                rpc.MSG_CRON_DELETE => .cron_delete,
+                rpc.MSG_CRON_TRIGGER => .cron_trigger,
+                rpc.MSG_SET_BUDGET => .set_budget,
+                rpc.MSG_DELETE_BUDGET => .delete_budget,
+                rpc.MSG_MODIFY_ENT_SETTING => .modify_ent_setting,
+                else => return .{ .err = "unsupported http write" },
+            };
+
+            var result = self.handler.apply(batch, op_type, &decoded.op_data);
+            self.emitMirrorOp(op_type, &decoded.op_data, &result);
+
+            // Batch enqueue: copy job_ids into result.fetched for response encoding.
+            if (frame.msg_type == rpc.MSG_ENQUEUE_BATCH and decoded.count > 1) {
+                for (0..decoded.count) |j| {
+                    const jid = self.http_scratch.jobs[j].job_id;
+                    @memcpy(result.fetched[j].id_buf[0..jid.len], jid);
+                    result.fetched[j].id_len = @intCast(jid.len);
+                }
+                result.affected = decoded.count;
+            }
+
+            return result;
+        }
+
+
+        // ====================================================================
+        // Encode — write responses into send_bufs
+        // ====================================================================
+
+        /// Encode responses into send_bufs. Does NOT queue sends — call flushSends after.
+        fn encodeResponses(self: *Self) void {
+            self.send_conn_count = 0;
+
+            for (self.frames[0..self.frame_count], 0..) |frame, i| {
+                const c = self.io.conn(frame.conn_id);
+                if (c.phase == .free) continue;
+
+                // RPC fetch with 0 jobs: store subscription, skip response.
+                // HTTP fetch returns empty immediately (request-response protocol).
+                if (frame.msg_type == rpc.MSG_FETCH_BATCH and frame.protocol == .rpc and
+                    self.results[i].affected == 0 and self.results[i].err == null)
+                {
+                    self.storeSubscription(frame.conn_id, &frame);
+                    continue;
+                }
+
+                if (frame.protocol == .http) {
+                    const resp_len = http.encodeWriteResponse(
+                        c.send_buf,
+                        frame.msg_type,
+                        &self.results[i],
+                        frame.path_param,
+                        frame.sub_action,
+                        &self.stores[0],
+                        frame.payload,
+                    );
+                    if (resp_len > 0) {
+                        self.trackSendConn(frame.conn_id);
+                        c.send_len = resp_len;
+                    }
+                    continue;
+                }
+
+                const resp_type = switch (frame.msg_type) {
+                    rpc.MSG_PING => rpc.MSG_PONG,
+                    else => rpc.responseType(frame.msg_type) orelse continue,
+                };
+
+                self.trackSendConn(frame.conn_id);
+
+                // Append response after any previous responses for this conn
+                const write_start = c.send_len;
+                var writer = BufWriter{ .buf = c.send_buf[write_start..] };
+                writer.pos = rpc.FRAME_HEADER_SIZE; // reserve header space
+
+                self.encodeResult(&writer, frame.msg_type, &self.results[i], frame.count);
+
+                const payload_len: u32 = @intCast(writer.pos - rpc.FRAME_HEADER_SIZE);
+                rpc.writeFrameHeader(
+                    c.send_buf[write_start..][0..rpc.FRAME_HEADER_SIZE],
+                    resp_type,
+                    frame.req_id,
+                    payload_len,
+                );
+
+                c.send_len += @intCast(writer.pos);
+            }
+        }
+
+        /// Record a connection that needs a send flushed (dedup).
+        fn trackSendConn(self: *Self, conn_id: u16) void {
+            for (self.send_conns[0..self.send_conn_count]) |existing| {
+                if (existing == conn_id) return;
+            }
+            assert.check(
+                self.send_conn_count < self.send_conns.len,
+                "pipeline: send_conns overflow",
+                .{},
+            );
+            self.send_conns[self.send_conn_count] = conn_id;
+            self.send_conn_count += 1;
+        }
+
+        /// Queue one send per connection that has accumulated response data.
+        fn flushSends(self: *Self) void {
+            for (self.send_conns[0..self.send_conn_count]) |conn_id| {
+                const c = self.io.conn(conn_id);
+                if (c.send_len > 0) {
+                    self.io.queueSend(conn_id, c.send_len);
+                }
+            }
+        }
+
+        fn encodeResult(self: *Self, writer: *BufWriter, msg_type: u8, result: *const ops_mod.OpResult, count: u16) void {
+            switch (msg_type) {
+                rpc.MSG_PING => {},
+                rpc.MSG_ENQUEUE_BATCH => rpc.encodeEnqueueResp(writer, result, count),
+                rpc.MSG_ACK_BATCH => rpc.encodeAckResp(writer, result, count),
+                rpc.MSG_FAIL_BATCH => rpc.encodeFailResp(writer, result, count),
+                rpc.MSG_HEARTBEAT => rpc.encodeHeartbeatResp(writer, result, count),
+                rpc.MSG_FETCH_BATCH => self.encodeFetchResult(writer, result),
+                rpc.MSG_MAINTENANCE,
+                rpc.MSG_QUEUE_CONFIG,
+                rpc.MSG_CLEAR_QUEUE,
+                rpc.MSG_DELETE_QUEUE,
+                rpc.MSG_BULK_ACTION,
+                => rpc.management.encodeGenericResp(writer, result),
+                rpc.MSG_BATCH_CREATE => {
+                    // batch_create response needs the generated batch_id
+                    // For now, use generic response
+                    rpc.management.encodeGenericResp(writer, result);
+                },
+                rpc.MSG_BATCH_SEAL,
+                rpc.MSG_CRON_CREATE,
+                rpc.MSG_CRON_UPDATE,
+                rpc.MSG_CRON_DELETE,
+                rpc.MSG_CRON_TRIGGER,
+                => rpc.management.encodeGenericResp(writer, result),
+                else => {
+                    if (result.err) |msg| {
+                        rpc.lifecycle.encodeError(writer, msg);
+                    }
+                },
+            }
+        }
+
+        fn encodeFetchResult(self: *Self, writer: *BufWriter, result: *const ops_mod.OpResult) void {
+            const count: u16 = @intCast(result.affected);
+            writer.writeU16(count);
+
+            for (0..count) |i| {
+                const fetched = &result.fetched[i];
+                const job_id = fetched.id_buf[0..fetched.id_len];
+                const queue = fetched.queue_buf[0..fetched.queue_len];
+
+                writer.writePrefixed(job_id);
+                writer.writePrefixed(queue);
+                writer.writeU16(fetched.attempt);
+                writer.writeU16(fetched.max_retries);
+
+                // Checkpoint + tags (not stored in FetchedJob — write empty)
+                // u8 length prefix (0 = empty), matching SDK wire format.
+                writer.writeU8(0);
+                writer.writeU8(0);
+
+                // Payload: zero-copy lookup into caller buffer
+                var payload_buf: [32768]u8 = undefined;
+                var jpk_buf: keys.KeyBuf = undefined;
+                const payload_key = keys.jobPayloadKey(&jpk_buf, job_id);
+                var store = &self.stores[0];
+                var batch = store.newBatch();
+                defer batch.close();
+                if (batch.getInto(payload_key, &payload_buf)) |payload_bytes| {
+                    const pl: u16 = @intCast(@min(payload_bytes.len, 32768));
+                    writer.writeU16(pl);
+                    writer.writeBytes(payload_bytes[0..pl]);
+                } else {
+                    writer.writeU16(0);
+                }
+            }
+        }
+
+
+
+        // ====================================================================
+        // Fetch subscriptions — store and fulfill
+        // ====================================================================
+
+        /// Store a fetch subscription in ConnState when fetch returned 0 jobs.
+        /// Re-parses the subscription from the frame payload (still valid before compaction).
+        fn storeSubscription(self: *Self, conn_id: u16, frame: *const FrameDesc) void {
+            const c = self.io.conn(conn_id);
+            if (c.phase == .free) return;
+
+            // HTTP: don't subscribe. HTTP is request-response — return empty result immediately.
+            // The client will retry (long-poll behavior is handled at a higher level).
+            if (frame.protocol == .http) return;
+
+            // Re-parse subscription from frame payload.
+            var reader = BufReader{ .data = frame.payload };
+            const sub = rpc.parseFetchSubscribe(&reader) catch return;
+
+            // Copy queue names into ConnState fixed buffers.
+            c.queue_count = sub.queue_count;
+            for (0..sub.queue_count) |qi| {
+                const qname = sub.queues[qi];
+                const qlen: u8 = @intCast(@min(qname.len, c.queue_bufs[qi].len));
+                @memcpy(c.queue_bufs[qi][0..qlen], qname[0..qlen]);
+                c.queue_lens[qi] = qlen;
+            }
+
+            // Copy worker_id.
+            const wlen: u8 = @intCast(@min(sub.worker_id.len, c.worker_id_buf.len));
+            @memcpy(c.worker_id_buf[0..wlen], sub.worker_id[0..wlen]);
+            c.worker_id_len = wlen;
+
+            c.credits = sub.credits;
+            c.lease_ms = sub.lease_ms;
+            c.last_req_id = frame.req_id;
+            c.waiting = true;
+
+            // Add to waiting list (skip if already present).
+            for (self.waiting_conns[0..self.waiting_conn_count]) |wc| {
+                if (wc == conn_id) return;
+            }
+            assert.check(
+                self.waiting_conn_count < max_waiting_conns,
+                "pipeline: waiting_conns overflow",
+                .{},
+            );
+            self.waiting_conns[self.waiting_conn_count] = conn_id;
+            self.waiting_conn_count += 1;
+        }
+
+        /// Save a recv conn_id for processing after deferred batch flushes.
+        /// Called during sync-repl wait when recv CQEs arrive but frames cannot
+        /// be processed yet (one batch at a time, TigerBeetle style).
+        fn deferRecvConn(self: *Self, conn_id: u16) void {
+            for (self.deferred_recv_conns[0..self.deferred_recv_conn_count]) |existing| {
+                if (existing == conn_id) return;
+            }
+            assert.check(
+                self.deferred_recv_conn_count < max_completions,
+                "pipeline: deferred_recv_conns overflow",
+                .{},
+            );
+            self.deferred_recv_conns[self.deferred_recv_conn_count] = conn_id;
+            self.deferred_recv_conn_count += 1;
+        }
+
+        /// Clean up subscription state when a connection closes.
+        /// ConnState may already be reset by the IO backend, so we can't check c.waiting.
+        /// Unconditionally try to remove from waiting list.
+        fn onConnClosed(self: *Self, conn_id: u16) void {
+            self.removeWaitingConn(conn_id);
+        }
+
+        /// Remove a connection from the waiting list (e.g., on disconnect or fulfillment).
+        fn removeWaitingConn(self: *Self, conn_id: u16) void {
+            var i: u32 = 0;
+            while (i < self.waiting_conn_count) {
+                if (self.waiting_conns[i] == conn_id) {
+                    // Swap-remove.
+                    self.waiting_conn_count -= 1;
+                    self.waiting_conns[i] = self.waiting_conns[self.waiting_conn_count];
+                    return;
+                }
+                i += 1;
+            }
+        }
+
+        /// After commit+encode, scan waiting connections and push jobs if notified queues match.
+        fn fulfillSubscriptions(self: *Self) void {
+            if (self.notified_queue_count == 0) return;
+            if (self.waiting_conn_count == 0) return;
+
+            // We may modify waiting_conns during iteration (removeWaitingConn uses swap-remove),
+            // so iterate by index and handle carefully.
+            var fulfilled: [max_waiting_conns]u16 = undefined;
+            var fulfilled_count: u32 = 0;
+
+            var kv_batch = self.stores[0].newBatch();
+            defer kv_batch.close();
+            var did_fulfill = false;
+
+            // Enable mutation recording for oplog + replication.
+            const record_mutations = self.config.repl_hook != null;
+            if (record_mutations) {
+                self.mut_list.clearRetainingCapacity();
+                kv_batch.enableRecording(self.allocator, &self.mut_list);
+            }
+            defer if (record_mutations) kv_batch.freeMutations();
+
+            for (self.waiting_conns[0..self.waiting_conn_count]) |conn_id| {
+                const c = self.io.conn(conn_id);
+                if (c.phase == .free or !c.waiting) continue;
+
+                // Check if any subscribed queue was notified this tick.
+                if (!self.hasQueueOverlap(c)) continue;
+
+                // Try to fetch jobs for this subscription.
+                var queue_slices: [16][]const u8 = undefined;
+                for (0..c.queue_count) |qi| {
+                    queue_slices[qi] = c.queue_bufs[qi][0..c.queue_lens[qi]];
+                }
+
+                const op_data = ops_mod.OpData{ .fetch = .{
+                    .queues = queue_slices[0..c.queue_count],
+                    .worker_id = c.worker_id_buf[0..c.worker_id_len],
+                    .lease_duration_ms = c.lease_ms,
+                    .count = c.credits,
+                    .now_ns = self.nowNs(),
+                } };
+
+                const result = self.handler.apply(&kv_batch, .fetch, &op_data);
+
+                if (result.affected == 0) continue; // jobs taken by someone else
+
+                did_fulfill = true;
+                self.emitMirrorOp(.fetch, &op_data, &result);
+
+                // Encode MSG_FETCH_BATCH_RESP into send_buf.
+                const write_start = c.send_len;
+                var writer = BufWriter{ .buf = c.send_buf[write_start..] };
+                writer.pos = rpc.FRAME_HEADER_SIZE;
+
+                self.encodeFetchResult(&writer, &result);
+
+                const payload_len: u32 = @intCast(writer.pos - rpc.FRAME_HEADER_SIZE);
+                rpc.writeFrameHeader(
+                    c.send_buf[write_start..][0..rpc.FRAME_HEADER_SIZE],
+                    rpc.MSG_FETCH_BATCH_RESP,
+                    c.last_req_id,
+                    payload_len,
+                );
+
+                c.send_len += @intCast(writer.pos);
+                self.trackSendConn(conn_id);
+
+                // Clear subscription.
+                c.waiting = false;
+                c.queue_count = 0;
+                c.credits = 0;
+                self.subscriptions_fulfilled += 1;
+
+                // Mark for removal from waiting list.
+                assert.check(fulfilled_count < max_waiting_conns, "pipeline: fulfilled overflow", .{});
+                fulfilled[fulfilled_count] = conn_id;
+                fulfilled_count += 1;
+            }
+
+            if (did_fulfill) {
+                kv_batch.commit();
+                if (record_mutations and self.mut_list.items.len > 0) {
+                    self.recordOplog();
+                }
+            }
+
+            // Remove fulfilled connections from waiting list.
+            for (fulfilled[0..fulfilled_count]) |conn_id| {
+                self.removeWaitingConn(conn_id);
+            }
+        }
+
+        /// Check if any of the connection's subscribed queues were notified this tick.
+        fn hasQueueOverlap(self: *const Self, c: *const ConnState) bool {
+            for (0..c.queue_count) |qi| {
+                const sub_queue = c.queue_bufs[qi][0..c.queue_lens[qi]];
+                for (0..self.notified_queue_count) |ni| {
+                    const notified = self.notified_queue_bufs[ni][0..self.notified_queue_lens[ni]];
+                    if (std.mem.eql(u8, sub_queue, notified)) return true;
+                }
+            }
+            return false;
+        }
+
+        /// Record a queue name as notified this tick (deduped).
+        fn recordNotifiedQueue(self: *Self, queue: []const u8) void {
+            // Deduplicate.
+            for (0..self.notified_queue_count) |i| {
+                const existing = self.notified_queue_bufs[i][0..self.notified_queue_lens[i]];
+                if (std.mem.eql(u8, existing, queue)) return;
+            }
+            if (self.notified_queue_count >= max_notified_queues) return; // saturate, don't crash
+            const idx = self.notified_queue_count;
+            const qlen: u8 = @intCast(@min(queue.len, 64));
+            @memcpy(self.notified_queue_bufs[idx][0..qlen], queue[0..qlen]);
+            self.notified_queue_lens[idx] = qlen;
+            self.notified_queue_count += 1;
+        }
+
+        // ====================================================================
+        // Notify — wake queue waiters post-commit
+        // ====================================================================
+
+        fn notifyForFrame(self: *Self, frame: *const FrameDesc, result: *const ops_mod.OpResult) void {
+            switch (frame.msg_type) {
+                rpc.MSG_ENQUEUE_BATCH => {
+                    // Enqueue can wake fetch waiters on affected queues.
+                    // Re-parse to get queue names — payload slices still valid
+                    // (compaction hasn't happened yet).
+                    var reader = BufReader{ .data = frame.payload };
+                    const parsed = rpc.parseEnqueue(&reader, &self.jobs_buf, 0) catch return;
+                    for (parsed.op.jobs) |job| {
+                        self.notify.notify(job.queue);
+                        self.recordNotifiedQueue(job.queue);
+                    }
+                },
+                rpc.MSG_ACK_BATCH,
+                rpc.MSG_FAIL_BATCH,
+                => {
+                    // Ack/fail can free capacity → wake waiters.
+                    // Re-parse to get queue names.
+                    if (frame.msg_type == rpc.MSG_ACK_BATCH) {
+                        var reader = BufReader{ .data = frame.payload };
+                        const parsed = rpc.parseAck(&reader, &self.acks_buf) catch return;
+                        for (parsed.op.acks) |ack| {
+                            self.notify.notify(ack.queue);
+                            self.recordNotifiedQueue(ack.queue);
+                        }
+                    } else {
+                        var reader = BufReader{ .data = frame.payload };
+                        const parsed = rpc.parseFail(&reader, &self.fails_buf) catch return;
+                        for (parsed.op.jobs) |job| {
+                            self.notify.notify(job.queue);
+                            self.recordNotifiedQueue(job.queue);
+                        }
+                    }
+                },
+                rpc.MSG_MAINTENANCE => {
+                    // Promote/reclaim can make jobs available.
+                    if (result.affected > 0) {
+                        var reader = BufReader{ .data = frame.payload };
+                        const parsed = rpc.management.parseMaintenance(&reader) catch return;
+                        switch (parsed.action) {
+                            .promote, .reclaim => {
+                                if (result.notify_queues) |queues| {
+                                    self.notify.notifyQueues(queues);
+                                    for (queues) |q| {
+                                        self.recordNotifiedQueue(q);
+                                    }
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {
+                    // For any other op (bulk, queue config, cron, etc.):
+                    // if the handler populated notify_queues, honor them.
+                    if (result.notify_queues) |queues| {
+                        self.notify.notifyQueues(queues);
+                        for (queues) |q| {
+                            self.recordNotifiedQueue(q);
+                        }
+                    }
+                },
+            }
+        }
+
+        // ====================================================================
+        // Recv buffer compaction
+        // ====================================================================
+
+        fn compactRecvBufs(self: *Self) void {
+            for (self.recv_compactions[0..self.recv_compaction_count]) |rc| {
+                const c = self.io.conn(rc.conn_id);
+                if (c.phase == .free) continue;
+                compactRecvBuf(c, rc.consumed);
+            }
+        }
+
+        fn compactRecvBuf(c: *ConnState, consumed: u32) void {
+            if (consumed == 0) return;
+            const remaining = c.recv_pos - consumed;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, c.recv_buf[0..remaining], c.recv_buf[consumed..c.recv_pos]);
+            }
+            c.recv_pos = @intCast(remaining);
+        }
+
+        // ====================================================================
+        // Recv re-queue — connections with partial frames need more data
+        // ====================================================================
+
+        /// After frame extraction, connections that received data but produced
+        /// no complete response (partial frame) need recv re-queued. Connections
+        /// with a pending send will get recv re-queued via the send_done path.
+        fn requeueRecvs(self: *Self, recv_conns: []const u16) void {
+            for (recv_conns) |conn_id| {
+                const c = self.io.conn(conn_id);
+                if (c.waiting) continue;
+                if (c.phase == .ready and c.recv_pos < c.recv_buf.len) {
+                    self.io.queueRecv(conn_id);
+                }
+            }
+        }
+
+        // ====================================================================
+        // Helpers
+        // ====================================================================
+
+        /// Emit a mirror event for a single op. Called inline during decode
+        /// while OpData is still live on the stack. mirrorFromOp copies all
+        /// fields into fixed-size MirrorOp payloads, so no dangling pointers.
+        fn emitMirrorOp(self: *Self, op_type: ops_mod.OpType, op_data: *const ops_mod.OpData, result: *const ops_mod.OpResult) void {
+            if (self.mirror) |m| {
+                // Drain handler effects BEFORE the primary op's mirror event.
+                // This ensures side-effect enqueues (chain jobs, batch callbacks,
+                // requeued jobs) are inserted into the mirror before any subsequent
+                // operation (e.g., fetch) tries to update them.
+                if (self.handler.side_effect_count > 0 or self.handler.bulk_result_count > 0 or self.handler.fail_result_count > 0) {
+                    mirror_events.mirrorEffects(m, self.handler);
+                    self.handler.resetEffects();
+                }
+                mirror_events.mirrorFromOp(m, op_type, op_data, result);
+            }
+        }
+
+        fn nowNs(self: *const Self) u64 {
+            const ts = self.config.clock_fn();
+            assert.check(ts > 0, "pipeline: clock_fn returned non-positive value: {d}", .{ts});
+            return @intCast(ts);
+        }
+    };
 }
 
 // ============================================================================
-// Config
+// Tests
 // ============================================================================
 
-/// Hook called after pipeline commits + oplog append with encoded mutations.
-/// Used by cluster mode to replicate to followers.
-pub const ReplHook = struct {
-    ptr: *anyopaque,
-    replFn: *const fn (ptr: *anyopaque, shard_id: u16, seq: u64, data: []const u8) void,
-    waitFn: ?*const fn (ptr: *anyopaque, seq: u64) void = null,
+const testing = std.testing;
+const SimBackend = @import("io/sim.zig").SimBackend;
+const talon = @import("talon");
 
-    pub fn replicate(self: ReplHook, shard_id: u16, seq: u64, data: []const u8) void {
-        self.replFn(self.ptr, shard_id, seq, data);
+const TestPipeline = Pipeline(SimBackend);
+
+var test_clock_ns: i64 = 1_000_000_000_000; // 1000s
+
+fn testClockFn() i64 {
+    return @atomicLoad(i64, &test_clock_ns, .monotonic);
+}
+
+fn advanceTestClock(delta_ns: i64) void {
+    _ = @atomicRmw(i64, &test_clock_ns, .Add, delta_ns, .monotonic);
+}
+
+const TestContext = struct {
+    db: *talon.DB,
+    stores: [1]kv.Store,
+    handler: OpHandler,
+    oplog: oplog_mod.Log,
+    notify: QueueNotifier,
+    backend: SimBackend,
+    pipeline: TestPipeline,
+    db_path: [*:0]const u8,
+
+    /// Heap-allocate and initialize a TestContext. Pipeline + SimBackend are ~7MB,
+    /// too large for the test runner's thread stack.
+    fn create(db_path: [*:0]const u8) !*TestContext {
+        const allocator = testing.allocator;
+        const self = try allocator.create(TestContext);
+        self.initInPlace(allocator, db_path, null);
+        return self;
     }
 
-    /// Block until at least one follower has acked the given sequence.
-    pub fn waitForAck(self: ReplHook, seq: u64) void {
-        if (self.waitFn) |wfn| wfn(self.ptr, seq);
+    fn createWithOplog(db_path: [*:0]const u8, oplog_path: [*:0]const u8) !*TestContext {
+        const allocator = testing.allocator;
+        const self = try allocator.create(TestContext);
+        self.initInPlace(allocator, db_path, oplog_path);
+        return self;
     }
-};
 
-// Replication entry for async handoff to background thread.
-const ReplEntryMax = 256 * 1024;
-const ReplRingSize = 256;
-const ReplEntry = struct {
-    data: []u8,
-    len: u32 = 0,
-};
+    fn initInPlace(self: *TestContext, allocator: std.mem.Allocator, db_path: [*:0]const u8, oplog_path: ?[*:0]const u8) void {
+        @atomicStore(i64, &test_clock_ns, 1_000_000_000_000, .monotonic);
 
-pub const Config = struct {
-    /// Max ops per batch before force-flush.
-    batch_max: u32 = 1024,
-    /// Max ops per sub-batch execution.
-    sub_batch_max: u32 = 64,
-    /// Channel buffer size (max pending requests).
-    max_pending: u32 = 16384,
-    /// Initial wait for batch accumulation (ns).
-    min_wait_ns: u64 = 50_000, // 50µs
-    /// Max batch accumulation window (ns).
-    max_window_ns: u64 = 8_000_000, // 8ms
-    /// Threshold to extend deadline from min_wait to max_window.
-    extend_at: u32 = 64,
-    /// Replication hook — called after oplog append with encoded mutations.
-    repl_hook: ?ReplHook = null,
-    /// true = wait for follower ack. false = replicate in background.
-    sync_replication: bool = false,
-};
+        const path_slice = std.mem.span(db_path);
+        std.fs.cwd().deleteTree(path_slice) catch {};
+        const db = talon.DB.open(allocator, path_slice, .{ .sync = false }) catch unreachable;
 
-// ============================================================================
-// Request — lives on caller's stack
-// ============================================================================
+        self.db = db;
+        self.stores = [1]kv.Store{kv.Store.init(db)};
+        self.handler = OpHandler.init(allocator);
+        self.handler.rebuildState(&self.stores);
+        self.oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &testClockFn }, oplog_path, 1024);
+        self.notify = QueueNotifier.init(allocator);
+        self.backend = SimBackend.init(allocator, .{
+            .listen_fd = -1,
+            .max_conns = 16,
+            .recv_buf_size = 65536,
+            .send_buf_size = 65536,
+        }) catch unreachable;
+        self.db_path = db_path;
 
-pub const Request = struct {
-    op_type: ops_mod.OpType,
-    data: ops_mod.OpData,
-    result: ops_mod.OpResult = .{},
-    event: std.Thread.ResetEvent = .{},
-};
+        self.pipeline = TestPipeline.init(
+            allocator,
+            &self.backend,
+            &self.handler,
+            &self.stores,
+            &self.oplog,
+            &self.notify,
+            null,
+            null,
+            .{ .clock_fn = &testClockFn },
+        );
+    }
 
-// ============================================================================
-// MPSC Request Queue (bounded, mutex-based)
-// ============================================================================
+    fn destroy(self: *TestContext) void {
+        const allocator = testing.allocator;
+        self.pipeline.deinit();
+        self.backend.deinit(allocator);
+        self.handler.deinit();
+        self.notify.deinit();
+        self.oplog.deinit();
+        self.db.close();
+        const path_slice = std.mem.span(self.db_path);
+        std.fs.cwd().deleteTree(path_slice) catch {};
+        allocator.destroy(self);
+    }
 
-const RequestQueue = struct {
-    buf: []*Request,
-    head: usize = 0,
-    tail: usize = 0,
-    count: usize = 0,
-    capacity: usize,
-    mutex: std.Thread.Mutex = .{},
-    not_empty: std.Thread.Condition = .{},
-    closed: bool = false,
+    /// Inject a raw RPC frame into a connection's recv_buf (single recv event).
+    fn injectFrame(self: *TestContext, conn_id: u16, msg_type: u8, req_id: u32, payload: []const u8) void {
+        // Build complete frame in a staging buffer, then inject as one recv.
+        var frame_buf: [65536]u8 = undefined;
+        rpc.writeFrameHeader(frame_buf[0..rpc.FRAME_HEADER_SIZE], msg_type, req_id, @intCast(payload.len));
+        if (payload.len > 0) {
+            @memcpy(frame_buf[rpc.FRAME_HEADER_SIZE..][0..payload.len], payload);
+        }
+        const total = rpc.FRAME_HEADER_SIZE + payload.len;
+        self.backend.injectRecv(conn_id, frame_buf[0..total]);
+    }
 
-    fn init(allocator: std.mem.Allocator, capacity: usize) !RequestQueue {
-        const buf = try allocator.alloc(*Request, capacity);
+    /// Read and parse the response frame header from a connection.
+    fn readResponseHeader(self: *TestContext, conn_id: u16) ?rpc.FrameHeader {
+        const resp = self.backend.readResponse(conn_id) orelse return null;
+        return rpc.readFrameHeader(resp);
+    }
+
+    /// Read full response: header + payload.
+    fn readResponse(self: *TestContext, conn_id: u16) ?struct { header: rpc.FrameHeader, payload: []const u8 } {
+        const c = self.backend.conn(conn_id);
+        if (c.send_len == 0) return null;
+        const data = c.send_buf[0..c.send_len];
+        const header = rpc.readFrameHeader(data) orelse return null;
+        const payload_start = rpc.FRAME_HEADER_SIZE;
+        const payload_end = payload_start + header.payload_len;
+        if (payload_end > data.len) return null;
         return .{
-            .buf = buf,
-            .capacity = capacity,
+            .header = header,
+            .payload = data[payload_start..payload_end],
         };
     }
 
-    fn deinit(self: *RequestQueue, allocator: std.mem.Allocator) void {
-        allocator.free(self.buf);
+    /// Inject a raw HTTP request into a connection's recv_buf.
+    fn injectHttp(self: *TestContext, conn_id: u16, request: []const u8) void {
+        self.backend.injectRecv(conn_id, request);
     }
 
-    /// Push a request. Returns false if queue is full (overloaded) or closed.
-    fn push(self: *RequestQueue, req: *Request) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.closed) return false;
-        if (self.count >= self.capacity) return false;
-        self.buf[self.tail] = req;
-        self.tail = (self.tail + 1) % self.capacity;
-        self.count += 1;
-        self.not_empty.signal();
-        return true;
+    /// Read the raw HTTP response from a connection's send_buf.
+    fn readHttpResponse(self: *TestContext, conn_id: u16) ?[]const u8 {
+        const c = self.backend.conn(conn_id);
+        if (c.send_len == 0) return null;
+        return c.send_buf[0..c.send_len];
     }
 
-    /// Wait for at least one request, then drain up to out.len.
-    /// Returns 0 if closed and empty.
-    fn waitAndDrain(self: *RequestQueue, out: []*Request, timeout_ns: u64) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        while (self.count == 0 and !self.closed) {
-            self.not_empty.timedWait(&self.mutex, timeout_ns) catch {
-                // Timeout — return 0 so caller can check running flag
-                return 0;
-            };
+    /// Extract the HTTP response body (everything after \r\n\r\n).
+    fn httpResponseBody(resp: []const u8) ?[]const u8 {
+        var i: usize = 0;
+        while (i + 3 < resp.len) : (i += 1) {
+            if (resp[i] == '\r' and resp[i + 1] == '\n' and resp[i + 2] == '\r' and resp[i + 3] == '\n')
+                return resp[i + 4 ..];
         }
-
-        if (self.count == 0) return 0;
-
-        const n = @min(self.count, out.len);
-        for (0..n) |i| {
-            out[i] = self.buf[self.head];
-            self.head = (self.head + 1) % self.capacity;
-        }
-        self.count -= n;
-        return n;
+        return null;
     }
 
-    /// Non-blocking drain of available requests.
-    fn drain(self: *RequestQueue, out: []*Request) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const n = @min(self.count, out.len);
-        for (0..n) |i| {
-            out[i] = self.buf[self.head];
-            self.head = (self.head + 1) % self.capacity;
-        }
-        self.count -= n;
-        return n;
-    }
-
-    fn close(self: *RequestQueue) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.closed = true;
-        self.not_empty.broadcast();
-    }
-
-    fn pendingCount(self: *RequestQueue) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.count;
+    /// Check HTTP response starts with expected status line.
+    fn httpResponseStatus(resp: []const u8) ?u16 {
+        // "HTTP/1.1 200 OK\r\n"
+        if (!std.mem.startsWith(u8, resp, "HTTP/1.1 ")) return null;
+        return std.fmt.parseInt(u16, resp[9..12], 10) catch null;
     }
 };
 
+test "ping/pong round-trip" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-ping");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+    ctx.injectFrame(conn_id, rpc.MSG_PING, 42, "");
+
+    ctx.pipeline.tick();
+
+    const resp = ctx.readResponse(conn_id).?;
+    try testing.expectEqual(rpc.MSG_PONG, resp.header.msg_type);
+    try testing.expectEqual(@as(u32, 42), resp.header.req_id);
+    try testing.expectEqual(@as(u32, 0), resp.header.payload_len);
+}
+
+test "enqueue round-trip" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-enqueue");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Build enqueue payload using BufWriter
+    var payload_buf: [512]u8 = undefined;
+    var w = BufWriter{ .buf = &payload_buf };
+    w.writeU16(1); // count
+    w.writePrefixed("test-queue"); // queue
+    w.writePrefixed("job-001"); // job_id
+    w.writeU8(128); // priority
+    w.writeU16(3); // max_retries
+    w.writeU8(0); // backoff = none
+    w.writeU32(0); // base_delay_ms
+    w.writeU32(0); // max_delay_ms
+    w.writeU32(0); // unique_period_s
+    w.writeU64(0); // scheduled_at_ns
+    w.writeU32(0); // expire_after_ms
+    w.writeU16(0); // chain_step
+    w.writeU16(0); // flags (no optional fields)
+
+    ctx.injectFrame(conn_id, rpc.MSG_ENQUEUE_BATCH, 1, w.written());
+    ctx.pipeline.tick();
+
+    // Verify response
+    const resp = ctx.readResponse(conn_id).?;
+    try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, resp.header.msg_type);
+    try testing.expectEqual(@as(u32, 1), resp.header.req_id);
+
+    // Parse response payload: [count:u16][error:u8]
+    var r = BufReader{ .data = resp.payload };
+    try testing.expectEqual(@as(u16, 1), try r.readU16()); // count
+    try testing.expectEqual(@as(u8, 0), try r.readU8()); // no error
+
+    // Verify job exists in KV
+    var key_buf: keys.KeyBuf = undefined;
+    const job_key = keys.jobKey(&key_buf, "job-001");
+    var verify_batch = ctx.stores[0].newBatch();
+    defer verify_batch.close();
+    var out_buf: [4096]u8 = undefined;
+    try testing.expect(verify_batch.getInto(job_key, &out_buf) != null);
+}
+
+test "multiple frames in one tick" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-multi");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Inject two pings
+    ctx.injectFrame(conn_id, rpc.MSG_PING, 1, "");
+    ctx.injectFrame(conn_id, rpc.MSG_PING, 2, "");
+
+    ctx.pipeline.tick();
+
+    // Both should produce responses — but only one send_buf per connection.
+    // The first response is in the send_buf. The second frame should
+    // also have been processed (applied_total == 2).
+    try testing.expectEqual(@as(u64, 2), ctx.pipeline.applied_total);
+}
+
+test "enqueue then fetch round-trip" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fetch");
+    defer ctx.destroy();
+
+    const conn_enqueue = ctx.backend.connect().?;
+
+    // Enqueue a job with payload
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("fetch-queue");
+    ew.writePrefixed("fetch-job-1");
+    ew.writeU8(128);
+    ew.writeU16(0);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(rpc.FLAG_PAYLOAD);
+    ew.writeU16Prefixed("hello payload");
+
+    ctx.injectFrame(conn_enqueue, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+    ctx.pipeline.tick();
+
+    // Consume the send_done so we can reuse the connection
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Fetch on a different connection
+    const conn_fetch = ctx.backend.connect().?;
+
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1); // credits
+    fw.writeU32(30000); // lease_ms
+    fw.writePrefixed("worker-1"); // worker_id
+    fw.writeU8(1); // queue_count
+    fw.writePrefixed("fetch-queue");
+
+    ctx.injectFrame(conn_fetch, rpc.MSG_FETCH_BATCH, 2, fw.written());
+    ctx.pipeline.tick();
+
+    // Verify fetch response
+    const resp = ctx.readResponse(conn_fetch).?;
+    try testing.expectEqual(rpc.MSG_FETCH_BATCH_RESP, resp.header.msg_type);
+
+    var r = BufReader{ .data = resp.payload };
+    const fetched_count = try r.readU16();
+    try testing.expectEqual(@as(u16, 1), fetched_count);
+
+    const job_id = try r.readPrefixed();
+    try testing.expectEqualStrings("fetch-job-1", job_id);
+}
+
+test "partial frame waits for more data" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-partial");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    var header_buf: [rpc.FRAME_HEADER_SIZE]u8 = undefined;
+    rpc.writeFrameHeader(&header_buf, rpc.MSG_PING, 99, 0);
+
+    // Split: inject only first 5 bytes (incomplete header)
+    ctx.backend.injectRecv(conn_id, header_buf[0..5]);
+    ctx.pipeline.tick();
+
+    try testing.expectEqual(@as(u64, 0), ctx.pipeline.applied_total);
+
+    // Inject remaining bytes
+    ctx.backend.injectRecv(conn_id, header_buf[5..]);
+    ctx.pipeline.tick();
+
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.applied_total);
+}
+
+test "recv_buf compaction preserves unconsumed data" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-compact");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Inject a complete ping frame + partial next frame header
+    var header_buf: [rpc.FRAME_HEADER_SIZE]u8 = undefined;
+    rpc.writeFrameHeader(&header_buf, rpc.MSG_PING, 1, 0);
+    ctx.backend.injectRecv(conn_id, &header_buf);
+
+    // Partial header of next frame (3 bytes)
+    ctx.backend.injectRecv(conn_id, &[_]u8{ rpc.MSG_PING, 0x02, 0x00 });
+
+    ctx.pipeline.tick();
+
+    // First ping processed
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.applied_total);
+
+    // The 3 bytes of partial frame should still be in recv_buf
+    const c = ctx.backend.conn(conn_id);
+    try testing.expectEqual(@as(u32, 3), c.recv_pos);
+    try testing.expectEqual(rpc.MSG_PING, c.recv_buf[0]);
+}
+
 // ============================================================================
-// Ack tracking — non-blocking follower ack for strong durability
+// HTTP Integration Tests
 // ============================================================================
 
-const ack_ring_size = 4096;
+test "HTTP GET /api/v1/info returns version" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-http-info");
+    defer ctx.destroy();
 
-const AckEntry = struct {
-    seq: u64 = 0,
-    // Pointers to requests that need signaling when this seq is acked.
-    // We store start/end indices into the sub-batch that produced this seq.
-    requests: [64]*Request = undefined,
-    count: u32 = 0,
-};
+    const conn_id = ctx.backend.connect().?;
+    ctx.injectHttp(conn_id, "GET /api/v1/info HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    ctx.pipeline.tick();
+
+    const resp = ctx.readHttpResponse(conn_id).?;
+    try testing.expectEqual(@as(u16, 200), TestContext.httpResponseStatus(resp).?);
+    const body = TestContext.httpResponseBody(resp).?;
+    try testing.expect(std.mem.indexOf(u8, body, "\"version\"") != null);
+    // Read bypasses batch — applied_total should be 0.
+    try testing.expectEqual(@as(u64, 0), ctx.pipeline.applied_total);
+}
+
+test "HTTP GET unknown route returns 404" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-http-404");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+    ctx.injectHttp(conn_id, "GET /nonexistent HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    ctx.pipeline.tick();
+
+    const resp = ctx.readHttpResponse(conn_id).?;
+    try testing.expectEqual(@as(u16, 404), TestContext.httpResponseStatus(resp).?);
+}
+
+test "HTTP POST /api/v1/enqueue creates job" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-http-enq");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+    const body = "{\"queue\":\"default\",\"priority\":5}";
+    var req_buf: [512]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf,
+        "POST /api/v1/enqueue HTTP/1.1\r\nContent-Length: {d}\r\nHost: localhost\r\n\r\n{s}",
+        .{ body.len, body },
+    ) catch unreachable;
+
+    ctx.injectHttp(conn_id, req);
+    ctx.pipeline.tick();
+
+    const resp = ctx.readHttpResponse(conn_id).?;
+    try testing.expectEqual(@as(u16, 201), TestContext.httpResponseStatus(resp).?);
+    const resp_body = TestContext.httpResponseBody(resp).?;
+    // Response should contain a generated job_id.
+    try testing.expect(std.mem.indexOf(u8, resp_body, "\"id\":\"job_") != null);
+    // Batch was used.
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.applied_total);
+}
+
+test "HTTP protocol detection — same pipeline handles both" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-http-mixed");
+    defer ctx.destroy();
+
+    // RPC connection: ping
+    const rpc_conn = ctx.backend.connect().?;
+    ctx.injectFrame(rpc_conn, rpc.MSG_PING, 1, "");
+
+    // HTTP connection: GET info
+    const http_conn = ctx.backend.connect().?;
+    ctx.injectHttp(http_conn, "GET /api/v1/info HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    ctx.pipeline.tick();
+
+    // RPC conn should have pong
+    const rpc_resp = ctx.readResponseHeader(rpc_conn).?;
+    try testing.expectEqual(rpc.MSG_PONG, rpc_resp.msg_type);
+
+    // HTTP conn should have 200 JSON
+    const http_resp = ctx.readHttpResponse(http_conn).?;
+    try testing.expectEqual(@as(u16, 200), TestContext.httpResponseStatus(http_resp).?);
+
+    // Protocol detection should be sticky
+    const rpc_c = ctx.backend.conn(rpc_conn);
+    try testing.expectEqual(ConnState.Protocol.rpc, rpc_c.protocol);
+    const http_c = ctx.backend.conn(http_conn);
+    try testing.expectEqual(ConnState.Protocol.http, http_c.protocol);
+}
+
+test "HTTP incomplete request waits for more data" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-http-partial");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+    // Send partial headers (no \r\n\r\n terminator yet).
+    ctx.injectHttp(conn_id, "GET /api/v1/info HTTP/1.1\r\nHost: local");
+    ctx.pipeline.tick();
+
+    // No response yet.
+    try testing.expect(ctx.readHttpResponse(conn_id) == null);
+    try testing.expectEqual(@as(u64, 0), ctx.pipeline.applied_total);
+}
 
 // ============================================================================
-// Pipeline
+// Fetch Subscription Tests
 // ============================================================================
 
-pub const Pipeline = struct {
-    config: Config,
-    queue: RequestQueue,
-    handler: *OpHandler,
-    shards: []kv.Store,
-    oplog: *oplog_mod.Log,
-    notify: *QueueNotifier,
-    thread: ?std.Thread = null,
-    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    allocator: std.mem.Allocator,
-
-    // Pre-allocated mutation list for per-sub-batch oplog recording.
-    mut_list: std.ArrayList(kv.Mutation) = .{},
-    // Accumulated mutations across all sub-batches for batch-level replication.
-    batch_mut_list: std.ArrayList(kv.Mutation) = .{},
-
-    // --- Non-blocking ack tracking for strong durability ---
-    // Requests waiting for follower ack before being signaled to callers.
-    // Ring buffer of (seq, requests) pairs. When ack arrives for seq N,
-    // all entries with seq <= N are drained and their events signaled.
-    ack_ring: [ack_ring_size]AckEntry = [_]AckEntry{.{}} ** ack_ring_size,
-    ack_head: usize = 0, // read position (oldest unacked)
-    ack_tail: usize = 0, // write position (next free slot)
-    ack_count: usize = 0,
-    ack_mu: std.Thread.Mutex = .{},
-    ack_cond: std.Thread.Condition = .{}, // signaled when ack arrives
-
-    // Last acked sequence from followers (updated by ack callback).
-    last_acked_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-
-    // Async replication ring — pipeline pushes, background thread sends.
-    repl_ring: ?[]ReplEntry = null,
-    repl_write_pos: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    repl_read_pos: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    repl_thread: ?std.Thread = null,
-
-    // Stats
-    applied_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    overload_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    batch_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-
-    pub fn init(
-        allocator: std.mem.Allocator,
-        handler: *OpHandler,
-        shards: []kv.Store,
-        oplog: *oplog_mod.Log,
-        notify: *QueueNotifier,
-        config: Config,
-    ) !Pipeline {
-        return .{
-            .config = config,
-            .queue = try RequestQueue.init(allocator, config.max_pending),
-            .handler = handler,
-            .shards = shards,
-            .oplog = oplog,
-            .notify = notify,
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *Pipeline) void {
-        self.stop();
-        self.queue.deinit(self.allocator);
-        self.mut_list.deinit(self.allocator);
-        self.batch_mut_list.deinit(self.allocator);
-    }
-
-    pub fn start(self: *Pipeline) !void {
-        if (self.running.load(.monotonic)) return;
-        self.running.store(true, .monotonic);
-        // Allocate async repl ring if needed.
-        if (self.config.repl_hook != null and !self.config.sync_replication) {
-            self.repl_ring = try self.allocator.alloc(ReplEntry, ReplRingSize);
-            for (self.repl_ring.?) |*e| {
-                e.data = try self.allocator.alloc(u8, ReplEntryMax);
-                e.len = 0;
-            }
-        }
-        self.thread = try std.Thread.spawn(.{}, applyLoop, .{self});
-        if (self.repl_ring != null) {
-            self.repl_thread = try std.Thread.spawn(.{}, replLoop, .{self});
-        }
-    }
-
-    pub fn stop(self: *Pipeline) void {
-        if (!self.running.load(.monotonic)) return;
-        self.running.store(false, .monotonic);
-        self.queue.close();
-        if (self.thread) |t| {
-            t.join();
-            self.thread = null;
-        }
-        if (self.repl_thread) |t| {
-            t.join();
-            self.repl_thread = null;
-        }
-        // Signal any remaining pending ack entries so callers don't block forever.
-        self.ack_mu.lock();
-        defer self.ack_mu.unlock();
-        while (self.ack_count > 0) {
-            const entry = &self.ack_ring[self.ack_head];
-            for (0..entry.count) |i| entry.requests[i].event.set();
-            entry.count = 0;
-            self.ack_head = (self.ack_head + 1) % ack_ring_size;
-            self.ack_count -= 1;
-        }
-    }
-
-    /// Submit an operation and block until the result is ready.
-    /// Thread-safe — multiple threads can submit concurrently.
-    pub fn submit(self: *Pipeline, op_type: ops_mod.OpType, data: *const ops_mod.OpData) ops_mod.OpResult {
-        var req = Request{
-            .op_type = op_type,
-            .data = data.*,
-        };
-
-        if (!self.queue.push(&req)) {
-            _ = self.overload_total.fetchAdd(1, .monotonic);
-            return .{ .err = "pipeline overloaded" };
-        }
-
-        // Block until apply loop processes this request.
-        req.event.wait();
-        return req.result;
-    }
-
-    // ========================================================================
-    // Apply loop (runs in background thread)
-    // ========================================================================
-
-    fn applyLoop(self: *Pipeline) void {
-        pinCurrentThread(0); // Pin apply loop to core 0 (most critical thread).
-
-        const batch_max: usize = @min(self.config.batch_max, 1024);
-        const sub_batch_max: usize = self.config.sub_batch_max;
-
-        // Pre-allocate batch buffer on stack.
-        var batch_buf: [1024]*Request = undefined;
-
-        while (self.running.load(.monotonic) or self.queue.pendingCount() > 0) {
-            // Double-buffered drain: try non-blocking drain first.
-            // This picks up requests that accumulated during the previous
-            // batch execution, avoiding the blocking wait overhead.
-            var batch_size = self.queue.drain(batch_buf[0..batch_max]);
-
-            if (batch_size == 0) {
-                // Queue empty — block until work arrives.
-                batch_size = self.queue.waitAndDrain(
-                    batch_buf[0..batch_max],
-                    100_000_000, // 100ms
-                );
-                if (batch_size == 0) continue;
-            }
-
-            // Adaptive spin-accumulate: only when batch is small and we
-            // haven't already collected a full batch from the drain above.
-            if (batch_size < batch_max) {
-                const deadline_ns: u64 = if (batch_size >= self.config.extend_at)
-                    self.config.max_window_ns
-                else
-                    self.config.min_wait_ns;
-                var spin_timer = std.time.Timer.start() catch unreachable;
-                while (batch_size < batch_max and spin_timer.read() < deadline_ns) {
-                    const more = self.queue.drain(batch_buf[batch_size..batch_max]);
-                    if (more > 0) {
-                        batch_size += more;
-                    } else {
-                        std.Thread.sleep(1_000); // 1µs
-                    }
-                }
-            }
-
-            if (self.config.repl_hook != null) {
-                // Cluster mode: apply sub-batches, encode overlay directly
-                // from Talon's arena (zero-copy), replicate once.
-                var repl_buf: [4 * 1024 * 1024]u8 = undefined;
-                var repl_pos: usize = 4; // reserve 4 bytes for count header
-                var total_mutations: u32 = 0;
-
-                var offset: usize = 0;
-                while (offset < batch_size) {
-                    const end = @min(offset + sub_batch_max, batch_size);
-                    const r = self.executeSubBatchLocal(batch_buf[offset..end], repl_buf[repl_pos..]);
-                    repl_pos += r.len;
-                    total_mutations += r.count;
-                    offset = end;
-                }
-
-                // Write count header at the start.
-                std.mem.writeInt(u32, repl_buf[0..4], total_mutations, .little);
-
-                // Notify queue waiters.
-                for (batch_buf[0..batch_size]) |req| {
-                    notify_mod.notifyFromOp(self.notify, req.op_type, &req.data, &req.result);
-                }
-
-                // Replicate encoded overlay.
-                if (total_mutations > 0) {
-                    if (self.config.sync_replication) {
-                        // Sync: oplog + send on pipeline thread, defer client signal.
-                        const seq = self.oplog.append(0, repl_buf[0..repl_pos]);
-                        self.config.repl_hook.?.replicate(0, seq, repl_buf[0..repl_pos]);
-                        self.pushAckPending(seq, batch_buf[0..batch_size]);
-                    } else {
-                        // Async: signal clients now, hand off to background thread.
-                        self.pushReplEntry(repl_buf[0..repl_pos]);
-                        for (batch_buf[0..batch_size]) |req| req.event.set();
-                    }
-                } else {
-                    for (batch_buf[0..batch_size]) |req| req.event.set();
-                }
-            } else {
-                // Single-node: use original optimized path.
-                var offset: usize = 0;
-                while (offset < batch_size) {
-                    const end = @min(offset + sub_batch_max, batch_size);
-                    self.executeSubBatch(batch_buf[offset..end]);
-                    offset = end;
-                }
-            }
-
-            _ = self.applied_total.fetchAdd(batch_size, .monotonic);
-            _ = self.batch_count.fetchAdd(1, .monotonic);
-        }
-    }
-
-    /// Apply a sub-batch to KV only — no replication, no signaling.
-    /// If encode_buf is provided, encodes the overlay directly into it BEFORE
-    /// commit (zero-copy from Talon's arena). Returns encoded slice length.
-    /// Apply sub-batch to KV. If encode_buf provided, encodes overlay
-    /// directly from Talon's arena BEFORE commit (zero-copy).
-    /// Returns (bytes_written, mutation_count).
-    const EncodeResult = struct { len: usize = 0, count: u32 = 0 };
-
-    fn executeSubBatchLocal(self: *Pipeline, batch: []*Request, encode_buf: ?[]u8) EncodeResult {
-        var kv_batch = self.shards[0].newBatch();
-        defer kv_batch.close();
-
-        for (batch) |req| {
-            req.result = self.handler.apply(&kv_batch, req.op_type, &req.data);
-        }
-
-        var result = EncodeResult{};
-        if (encode_buf) |buf| {
-            const r = kv_batch.encodeOverlay(buf);
-            result.len = r.len;
-            result.count = r.count;
-        }
-
-        kv_batch.commit();
-        return result;
-    }
-
-    /// Single-node path: apply, commit, notify, signal. No replication overhead.
-    fn executeSubBatch(self: *Pipeline, batch: []*Request) void {
-        if (self.shards.len <= 1) {
-            self.executeSubBatchSingleShard(batch, 0);
-        } else {
-            self.executeSubBatchRouted(batch);
-        }
-
-        for (batch) |req| {
-            notify_mod.notifyFromOp(self.notify, req.op_type, &req.data, &req.result);
-            req.event.set();
-        }
-    }
-
-    /// Fast path: all ops go to one shard in a single KV batch.
-    fn executeSubBatchSingleShard(self: *Pipeline, batch: []*Request, shard_idx: u16) void {
-        var kv_batch = self.shards[shard_idx].newBatch();
-        defer kv_batch.close();
-
-        const has_oplog = self.oplog.hasFile();
-
-        if (has_oplog) {
-            self.mut_list.clearRetainingCapacity();
-            kv_batch.enableRecording(self.allocator, &self.mut_list);
-        }
-        defer if (has_oplog) kv_batch.freeMutations();
-
-        for (batch) |req| {
-            req.result = self.handler.apply(&kv_batch, req.op_type, &req.data);
-        }
-
-        kv_batch.commit();
-
-        if (has_oplog and self.mut_list.items.len > 0) {
-            const encoded = oplog_mod.encodeMutations(self.allocator, self.mut_list.items);
-            defer self.allocator.free(encoded);
-            const seq = self.oplog.append(shard_idx, encoded);
-
-            // Send to followers (non-blocking). Ack handling is in onFollowerAck.
-            if (self.config.repl_hook) |hook| {
-                hook.replicate(shard_idx, seq, encoded);
-            }
-        }
-    }
-
-    /// Multi-shard path: route each op to the correct shard, group by shard,
-    /// apply each group in its own KV batch.
-    fn executeSubBatchRouted(self: *Pipeline, batch: []*Request) void {
-        const shard_count: u16 = @intCast(self.shards.len);
-
-        // Check if all ops route to the same shard (common case).
-        var first_shard: ?u16 = null;
-        var all_same = true;
-        for (batch) |req| {
-            const route = shard_mod.classifyRoute(shard_count, req.op_type, &req.data);
-            const idx = switch (route.mode) {
-                .single_shard => route.shard_idx,
-                .global => @as(u16, 0),
-                .broadcast, .multi_shard => blk: {
-                    all_same = false;
-                    break :blk route.shard_idx;
-                },
-            };
-            if (first_shard == null) {
-                first_shard = idx;
-            } else if (idx != first_shard.?) {
-                all_same = false;
-            }
-        }
-
-        // Fast path: all ops target the same shard.
-        if (all_same) {
-            self.executeSubBatchSingleShard(batch, first_shard orelse 0);
-            return;
-        }
-
-        // Slow path: per-op apply with individual routing.
-        for (batch) |req| {
-            const route = shard_mod.classifyRoute(shard_count, req.op_type, &req.data);
-            switch (route.mode) {
-                .single_shard, .global, .multi_shard => {
-                    self.applySingleOp(req, route.shard_idx);
-                },
-                .broadcast => {
-                    // Apply to every shard; keep last result.
-                    for (0..shard_count) |s| {
-                        req.result = self.applySingleOpInner(req.op_type, &req.data, @intCast(s));
-                        if (req.result.err != null) break;
-                    }
-                },
-            }
-        }
-    }
-
-    /// Apply a single request to a specific shard.
-    fn applySingleOp(self: *Pipeline, req: *Request, shard_idx: u16) void {
-        req.result = self.applySingleOpInner(req.op_type, &req.data, shard_idx);
-    }
-
-    fn applySingleOpInner(self: *Pipeline, op_type: ops_mod.OpType, data: *const ops_mod.OpData, shard_idx: u16) ops_mod.OpResult {
-        var kv_batch = self.shards[shard_idx].newBatch();
-        defer kv_batch.close();
-
-        const has_oplog = self.oplog.hasFile();
-
-        if (has_oplog) {
-            self.mut_list.clearRetainingCapacity();
-            kv_batch.enableRecording(self.allocator, &self.mut_list);
-        }
-        defer if (has_oplog) kv_batch.freeMutations();
-
-        const result = self.handler.apply(&kv_batch, op_type, data);
-        kv_batch.commit();
-
-        if (has_oplog and self.mut_list.items.len > 0) {
-            const encoded = oplog_mod.encodeMutations(self.allocator, self.mut_list.items);
-            defer self.allocator.free(encoded);
-            const seq = self.oplog.append(shard_idx, encoded);
-
-            if (self.config.repl_hook) |hook| {
-                hook.replicate(shard_idx, seq, encoded);
-            }
-        }
-
-        return result;
-    }
-
-    // ========================================================================
-    // Non-blocking ack tracking
-    // ========================================================================
-
-    /// Push requests to the ack-pending ring. Called from pipeline thread.
-    fn pushAckPending(self: *Pipeline, seq: u64, requests: []*Request) void {
-        self.ack_mu.lock();
-        defer self.ack_mu.unlock();
-
-        // Check for acks that already arrived while we were applying.
-        const already_acked = self.last_acked_seq.load(.acquire);
-        if (already_acked >= seq) {
-            // Follower already acked this — signal immediately.
-            for (requests) |req| req.event.set();
-            return;
-        }
-
-        if (self.ack_count >= ack_ring_size) {
-            // Ring full — fallback to synchronous signal (shouldn't happen in practice).
-            for (requests) |req| req.event.set();
-            return;
-        }
-
-        var entry = &self.ack_ring[self.ack_tail];
-        entry.seq = seq;
-        entry.count = @intCast(@min(requests.len, 64));
-        for (0..entry.count) |i| {
-            entry.requests[i] = requests[i];
-        }
-        // Signal overflow requests immediately if > 64 per batch.
-        for (requests[entry.count..]) |req| req.event.set();
-
-        self.ack_tail = (self.ack_tail + 1) % ack_ring_size;
-        self.ack_count += 1;
-    }
-
-    /// Called when a follower acks a sequence number. Thread-safe —
-    /// called from the TCP receive thread or tick loop.
-    /// Drains all pending entries with seq <= acked_seq and signals their requests.
-    pub fn onFollowerAck(self: *Pipeline, acked_seq: u64) void {
-        // Update the atomic so pushAckPending can fast-path.
-        const prev = self.last_acked_seq.load(.monotonic);
-        if (acked_seq > prev) {
-            self.last_acked_seq.store(acked_seq, .release);
-        }
-
-        self.ack_mu.lock();
-        defer self.ack_mu.unlock();
-
-        while (self.ack_count > 0) {
-            const entry = &self.ack_ring[self.ack_head];
-            if (entry.seq > acked_seq) break;
-
-            // Signal all requests in this entry.
-            for (0..entry.count) |i| {
-                entry.requests[i].event.set();
-            }
-            entry.count = 0;
-
-            self.ack_head = (self.ack_head + 1) % ack_ring_size;
-            self.ack_count -= 1;
-        }
-    }
-
-    // ========================================================================
-    // Async replication — background thread for oplog + TCP send
-    // ========================================================================
-
-    fn pushReplEntry(self: *Pipeline, data: []const u8) void {
-        const ring = self.repl_ring orelse return;
-        const wp = self.repl_write_pos.load(.monotonic);
-        const rp = self.repl_read_pos.load(.acquire);
-        if (wp - rp >= ReplRingSize) return;
-        const idx = wp % ReplRingSize;
-        const len: u32 = @intCast(@min(data.len, ReplEntryMax));
-        @memcpy(ring[idx].data[0..len], data[0..len]);
-        ring[idx].len = len;
-        self.repl_write_pos.store(wp + 1, .release);
-    }
-
-    fn replLoop(self: *Pipeline) void {
-        pinCurrentThread(1); // Pin replication loop to core 1.
-
-        const hook = self.config.repl_hook orelse return;
-        const ring = self.repl_ring orelse return;
-
-        while (self.running.load(.monotonic) or self.repl_write_pos.load(.acquire) != self.repl_read_pos.load(.monotonic)) {
-            const wp = self.repl_write_pos.load(.acquire);
-            const rp = self.repl_read_pos.load(.monotonic);
-            if (wp == rp) {
-                std.Thread.sleep(10_000); // 10µs idle
-                continue;
-            }
-            var pos = rp;
-            while (pos < wp) {
-                const idx = pos % ReplRingSize;
-                const entry = &ring[idx];
-                const seq = self.oplog.append(0, entry.data[0..entry.len]);
-                hook.replicate(0, seq, entry.data[0..entry.len]);
-                pos += 1;
-            }
-            self.repl_read_pos.store(pos, .release);
-        }
-    }
-
-    // ========================================================================
-    // Stats
-    // ========================================================================
-
-    pub fn getAppliedTotal(self: *const Pipeline) u64 {
-        return self.applied_total.load(.monotonic);
-    }
-
-    pub fn getOverloadTotal(self: *const Pipeline) u64 {
-        return self.overload_total.load(.monotonic);
-    }
-
-    pub fn getBatchCount(self: *const Pipeline) u64 {
-        return self.batch_count.load(.monotonic);
-    }
-};
+test "fetch with no jobs stores subscription (no response)" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fetch-sub");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Fetch on empty queue — should subscribe, not respond.
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1); // credits
+    fw.writeU32(30000); // lease_ms
+    fw.writePrefixed("worker-1"); // worker_id
+    fw.writeU8(1); // queue_count
+    fw.writePrefixed("empty-queue");
+
+    ctx.injectFrame(conn_id, rpc.MSG_FETCH_BATCH, 10, fw.written());
+    ctx.pipeline.tick();
+
+    // No response — connection is subscribed.
+    try testing.expect(ctx.readResponseHeader(conn_id) == null);
+
+    // ConnState should be marked as waiting.
+    const c = ctx.backend.conn(conn_id);
+    try testing.expect(c.waiting);
+    try testing.expectEqual(@as(u8, 1), c.queue_count);
+    try testing.expectEqualStrings("empty-queue", c.queue_bufs[0][0..c.queue_lens[0]]);
+    try testing.expectEqual(@as(u32, 1), c.credits);
+    try testing.expectEqual(@as(u32, 10), c.last_req_id);
+
+    // Pipeline should track the waiting connection.
+    try testing.expectEqual(@as(u32, 1), ctx.pipeline.waiting_conn_count);
+}
+
+test "enqueue fulfills waiting fetch subscription" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fetch-push");
+    defer ctx.destroy();
+
+    const fetch_conn = ctx.backend.connect().?;
+    const enq_conn = ctx.backend.connect().?;
+
+    // 1. Fetch on empty queue — subscribes.
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("push-queue");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 5, fw.written());
+    ctx.pipeline.tick();
+
+    try testing.expect(ctx.readResponseHeader(fetch_conn) == null);
+    try testing.expect(ctx.backend.conn(fetch_conn).waiting);
+
+    // Drain send_done so enqueue conn can be used.
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // 2. Enqueue a job to the subscribed queue.
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("push-queue");
+    ew.writePrefixed("pushed-job-1");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0); // flags
+
+    ctx.injectFrame(enq_conn, rpc.MSG_ENQUEUE_BATCH, 6, ew.written());
+    ctx.pipeline.tick();
+
+    // Enqueue conn should have its response.
+    const enq_resp = ctx.readResponseHeader(enq_conn).?;
+    try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, enq_resp.msg_type);
+
+    // Fetch conn should have received a pushed MSG_FETCH_BATCH_RESP.
+    const fetch_c = ctx.backend.conn(fetch_conn);
+    try testing.expect(fetch_c.send_len > 0);
+    const fetch_resp_data = fetch_c.send_buf[0..fetch_c.send_len];
+    const fetch_hdr = rpc.readFrameHeader(fetch_resp_data).?;
+    try testing.expectEqual(rpc.MSG_FETCH_BATCH_RESP, fetch_hdr.msg_type);
+    try testing.expectEqual(@as(u32, 5), fetch_hdr.req_id); // matches original fetch req_id
+
+    // Parse the pushed fetch response.
+    const payload = fetch_resp_data[rpc.FRAME_HEADER_SIZE .. rpc.FRAME_HEADER_SIZE + fetch_hdr.payload_len];
+    var r = BufReader{ .data = payload };
+    const count = try r.readU16();
+    try testing.expectEqual(@as(u16, 1), count);
+    const job_id = try r.readPrefixed();
+    try testing.expectEqualStrings("pushed-job-1", job_id);
+
+    // Subscription should be cleared.
+    try testing.expect(!fetch_c.waiting);
+    try testing.expectEqual(@as(u32, 0), ctx.pipeline.waiting_conn_count);
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.subscriptions_fulfilled);
+}
+
+test "fetch subscription not fulfilled for unrelated queue" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fetch-nomatch");
+    defer ctx.destroy();
+
+    const fetch_conn = ctx.backend.connect().?;
+    const enq_conn = ctx.backend.connect().?;
+
+    // Subscribe to "queue-a".
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("queue-a");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 1, fw.written());
+    ctx.pipeline.tick();
+    try testing.expect(ctx.backend.conn(fetch_conn).waiting);
+
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Enqueue to "queue-b" — should NOT fulfill the subscription.
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("queue-b");
+    ew.writePrefixed("unrelated-job");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0);
+
+    ctx.injectFrame(enq_conn, rpc.MSG_ENQUEUE_BATCH, 2, ew.written());
+    ctx.pipeline.tick();
+
+    // Fetch conn should still be waiting — no push.
+    try testing.expect(ctx.backend.conn(fetch_conn).waiting);
+    try testing.expectEqual(@as(u32, 1), ctx.pipeline.waiting_conn_count);
+    try testing.expectEqual(@as(u64, 0), ctx.pipeline.subscriptions_fulfilled);
+}
+
+test "subscription cleared on disconnect" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fetch-disc");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Subscribe.
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("disc-queue");
+
+    ctx.injectFrame(conn_id, rpc.MSG_FETCH_BATCH, 1, fw.written());
+    ctx.pipeline.tick();
+    try testing.expectEqual(@as(u32, 1), ctx.pipeline.waiting_conn_count);
+
+    // Disconnect.
+    ctx.backend.disconnect(conn_id);
+    ctx.pipeline.tick();
+
+    // Waiting list should be cleaned up.
+    try testing.expectEqual(@as(u32, 0), ctx.pipeline.waiting_conn_count);
+}
+
+// ============================================================================
+// Maintenance Scheduling Tests
+// ============================================================================
+
+test "maintenance scheduling" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-maint");
+    defer ctx.destroy();
+
+    // --- Idle tick fires maintenance ---
+    ctx.pipeline.config.promote_interval_ns = 1_000_000_000;
+    ctx.pipeline.tick();
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.maintenance_runs);
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.applied_total);
+
+    // --- Same clock → doesn't fire again ---
+    ctx.pipeline.tick();
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.maintenance_runs);
+
+    // --- Advance clock past interval → fires again ---
+    advanceTestClock(2_000_000_000);
+    ctx.pipeline.tick();
+    try testing.expectEqual(@as(u64, 2), ctx.pipeline.maintenance_runs);
+    try testing.expectEqual(@as(u64, 2), ctx.pipeline.applied_total);
+
+    // --- All 6 actions fire in one tick ---
+    ctx.pipeline.config.reclaim_interval_ns = 1_000_000_000;
+    ctx.pipeline.config.unique_interval_ns = 1_000_000_000;
+    ctx.pipeline.config.rate_limit_interval_ns = 1_000_000_000;
+    ctx.pipeline.config.expire_interval_ns = 1_000_000_000;
+    ctx.pipeline.config.purge_interval_ns = 1_000_000_000;
+    advanceTestClock(2_000_000_000);
+    ctx.pipeline.tick();
+    // promote + 5 new actions = 6 in this tick, 8 total
+    try testing.expectEqual(@as(u64, 8), ctx.pipeline.maintenance_runs);
+
+    // --- Coexists with client frames ---
+    advanceTestClock(2_000_000_000);
+    const conn_id = ctx.backend.connect().?;
+    ctx.injectFrame(conn_id, rpc.MSG_PING, 1, "");
+    ctx.pipeline.tick();
+    // Pong response arrives despite maintenance.
+    const resp = ctx.readResponseHeader(conn_id).?;
+    try testing.expectEqual(rpc.MSG_PONG, resp.msg_type);
+    try testing.expect(ctx.pipeline.maintenance_runs > 8);
+}
+
+test "maintenance promote wakes fetch subscription" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-maint-wake");
+    defer ctx.destroy();
+
+    // Enqueue a scheduled job (500ms in the future).
+    const enq_conn = ctx.backend.connect().?;
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("sched-queue");
+    ew.writePrefixed("sched-job-1");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0); // backoff
+    ew.writeU32(0); // base_delay
+    ew.writeU32(0); // max_delay
+    ew.writeU32(0); // unique_period
+    ew.writeU64(@intCast(@as(i64, @atomicLoad(i64, &test_clock_ns, .monotonic)) + 500_000_000)); // scheduled_at_ns
+    ew.writeU32(0); // expire_after
+    ew.writeU16(0); // chain_step
+    ew.writeU16(0); // flags
+
+    ctx.injectFrame(enq_conn, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+    ctx.pipeline.tick();
+
+    // Drain send_done.
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Fetch — job is scheduled (not pending), so 0 jobs → subscription stored.
+    const fetch_conn = ctx.backend.connect().?;
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1); // credits
+    fw.writeU32(30000); // lease_ms
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1); // queue_count
+    fw.writePrefixed("sched-queue");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 5, fw.written());
+    ctx.pipeline.tick();
+    try testing.expect(ctx.backend.conn(fetch_conn).waiting);
+
+    // Advance clock past scheduled time + enable promote.
+    advanceTestClock(2_000_000_000); // +2s (past 500ms schedule)
+    ctx.pipeline.config.promote_interval_ns = 1_000_000_000;
+    ctx.pipeline.tick();
+
+    // Promote should have fired and found the scheduled job.
+    try testing.expect(ctx.pipeline.maintenance_runs >= 1);
+    // Job should now be pending — fetch subscription fulfilled.
+    try testing.expect(!ctx.backend.conn(fetch_conn).waiting);
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.subscriptions_fulfilled);
+}
+
+fn testReplNoop(_: *anyopaque, _: u16, _: u64, _: []const u8) void {}
+
+test "sync-repl deferred recv connections are not lost" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-sync-repl-deferred");
+    defer ctx.destroy();
+
+    // Enable sync replication with a no-op repl hook.
+    var repl_ctx: u8 = 0;
+    ctx.pipeline.config.sync_replication = true;
+    ctx.pipeline.config.repl_hook = .{
+        .ptr = @ptrCast(&repl_ctx),
+        .replicate_fn = &testReplNoop,
+    };
+
+    const enq_conn = ctx.backend.connect().?;
+    const fetch_conn = ctx.backend.connect().?;
+
+    // 1. Enqueue a job — response will be deferred until follower ack.
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("sync-queue");
+    ew.writePrefixed("sync-job-1");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0);
+
+    ctx.injectFrame(enq_conn, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+    ctx.pipeline.tick();
+
+    // Enqueue processed but deferred — no response yet.
+    try testing.expect(ctx.pipeline.pending_ack_seq > 0);
+    try testing.expect(ctx.readResponse(enq_conn) == null);
+
+    // 2. Fetch arrives while enqueue ack is pending.
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("sync-queue");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 5, fw.written());
+    ctx.pipeline.tick(); // Still waiting — fetch recv saved, not lost.
+
+    try testing.expect(ctx.pipeline.pending_ack_seq > 0);
+    try testing.expectEqual(@as(u32, 1), ctx.pipeline.deferred_recv_conn_count);
+
+    // 3. Ack the enqueue batch — flush + fall through processes deferred fetch.
+    ctx.pipeline.last_acked_seq.store(ctx.pipeline.pending_ack_seq, .release);
+    ctx.pipeline.tick();
+
+    // Enqueue response available.
+    const enq_resp = ctx.readResponse(enq_conn).?;
+    try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, enq_resp.header.msg_type);
+
+    // Fetch was processed (deferred for its own ack).
+    try testing.expect(ctx.pipeline.pending_ack_seq > 0);
+    try testing.expectEqual(@as(u32, 0), ctx.pipeline.deferred_recv_conn_count);
+
+    // 4. Ack the fetch batch — fetch response delivered.
+    ctx.pipeline.last_acked_seq.store(ctx.pipeline.pending_ack_seq, .release);
+    ctx.pipeline.tick();
+
+    // Fetch response should contain the enqueued job.
+    const fetch_resp = ctx.readResponse(fetch_conn).?;
+    try testing.expectEqual(rpc.MSG_FETCH_BATCH_RESP, fetch_resp.header.msg_type);
+    try testing.expectEqual(@as(u32, 5), fetch_resp.header.req_id);
+
+    var r = BufReader{ .data = fetch_resp.payload };
+    const count = try r.readU16();
+    try testing.expectEqual(@as(u16, 1), count);
+    const job_id = try r.readPrefixed();
+    try testing.expectEqualStrings("sync-job-1", job_id);
+}

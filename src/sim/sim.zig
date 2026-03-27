@@ -1,6 +1,6 @@
 //! VOPR Simulator — deterministic simulation with invariant checking.
 //!
-//! Single-node simulation: creates a Pipeline v2 over SimBackend and
+//! Single-node simulation: creates a Pipeline over SimBackend and
 //! N simulated clients with persistent connections. Each tick:
 //!   1. Advance clock (+ random time jumps)
 //!   2. Each client injects one RPC frame into SimBackend
@@ -22,7 +22,7 @@ const handler_mod = corvo.handler;
 const oplog_mod = corvo.oplog;
 const notify_mod = corvo.notify;
 const mirror_mod = corvo.mirror;
-const pipeline_v2 = corvo.pipeline_v2;
+const pipeline_mod = corvo.pipeline;
 const io_mod = corvo.io;
 
 const SimClock = @import("clock.zig").SimClock;
@@ -36,7 +36,7 @@ const max_queues = 8;
 const max_clients = 16;
 
 const SimBackend = io_mod.SimBackend;
-const Pipeline = pipeline_v2.Pipeline(SimBackend);
+const Pipeline = pipeline_mod.Pipeline(SimBackend);
 
 pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     const seed: u64 = if (config.seed == 0)

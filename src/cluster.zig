@@ -13,9 +13,7 @@ const repl_mod = @import("replicator.zig");
 const follower_mod = @import("follower.zig");
 const transport_mod = @import("transport.zig");
 const tcp_mod = @import("tcp_transport.zig");
-const pipeline_v2 = @import("pipeline_v2.zig");
-const pipeline_mod = @import("pipeline.zig"); // legacy — removed in step 16
-const engine_mod = @import("engine.zig"); // legacy — removed in step 16
+const pipeline_mod = @import("pipeline.zig");
 const handler_mod = @import("handler.zig");
 
 // ============================================================================
@@ -47,7 +45,7 @@ pub const ClusterNode = struct {
     follower: ?*follower_mod.Follower = null, // heap-allocated for stable pointers
     shards: []kv.Store,
     handler: ?*handler_mod.OpHandler = null, // for rebuild after snapshot
-    oplog: ?*oplog_mod.Log = null, // for sync-repl retry (set by main_v2)
+    oplog: ?*oplog_mod.Log = null, // for sync-repl retry (set by main)
     allocator: std.mem.Allocator,
 
     // Tick loop
@@ -139,19 +137,11 @@ pub const ClusterNode = struct {
         }
     }
 
-    /// Returns a ReplHook for pipeline_v2 to call after oplog append.
-    pub fn replHook(self: *ClusterNode) pipeline_v2.ReplHook {
+    /// Returns a ReplHook for pipeline to call after oplog append.
+    pub fn replHook(self: *ClusterNode) pipeline_mod.ReplHook {
         return .{
             .ptr = @ptrCast(self),
             .replicate_fn = @ptrCast(&replicateImpl),
-        };
-    }
-
-    /// Legacy ReplHook for old pipeline.zig — removed in step 16.
-    pub fn replHookLegacy(self: *ClusterNode) pipeline_mod.ReplHook {
-        return .{
-            .ptr = @ptrCast(self),
-            .replFn = @ptrCast(&replicateImpl),
         };
     }
 
@@ -186,18 +176,6 @@ pub const ClusterNode = struct {
     pub fn leaseValid(self: *ClusterNode) bool {
         const now: i64 = @intCast(@as(i128, std.time.nanoTimestamp()));
         return self.election.leaseValid(now);
-    }
-
-    /// Legacy LeaseCheck for old engine — removed in step 16.
-    pub fn leaseCheck(self: *ClusterNode) engine_mod.LeaseCheck {
-        return .{
-            .ptr = @ptrCast(self),
-            .checkFn = @ptrCast(&leaseCheckImpl),
-        };
-    }
-
-    fn leaseCheckImpl(self: *ClusterNode) bool {
-        return self.leaseValid();
     }
 
     /// Wait for leader election to complete (blocking).
@@ -584,21 +562,16 @@ fn fastPathAckCallback(from: []const u8, epoch: u64, seq: u64) void {
         .epoch = epoch,
         .seq = seq,
     });
-    // Notify pipeline_v2's ack atomic — unblocks deferred responses in sync mode.
+    // Notify pipeline's ack atomic — unblocks deferred responses in sync mode.
     if (g_ack_seq_ptr) |ptr| {
         const prev = ptr.load(.monotonic);
         if (seq > prev) ptr.store(seq, .release);
     }
-    // Legacy: notify old pipeline — removed in step 16.
-    if (g_pipeline_for_ack) |p| p.onFollowerAck(seq);
 }
 
-/// Pointer to the pipeline_v2's last_acked_seq atomic. Set by main_v2.zig
+/// Pointer to the pipeline's last_acked_seq atomic. Set by main.zig
 /// when starting in cluster mode. TCP receive threads write directly.
 pub var g_ack_seq_ptr: ?*std.atomic.Value(u64) = null;
-
-/// Legacy: pointer to old pipeline for onFollowerAck — removed in step 16.
-pub var g_pipeline_for_ack: ?*pipeline_mod.Pipeline = null;
 
 // ============================================================================
 // KVApplier — applies replicated mutations to local KV store

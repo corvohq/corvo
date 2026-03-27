@@ -158,6 +158,9 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
         if (iter.first()) {
             while (true) {
+                // Cap per-tick reclaim to avoid bulk_results overflow.
+                if (self.bulk_result_count >= OpHandler.max_bulk_results - 1) break;
+
                 const val = iter.value();
                 const key = iter.key();
                 assert.check(val.len == 8, "invalid active key value length", .{});
@@ -287,6 +290,9 @@ fn applyExpire(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
         if (iter.first()) {
             while (true) {
+                // Cap per-tick expire to avoid bulk_results overflow.
+                if (self.bulk_result_count >= OpHandler.max_bulk_results - 1) break;
+
                 const key = iter.key();
                 const prefix_len = keys.prefix_expire.len;
                 const expires_at = keys.getU64BE(key[prefix_len .. prefix_len + 8]);
@@ -372,6 +378,10 @@ fn applyPurge(self: *OpHandler, b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult 
 
         if (iter.first()) {
             while (true) {
+                // Cap per-tick purge to avoid bulk_results overflow.
+                // Remaining dead keys are cleaned on the next purge interval.
+                if (self.bulk_result_count >= OpHandler.max_bulk_results - 1) break;
+
                 const key = iter.key();
                 const prefix_len = keys.prefix_dead.len;
                 const completed_at = keys.getU64BE(key[prefix_len .. prefix_len + 8]);
@@ -379,7 +389,7 @@ fn applyPurge(self: *OpHandler, b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult 
 
                 const job_id = key[prefix_len + 8 ..];
 
-                // Defensive: skip purging non-terminal jobs (stale d| keys from re-enqueue)
+                // Skip purging non-terminal jobs (stale d| keys from re-enqueue).
                 var jk_buf: keys.KeyBuf = undefined;
                 const job_bytes = b.get(keys.jobKey(&jk_buf, job_id));
                 if (job_bytes != null) {

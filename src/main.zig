@@ -1,90 +1,123 @@
-//! Corvo server — main entry point.
+//! Corvo server — single-threaded pipeline over io_uring/kqueue.
+//!
+//! Single port handles both RPC (binary) and HTTP (JSON) via protocol detection.
+//! Supports single-node and cluster mode (PBR with leader election).
+//!
+//! Configuration: defaults → config file (--config) → CLI args.
 //!
 //! Usage: corvo [options]
-//!   --bind       Listen address (default: 0.0.0.0)
-//!   --port       Listen port (default: 8080)
-//!   --rpc-port   RPC port (default: 9878)
-//!   --data-dir   Data directory (default: /tmp/corvo-data)
-//!   --no-mirror  Disable SQLite mirror
-//!   --node-id    Node ID for cluster mode (enables PBR)
-//!   --peers      Comma-separated peers: node-2@host:port,node-3@host:port
-//!   --pbr-port   PBR transport port (default: 9001)
+//!   --config <path>           Config file (key = value format)
+//!   --bind <addr>             Listen address (default: 0.0.0.0)
+//!   --port <port>             Listen port (default: 9878)
+//!   --data-dir <dir>          Data directory (default: /tmp/corvo-data)
+//!   --no-mirror               Disable SQLite mirror
+//!   --node-id <id>            Node ID for cluster mode (enables cluster)
+//!   --peers <spec>            Comma-separated peer list: id@host:port,...
+//!   --sync-repl               Enable sync replication
+//!   --max-payload-size <n>    Max payload size in bytes (default: 65536)
+//!   --max-conns <n>           Max concurrent connections (default: 4096)
+//!   --max-queues <n>          Max number of queues (default: 100)
+//!   --max-tags-per-queue <n>  Max fairness tags per queue (default: 1000)
+//!   --help                    Show this help
 
 const std = @import("std");
 const talon = @import("talon");
 const corvo = @import("corvo");
 
+const config_mod = corvo.server_config;
+const io_mod = corvo.io;
 const kv = corvo.kv;
-const engine_mod = corvo.engine;
+const rpc = corvo.rpc;
+const handler_mod = corvo.handler;
+const oplog_mod = corvo.oplog;
+const notify_mod = corvo.notify;
 const mirror_mod = corvo.mirror;
-const store_mod = corvo.store;
-const server_mod = corvo.server;
-const rpc_mod = corvo.rpc;
-const rpc_uring_mod = corvo.rpc_uring;
-const scheduler_mod = corvo.scheduler;
-const cluster_mod = corvo.cluster;
+const sqlite_read = corvo.sqlite_read;
 const pipeline_mod = corvo.pipeline;
+const cluster_mod = corvo.cluster;
 
-const log = std.log.scoped(.corvo);
+const RealPipeline = pipeline_mod.Pipeline(io_mod.Backend);
+const ServerConfig = config_mod.ServerConfig;
 
 var running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true);
-var g_server: *server_mod.Server = undefined;
 
 fn handleSignal(_: c_int) callconv(.c) void {
     running.store(false, .monotonic);
-    g_server.running.store(false, .monotonic);
+}
+
+fn realClock() i64 {
+    return @intCast(std.time.nanoTimestamp());
 }
 
 // ============================================================================
-// Peer parsing: "node-2@host:port,node-3@host:port"
+// Peer parsing: "id@host:port"
 // ============================================================================
 
-const MAX_PEERS = 8;
+const max_peers = 6;
 
-const ParsedPeers = struct {
-    ids: [MAX_PEERS][]const u8 = undefined,
-    addrs: [MAX_PEERS]std.net.Address = undefined,
-    count: usize = 0,
-};
+fn parsePeers(spec: []const u8, ids_out: *[max_peers][]const u8, addrs_out: *[max_peers]std.net.Address) !u8 {
+    var count: u8 = 0;
+    var rest = spec;
 
-fn parsePeers(peers_str: []const u8) ParsedPeers {
-    var result = ParsedPeers{};
-    var remaining = peers_str;
+    while (rest.len > 0) {
+        const end = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+        const entry = rest[0..end];
+        rest = if (end < rest.len) rest[end + 1 ..] else "";
 
-    while (remaining.len > 0 and result.count < MAX_PEERS) {
-        // Find comma or end
-        var end = remaining.len;
-        for (remaining, 0..) |c, i| {
-            if (c == ',') {
-                end = i;
-                break;
-            }
-        }
-        const peer = remaining[0..end];
-        remaining = if (end < remaining.len) remaining[end + 1 ..] else "";
+        if (entry.len == 0) continue;
 
-        if (peer.len == 0) continue;
+        const at_pos = std.mem.indexOfScalar(u8, entry, '@') orelse return error.InvalidPeerSpec;
+        const id = entry[0..at_pos];
+        const host_port = entry[at_pos + 1 ..];
 
-        // Parse "node-id@host:port"
-        const at_pos = std.mem.indexOfScalar(u8, peer, '@') orelse continue;
-        const node_id = peer[0..at_pos];
-        const addr_str = peer[at_pos + 1 ..];
+        const colon_pos = std.mem.lastIndexOfScalar(u8, host_port, ':') orelse return error.InvalidPeerSpec;
+        const host = host_port[0..colon_pos];
+        const port_str = host_port[colon_pos + 1 ..];
+        const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPeerSpec;
 
-        // Parse host:port
-        const colon_pos = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse continue;
-        const host = addr_str[0..colon_pos];
-        const port_str = addr_str[colon_pos + 1 ..];
-        const port_num = std.fmt.parseInt(u16, port_str, 10) catch continue;
+        // Cluster transport bind port = server port + 1000 (convention).
+        const cluster_port = port + 1000;
 
-        const addr = std.net.Address.parseIp(host, port_num) catch
-            std.net.Address.parseIp("127.0.0.1", port_num) catch continue;
-
-        result.ids[result.count] = node_id;
-        result.addrs[result.count] = addr;
-        result.count += 1;
+        ids_out[count] = id;
+        addrs_out[count] = try std.net.Address.parseIp(host, cluster_port);
+        count += 1;
     }
 
-    return result;
+    return count;
+}
+
+// ============================================================================
+// Help
+// ============================================================================
+
+fn printHelp() void {
+    std.debug.print(
+        \\corvo — single-threaded pipeline server
+        \\
+        \\Usage: corvo [options]
+        \\
+        \\Options:
+        \\  --config <path>           Config file (key = value format)
+        \\  --bind <addr>             Listen address (default: 0.0.0.0)
+        \\  --port <port>             Listen port (default: 9878)
+        \\  --data-dir <dir>          Data directory (default: /tmp/corvo-data)
+        \\  --no-mirror               Disable SQLite mirror
+        \\  --max-payload-size <n>    Max payload bytes (default: 65536, max: 262144)
+        \\  --max-conns <n>           Max connections (default: 4096)
+        \\  --max-queues <n>          Max queues (default: 100)
+        \\  --max-tags-per-queue <n>  Max fairness tags per queue (default: 1000)
+        \\  --node-id <id>            Node ID (enables cluster mode)
+        \\  --peers <spec>            Peers: id@host:port,id@host:port,...
+        \\  --sync-repl               Enable sync replication
+        \\  --help                    Show this help
+        \\
+        \\Config file format:
+        \\  # comment
+        \\  key = value
+        \\
+        \\  See docs/pipeline-refactor-v2.md for config keys.
+        \\
+    , .{});
 }
 
 // ============================================================================
@@ -92,318 +125,296 @@ fn parsePeers(peers_str: []const u8) ParsedPeers {
 // ============================================================================
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+    const allocator = std.heap.c_allocator;
 
-    // --- Parse CLI args ---
+    // --- Check for CLI subcommands before server startup ---
+    {
+        var peek = try std.process.argsWithAllocator(allocator);
+        defer peek.deinit();
+        _ = peek.next(); // skip program name
+        if (peek.next()) |first_arg| {
+            if (first_arg.len > 0 and first_arg[0] != '-') {
+                corvo.cli.dispatch(first_arg, &peek);
+                return;
+            }
+        }
+    }
+
+    var config = ServerConfig{};
+
+    // --- First pass: find --config path ---
+    var config_path_buf: [256]u8 = undefined;
+    var config_path_len: usize = 0;
+    {
+        var scan = try std.process.argsWithAllocator(allocator);
+        defer scan.deinit();
+        _ = scan.next(); // skip program name
+        while (scan.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--config")) {
+                if (scan.next()) |path| {
+                    const len = @min(path.len, config_path_buf.len);
+                    @memcpy(config_path_buf[0..len], path[0..len]);
+                    config_path_len = len;
+                }
+                break;
+            }
+        }
+    }
+
+    // --- Load config file (if specified) ---
+    var file_buf: [8192]u8 = undefined;
+    if (config_path_len > 0) {
+        const path = config_path_buf[0..config_path_len];
+        const file = std.fs.cwd().openFile(path, .{}) catch {
+            std.debug.print("corvo: failed to open config file: {s}\n", .{path});
+            return;
+        };
+        defer file.close();
+        const n = file.readAll(&file_buf) catch {
+            std.debug.print("corvo: failed to read config file: {s}\n", .{path});
+            return;
+        };
+        config.loadFile(file_buf[0..n]) catch |err| {
+            std.debug.print("corvo: config file error: {s}\n", .{@errorName(err)});
+            return;
+        };
+    }
+
+    // --- Second pass: CLI args override config file ---
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // skip program name
 
-    var bind: []const u8 = "0.0.0.0";
-    var port: u16 = 8080;
-    var rpc_port: u16 = 9878;
-    var data_dir: []const u8 = "/tmp/corvo-data";
-    var no_mirror = false;
-    var no_oplog = false;
-    var use_io_uring = false;
-    var node_id: []const u8 = "";
-    var peers_str: []const u8 = "";
-    var pbr_port: u16 = 9001;
-    var shutdown_timeout_s: u16 = 30;
-    var worker_count: u16 = 0;
-    var rate_limit_enabled = false;
-    var rate_limit_rps: f64 = 1000;
-    var cluster_replication: []const u8 = "async";
-
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--bind")) {
-            bind = args.next() orelse {
-                log.err("--bind requires an argument", .{});
+        if (std.mem.eql(u8, arg, "--config")) {
+            _ = args.next(); // already handled
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            printHelp();
+            return;
+        } else if (std.mem.eql(u8, arg, "--bind")) {
+            config.bind = args.next() orelse {
+                std.debug.print("--bind requires an argument\n", .{});
                 return;
             };
         } else if (std.mem.eql(u8, arg, "--port")) {
-            const port_str = args.next() orelse {
-                log.err("--port requires an argument", .{});
+            const val = args.next() orelse {
+                std.debug.print("--port requires an argument\n", .{});
                 return;
             };
-            port = std.fmt.parseInt(u16, port_str, 10) catch {
-                log.err("invalid port: {s}", .{port_str});
-                return;
-            };
-        } else if (std.mem.eql(u8, arg, "--rpc-port")) {
-            const rpc_port_str = args.next() orelse {
-                log.err("--rpc-port requires an argument", .{});
-                return;
-            };
-            rpc_port = std.fmt.parseInt(u16, rpc_port_str, 10) catch {
-                log.err("invalid rpc-port: {s}", .{rpc_port_str});
+            config.port = std.fmt.parseInt(u16, val, 10) catch {
+                std.debug.print("invalid port: {s}\n", .{val});
                 return;
             };
         } else if (std.mem.eql(u8, arg, "--data-dir")) {
-            data_dir = args.next() orelse {
-                log.err("--data-dir requires an argument", .{});
+            config.data_dir = args.next() orelse {
+                std.debug.print("--data-dir requires an argument\n", .{});
                 return;
             };
         } else if (std.mem.eql(u8, arg, "--no-mirror")) {
-            no_mirror = true;
-        } else if (std.mem.eql(u8, arg, "--no-oplog")) {
-            no_oplog = true;
-        } else if (std.mem.eql(u8, arg, "--io-uring")) {
-            use_io_uring = true;
+            config.mirror = false;
         } else if (std.mem.eql(u8, arg, "--node-id")) {
-            node_id = args.next() orelse {
-                log.err("--node-id requires an argument", .{});
+            config.node_id = args.next() orelse {
+                std.debug.print("--node-id requires an argument\n", .{});
                 return;
             };
         } else if (std.mem.eql(u8, arg, "--peers")) {
-            peers_str = args.next() orelse {
-                log.err("--peers requires an argument", .{});
+            config.peers = args.next() orelse {
+                std.debug.print("--peers requires an argument\n", .{});
                 return;
             };
-        } else if (std.mem.eql(u8, arg, "--pbr-port")) {
-            const pbr_port_str = args.next() orelse {
-                log.err("--pbr-port requires an argument", .{});
+        } else if (std.mem.eql(u8, arg, "--sync-repl")) {
+            config.sync_replication = true;
+        } else if (std.mem.eql(u8, arg, "--max-payload-size")) {
+            const val = args.next() orelse {
+                std.debug.print("--max-payload-size requires an argument\n", .{});
                 return;
             };
-            pbr_port = std.fmt.parseInt(u16, pbr_port_str, 10) catch {
-                log.err("invalid pbr-port: {s}", .{pbr_port_str});
+            config.max_payload_size = std.fmt.parseInt(u32, val, 10) catch {
+                std.debug.print("invalid max-payload-size: {s}\n", .{val});
                 return;
             };
-        } else if (std.mem.eql(u8, arg, "--shutdown-timeout")) {
-            const timeout_str = args.next() orelse {
-                log.err("--shutdown-timeout requires an argument", .{});
+        } else if (std.mem.eql(u8, arg, "--max-conns")) {
+            const val = args.next() orelse {
+                std.debug.print("--max-conns requires an argument\n", .{});
                 return;
             };
-            shutdown_timeout_s = std.fmt.parseInt(u16, timeout_str, 10) catch {
-                log.err("invalid shutdown-timeout: {s}", .{timeout_str});
+            config.max_conns = std.fmt.parseInt(u16, val, 10) catch {
+                std.debug.print("invalid max-conns: {s}\n", .{val});
                 return;
             };
-        } else if (std.mem.eql(u8, arg, "--threads")) {
-            const w_str = args.next() orelse {
-                log.err("--threads requires an argument", .{});
+        } else if (std.mem.eql(u8, arg, "--max-queues")) {
+            const val = args.next() orelse {
+                std.debug.print("--max-queues requires an argument\n", .{});
                 return;
             };
-            worker_count = std.fmt.parseInt(u16, w_str, 10) catch {
-                log.err("invalid threads: {s}", .{w_str});
+            config.max_queues = std.fmt.parseInt(u32, val, 10) catch {
+                std.debug.print("invalid max-queues: {s}\n", .{val});
                 return;
             };
-        } else if (std.mem.eql(u8, arg, "--cluster-replication")) {
-            cluster_replication = args.next() orelse {
-                log.err("--cluster-replication requires: async, sync", .{});
+        } else if (std.mem.eql(u8, arg, "--max-tags-per-queue")) {
+            const val = args.next() orelse {
+                std.debug.print("--max-tags-per-queue requires an argument\n", .{});
                 return;
             };
-        } else if (std.mem.eql(u8, arg, "--rate-limit")) {
-            rate_limit_enabled = true;
-        } else if (std.mem.eql(u8, arg, "--rate-limit-rps")) {
-            const rps_str = args.next() orelse {
-                log.err("--rate-limit-rps requires an argument", .{});
+            config.max_tags_per_queue = std.fmt.parseInt(u32, val, 10) catch {
+                std.debug.print("invalid max-tags-per-queue: {s}\n", .{val});
                 return;
             };
-            rate_limit_rps = std.fmt.parseFloat(f64, rps_str) catch {
-                log.err("invalid rate-limit-rps: {s}", .{rps_str});
-                return;
-            };
-            rate_limit_enabled = true;
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            std.debug.print(
-                \\Corvo — distributed job queue
-                \\
-                \\Usage: corvo [options]
-                \\
-                \\Options:
-                \\  --bind <addr>       Listen address (default: 0.0.0.0)
-                \\  --port <port>       HTTP port (default: 8080)
-                \\  --rpc-port <port>   Binary RPC port (default: 9878)
-                \\  --data-dir <dir>    Data directory (default: /tmp/corvo-data)
-                \\  --no-mirror         Disable SQLite mirror
-                \\  --no-oplog          Disable oplog
-                \\  --io-uring          Use io_uring RPC server (Linux only)
-                \\  --node-id <id>      Node ID (enables cluster mode)
-                \\  --peers <spec>      Peers: node-2@host:port,node-3@host:port
-                \\  --pbr-port <port>   PBR transport port (default: 9001)
-                \\  --shutdown-timeout <s>  Graceful shutdown timeout in seconds (default: 30)
-                \\  --threads <n>          HTTP server threads (default: CPU count)
-                \\  --rate-limit           Enable HTTP rate limiting
-                \\  --rate-limit-rps <n>   Rate limit requests/sec per client (default: 1000)
-                \\  --help              Show this help
-                \\
-            , .{});
-            return;
         }
     }
 
-    // --- Cluster mode detection ---
-    const cluster_mode = node_id.len > 0 and peers_str.len > 0;
-    const parsed_peers = if (cluster_mode) parsePeers(peers_str) else ParsedPeers{};
+    // --- Validate config ---
+    config.validate() catch |err| {
+        std.debug.print("corvo: config error: {s}\n", .{@errorName(err)});
+        return;
+    };
 
-    if (cluster_mode) {
-        std.debug.print("corvo: cluster mode (node={s}, peers={d}, pbr-port={d})\n", .{
-            node_id, parsed_peers.count, pbr_port,
-        });
-    }
+    const cluster_mode = config.clusterMode();
+
+    std.debug.print("corvo: starting (bind={s}, port={d}, data={s}{s})\n", .{
+        config.bind, config.port, config.data_dir, if (cluster_mode) ", cluster" else "",
+    });
+
+    // --- Ensure data directory exists ---
+    std.fs.cwd().makePath(config.data_dir) catch {};
 
     // --- Open Talon DB ---
-    std.debug.print("corvo: starting (bind={s}, http={d}, rpc={d}, data={s})\n", .{ bind, port, rpc_port, data_dir });
-
-    // Ensure data directory exists.
-    std.fs.cwd().makePath(data_dir) catch {};
-
-    // Build KV path.
     var kv_path_buf: [256]u8 = undefined;
-    const kv_path = std.fmt.bufPrint(&kv_path_buf, "{s}/kv", .{data_dir}) catch {
-        log.err("data-dir path too long", .{});
-        return;
-    };
-
+    const kv_path = std.fmt.bufPrint(&kv_path_buf, "{s}/kv", .{config.data_dir}) catch unreachable;
     const db = try talon.DB.open(allocator, kv_path, .{});
     defer db.close();
-
-    // --- Engine ---
-    var oplog_path_buf: [256]u8 = undefined;
-    const oplog_path_slice = std.fmt.bufPrint(&oplog_path_buf, "{s}/oplog.bin", .{data_dir}) catch {
-        log.err("oplog path too long", .{});
-        return;
-    };
-    var oplog_path_z: [257]u8 = undefined;
-    @memcpy(oplog_path_z[0..oplog_path_slice.len], oplog_path_slice);
-    oplog_path_z[oplog_path_slice.len] = 0;
-
-    // In cluster mode, always enable oplog (needed for replication).
-    const use_oplog = cluster_mode or !no_oplog;
 
     const kvstore = kv.Store.init(db);
     var stores = [1]kv.Store{kvstore};
 
-    // --- Cluster Node (optional) ---
-    var cluster_node: ?cluster_mod.ClusterNode = null;
-    var repl_hook: ?pipeline_mod.ReplHook = null;
+    // --- OpHandler ---
+    var handler = handler_mod.OpHandler.init(allocator);
+    handler.max_queues = config.max_queues;
+    handler.max_tags_per_queue = config.max_tags_per_queue;
+    defer handler.deinit();
+    handler.rebuildState(&stores);
 
-    if (cluster_mode) {
-        const pbr_addr = std.net.Address.parseIp(bind, pbr_port) catch
-            std.net.Address.parseIp("0.0.0.0", pbr_port) catch unreachable;
+    // --- Oplog ---
+    var oplog_path_buf: [256]u8 = undefined;
+    const oplog_path_slice = std.fmt.bufPrint(&oplog_path_buf, "{s}/oplog", .{config.data_dir}) catch unreachable;
+    var oplog_path_z: [257]u8 = undefined;
+    @memcpy(oplog_path_z[0..oplog_path_slice.len], oplog_path_slice);
+    oplog_path_z[oplog_path_slice.len] = 0;
 
-        cluster_node = cluster_mod.ClusterNode.init(allocator, &stores, .{
-            .node_id = node_id,
-            .peer_ids = parsed_peers.ids[0..parsed_peers.count],
-            .peer_addrs = parsed_peers.addrs[0..parsed_peers.count],
-            .bind_addr = pbr_addr,
-        });
-        try cluster_node.?.start();
-        repl_hook = cluster_node.?.replHookLegacy();
-    }
-    defer if (cluster_node) |*cn| cn.deinit();
+    var oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &realClock }, oplog_path_z[0..oplog_path_slice.len :0], 8192);
+    defer oplog.deinit();
 
-    var engine = engine_mod.Engine.init(allocator, &stores, .{
-        .node_id = if (node_id.len > 0) node_id else "node-1",
-        .oplog_path = if (use_oplog) oplog_path_z[0..oplog_path_slice.len :0] else null,
-        .sync_replication = std.mem.eql(u8, cluster_replication, "sync"),
-    });
-    defer engine.deinit();
+    // --- QueueNotifier ---
+    var notify = notify_mod.QueueNotifier.init(allocator);
+    defer notify.deinit();
 
-    // --- Mirror (optional) ---
+    // --- Mirror + SQLite reader (optional) ---
     var mirror: ?mirror_mod.Mirror = null;
-    if (!no_mirror) {
+    var reader: ?sqlite_read.Reader = null;
+
+    if (config.mirror) {
         var mirror_path_buf: [256]u8 = undefined;
-        const mirror_path_slice = std.fmt.bufPrint(&mirror_path_buf, "{s}/mirror.db", .{data_dir}) catch {
-            log.err("mirror path too long", .{});
-            return;
-        };
-        // Null-terminate for C FFI.
+        const mirror_path_slice = std.fmt.bufPrint(&mirror_path_buf, "{s}/mirror.db", .{config.data_dir}) catch unreachable;
         var mirror_path_z: [257]u8 = undefined;
         @memcpy(mirror_path_z[0..mirror_path_slice.len], mirror_path_slice);
         mirror_path_z[mirror_path_slice.len] = 0;
 
         mirror = mirror_mod.Mirror.init(allocator, mirror_path_z[0..mirror_path_slice.len :0]) catch |err| {
-            log.err("failed to init mirror: {}", .{err});
+            std.debug.print("corvo: failed to init mirror: {}\n", .{err});
             return;
         };
         try mirror.?.start();
+        reader = sqlite_read.Reader.init(&mirror.?.db);
     }
     defer if (mirror) |*m| m.deinit();
 
-    // --- Start async pipeline ---
-    try engine.startPipelineWithHook(repl_hook);
-    defer engine.stopPipeline();
+    // --- Cluster setup (optional) ---
+    var cluster_node: ?cluster_mod.ClusterNode = null;
+    var repl_hook: ?pipeline_mod.ReplHook = null;
 
-    // --- Store ---
-    var store = store_mod.Store.init(
-        allocator,
-        &engine,
-        if (mirror) |*m| m else null,
-    );
+    if (cluster_mode) {
+        var peer_ids: [max_peers][]const u8 = undefined;
+        var peer_addrs: [max_peers]std.net.Address = undefined;
+        const peer_count = parsePeers(config.peers, &peer_ids, &peer_addrs) catch {
+            std.debug.print("invalid --peers format (expected: id@host:port,...)\n", .{});
+            return;
+        };
 
-    // --- Scheduler ---
-    var sched = scheduler_mod.Scheduler.init(&store, .{});
-    try sched.start();
-    defer sched.stop();
+        // Cluster transport binds on server port + 1000.
+        const cluster_port: u16 = config.port + 1000;
+        const cluster_bind_addr = try std.net.Address.parseIp(config.bind, cluster_port);
 
-    // --- Wait for leader election in cluster mode ---
-    if (cluster_node) |*cn| {
-        std.debug.print("corvo: waiting for leader election...\n", .{});
-        if (cn.waitForLeader(15_000)) {
-            const state = cn.election.currentState();
-            if (state.state == .leader) {
-                std.debug.print("corvo: this node is the leader\n", .{});
-            } else {
-                std.debug.print("corvo: leader is {s}\n", .{state.leader_id});
-            }
-        } else {
-            std.debug.print("corvo: WARNING: no leader elected after 15s\n", .{});
-        }
+        cluster_node = cluster_mod.ClusterNode.init(allocator, &stores, .{
+            .node_id = config.node_id,
+            .peer_ids = peer_ids[0..peer_count],
+            .peer_addrs = peer_addrs[0..peer_count],
+            .bind_addr = cluster_bind_addr,
+            .config_hash = config.clusterHash(),
+        });
+
+        try cluster_node.?.start();
+        repl_hook = cluster_node.?.replHook();
+
+        std.debug.print("corvo: cluster node={s}, peers={d}, transport=:{d}, config_hash={x}\n", .{
+            config.node_id, peer_count, cluster_port, config.clusterHash(),
+        });
     }
+    defer if (cluster_node) |*cn| cn.deinit();
 
-    // --- HTTP Server ---
-    var server = server_mod.Server.init(allocator, &store, .{
-        .bind_address = bind,
-        .port = port,
-        .worker_count = worker_count,
-        .rate_limit = .{
-            .enabled = rate_limit_enabled,
-            .write_rps = rate_limit_rps,
-            .write_burst = rate_limit_rps * 2,
-            .read_rps = rate_limit_rps * 2,
-            .read_burst = rate_limit_rps * 4,
-        },
+    // --- Create listen socket ---
+    const addr = try std.net.Address.parseIp(config.bind, config.port);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    const listen_fd = listener.stream.handle;
+
+    // --- IO backend ---
+    // Buffer sizes derived from max_payload_size: must fit a complete frame
+    // (header + payload) plus headroom for protocol framing.
+    const buf_size: u32 = config.max_payload_size + @as(u32, rpc.FRAME_HEADER_SIZE) + 1024;
+    var io_backend = try io_mod.Backend.init(allocator, .{
+        .listen_fd = listen_fd,
+        .max_conns = config.max_conns,
+        .recv_buf_size = buf_size,
+        .send_buf_size = buf_size,
     });
-    server.scheduler = &sched;
-    if (cluster_node) |*cn| {
-        server.cluster = cn;
-        cn.handler = engine.getHandler();
-        engine.lease_check = cn.leaseCheck();
-        // Wire pipeline ack callback for non-blocking strong durability.
-        if (engine.pipeline) |*p| {
-            cluster_mod.g_pipeline_for_ack = p;
-        }
+    defer io_backend.deinit(allocator);
+
+    // Seed the first accept
+    io_backend.queueAccept();
+    io_backend.submit();
+
+    // --- Pipeline (heap-allocated: ~5MB struct, too large for thread stack) ---
+    var pipeline = RealPipeline.initHeap(
+        allocator,
+        &io_backend,
+        &handler,
+        &stores,
+        &oplog,
+        &notify,
+        if (reader) |*r| r else null,
+        if (mirror) |*m| m else null,
+        .{
+            .clock_fn = &realClock,
+            .max_payload_size = config.max_payload_size,
+            .promote_interval_ns = config.promote_interval_ns,
+            .reclaim_interval_ns = config.reclaim_interval_ns,
+            .unique_interval_ns = config.unique_interval_ns,
+            .rate_limit_interval_ns = config.rate_limit_interval_ns,
+            .expire_interval_ns = config.expire_interval_ns,
+            .purge_interval_ns = config.purge_interval_ns,
+            .repl_hook = repl_hook,
+            .sync_replication = config.sync_replication,
+        },
+    );
+    defer pipeline.destroyHeap();
+
+    // Wire cluster ack notification to pipeline's atomic + oplog for retry.
+    if (cluster_mode) {
+        cluster_mod.g_ack_seq_ptr = pipeline.ackSeqPtr();
+        cluster_node.?.oplog = &oplog;
     }
-    try server.start();
-    defer server.stop();
 
-    // --- Binary RPC Server ---
-    const rpc_config = rpc_mod.RpcConfig{
-        .bind_address = bind,
-        .port = rpc_port,
-    };
-
-    var rpc_server: ?rpc_mod.RpcServer = null;
-    var rpc_uring_server: ?*rpc_uring_mod.IoUringRpcServer = null;
-
-    if (use_io_uring) {
-        const s = try rpc_uring_mod.IoUringRpcServer.create(allocator, &store, rpc_config);
-        try s.start();
-        rpc_uring_server = s;
-        std.debug.print("corvo: listening http={s}:{d} rpc={s}:{d} (io_uring)\n", .{ bind, port, bind, rpc_port });
-    } else {
-        rpc_server = rpc_mod.RpcServer.init(allocator, &store, rpc_config);
-        try rpc_server.?.start();
-        std.debug.print("corvo: listening http={s}:{d} rpc={s}:{d}\n", .{ bind, port, bind, rpc_port });
-    }
-    defer if (rpc_server) |*s| s.stop();
-    defer if (rpc_uring_server) |s| s.stop();
-
-    // --- Set up signal handling ---
-    g_server = &server;
-
+    // --- Signal handling ---
     const sa = std.posix.Sigaction{
         .handler = .{ .handler = handleSignal },
         .mask = std.posix.sigemptyset(),
@@ -412,56 +423,27 @@ pub fn main() !void {
     std.posix.sigaction(std.posix.SIG.INT, &sa, null);
     std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
 
-    // --- Wait for signal ---
-    while (running.load(.monotonic)) {
-        std.Thread.sleep(1_000_000_000); // 1s
-    }
-
-    std.debug.print("\ncorvo: received signal, shutting down gracefully (timeout={d}s)...\n", .{shutdown_timeout_s});
-
-    // Spawn a watchdog thread that force-exits after the timeout.
-    const timeout_ns: u64 = @as(u64, shutdown_timeout_s) * 1_000_000_000;
-    const watchdog = std.Thread.spawn(.{}, struct {
-        fn run(ns: u64) void {
-            std.Thread.sleep(ns);
-            std.debug.print("corvo: shutdown timeout exceeded, forcing exit\n", .{});
-            std.process.exit(1);
-        }
-    }.run, .{timeout_ns}) catch null;
-    if (watchdog) |w| w.detach();
-
-    // Stop accepting new connections and close active ones.
-    server.stop();
-    std.debug.print("corvo: http server stopped\n", .{});
-
-    // Stop RPC servers.
-    if (rpc_server) |*s| {
-        s.stop();
-        rpc_server = null;
-    }
-    if (rpc_uring_server) |s| {
-        s.stop();
-        rpc_uring_server = null;
-    }
-
-    // Stop scheduler (no more maintenance/cron ticks).
-    sched.stop();
-
-    // Flush mirror to ensure all pending writes are committed.
-    if (mirror) |*m| {
-        m.stop();
-        std.debug.print("corvo: mirror flushed\n", .{});
-    }
-
-    // Stop engine pipeline (drains in-flight batches).
-    engine.stopPipeline();
-    std.debug.print("corvo: pipeline drained\n", .{});
-
-    // Stop cluster node if running.
+    // Wait for leader election if in cluster mode.
     if (cluster_node) |*cn| {
-        cn.deinit();
-        cluster_node = null;
+        std.debug.print("corvo: waiting for leader election...\n", .{});
+        if (!cn.waitForLeader(30000)) {
+            std.debug.print("corvo: leader election timed out\n", .{});
+            return;
+        }
+        const state = cn.election.currentState();
+        std.debug.print("corvo: leader elected (epoch={d}, leader={s})\n", .{
+            state.epoch, if (state.leader_id.len > 0) state.leader_id else "(self)",
+        });
     }
 
-    std.debug.print("corvo: shutdown complete\n", .{});
+    std.debug.print("corvo: listening on {s}:{d} (rpc+http)\n", .{ config.bind, config.port });
+
+    // --- Tick loop ---
+    while (running.load(.monotonic)) {
+        pipeline.tick();
+    }
+
+    std.debug.print("\ncorvo: shutting down ({d} ticks, {d} ops)\n", .{
+        pipeline.ticks_total, pipeline.applied_total,
+    });
 }

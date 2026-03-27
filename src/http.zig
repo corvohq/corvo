@@ -1,4 +1,4 @@
-//! HTTP protocol module — parse, route, encode/decode for pipeline_v2.
+//! HTTP protocol module — parse, route, encode/decode for pipeline.
 //!
 //! Pure functions. No IO, no state. Pipeline calls these.
 //! Owns all HTTP protocol details — pipeline stays protocol-ignorant.

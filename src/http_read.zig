@@ -62,7 +62,7 @@ pub fn dispatch(
     if (std.mem.eql(u8, api, "/metrics/throughput"))
         return http.writeResponse(send_buf, 200, "{\"enqueued\":0,\"completed\":0,\"failed\":0}");
     if (std.mem.eql(u8, api, "/events"))
-        return http.writeResponse(send_buf, 200, "{\"error\":\"SSE not yet supported on pipeline_v2\"}");
+        return http.writeResponse(send_buf, 200, "{\"error\":\"SSE not yet supported\"}");
 
     return writeError(send_buf, 404, "not found");
 }

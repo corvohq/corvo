@@ -25,7 +25,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates libsqlite3-0 && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /app/zig-out/bin/corvo-v2 /usr/local/bin/corvo-v2
+COPY --from=build /app/zig-out/bin/corvo /usr/local/bin/corvo
 COPY --from=build /app/zig-out/bin/corvo-inspect /usr/local/bin/corvo-inspect
 
 RUN mkdir -p /data
@@ -33,5 +33,5 @@ VOLUME /data
 
 EXPOSE 9878
 
-ENTRYPOINT ["corvo-v2"]
+ENTRYPOINT ["corvo"]
 CMD ["--data-dir", "/data", "--bind", "0.0.0.0"]

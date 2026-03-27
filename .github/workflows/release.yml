@@ -54,7 +54,7 @@ jobs:
       - name: Package binaries
         run: |
           mkdir -p dist
-          cp zig-out/bin/corvo-v2 dist/
+          cp zig-out/bin/corvo dist/
           cp zig-out/bin/corvo-inspect dist/
           chmod +x dist/*
           tar czf ${{ matrix.artifact }}.tar.gz -C dist .
