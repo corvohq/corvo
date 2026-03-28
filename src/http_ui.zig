@@ -25,6 +25,7 @@ const max_table_rows = 25;
 /// Comptime-parsed Mustache templates.
 const layout_tmpl = zigstache.Template.parse(ui_embed.layout_html) catch unreachable;
 const dashboard_tmpl = zigstache.Template.parse(ui_embed.dashboard_html) catch unreachable;
+const dashboard_stats_tmpl = zigstache.Template.parse(ui_embed.dashboard_stats_html) catch unreachable;
 const queues_tmpl = zigstache.Template.parse(ui_embed.queues_html) catch unreachable;
 const queues_table_tmpl = zigstache.Template.parse(ui_embed.queues_table_html) catch unreachable;
 const queue_detail_tmpl = zigstache.Template.parse(ui_embed.queue_detail_html) catch unreachable;
@@ -75,13 +76,49 @@ fn renderPage(send_buf: []u8, title: []const u8, content: []const u8) u32 {
 // ============================================================================
 
 fn dashboard(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    var stats_buf: [page_buf_size]u8 = undefined;
-    var hw = html.HtmlWriter.init(&stats_buf);
-    writeDashboardStats(&hw, reader);
+    var queue_buf: [64]sqlite_read.QueueStats = undefined;
+    var queue_views: [64]QueueView = undefined;
+    var bar_buf: [64]BarView = undefined;
+    var job_buf: [10]sqlite_read.JobRow = undefined;
+    var failure_views: [10]FailureView = undefined;
+
+    const has_data = reader != null;
+    const queues = getQueueViews(reader, &queue_buf, &queue_views);
+
+    var total_pending: i64 = 0;
+    var total_active: i64 = 0;
+    var total_dead: i64 = 0;
+    for (queue_buf[0..queues.len]) |q| {
+        total_pending += q.pending;
+        total_active += q.active;
+        total_dead += q.dead;
+    }
+    const worker_count: i32 = if (reader) |rdr| rdr.countWorkers() catch 0 else 0;
+    const bars = if (queues.len > 0) buildBarViews(queue_buf[0..queues.len], &bar_buf) else bar_buf[0..0];
+    const failures = if (reader) |rdr| getFailureViews(rdr, &job_buf, &failure_views) else failure_views[0..0];
+
+    const data = .{
+        .has_data = has_data,
+        .total_pending = total_pending,
+        .total_active = total_active,
+        .total_dead = total_dead,
+        .queue_count = @as(i64, @intCast(queues.len)),
+        .worker_count = worker_count,
+        .has_bars = queues.len > 0,
+        .chart_w = @as(u32, 600),
+        .chart_total_h = @as(u32, 190),
+        .bars = bars,
+        .has_failures = failures.len > 0,
+        .failures = failures,
+        .has_queues = queues.len > 0,
+        .queues = queues,
+    };
 
     var content_buf: [page_buf_size]u8 = undefined;
-    const content = dashboard_tmpl.render(&content_buf, .{ .stats = hw.getWritten() }) catch
-        return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
+    const content = dashboard_tmpl.renderWithPartials(&content_buf, data, .{
+        .stats = &dashboard_stats_tmpl,
+        .queues_table = &queues_table_tmpl,
+    }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Dashboard", content);
 }
 
@@ -427,10 +464,46 @@ fn clusterPage(send_buf: []u8, _: ?*sqlite_read.Reader) u32 {
 // ============================================================================
 
 fn dashboardStatsPartial(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
+    var queue_buf: [64]sqlite_read.QueueStats = undefined;
+    var queue_views: [64]QueueView = undefined;
+    var bar_buf: [64]BarView = undefined;
+    var job_buf: [10]sqlite_read.JobRow = undefined;
+    var failure_views: [10]FailureView = undefined;
+
+    const has_data = reader != null;
+    const queues = getQueueViews(reader, &queue_buf, &queue_views);
+
+    var total_pending: i64 = 0;
+    var total_active: i64 = 0;
+    var total_dead: i64 = 0;
+    for (queue_buf[0..queues.len]) |q| {
+        total_pending += q.pending;
+        total_active += q.active;
+        total_dead += q.dead;
+    }
+    const worker_count: i32 = if (reader) |rdr| rdr.countWorkers() catch 0 else 0;
+    const bars = if (queues.len > 0) buildBarViews(queue_buf[0..queues.len], &bar_buf) else bar_buf[0..0];
+    const failures = if (reader) |rdr| getFailureViews(rdr, &job_buf, &failure_views) else failure_views[0..0];
+
     var buf: [page_buf_size]u8 = undefined;
-    var hw = html.HtmlWriter.init(&buf);
-    writeDashboardStats(&hw, reader);
-    return http.writeResponseHtml(send_buf, 200, hw.getWritten());
+    const result = dashboard_stats_tmpl.renderWithPartials(&buf, .{
+        .has_data = has_data,
+        .total_pending = total_pending,
+        .total_active = total_active,
+        .total_dead = total_dead,
+        .queue_count = @as(i64, @intCast(queues.len)),
+        .worker_count = worker_count,
+        .has_bars = queues.len > 0,
+        .chart_w = @as(u32, 600),
+        .chart_total_h = @as(u32, 190),
+        .bars = bars,
+        .has_failures = failures.len > 0,
+        .failures = failures,
+        .has_queues = queues.len > 0,
+        .queues = queues,
+    }, .{ .queues_table = &queues_table_tmpl }) catch
+        return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
+    return http.writeResponseHtml(send_buf, 200, result);
 }
 
 fn queuesTablePartial(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
@@ -452,6 +525,29 @@ fn enqueueFormPartial(send_buf: []u8) u32 {
 // ============================================================================
 // View Structs + Data Builders
 // ============================================================================
+
+const BarView = struct {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    label_x: u32,
+    label_y: u32,
+    value_x: u32,
+    value_y: u32,
+    name: []const u8,
+    total: i64,
+    has_value: bool,
+};
+
+const FailureView = struct {
+    id: []const u8,
+    queue: []const u8,
+    priority: i32,
+    attempt: i32,
+    max_retries: i32,
+    created_at: []const u8,
+};
 
 const QueueView = struct {
     name: []const u8,
@@ -480,6 +576,55 @@ fn getQueueViews(reader: ?*sqlite_read.Reader, queue_buf: *[64]sqlite_read.Queue
             .scheduled = q.scheduled,
             .held = q.held,
             .paused = q.paused,
+        };
+    }
+    return views[0..count];
+}
+
+fn buildBarViews(queues: []const sqlite_read.QueueStats, bars: *[64]BarView) []const BarView {
+    const chart_h: u32 = 160;
+    const bar_gap: u32 = 4;
+    const n: u32 = @intCast(queues.len);
+    const bar_w: u32 = @min((600 -| (n -| 1) * bar_gap) / @max(n, 1), 60);
+
+    var max_val: i64 = 1;
+    for (queues) |q| {
+        const total = q.pending + q.active + q.retrying;
+        if (total > max_val) max_val = total;
+    }
+
+    for (queues, 0..) |q, i| {
+        const total: i64 = q.pending + q.active + q.retrying;
+        const bar_h: u32 = @intCast(@max(@divTrunc(total * chart_h, max_val), 0));
+        const x: u32 = @as(u32, @intCast(i)) * (bar_w + bar_gap);
+        bars[i] = .{
+            .x = x,
+            .y = chart_h - bar_h,
+            .w = bar_w,
+            .h = bar_h,
+            .label_x = x + bar_w / 2,
+            .label_y = chart_h + 16,
+            .value_x = x + bar_w / 2,
+            .value_y = (chart_h - bar_h) -| 4,
+            .name = q.nameSlice(),
+            .total = total,
+            .has_value = total > 0,
+        };
+    }
+    return bars[0..n];
+}
+
+fn getFailureViews(reader: *sqlite_read.Reader, job_buf: *[10]sqlite_read.JobRow, views: *[10]FailureView) []const FailureView {
+    const count = reader.queryJobsByQueueState(null, "dead", 10, 0, job_buf) catch return views[0..0];
+    for (0..count) |i| {
+        const j = &job_buf[i];
+        views[i] = .{
+            .id = j.idSlice(),
+            .queue = j.queueSlice(),
+            .priority = j.priority,
+            .attempt = j.attempt,
+            .max_retries = j.max_retries,
+            .created_at = j.createdAtSlice(),
         };
     }
     return views[0..count];

@@ -1,0 +1,76 @@
+{{#has_data}}
+<div class="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
+    <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Total Pending</div>
+    <div class="mt-2 text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">{{total_pending}}</div>
+  </div>
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
+    <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Active</div>
+    <div class="mt-2 text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">{{total_active}}</div>
+  </div>
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
+    <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Dead</div>
+    <div class="mt-2 text-2xl font-semibold tracking-tight text-red-600 dark:text-red-400">{{total_dead}}</div>
+  </div>
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
+    <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Queues</div>
+    <div class="mt-2 text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">{{queue_count}}</div>
+  </div>
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
+    <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Workers</div>
+    <div class="mt-2 text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">{{worker_count}}</div>
+  </div>
+</div>
+{{#has_bars}}
+<div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6 mb-6">
+  <svg width="{{chart_w}}" height="{{chart_total_h}}" class="w-full" viewBox="0 0 {{chart_w}} {{chart_total_h}}">
+    {{#bars}}
+    <rect x="{{x}}" y="{{y}}" width="{{w}}" height="{{h}}" class="fill-indigo-500" rx="2"/>
+    <text x="{{label_x}}" y="{{label_y}}" text-anchor="middle" font-size="12" class="fill-zinc-500 dark:fill-zinc-400">{{name}}</text>
+    {{#has_value}}<text x="{{value_x}}" y="{{value_y}}" text-anchor="middle" font-size="12" class="fill-zinc-700 dark:fill-zinc-300" font-weight="500">{{total}}</text>{{/has_value}}
+    {{/bars}}
+  </svg>
+</div>
+{{/has_bars}}
+{{#has_failures}}
+<div class="mb-6">
+  <h2 class="text-lg font-semibold tracking-tight text-zinc-900 dark:text-zinc-100 mb-3">Recent Failures</h2>
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm overflow-x-auto">
+  <table class="w-full text-sm">
+  <thead>
+  <tr class="border-b border-zinc-200 dark:border-zinc-800">
+    <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">ID</th>
+    <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Queue</th>
+    <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Priority</th>
+    <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Attempt</th>
+    <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Created</th>
+    <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Actions</th>
+  </tr>
+  </thead>
+  <tbody class="divide-y divide-zinc-100 dark:divide-zinc-800">
+  {{#failures}}
+  <tr class="hover:bg-zinc-50 dark:hover:bg-zinc-800">
+    <td class="px-6 py-3 font-mono text-xs"><a href="/ui/jobs/{{id}}" class="text-indigo-600 dark:text-indigo-400 hover:underline">{{id}}</a></td>
+    <td class="px-6 py-3 text-zinc-700 dark:text-zinc-300">{{queue}}</td>
+    <td class="px-6 py-3 text-zinc-700 dark:text-zinc-300">{{priority}}</td>
+    <td class="px-6 py-3 text-zinc-700 dark:text-zinc-300">{{attempt}}/{{max_retries}}</td>
+    <td class="px-6 py-3 text-zinc-700 dark:text-zinc-300"><time data-ts="{{created_at}}">{{created_at}}</time></td>
+    <td class="px-6 py-3"><div class="flex gap-1">
+      <button hx-post="/api/v1/jobs/{{id}}/retry" hx-swap="none" class="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-800">Retry</button>
+      <button hx-post="/api/v1/jobs/{{id}}/delete" hx-swap="none" class="text-xs font-medium text-red-600 dark:text-red-400 hover:text-red-800">Delete</button>
+    </div></td>
+  </tr>
+  {{/failures}}
+  </tbody>
+  </table>
+  </div>
+</div>
+{{/has_failures}}
+{{#has_queues}}
+<h2 class="text-lg font-semibold tracking-tight text-zinc-900 dark:text-zinc-100 mb-3">Queues</h2>
+{{> queues_table}}
+{{/has_queues}}
+{{/has_data}}
+{{^has_data}}
+<p class="text-zinc-500 dark:text-zinc-400">Waiting for data...</p>
+{{/has_data}}
