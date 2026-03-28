@@ -167,6 +167,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             rate_limit_interval_ns: u64 = 0,
             expire_interval_ns: u64 = 0,
             purge_interval_ns: u64 = 0,
+            purge_threshold: u32 = 0, // 0 = disabled; trigger purge when dead_since_purge exceeds this
             repl_hook: ?ReplHook = null,
             sync_replication: bool = false,
             /// Adaptive batch coalescing window for sync replication (nanoseconds).
@@ -647,7 +648,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 .{ .ns = self.config.purge_interval_ns, .last = &self.last_purge_ns, .action = .purge },
             };
 
-            var any_due = false;
+            // Count-based purge trigger: fire purge early when terminal job count exceeds threshold.
+            const purge_threshold = self.config.purge_threshold;
+            const threshold_purge_due = purge_threshold > 0 and self.handler.dead_since_purge >= purge_threshold;
+
+            var any_due = threshold_purge_due;
             for (intervals) |iv| {
                 if (iv.ns > 0 and now_ns - iv.last.* >= iv.ns) {
                     any_due = true;
@@ -681,6 +686,20 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 }
 
                 iv.last.* = now_ns;
+                self.maintenance_runs += 1;
+                self.applied_total += 1;
+
+                // Reset counter when purge fires via timer.
+                if (iv.action == .purge) self.handler.dead_since_purge = 0;
+            }
+
+            // Threshold-triggered purge (fires even if timer hasn't elapsed).
+            if (threshold_purge_due and now_ns - self.last_purge_ns < self.config.purge_interval_ns) {
+                const op_data = ops_mod.OpData{ .maintenance = .{ .action = .purge, .now_ns = now_ns, .cutoff_ns = now_ns } };
+                const result = self.handler.apply(&batch, .maintenance, &op_data);
+                self.emitMirrorOp(.maintenance, &op_data, &result);
+                self.last_purge_ns = now_ns;
+                self.handler.dead_since_purge = 0;
                 self.maintenance_runs += 1;
                 self.applied_total += 1;
             }

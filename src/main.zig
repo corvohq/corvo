@@ -75,11 +75,8 @@ fn parsePeers(spec: []const u8, ids_out: *[max_peers][]const u8, addrs_out: *[ma
         const port_str = host_port[colon_pos + 1 ..];
         const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPeerSpec;
 
-        // Cluster transport bind port = server port + 1000 (convention).
-        const cluster_port = port + 1000;
-
         ids_out[count] = id;
-        addrs_out[count] = try std.net.Address.parseIp(host, cluster_port);
+        addrs_out[count] = try std.net.Address.parseIp(host, port);
         count += 1;
     }
 
@@ -107,7 +104,8 @@ fn printHelp() void {
         \\  --max-queues <n>          Max queues (default: 100)
         \\  --max-tags-per-queue <n>  Max fairness tags per queue (default: 1000)
         \\  --node-id <id>            Node ID (enables cluster mode)
-        \\  --peers <spec>            Peers: id@host:port,id@host:port,...
+        \\  --peers <spec>            Peers: id@host:cluster_port,...
+        \\  --cluster-port <port>     Local cluster transport port (default: server port + 1000)
         \\  --sync-repl               Enable sync replication
         \\  --help                    Show this help
         \\
@@ -224,6 +222,15 @@ pub fn main() !void {
             };
         } else if (std.mem.eql(u8, arg, "--sync-repl")) {
             config.sync_replication = true;
+        } else if (std.mem.eql(u8, arg, "--cluster-port")) {
+            const val = args.next() orelse {
+                std.debug.print("--cluster-port requires an argument\n", .{});
+                return;
+            };
+            config.cluster_port = std.fmt.parseInt(u16, val, 10) catch {
+                std.debug.print("invalid cluster-port: {s}\n", .{val});
+                return;
+            };
         } else if (std.mem.eql(u8, arg, "--max-payload-size")) {
             const val = args.next() orelse {
                 std.debug.print("--max-payload-size requires an argument\n", .{});
@@ -341,8 +348,7 @@ pub fn main() !void {
             return;
         };
 
-        // Cluster transport binds on server port + 1000.
-        const cluster_port: u16 = config.port + 1000;
+        const cluster_port = config.resolvedClusterPort();
         const cluster_bind_addr = try std.net.Address.parseIp(config.bind, cluster_port);
 
         cluster_node = cluster_mod.ClusterNode.init(allocator, &stores, .{
@@ -403,6 +409,7 @@ pub fn main() !void {
             .rate_limit_interval_ns = config.rate_limit_interval_ns,
             .expire_interval_ns = config.expire_interval_ns,
             .purge_interval_ns = config.purge_interval_ns,
+            .purge_threshold = config.purge_threshold,
             .repl_hook = repl_hook,
             .sync_replication = config.sync_replication,
             .coalesce_window_ns = if (config.sync_replication) 200_000 else 0,

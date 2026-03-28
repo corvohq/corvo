@@ -197,6 +197,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 job.lease_expires_at_ns = 0;
                 var dk_buf: keys.KeyBuf = undefined;
                 b.set(keys.deadKey(&dk_buf, op.now_ns, job_id), "");
+                self.dead_since_purge += 1;
                 self.recordBulkResult(job_id, .update_state, "cancelled", "", op.now_ns);
             },
 
@@ -306,6 +307,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 job.failed_at_ns = op.now_ns;
                 var dk_buf: keys.KeyBuf = undefined;
                 b.set(keys.deadKey(&dk_buf, op.now_ns, job_id), "");
+                self.dead_since_purge += 1;
                 // Write job error KV entry for rejected jobs.
                 {
                     var ek_buf: keys.KeyBuf = undefined;

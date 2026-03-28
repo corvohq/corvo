@@ -25,6 +25,7 @@ pub const ServerConfig = struct {
     // Cluster identity (node-local)
     node_id: []const u8 = "",
     peers: []const u8 = "",
+    cluster_port: u16 = 0, // 0 = server port + 1000
 
     // ================================================================
     // Shared settings (included in cluster hash — must match across nodes)
@@ -41,6 +42,7 @@ pub const ServerConfig = struct {
     rate_limit_interval_ns: u64 = 30_000_000_000,
     expire_interval_ns: u64 = 10_000_000_000,
     purge_interval_ns: u64 = 3_600_000_000_000,
+    purge_threshold: u32 = 10_000, // 0 = disabled; purge early when terminal job count exceeds this
 
     sync_replication: bool = false,
 
@@ -50,6 +52,11 @@ pub const ServerConfig = struct {
 
     pub fn clusterMode(self: *const ServerConfig) bool {
         return self.node_id.len > 0;
+    }
+
+    /// Resolved cluster port: explicit value or server port + 1000.
+    pub fn resolvedClusterPort(self: *const ServerConfig) u16 {
+        return if (self.cluster_port > 0) self.cluster_port else self.port +| 1000;
     }
 
     // ================================================================
@@ -69,6 +76,7 @@ pub const ServerConfig = struct {
         h = fnvU64(h, self.rate_limit_interval_ns);
         h = fnvU64(h, self.expire_interval_ns);
         h = fnvU64(h, self.purge_interval_ns);
+        h = fnvU32(h, self.purge_threshold);
         h = fnvByte(h, @intFromBool(self.sync_replication));
         return h;
     }
@@ -156,12 +164,16 @@ pub const ServerConfig = struct {
             self.expire_interval_ns = parseInt(u64, val) orelse return error.InvalidValue;
         } else if (eql(key, "purge-interval")) {
             self.purge_interval_ns = parseInt(u64, val) orelse return error.InvalidValue;
+        } else if (eql(key, "purge-threshold")) {
+            self.purge_threshold = parseInt(u32, val) orelse return error.InvalidValue;
         } else if (eql(key, "sync-replication")) {
             self.sync_replication = parseBool(val) orelse return error.InvalidValue;
         } else if (eql(key, "node-id")) {
             self.node_id = val;
         } else if (eql(key, "peers")) {
             self.peers = val;
+        } else if (eql(key, "cluster-port")) {
+            self.cluster_port = parseInt(u16, val) orelse return error.InvalidValue;
         } else {
             return error.UnknownKey;
         }

@@ -11,8 +11,8 @@
 - [ ] SSE streaming (`/events`) — pipeline-level connection tracking, push events to subscribers (currently returns error stub)
 - [ ] Throughput metrics (`/metrics/throughput`) — ring buffer for ops/sec (currently returns zeroes)
 - [ ] Cluster events (`/cluster/events`) — real event stream (currently returns empty array)
-- [ ] Purge: limit-based trigger — purge when completed count exceeds threshold, not just hourly timer
-- [ ] Explicit `--cluster-port` flag — implicit +1000 is a footgun for sysadmins
+- [x] Purge: limit-based trigger — `purge_threshold` config (default 10k); handler tracks `dead_since_purge`, pipeline triggers early purge when exceeded
+- [x] Explicit `--cluster-port` flag — overrides default (server port + 1000); peer spec port is now the cluster transport port directly
 
 ## bench-rpc
 

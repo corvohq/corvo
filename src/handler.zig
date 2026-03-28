@@ -55,6 +55,11 @@ pub const OpHandler = struct {
     /// Allocator for handler-owned state (maps, etc).
     allocator: Allocator,
 
+    /// Terminal jobs created since last purge. Incremented when a d| key
+    /// is written (ack/fail/reclaim/expire/bulk). Pipeline uses this to
+    /// trigger purge early when count exceeds purge_threshold.
+    dead_since_purge: u32 = 0,
+
     // Explicit resource limits (TigerStyle: all collections must have bounds).
     max_queues: u32 = 100,
     max_tags_per_queue: u32 = 1000,

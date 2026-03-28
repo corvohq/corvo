@@ -56,6 +56,7 @@ pub fn applyAck(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.AckOp) ops.O
             job.completed_at_ns = op.now_ns;
             var dk_buf: keys.KeyBuf = undefined;
             b.set(keys.deadKey(&dk_buf, op.now_ns, job.id), "");
+            self.dead_since_purge += 1;
 
             if (job.expire_after_ms > 0 and job.expire_at_ns > 0) {
                 var xk_buf: keys.KeyBuf = undefined;
