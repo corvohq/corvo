@@ -1,6 +1,10 @@
 /** @type {import('tailwindcss').Config} */
 module.exports = {
-  content: ["./src/http_ui.zig"],
+  darkMode: 'class',
+  content: [
+    "./src/http_ui.zig",
+    "./ui/templates/**/*.html",
+  ],
   theme: {
     extend: {},
   },

@@ -7,8 +7,9 @@
   <link rel="icon" href="/ui/favicon.svg">
   <link rel="stylesheet" href="/ui/tailwind.css">
   <script src="/ui/htmx.min.js"></script>
+  <script>if(localStorage.getItem('theme')==='dark'||(localStorage.getItem('theme')===null&&matchMedia('(prefers-color-scheme:dark)').matches))document.documentElement.classList.add('dark')</script>
 </head>
-<body class="bg-zinc-50 text-zinc-900 min-h-screen">
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 min-h-screen">
 
 <div id="toast" class="fixed top-4 right-4 z-50"></div>
 
@@ -58,13 +59,20 @@
 <div class="max-w-7xl mx-auto">
   <div class="flex items-center justify-between mb-6">
     <div class="flex items-center gap-3">
-      <button class="md:hidden p-1 text-zinc-600" onclick="document.getElementById('mobile-sidebar').classList.remove('hidden')">
+      <button class="md:hidden p-1 text-zinc-600 dark:text-zinc-400" onclick="document.getElementById('mobile-sidebar').classList.remove('hidden')">
         <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
       </button>
-      <h1 class="text-xl md:text-2xl font-bold tracking-tight text-zinc-900">{{title}}</h1>
+      <h1 class="text-xl md:text-2xl font-bold tracking-tight text-zinc-900 dark:text-zinc-100">{{title}}</h1>
     </div>
-    <button hx-get="/ui/partials/enqueue-form" hx-target="#modal" hx-swap="innerHTML"
-      class="bg-zinc-900 text-white hover:bg-zinc-800 rounded-md px-3 py-1.5 md:px-4 md:py-2 text-xs md:text-sm font-medium">Enqueue</button>
+    <div class="flex items-center gap-2">
+      <button onclick="document.documentElement.classList.toggle('dark');localStorage.setItem('theme',document.documentElement.classList.contains('dark')?'dark':'light')"
+        class="p-2 rounded-md text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800">
+        <svg class="w-5 h-5 dark:hidden" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
+        <svg class="w-5 h-5 hidden dark:block" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+      </button>
+      <button hx-get="/ui/partials/enqueue-form" hx-target="#modal" hx-swap="innerHTML"
+        class="bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:bg-zinc-800 dark:hover:bg-zinc-200 rounded-md px-3 py-1.5 md:px-4 md:py-2 text-xs md:text-sm font-medium">Enqueue</button>
+    </div>
   </div>
   <div id="modal"></div>
 {{{content}}}
