@@ -11,8 +11,8 @@ const sqlite_read = @import("sqlite_read.zig");
 const ui_embed = @import("ui_embed");
 
 /// Max HTML body size. Pages render into a buffer of this size.
-/// With HTTP headers (~200 bytes), total response stays under 33KB.
-const page_buf_size = 32768;
+/// Mustache templates with dark mode classes need more space than HtmlWriter.
+const page_buf_size = 49152;
 
 /// Layout-expanded page buffer. Must fit layout template + page content + HTTP headers
 /// within send_buf (~66KB). Layout is ~4KB, headers ~200B.
@@ -689,8 +689,8 @@ fn buildBarViews(queues: []const sqlite_read.QueueStats, bars: *[64]BarView) []c
         if (total > max_val) max_val = total;
     }
 
-    for (queues, 0..) |q, i| {
-        const total: i64 = q.pending + q.active + q.retrying;
+    for (0..queues.len) |i| {
+        const total: i64 = queues[i].pending + queues[i].active + queues[i].retrying;
         const bar_h: u32 = @intCast(@max(@divTrunc(total * chart_h, max_val), 0));
         const x: u32 = @as(u32, @intCast(i)) * (bar_w + bar_gap);
         bars[i] = .{
@@ -702,7 +702,7 @@ fn buildBarViews(queues: []const sqlite_read.QueueStats, bars: *[64]BarView) []c
             .label_y = chart_h + 16,
             .value_x = x + bar_w / 2,
             .value_y = (chart_h - bar_h) -| 4,
-            .name = q.nameSlice(),
+            .name = queues[i].nameSlice(),
             .total = total,
             .has_value = total > 0,
         };
