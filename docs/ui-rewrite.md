@@ -91,12 +91,12 @@ ui/favicon.svg            — existing favicon
 
 ### Bundle size comparison
 
-| Asset         | React SPA | HTMX rewrite |
-|---------------|-----------|--------------|
-| JS            | 890 KB    | ~14 KB       |
-| CSS           | 41 KB     | ~41 KB       |
-| Total         | 931 KB    | ~55 KB       |
-| Fits send_buf | No        | Yes          |
+| Asset         | React SPA | HTMX rewrite | HTMX gzipped |
+|---------------|-----------|--------------|--------------|
+| JS            | 890 KB    | 51 KB        | 16 KB        |
+| CSS           | 41 KB     | 13 KB        | 3.4 KB       |
+| Total         | 931 KB    | 64 KB        | 19.4 KB      |
+| Fits send_buf | No        | Yes          | Yes          |
 
 ### What stays
 
@@ -115,15 +115,34 @@ ui/favicon.svg            — existing favicon
 
 ## Implementation order
 
-1. Create html_writer.zig (buffer-based HTML builder)
-2. Download htmx.min.js, pre-build tailwind.css, update ui_embed.zig
-3. Build layout/shell (sidebar nav, page template)
-4. Dashboard page (stats + SVG chart)
-5. Queues list + queue detail with actions
-6. Dead letter / held / scheduled pages
-7. Job detail page with actions
-8. Workers + cluster pages
-9. Enqueue dialog (modal form via hx-get fragment)
-10. Bulk actions (select + action bar)
-11. Update Playwright tests
-12. Delete React UI
+### Done (2026-03-27)
+
+1. ~~Create html_writer.zig (buffer-based HTML builder)~~
+2. ~~Download htmx.min.js, pre-build tailwind.css, update ui_embed.zig~~
+3. ~~Build layout/shell (sidebar nav, page template)~~
+4. ~~Dashboard page (stats + SVG bar chart)~~
+5. ~~Queues list + queue detail with basic actions~~
+6. ~~Dead letter / held / scheduled pages with row actions~~
+7. ~~Job detail page with retry/cancel/delete~~
+8. ~~Workers + cluster pages~~
+9. ~~Enqueue dialog (basic: queue + payload)~~
+10. ~~Bulk actions (select-all + action bar)~~
+11. ~~Update Playwright tests~~
+12. ~~Delete React UI (80+ files, no more npm/node_modules)~~
+13. ~~Pre-gzip static assets (htmx 16KB, tailwind 3.4KB gzipped)~~
+14. ~~Match React color scheme (white sidebar, indigo active, clean cards)~~
+
+### Remaining
+
+15. Queue detail: stats bar (pending/active/dead/completed counts), filter tabs
+    (pending/completed/retrying/dead/scheduled/held), search bar
+16. Job detail: metadata grid (2-column layout), payload with copy button,
+    timeline section, state/priority tabs
+17. Enqueue dialog: add priority, max retries, scheduled at, unique key fields
+18. Pagination on all job tables (currently capped at 25 rows)
+19. Date formatting: relative timestamps ("1m ago") instead of raw ISO strings
+20. Job search/filters: search bar + state/queue filter dropdowns
+    (check git history for full filter set from React UI)
+21. Throughput chart: time-series line chart (enqueued/completed/failed) —
+    requires wiring up metrics/throughput endpoint with real data
+22. Export: JSON/CSV export buttons on job tables
