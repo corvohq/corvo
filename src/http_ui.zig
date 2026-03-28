@@ -203,7 +203,7 @@ fn jobDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, job_id: []const u
 
     // Details table.
     hw.open("div");
-    hw.attr("class", "bg-white border border-gray-200 rounded-lg overflow-hidden");
+    hw.attr("class", "bg-white border border-gray-200 rounded-lg overflow-x-auto");
     hw.open("table");
     hw.attr("class", "w-full text-sm");
     hw.open("tbody");
@@ -266,7 +266,7 @@ fn workersPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
         hw.close("p");
     } else {
         hw.open("div");
-        hw.attr("class", "bg-white border border-gray-200 rounded-lg overflow-hidden");
+        hw.attr("class", "bg-white border border-gray-200 rounded-lg overflow-x-auto");
         hw.open("table");
         hw.attr("class", "w-full text-sm");
         hw.open("thead");
@@ -308,7 +308,7 @@ fn clusterPage(send_buf: []u8, _: ?*sqlite_read.Reader) u32 {
     layoutStart(&hw, "Cluster", "/cluster");
 
     hw.open("div");
-    hw.attr("class", "bg-white border border-gray-200 rounded-lg overflow-hidden");
+    hw.attr("class", "bg-white border border-gray-200 rounded-lg overflow-x-auto");
 
     // Status header.
     hw.open("div");
@@ -482,29 +482,52 @@ fn layoutStart(hw: *html.HtmlWriter, title: []const u8, current_path: []const u8
     hw.attr("class", "fixed top-4 right-4 z-50");
     hw.close("div");
 
-    // Sidebar.
+    // Sidebar (hidden on mobile, shown on md+).
     writeSidebar(hw, current_path);
+
+    // Mobile sidebar overlay (hidden by default).
+    hw.open("div");
+    hw.attr("id", "mobile-sidebar");
+    hw.attr("class", "fixed inset-0 z-40 hidden");
+    hw.open("div");
+    hw.attr("class", "fixed inset-0 bg-black bg-opacity-50");
+    hw.attr("onclick", "document.getElementById('mobile-sidebar').classList.add('hidden')");
+    hw.close("div");
+    hw.open("div");
+    hw.attr("class", "fixed inset-y-0 left-0 w-56 bg-white border-r border-gray-200 flex flex-col z-50");
+    writeSidebarContent(hw, current_path);
+    hw.close("div");
+    hw.close("div");
 
     // Main content area.
     hw.open("main");
-    hw.attr("class", "flex-1 p-6");
+    hw.attr("class", "flex-1 p-4 md:p-6 min-w-0");
 
     hw.open("div");
     hw.attr("class", "max-w-7xl mx-auto");
 
-    // Page header with enqueue button.
+    // Page header: hamburger (mobile) + title + enqueue button.
     hw.open("div");
     hw.attr("class", "flex items-center justify-between mb-6");
+    hw.open("div");
+    hw.attr("class", "flex items-center gap-3");
+    // Hamburger button (mobile only).
+    hw.open("button");
+    hw.attr("class", "md:hidden p-1 text-gray-600");
+    hw.attr("onclick", "document.getElementById('mobile-sidebar').classList.remove('hidden')");
+    hw.raw("<svg class=\"w-6 h-6\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" viewBox=\"0 0 24 24\"><path d=\"M4 6h16M4 12h16M4 18h16\"/></svg>");
+    hw.close("button");
     hw.open("h1");
-    hw.attr("class", "text-2xl font-bold text-gray-900");
+    hw.attr("class", "text-xl md:text-2xl font-bold text-gray-900");
     hw.text(title);
     hw.close("h1");
+    hw.close("div");
     hw.open("button");
     hw.attr("hx-get", "/ui/partials/enqueue-form");
     hw.attr("hx-target", "#modal");
     hw.attr("hx-swap", "innerHTML");
-    hw.attr("class", "px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700");
-    hw.text("Enqueue Job");
+    hw.attr("class", "px-3 py-1.5 md:px-4 md:py-2 text-xs md:text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700");
+    hw.text("Enqueue");
     hw.close("button");
     hw.close("div");
 
@@ -559,8 +582,12 @@ fn layoutEnd(hw: *html.HtmlWriter) void {
 
 fn writeSidebar(hw: *html.HtmlWriter, current_path: []const u8) void {
     hw.open("aside");
-    hw.attr("class", "w-56 bg-white border-r border-gray-200 flex flex-col min-h-screen");
+    hw.attr("class", "hidden md:flex w-56 bg-white border-r border-gray-200 flex-col min-h-screen");
+    writeSidebarContent(hw, current_path);
+    hw.close("aside");
+}
 
+fn writeSidebarContent(hw: *html.HtmlWriter, current_path: []const u8) void {
     // Logo.
     hw.open("div");
     hw.attr("class", "h-14 flex items-center px-4 border-b border-gray-200");
@@ -585,8 +612,6 @@ fn writeSidebar(hw: *html.HtmlWriter, current_path: []const u8) void {
     navLink(hw, "/ui/workers", "Workers", current_path);
     navLink(hw, "/ui/cluster", "Cluster", current_path);
     hw.close("nav");
-
-    hw.close("aside");
 }
 
 const nav_base = "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors ";
@@ -785,7 +810,7 @@ fn writeQueuesTable(hw: *html.HtmlWriter, reader: ?*sqlite_read.Reader) void {
     }
 
     hw.open("div");
-    hw.attr("class", "bg-white border border-gray-200 rounded-lg overflow-hidden");
+    hw.attr("class", "bg-white border border-gray-200 rounded-lg overflow-x-auto");
     hw.open("table");
     hw.attr("class", "w-full text-sm");
     hw.open("thead");
@@ -893,7 +918,7 @@ fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow, actions
     }
 
     hw.open("div");
-    hw.attr("class", "bg-white border border-gray-200 rounded-lg overflow-hidden");
+    hw.attr("class", "bg-white border border-gray-200 rounded-lg overflow-x-auto");
     hw.open("table");
     hw.attr("class", "w-full text-sm");
     hw.open("thead");

@@ -134,15 +134,28 @@ ui/favicon.svg            — existing favicon
 
 ### Remaining
 
-15. Queue detail: stats bar (pending/active/dead/completed counts), filter tabs
+15. **HTML templates refactor**: Move layout/sidebar/scripts out of Zig function
+    calls and into `@embedFile`'d `.html` template files with `{{placeholder}}`
+    substitution. Layout shell (~3KB of static HTML) is repeated on every page —
+    templates give HTML syntax highlighting, easier design iteration, and cleaner
+    code. Dynamic content (tables, stats) stays in Zig, rendered into a fragment
+    buffer that gets spliced into the template at `{{content}}`.
+    ```
+    ui/templates/layout.html     — full page shell (head, sidebar, scripts)
+    ui/templates/queue-row.html  — single queue table row
+    ui/templates/job-row.html    — single job table row
+    ui/templates/stat-card.html  — dashboard stat card
+    ```
+16. Queue detail: stats bar (pending/active/dead/completed counts), filter tabs
     (pending/completed/retrying/dead/scheduled/held), search bar
-16. Job detail: metadata grid (2-column layout), payload with copy button,
+17. Job detail: metadata grid (2-column layout), payload with copy button,
     timeline section, state/priority tabs
-17. Enqueue dialog: add priority, max retries, scheduled at, unique key fields
-18. Pagination on all job tables (currently capped at 25 rows)
-19. Date formatting: relative timestamps ("1m ago") instead of raw ISO strings
-20. Job search/filters: search bar + state/queue filter dropdowns
+18. Enqueue dialog: add priority, max retries, scheduled at, unique key fields
+19. Pagination on all job tables (currently capped at 25 rows)
+20. Date formatting: relative timestamps ("1m ago") instead of raw ISO strings
+21. Job search/filters: search bar + state/queue filter dropdowns
     (check git history for full filter set from React UI)
-21. Throughput chart: time-series line chart (enqueued/completed/failed) —
+22. Throughput chart: time-series line chart (enqueued/completed/failed) —
     requires wiring up metrics/throughput endpoint with real data
-22. Export: JSON/CSV export buttons on job tables
+23. Export: JSON/CSV export buttons on job tables
+24. Mobile responsive: hamburger menu, collapsible sidebar, scrollable tables
