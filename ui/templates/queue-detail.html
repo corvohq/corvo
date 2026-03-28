@@ -1,14 +1,54 @@
 <div class="space-y-6">
   <div class="flex items-center justify-between">
-    <h2 class="text-xl font-semibold text-gray-900">{{queue_name}}</h2>
-    {{{status_badge}}}
+    <div class="flex items-center gap-3">
+      <h2 class="text-xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">{{queue_name}}</h2>
+      {{#is_paused}}<span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-amber-50 dark:bg-amber-950 text-amber-700 dark:text-amber-400">Paused</span>{{/is_paused}}
+      {{^is_paused}}<span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-emerald-50 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-400">Active</span>{{/is_paused}}
+    </div>
     <div class="flex items-center gap-2">
-      {{{export_buttons}}}
-      {{{action_buttons}}}
+      <button onclick="corvoExport('json','{{export_state}}','{{queue_name}}')" class="border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md px-3 py-1.5 text-xs font-medium text-zinc-600 dark:text-zinc-400">JSON</button>
+      <button onclick="corvoExport('csv','{{export_state}}','{{queue_name}}')" class="border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md px-3 py-1.5 text-xs font-medium text-zinc-600 dark:text-zinc-400">CSV</button>
+      <button hx-post="/api/v1/queues/{{queue_name}}/pause" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-amber-500 hover:bg-amber-600">Pause</button>
+      <button hx-post="/api/v1/queues/{{queue_name}}/resume" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-emerald-500 hover:bg-emerald-600">Resume</button>
+      <button hx-post="/api/v1/queues/{{queue_name}}/drain" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-indigo-500 hover:bg-indigo-600">Drain</button>
     </div>
   </div>
-{{{stats_bar}}}
-{{{filter_section}}}
-  <div id="queue-jobs">{{{job_table}}}</div>
-{{{pagination}}}
+  {{#has_stats}}
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
+      <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Pending</div>
+      <div class="mt-2 text-2xl font-semibold tracking-tight text-blue-700 dark:text-blue-400">{{pending}}</div>
+    </div>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
+      <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Active</div>
+      <div class="mt-2 text-2xl font-semibold tracking-tight text-emerald-700 dark:text-emerald-400">{{active}}</div>
+    </div>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
+      <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Dead</div>
+      <div class="mt-2 text-2xl font-semibold tracking-tight text-red-600 dark:text-red-400">{{dead}}</div>
+    </div>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
+      <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Completed</div>
+      <div class="mt-2 text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">{{completed}}</div>
+    </div>
+  </div>
+  {{/has_stats}}
+  <div class="flex flex-col sm:flex-row sm:items-center gap-3">
+    <div class="flex flex-wrap gap-1">
+      {{#filter_tabs}}
+      <a href="{{href}}" class="{{tab_class}}">{{label}}<span class="ml-1 text-xs opacity-70">{{count}}</span></a>
+      {{/filter_tabs}}
+    </div>
+    <input type="text" placeholder="Filter jobs..." class="rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-1.5 text-sm text-zinc-900 dark:text-zinc-100 focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-100 sm:ml-auto w-full sm:w-48" oninput="corvoFilterRows(this.value)">
+  </div>
+  {{> job_table}}
+  {{#has_pages}}
+  <div class="flex items-center justify-between">
+    <span class="text-sm text-zinc-500 dark:text-zinc-400">Page {{page_display}} of {{total_pages}}</span>
+    <div class="flex gap-2">
+      {{#has_prev}}<a href="{{prev_url}}" class="border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md px-3 py-1.5 text-sm font-medium text-zinc-700 dark:text-zinc-300">&larr; Previous</a>{{/has_prev}}
+      {{#has_next}}<a href="{{next_url}}" class="border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md px-3 py-1.5 text-sm font-medium text-zinc-700 dark:text-zinc-300">Next &rarr;</a>{{/has_next}}
+    </div>
+  </div>
+  {{/has_pages}}
 </div>

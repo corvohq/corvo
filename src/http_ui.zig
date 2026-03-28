@@ -137,117 +137,93 @@ fn queuesPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
 }
 
 fn queueDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, queue_name: []const u8, query: []const u8) u32 {
-    // Action buttons (always shown).
-    var btn_buf: [4096]u8 = undefined;
-    var btn_hw = html.HtmlWriter.init(&btn_buf);
-    writeQueueActionButton(&btn_hw, queue_name, "pause", "Pause", "bg-yellow-500 hover:bg-yellow-600");
-    writeQueueActionButton(&btn_hw, queue_name, "resume", "Resume", "bg-green-500 hover:bg-green-600");
-    writeQueueActionButton(&btn_hw, queue_name, "drain", "Drain", "bg-blue-500 hover:bg-blue-600");
-
-    const rdr = reader orelse {
-        var content_buf: [page_buf_size]u8 = undefined;
-        const content = queue_detail_tmpl.render(&content_buf, .{
-            .queue_name = queue_name,
-            .status_badge = "",
-            .action_buttons = btn_hw.getWritten(),
-            .export_buttons = "",
-            .stats_bar = "",
-            .filter_section = "",
-            .job_table = "<p class=\"text-gray-500\">No data available</p>",
-            .pagination = "",
-        }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
-        return renderPage(send_buf, "Queue Detail", content);
-    };
-
     const state_filter = getQueryParam(query, "state");
     const page = parsePageParam(query);
     const offset: u32 = page * max_table_rows;
 
-    // Stats bar.
-    var stats_buf: [4096]u8 = undefined;
-    var stats_hw = html.HtmlWriter.init(&stats_buf);
+    // Find this queue's stats.
     var queue_stats_buf: [64]sqlite_read.QueueStats = undefined;
-    const q_count = rdr.getQueueStats(&queue_stats_buf) catch 0;
     var qs: ?*const sqlite_read.QueueStats = null;
-    for (0..q_count) |i| {
-        if (eql(queue_stats_buf[i].nameSlice(), queue_name)) {
-            qs = &queue_stats_buf[i];
-            break;
+    if (reader) |rdr| {
+        const q_count = rdr.getQueueStats(&queue_stats_buf) catch 0;
+        for (0..q_count) |i| {
+            if (eql(queue_stats_buf[i].nameSlice(), queue_name)) {
+                qs = &queue_stats_buf[i];
+                break;
+            }
         }
     }
     const paused = if (qs) |q| q.paused else false;
-    const status_badge: []const u8 = if (paused)
-        "<span class=\"inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800\">Paused</span>"
-    else
-        "<span class=\"inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800\">Active</span>";
 
-    if (qs) |q| {
-        stats_hw.open("div");
-        stats_hw.attr("class", "grid grid-cols-2 md:grid-cols-4 gap-4");
-        statCard(&stats_hw, "Pending", q.pending, "text-blue-700");
-        statCard(&stats_hw, "Active", q.active, "text-green-700");
-        statCard(&stats_hw, "Dead", q.dead, "text-red-600");
-        statCardInt(&stats_hw, "Completed", q.completed, "text-gray-900");
-        stats_hw.close("div");
+    // Filter tabs.
+    const filter_states = [_]?[]const u8{ null, "pending", "active", "retrying", "dead", "completed", "scheduled", "held" };
+    const filter_labels = [_][]const u8{ "All", "Pending", "Active", "Retrying", "Dead", "Completed", "Scheduled", "Held" };
+    var tab_url_bufs: [8][128]u8 = undefined;
+    var filter_tabs: [8]FilterTabView = undefined;
+    for (filter_states, filter_labels, 0..) |fs, fl, i| {
+        var s = std.io.fixedBufferStream(&tab_url_bufs[i]);
+        s.writer().print("/ui/queues/{s}", .{queue_name}) catch {};
+        if (fs) |state| s.writer().print("?state={s}", .{state}) catch {};
+        const is_active = if (fs) |st| (if (state_filter) |cf| eql(st, cf) else false) else state_filter == null;
+        filter_tabs[i] = .{
+            .href = s.getWritten(),
+            .label = fl,
+            .count = if (qs) |q| filterCount(q, fs) else 0,
+            .tab_class = if (is_active) active_tab_class else inactive_tab_class,
+        };
     }
 
-    // Filter section (tabs + search).
-    var filter_buf: [4096]u8 = undefined;
-    var filter_hw = html.HtmlWriter.init(&filter_buf);
-    filter_hw.open("div");
-    filter_hw.attr("class", "flex flex-col sm:flex-row sm:items-center gap-3");
-    filter_hw.open("div");
-    filter_hw.attr("class", "flex flex-wrap gap-1");
-    filterTab(&filter_hw, queue_name, null, "All", state_filter, qs);
-    filterTab(&filter_hw, queue_name, "pending", "Pending", state_filter, qs);
-    filterTab(&filter_hw, queue_name, "active", "Active", state_filter, qs);
-    filterTab(&filter_hw, queue_name, "retrying", "Retrying", state_filter, qs);
-    filterTab(&filter_hw, queue_name, "dead", "Dead", state_filter, qs);
-    filterTab(&filter_hw, queue_name, "completed", "Completed", state_filter, qs);
-    filterTab(&filter_hw, queue_name, "scheduled", "Scheduled", state_filter, qs);
-    filterTab(&filter_hw, queue_name, "held", "Held", state_filter, qs);
-    filter_hw.close("div");
-    filter_hw.voidElem("input");
-    filter_hw.attr("type", "text");
-    filter_hw.attr("placeholder", "Filter jobs...");
-    filter_hw.attr("class", "px-3 py-1.5 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 sm:ml-auto w-full sm:w-48");
-    filter_hw.attr("oninput", "corvoFilterRows(this.value)");
-    filter_hw.close("div");
-
-    // Export buttons.
-    var export_buf: [4096]u8 = undefined;
-    var export_hw = html.HtmlWriter.init(&export_buf);
-    writeExportButtons(&export_hw, state_filter, queue_name);
-
-    // Job table.
-    var table_buf: [page_buf_size]u8 = undefined;
-    var table_hw = html.HtmlWriter.init(&table_buf);
+    // Job views.
     var job_buf: [max_table_rows]sqlite_read.JobRow = undefined;
-    const count = rdr.queryJobsByQueueState(queue_name, state_filter, max_table_rows, offset, &job_buf) catch 0;
-    writeJobTable(&table_hw, job_buf[0..count], .queue_detail);
+    var job_views: [max_table_rows]JobView = undefined;
+    var action_buf: [max_table_rows * 2]JobAction = undefined;
+    const count: usize = if (reader) |rdr| rdr.queryJobsByQueueState(queue_name, state_filter, max_table_rows, offset, &job_buf) catch 0 else 0;
+    const jobs = getJobViews(job_buf[0..count], &job_views, &action_buf, .queue_detail);
+
+    var bulk_buf: [2]BulkAction = undefined;
+    const bulk_actions = getBulkActions(.queue_detail, &bulk_buf);
 
     // Pagination.
-    var pag_buf: [4096]u8 = undefined;
-    var pag_hw = html.HtmlWriter.init(&pag_buf);
     const total: u32 = if (qs) |q| queueStateCount(q, state_filter) else 0;
     const total_pages = if (total > 0) (total + max_table_rows - 1) / max_table_rows else 1;
-    var url_buf: [256]u8 = undefined;
-    var url_stream = std.io.fixedBufferStream(&url_buf);
-    url_stream.writer().print("/ui/queues/{s}?", .{queue_name}) catch {};
-    if (state_filter) |sf| url_stream.writer().print("state={s}&", .{sf}) catch {};
-    writePagination(&pag_hw, url_stream.getWritten(), page, total_pages);
+    var prev_url_buf: [256]u8 = undefined;
+    var next_url_buf: [256]u8 = undefined;
+    var prev_s = std.io.fixedBufferStream(&prev_url_buf);
+    var next_s = std.io.fixedBufferStream(&next_url_buf);
+    prev_s.writer().print("/ui/queues/{s}?", .{queue_name}) catch {};
+    next_s.writer().print("/ui/queues/{s}?", .{queue_name}) catch {};
+    if (state_filter) |sf| {
+        prev_s.writer().print("state={s}&", .{sf}) catch {};
+        next_s.writer().print("state={s}&", .{sf}) catch {};
+    }
+    prev_s.writer().print("page={d}", .{page -| 1}) catch {};
+    next_s.writer().print("page={d}", .{page + 1}) catch {};
 
+    const tabs: []const FilterTabView = &filter_tabs;
     var content_buf: [page_buf_size]u8 = undefined;
-    const content = queue_detail_tmpl.render(&content_buf, .{
+    const content = queue_detail_tmpl.renderWithPartials(&content_buf, .{
         .queue_name = queue_name,
-        .status_badge = status_badge,
-        .action_buttons = btn_hw.getWritten(),
-        .export_buttons = export_hw.getWritten(),
-        .stats_bar = stats_hw.getWritten(),
-        .filter_section = filter_hw.getWritten(),
-        .job_table = table_hw.getWritten(),
-        .pagination = pag_hw.getWritten(),
-    }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
+        .is_paused = paused,
+        .export_state = if (state_filter) |sf| sf else "",
+        .has_stats = qs != null,
+        .pending = if (qs) |q| q.pending else @as(i32, 0),
+        .active = if (qs) |q| q.active else @as(i32, 0),
+        .dead = if (qs) |q| q.dead else @as(i32, 0),
+        .completed = if (qs) |q| q.completed else @as(i32, 0),
+        .filter_tabs = tabs,
+        .has_bulk = true,
+        .bulk_actions = bulk_actions,
+        .has_jobs = count > 0,
+        .jobs = jobs,
+        .has_pages = total_pages > 1,
+        .page_display = page + 1,
+        .total_pages = total_pages,
+        .has_prev = page > 0,
+        .prev_url = prev_s.getWritten(),
+        .has_next = page + 1 < total_pages,
+        .next_url = next_s.getWritten(),
+    }, .{ .job_table = &job_table_tmpl }) catch
+        return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Queue Detail", content);
 }
 
@@ -589,6 +565,16 @@ const JobView = struct {
     has_cb: bool,
     actions: []const JobAction,
 };
+
+const FilterTabView = struct {
+    href: []const u8,
+    label: []const u8,
+    count: i32,
+    tab_class: []const u8,
+};
+
+const active_tab_class = "px-3 py-1.5 text-sm font-medium rounded-md bg-indigo-100 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-300";
+const inactive_tab_class = "px-3 py-1.5 text-sm font-medium rounded-md text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800";
 
 const QueueView = struct {
     name: []const u8,
@@ -1359,6 +1345,20 @@ fn writeQueueFilter(hw: *html.HtmlWriter, rdr: *sqlite_read.Reader, base_path: [
     }
 
     hw.close("select");
+}
+
+fn filterCount(q: *const sqlite_read.QueueStats, state: ?[]const u8) i32 {
+    if (state) |s| {
+        if (eql(s, "pending")) return q.pending;
+        if (eql(s, "active")) return q.active;
+        if (eql(s, "retrying")) return q.retrying;
+        if (eql(s, "dead")) return q.dead;
+        if (eql(s, "completed")) return q.completed;
+        if (eql(s, "scheduled")) return q.scheduled;
+        if (eql(s, "held")) return q.held;
+        return 0;
+    }
+    return q.pending + q.active + q.retrying + q.dead + q.completed + q.scheduled + q.held;
 }
 
 fn queueStateCount(q: *const sqlite_read.QueueStats, state: ?[]const u8) u32 {
