@@ -11,6 +11,13 @@ pub fn build(b: *std.Build) void {
     });
     const talon_mod = talon_dep.module("talon");
 
+    // --- zigstache dependency ---
+    const zigstache_dep = b.dependency("zigstache", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zigstache_mod = zigstache_dep.module("zigstache");
+
     // --- Corvo library module ---
     const corvo_mod = b.addModule("corvo", .{
         .root_source_file = b.path("src/root.zig"),
@@ -18,6 +25,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     corvo_mod.addImport("talon", talon_mod);
+    corvo_mod.addImport("zigstache", zigstache_mod);
     corvo_mod.addAnonymousImport("ui_embed", .{ .root_source_file = b.path("ui_embed.zig") });
     corvo_mod.link_libc = true;
     corvo_mod.linkSystemLibrary("sqlite3", .{});
@@ -36,6 +44,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_mod.addImport("talon", talon_mod);
+    test_mod.addImport("zigstache", zigstache_mod);
     test_mod.addAnonymousImport("ui_embed", .{ .root_source_file = b.path("ui_embed.zig") });
     test_mod.link_libc = true;
     test_mod.linkSystemLibrary("sqlite3", .{});
