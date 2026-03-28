@@ -102,10 +102,13 @@ pub fn metrics(send_buf: []u8, mirror_stats: ?MirrorStats, reader: ?*sqlite_read
                 "# HELP corvo_mirror_dropped_total Operations dropped due to full queue\n" ++
                 "# TYPE corvo_mirror_dropped_total counter\n" ++
                 "corvo_mirror_dropped_total {d}\n" ++
+                "# HELP corvo_mirror_rebuilds_total Full KV-to-SQLite rebuilds triggered by overflow\n" ++
+                "# TYPE corvo_mirror_rebuilds_total counter\n" ++
+                "corvo_mirror_rebuilds_total {d}\n" ++
                 "# HELP corvo_mirror_lag Operations pending in mirror queue\n" ++
                 "# TYPE corvo_mirror_lag gauge\n" ++
                 "corvo_mirror_lag {d}\n",
-            .{ ms.queued, ms.committed, ms.dropped, lag },
+            .{ ms.queued, ms.committed, ms.dropped, ms.rebuilds, lag },
         ) catch &[0]u8{}).len;
     }
 

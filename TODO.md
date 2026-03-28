@@ -6,7 +6,7 @@
 
 ## Server
 
-- [ ] Mirror rebuild on overflow — when ring buffer drops ops (write rate > flush rate), set `needs_rebuild` flag and do a full KV→SQLite scan on next `flushAll()` instead of draining the ring. Currently 70% of mirror ops are silently dropped under heavy load (470k writes/sec vs 82k flush/sec), leaving the UI permanently stale.
+- [x] Mirror rebuild on overflow — when ring buffer drops ops, `needs_rebuild` flag triggers full KV→SQLite rebuild on next `flushAll()`. Scans all entity prefixes (j|, jp|, qc|, w|, sc|, b|, bg|) and restores complete mirror state. Metrics endpoint exposes rebuild count.
 - [ ] Rate limiting — token bucket module, per-queue/global limits
 - [ ] SSE streaming (`/events`) — pipeline-level connection tracking, push events to subscribers (currently returns error stub)
 - [ ] Throughput metrics (`/metrics/throughput`) — ring buffer for ops/sec (currently returns zeroes)

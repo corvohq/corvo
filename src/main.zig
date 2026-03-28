@@ -323,6 +323,7 @@ pub fn main() !void {
             std.debug.print("corvo: failed to init mirror: {}\n", .{err});
             return;
         };
+        mirror.?.kv_stores = &stores;
         try mirror.?.start();
         reader = sqlite_read.Reader.init(&mirror.?.db);
     }
