@@ -371,6 +371,7 @@ pub fn encodeQueue(buf: []u8, q: *const types.Queue) []const u8 {
     pos = writeU64LE(buf, pos, q.created_at_ns);
 
     pos = writeStr(buf, pos, q.name);
+    pos = writeStr(buf, pos, q.namespace);
 
     return buf[0..pos];
 }
@@ -409,6 +410,12 @@ pub fn decodeQueue(data: []const u8) types.Queue {
     const name = readStr(data, pos);
     pos = name.next;
     q.name = name.val;
+
+    // Namespace: backward-compatible — only read if data remains.
+    if (pos < data.len) {
+        const ns = readStr(data, pos);
+        q.namespace = ns.val;
+    }
 
     return q;
 }

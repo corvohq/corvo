@@ -167,7 +167,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
             rate_limit_interval_ns: u64 = 0,
             expire_interval_ns: u64 = 0,
             purge_interval_ns: u64 = 0,
-            purge_threshold: u32 = 0, // 0 = disabled; trigger purge when dead_since_purge exceeds this
             repl_hook: ?ReplHook = null,
             sync_replication: bool = false,
             /// Adaptive batch coalescing window for sync replication (nanoseconds).
@@ -467,6 +466,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 self.requeueRecvs(recv_conns[0..recv_conn_count]);
             }
 
+            // No periodic mirror flush — buffer accumulates until HTTP read
+            // triggers flushAll(). On overflow, next read does full KV→SQLite rebuild.
+
             self.io.submit();
             self.ticks_total += 1;
         }
@@ -648,11 +650,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 .{ .ns = self.config.purge_interval_ns, .last = &self.last_purge_ns, .action = .purge },
             };
 
-            // Count-based purge trigger: fire purge early when terminal job count exceeds threshold.
-            const purge_threshold = self.config.purge_threshold;
-            const threshold_purge_due = purge_threshold > 0 and self.handler.dead_since_purge >= purge_threshold;
-
-            var any_due = threshold_purge_due;
+            var any_due = false;
             for (intervals) |iv| {
                 if (iv.ns > 0 and now_ns - iv.last.* >= iv.ns) {
                     any_due = true;
@@ -676,7 +674,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 if (iv.ns == 0) continue;
                 if (now_ns - iv.last.* < iv.ns) continue;
 
-                const op_data = ops_mod.OpData{ .maintenance = .{ .action = iv.action, .now_ns = now_ns, .cutoff_ns = now_ns } };
+                const cutoff = if (iv.action == .rate_limit and self.handler.max_rate_window_ns > 0)
+                    now_ns -| self.handler.max_rate_window_ns
+                else
+                    now_ns;
+                const op_data = ops_mod.OpData{ .maintenance = .{ .action = iv.action, .now_ns = now_ns, .cutoff_ns = cutoff } };
                 const result = self.handler.apply(&batch, .maintenance, &op_data);
                 self.emitMirrorOp(.maintenance, &op_data, &result);
 
@@ -686,20 +688,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 }
 
                 iv.last.* = now_ns;
-                self.maintenance_runs += 1;
-                self.applied_total += 1;
-
-                // Reset counter when purge fires via timer.
-                if (iv.action == .purge) self.handler.dead_since_purge = 0;
-            }
-
-            // Threshold-triggered purge (fires even if timer hasn't elapsed).
-            if (threshold_purge_due and now_ns - self.last_purge_ns < self.config.purge_interval_ns) {
-                const op_data = ops_mod.OpData{ .maintenance = .{ .action = .purge, .now_ns = now_ns, .cutoff_ns = now_ns } };
-                const result = self.handler.apply(&batch, .maintenance, &op_data);
-                self.emitMirrorOp(.maintenance, &op_data, &result);
-                self.last_purge_ns = now_ns;
-                self.handler.dead_since_purge = 0;
                 self.maintenance_runs += 1;
                 self.applied_total += 1;
             }
@@ -1030,6 +1018,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 rpc.MSG_SET_BUDGET => .set_budget,
                 rpc.MSG_DELETE_BUDGET => .delete_budget,
                 rpc.MSG_MODIFY_ENT_SETTING => .modify_ent_setting,
+                rpc.MSG_GLOBAL_CONFIG => .global_config,
                 else => return .{ .err = "unsupported http write" },
             };
 

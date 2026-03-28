@@ -60,11 +60,27 @@ pub const OpHandler = struct {
     /// trigger purge early when count exceeds purge_threshold.
     dead_since_purge: u32 = 0,
 
+    /// Maximum rate window across all queues/global/namespace rate limits.
+    /// Used by maintenance to compute correct cleanup cutoff.
+    max_rate_window_ns: u64 = 0,
+
+    /// Global rate limit (0 = unlimited). Set via POST /api/v1/throttle.
+    global_rate_limit: u32 = 0,
+    global_rate_window_ms: u32 = 0,
+
+    /// Namespace rate limit configs. Keyed by namespace name.
+    ns_rate_limits: std.StringHashMap(NsRateLimit),
+
     // Explicit resource limits (TigerStyle: all collections must have bounds).
     max_queues: u32 = 100,
     max_tags_per_queue: u32 = 1000,
 
     const mirror_mod = @import("mirror.zig");
+
+    pub const NsRateLimit = struct {
+        rate_limit: u32 = 0,
+        rate_window_ms: u32 = 0,
+    };
 
     const max_side_effects = 32;
     const max_fail_results = 256;
@@ -125,6 +141,7 @@ pub const OpHandler = struct {
             .fairness_served = std.StringHashMap(std.StringHashMap(i32)).init(allocator),
             .pending = pending_index_mod.PendingIndex.init(allocator),
             .queue_configs = std.StringHashMap(types.Queue).init(allocator),
+            .ns_rate_limits = std.StringHashMap(NsRateLimit).init(allocator),
             .allocator = allocator,
         };
     }
@@ -171,6 +188,11 @@ pub const OpHandler = struct {
             while (it.next()) |entry| self.allocator.free(@constCast(entry.key_ptr.*));
         }
         self.queue_configs.deinit();
+        {
+            var it = self.ns_rate_limits.iterator();
+            while (it.next()) |entry| self.allocator.free(@constCast(entry.key_ptr.*));
+        }
+        self.ns_rate_limits.deinit();
     }
 
     /// Clear all in-memory state. Call before rebuildState() after snapshot restore.
@@ -211,6 +233,20 @@ pub const OpHandler = struct {
             }
             self.fairness_served.clearRetainingCapacity();
         }
+
+        // Clear namespace rate limits.
+        {
+            var it = self.ns_rate_limits.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(@constCast(entry.key_ptr.*));
+            }
+            self.ns_rate_limits.clearRetainingCapacity();
+        }
+
+        // Reset global config.
+        self.global_rate_limit = 0;
+        self.global_rate_window_ms = 0;
+        self.max_rate_window_ns = 0;
     }
 
     /// Rebuild in-memory state from KV after restart.
@@ -280,8 +316,49 @@ pub const OpHandler = struct {
                     if (!qc_iter.next()) break;
                 }
             }
+
+            // Load global config from g|rl key.
+            {
+                var gc_buf: keys.KeyBuf = undefined;
+                const gc_key = keys.globalConfigKey(&gc_buf);
+                if (batch.get(gc_key)) |gc_val| {
+                    if (gc_val.len >= 8) {
+                        self.global_rate_limit = std.mem.readInt(u32, gc_val[0..4], .little);
+                        self.global_rate_window_ms = std.mem.readInt(u32, gc_val[4..8], .little);
+                    }
+                }
+            }
+
+            // Load namespace rate limit configs from ent_nsrl| keys.
+            {
+                var nsrl_buf: keys.KeyBuf = undefined;
+                var nsrle_buf: keys.KeyBuf = undefined;
+                const nsrlp = keys.prefix_ent_ns_rate_limit;
+                @memcpy(nsrl_buf[0..nsrlp.len], nsrlp);
+                if (keys.prefixEnd(&nsrle_buf, nsrl_buf[0..nsrlp.len])) |nsrl_end| {
+                    var nsrl_iter = batch.newIter(nsrl_buf[0..nsrlp.len], nsrl_end);
+                    defer nsrl_iter.close();
+                    if (nsrl_iter.first()) {
+                        while (true) {
+                            const nsrl_val = nsrl_iter.value();
+                            if (nsrl_val.len >= 8) {
+                                const nsrl_key = nsrl_iter.key();
+                                const ns_name = nsrl_key[nsrlp.len..];
+                                if (ns_name.len > 0) {
+                                    self.putNsRateLimit(ns_name, .{
+                                        .rate_limit = std.mem.readInt(u32, nsrl_val[0..4], .little),
+                                        .rate_window_ms = std.mem.readInt(u32, nsrl_val[4..8], .little),
+                                    });
+                                }
+                            }
+                            if (!nsrl_iter.next()) break;
+                        }
+                    }
+                }
+            }
         }
 
+        self.recomputeMaxRateWindow();
         _ = .{ pending_count, active_count, total_count };
     }
 
@@ -422,6 +499,7 @@ pub const OpHandler = struct {
             .cron_trigger => self.applyTriggerCron(b, &data.cron_trigger),
             .set_budget => self.applySetBudget(b, &data.set_budget),
             .delete_budget => self.applyDeleteBudget(b, &data.delete_budget),
+            .global_config => self.applyGlobalConfig(b, &data.global_config),
             .multi => .{ .err = "nested multi not supported" },
         };
     }
@@ -544,6 +622,25 @@ pub const OpHandler = struct {
         }
     }
 
+    /// Recompute max_rate_window_ns from all rate limit sources.
+    /// Called when any queue throttle, global config, or namespace config changes.
+    pub fn recomputeMaxRateWindow(self: *OpHandler) void {
+        var max_ms: u32 = self.global_rate_window_ms;
+        {
+            var it = self.queue_configs.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.rate_window_ms > max_ms) max_ms = entry.value_ptr.rate_window_ms;
+            }
+        }
+        {
+            var it = self.ns_rate_limits.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.rate_window_ms > max_ms) max_ms = entry.value_ptr.rate_window_ms;
+            }
+        }
+        self.max_rate_window_ns = @as(u64, max_ms) * 1_000_000;
+    }
+
     // ========================================================================
     // Key helpers (single-source key constructors from job fields)
     // ========================================================================
@@ -656,6 +753,41 @@ pub const OpHandler = struct {
 
     // Enterprise
     pub const applyModifyEntSetting = @import("handler_ent.zig").applyModifyEntSetting;
+
+    // Global config
+    pub fn applyGlobalConfig(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.GlobalConfigOp) ops.OpResult {
+        self.global_rate_limit = op.rate_limit;
+        self.global_rate_window_ms = op.rate_window_ms;
+
+        var key_buf: keys.KeyBuf = undefined;
+        const key = keys.globalConfigKey(&key_buf);
+        if (op.rate_limit > 0) {
+            var val_buf: [8]u8 = undefined;
+            std.mem.writeInt(u32, val_buf[0..4], op.rate_limit, .little);
+            std.mem.writeInt(u32, val_buf[4..8], op.rate_window_ms, .little);
+            b.set(key, &val_buf);
+        } else {
+            b.delete(key);
+        }
+
+        self.recomputeMaxRateWindow();
+        return .{ .affected = 1 };
+    }
+
+    // Namespace rate limit cache helpers
+    pub fn putNsRateLimit(self: *OpHandler, namespace: []const u8, rl: NsRateLimit) void {
+        const entry = self.ns_rate_limits.getOrPut(namespace) catch unreachable;
+        if (!entry.found_existing) {
+            entry.key_ptr.* = self.allocator.dupe(u8, namespace) catch unreachable;
+        }
+        entry.value_ptr.* = rl;
+    }
+
+    pub fn removeNsRateLimit(self: *OpHandler, namespace: []const u8) void {
+        if (self.ns_rate_limits.fetchRemove(namespace)) |entry| {
+            self.allocator.free(@constCast(entry.key));
+        }
+    }
 
     /// Handle batch job completion — decrement pending, fire callback if batch is done.
     pub fn handleBatchJobComplete(self: *OpHandler, b: *kv.WriteBatch, batch_id: []const u8, succeeded: bool, now_ns: u64) void {

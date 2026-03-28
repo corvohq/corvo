@@ -67,9 +67,11 @@ pub const MSG_CRON_TRIGGER_RESP: u8 = 0x9A;
 pub const MSG_SET_BUDGET: u8 = 0x1B;
 pub const MSG_DELETE_BUDGET: u8 = 0x1C;
 pub const MSG_MODIFY_ENT_SETTING: u8 = 0x1D;
+pub const MSG_GLOBAL_CONFIG: u8 = 0x1E;
 pub const MSG_SET_BUDGET_RESP: u8 = 0x9B;
 pub const MSG_DELETE_BUDGET_RESP: u8 = 0x9C;
 pub const MSG_MODIFY_ENT_SETTING_RESP: u8 = 0x9D;
+pub const MSG_GLOBAL_CONFIG_RESP: u8 = 0x9E;
 
 // Response types (server -> client)
 pub const MSG_ENQUEUE_BATCH_RESP: u8 = 0x81;
@@ -316,6 +318,7 @@ pub fn responseType(msg_type: u8) ?u8 {
         MSG_SET_BUDGET => MSG_SET_BUDGET_RESP,
         MSG_DELETE_BUDGET => MSG_DELETE_BUDGET_RESP,
         MSG_MODIFY_ENT_SETTING => MSG_MODIFY_ENT_SETTING_RESP,
+        MSG_GLOBAL_CONFIG => MSG_GLOBAL_CONFIG_RESP,
         else => null,
     };
 }

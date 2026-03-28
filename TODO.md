@@ -7,7 +7,8 @@
 ## Server
 
 - [x] Mirror rebuild on overflow — when ring buffer drops ops, `needs_rebuild` flag triggers full KV→SQLite rebuild on next `flushAll()`. Scans all entity prefixes (j|, jp|, qc|, w|, sc|, b|, bg|) and restores complete mirror state. Metrics endpoint exposes rebuild count.
-- [ ] Rate limiting — token bucket module, per-queue/global limits
+- [x] Rate limiting — sliding window per-queue (existing) + global (`POST /api/v1/throttle`) + enterprise namespace (`POST /api/v1/namespaces/{ns}/throttle`), queue namespace assignment (`POST /api/v1/queues/{name}/namespace`), cleanup cutoff fix
+- [ ] **KV-only reads — eliminate SQLite mirror** — rewrite `http_read.zig` + `sqlite_read.zig` to read directly from Talon KV via prefix scans. Removes mirror buffer, rebuild-on-overflow, SQLite dependency for reads. Keeps SQLite only for FTS5 search (optional). Pagination via cursor-based key seek.
 - [ ] SSE streaming (`/events`) — pipeline-level connection tracking, push events to subscribers (currently returns error stub)
 - [ ] Throughput metrics (`/metrics/throughput`) — ring buffer for ops/sec (currently returns zeroes)
 - [ ] Cluster events (`/cluster/events`) — real event stream (currently returns empty array)

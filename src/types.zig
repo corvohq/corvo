@@ -164,6 +164,7 @@ pub const Queue = struct {
     rate_window_ms: u32 = 0, // 0 = default (1000ms)
     fairness: bool = false,
     created_at_ns: u64 = 0,
+    namespace: []const u8 = "",
 };
 
 // ============================================================================

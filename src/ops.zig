@@ -35,6 +35,7 @@ pub const OpType = enum(u8) {
     cron_trigger = 18,
     set_budget = 19,
     delete_budget = 20,
+    global_config = 21,
 };
 
 // ============================================================================
@@ -194,6 +195,7 @@ pub const QueueAction = enum(u8) {
     fairness = 5,
     clear = 6,
     delete = 7,
+    namespace = 8,
 
     pub fn toString(self: QueueAction) []const u8 {
         return switch (self) {
@@ -204,6 +206,7 @@ pub const QueueAction = enum(u8) {
             .fairness => "fairness",
             .clear => "clear",
             .delete => "delete",
+            .namespace => "namespace",
         };
     }
 };
@@ -215,6 +218,7 @@ pub const QueueOp = struct {
     rate_limit: u32 = 0,
     rate_window_ms: u32 = 0,
     fairness: bool = false,
+    namespace: []const u8 = "",
 };
 
 pub const ClearQueueOp = struct {
@@ -341,6 +345,15 @@ pub const DeleteBudgetOp = struct {
 };
 
 // ============================================================================
+// Global config
+// ============================================================================
+
+pub const GlobalConfigOp = struct {
+    rate_limit: u32 = 0,
+    rate_window_ms: u32 = 0,
+};
+
+// ============================================================================
 // Enterprise
 // ============================================================================
 
@@ -361,6 +374,9 @@ pub const ModifyEntSettingOp = struct {
     id: []const u8 = "",
     scope: []const u8 = "",
     data: ?[]const u8 = null, // null = delete, otherwise = upsert
+    // Typed fields for ns_rate_limit (avoids JSON parsing in handler).
+    rate_limit: u32 = 0,
+    rate_window_ms: u32 = 0,
 };
 
 // ============================================================================
@@ -393,6 +409,7 @@ pub const OpData = union(OpType) {
     cron_trigger: TriggerCronOp,
     set_budget: SetBudgetOp,
     delete_budget: DeleteBudgetOp,
+    global_config: GlobalConfigOp,
 };
 
 // ============================================================================
@@ -444,7 +461,7 @@ test "OpType exhaustive" {
         .queue_config, .clear_queue, .delete_queue, .maintenance => true,
         .batch_create, .batch_seal, .modify_ent_setting, .multi => true,
         .cron_create, .cron_update, .cron_delete, .cron_trigger => true,
-        .set_budget, .delete_budget => true,
+        .set_budget, .delete_budget, .global_config => true,
     };
 }
 

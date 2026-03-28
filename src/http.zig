@@ -326,6 +326,8 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
                 return writeRoute(rpc.MSG_CRON_CREATE, "", "");
             if (std.mem.eql(u8, api, "/budgets"))
                 return writeRoute(rpc.MSG_SET_BUDGET, "", "");
+            if (std.mem.eql(u8, api, "/throttle"))
+                return writeRoute(rpc.MSG_GLOBAL_CONFIG, "", "set");
             if (std.mem.eql(u8, api, "/approval-policies"))
                 return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, "", "approval_policy");
             if (std.mem.eql(u8, api, "/auth/keys"))
@@ -371,6 +373,15 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
             if (std.mem.startsWith(u8, api, "/webhooks/")) {
                 const queue = api["/webhooks/".len..];
                 if (queue.len > 0) return writeRoute(rpc.MSG_ENQUEUE_BATCH, queue, "webhook");
+            }
+
+            // POST /namespaces/{ns}/throttle
+            if (std.mem.startsWith(u8, api, "/namespaces/")) {
+                const rest = api["/namespaces/".len..];
+                if (std.mem.endsWith(u8, rest, "/throttle")) {
+                    const ns = rest[0 .. rest.len - "/throttle".len];
+                    if (ns.len > 0) return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, ns, "ns_rate_limit");
+                }
             }
         },
 
@@ -420,6 +431,19 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
                     const target = rest[s + 1 ..];
                     if (scope.len > 0 and target.len > 0)
                         return writeRoute(rpc.MSG_DELETE_BUDGET, scope, target);
+                }
+            }
+
+            // DELETE /throttle
+            if (std.mem.eql(u8, api, "/throttle"))
+                return writeRoute(rpc.MSG_GLOBAL_CONFIG, "", "remove");
+
+            // DELETE /namespaces/{ns}/throttle
+            if (std.mem.startsWith(u8, api, "/namespaces/")) {
+                const rest = api["/namespaces/".len..];
+                if (std.mem.endsWith(u8, rest, "/throttle")) {
+                    const ns = rest[0 .. rest.len - "/throttle".len];
+                    if (ns.len > 0) return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, ns, "ns_rate_limit_delete");
                 }
             }
 
@@ -474,9 +498,10 @@ fn classifyQueueAction(method: Method, rest: []const u8) RouteAction {
 
     if (method == .DELETE) {
         if (action.len == 0) return writeRoute(rpc.MSG_DELETE_QUEUE, name, "");
-        // DELETE /queues/{name}/throttle or /fairness → remove setting
+        // DELETE /queues/{name}/throttle or /fairness or /namespace → remove setting
         if (std.mem.eql(u8, action, "throttle")) return writeRoute(rpc.MSG_QUEUE_CONFIG, name, "throttle_remove");
         if (std.mem.eql(u8, action, "fairness")) return writeRoute(rpc.MSG_QUEUE_CONFIG, name, "fairness_remove");
+        if (std.mem.eql(u8, action, "namespace")) return writeRoute(rpc.MSG_QUEUE_CONFIG, name, "namespace_remove");
         return .not_found;
     }
 
@@ -484,7 +509,7 @@ fn classifyQueueAction(method: Method, rest: []const u8) RouteAction {
     if (action.len == 0) return .not_found;
     if (std.mem.eql(u8, action, "clear")) return writeRoute(rpc.MSG_CLEAR_QUEUE, name, "");
 
-    const valid = [_][]const u8{ "pause", "resume", "concurrency", "throttle", "fairness", "drain" };
+    const valid = [_][]const u8{ "pause", "resume", "concurrency", "throttle", "fairness", "drain", "namespace" };
     for (valid) |v| {
         if (std.mem.eql(u8, action, v))
             return writeRoute(rpc.MSG_QUEUE_CONFIG, name, action);
@@ -622,6 +647,7 @@ pub fn decodeWrite(
         rpc.MSG_SET_BUDGET => return decodeSetBudget(body, now_ns, scratch),
         rpc.MSG_DELETE_BUDGET => return .{ .op_data = .{ .delete_budget = .{ .scope = param, .target = sub_action } }, .count = 1 },
         rpc.MSG_MODIFY_ENT_SETTING => return decodeEntSetting(body, param, sub_action, scratch),
+        rpc.MSG_GLOBAL_CONFIG => return decodeGlobalConfig(body, sub_action),
         else => return .{ .op_data = .{ .enqueue = .{} }, .count = 0 },
     }
 }
@@ -639,6 +665,8 @@ pub const DecodeScratch = struct {
     // Secondary ID buf for generated cron_id, batch_id, budget_id, trigger job_id
     id_buf2: [64]u8 = undefined,
     id2_len: u8 = 0,
+    // Buffer for binary-encoded namespace rate limit config.
+    ns_rl_buf: [8]u8 = undefined,
 };
 
 fn decodeEnqueue(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
@@ -1135,6 +1163,12 @@ fn decodeQueueConfig(body: []const u8, queue: []const u8, sub_action: []const u8
     } else if (std.mem.eql(u8, sub_action, "fairness_remove")) {
         op.action = .fairness;
         op.fairness = false;
+    } else if (std.mem.eql(u8, sub_action, "namespace")) {
+        op.action = .namespace;
+        op.namespace = extractJSONString(body, "namespace") orelse "";
+    } else if (std.mem.eql(u8, sub_action, "namespace_remove")) {
+        op.action = .namespace;
+        op.namespace = "";
     } else {
         return .{ .op_data = .{ .queue_config = .{} }, .count = 0 };
     }
@@ -1257,7 +1291,48 @@ fn decodeEntSetting(body: []const u8, param: []const u8, sub_action: []const u8,
             .data = null,
         } }, .count = 1 };
     }
+    if (std.mem.eql(u8, sub_action, "ns_rate_limit")) {
+        const rate: u32 = if (extractJSONInt(body, "rate")) |r|
+            @intCast(std.math.clamp(r, 0, std.math.maxInt(i32)))
+        else
+            0;
+        const window: u32 = if (extractJSONInt(body, "window_ms")) |w|
+            @intCast(std.math.clamp(w, 0, std.math.maxInt(i32)))
+        else
+            1000;
+        // Encode binary data into scratch buffer for KV persistence.
+        std.mem.writeInt(u32, scratch.ns_rl_buf[0..4], rate, .little);
+        std.mem.writeInt(u32, scratch.ns_rl_buf[4..8], window, .little);
+        return .{ .op_data = .{ .modify_ent_setting = .{
+            .setting = .ns_rate_limit,
+            .id = param,
+            .data = &scratch.ns_rl_buf,
+            .rate_limit = rate,
+            .rate_window_ms = window,
+        } }, .count = 1 };
+    }
+    if (std.mem.eql(u8, sub_action, "ns_rate_limit_delete")) {
+        return .{ .op_data = .{ .modify_ent_setting = .{
+            .setting = .ns_rate_limit,
+            .id = param,
+            .data = null,
+        } }, .count = 1 };
+    }
     return .{ .op_data = .{ .modify_ent_setting = .{} }, .count = 0 };
+}
+
+fn decodeGlobalConfig(body: []const u8, sub_action: []const u8) DecodeResult {
+    if (std.mem.eql(u8, sub_action, "remove")) {
+        return .{ .op_data = .{ .global_config = .{ .rate_limit = 0, .rate_window_ms = 0 } }, .count = 1 };
+    }
+    var op = ops_mod.GlobalConfigOp{};
+    if (extractJSONInt(body, "rate")) |r|
+        op.rate_limit = @intCast(std.math.clamp(r, 0, std.math.maxInt(i32)));
+    op.rate_window_ms = if (extractJSONInt(body, "window_ms")) |w|
+        @intCast(std.math.clamp(w, 0, std.math.maxInt(i32)))
+    else
+        1000;
+    return .{ .op_data = .{ .global_config = op }, .count = 1 };
 }
 
 /// Extract a JSON boolean value: "key":true → true, "key":false → false.

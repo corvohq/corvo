@@ -1,6 +1,7 @@
 //! Enterprise settings handler — modify KV-backed enterprise settings.
 //! Ported from Go internal/ops/ops_ent.go.
 
+const std = @import("std");
 const assert = @import("assert.zig");
 const ops = @import("ops.zig");
 const keys = @import("keys.zig");
@@ -8,7 +9,7 @@ const kv = @import("kv.zig");
 const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
 
-pub fn applyModifyEntSetting(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.ModifyEntSettingOp) ops.OpResult {
+pub fn applyModifyEntSetting(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.ModifyEntSettingOp) ops.OpResult {
     const prefix = entSettingPrefix(op.setting);
 
     // api_key_used is mirror-only metadata; skip KV write.
@@ -26,6 +27,19 @@ pub fn applyModifyEntSetting(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.Mo
         b.set(key, data);
     } else {
         b.delete(key);
+    }
+
+    // Namespace rate limit: update in-memory cache from typed fields.
+    if (op.setting == .ns_rate_limit and op.id.len > 0) {
+        if (op.data != null) {
+            self.putNsRateLimit(op.id, .{
+                .rate_limit = op.rate_limit,
+                .rate_window_ms = op.rate_window_ms,
+            });
+        } else {
+            self.removeNsRateLimit(op.id);
+        }
+        self.recomputeMaxRateWindow();
     }
 
     return .{};

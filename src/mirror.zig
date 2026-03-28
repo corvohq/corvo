@@ -1,14 +1,14 @@
-//! SQLite Mirror — async materialized view writer.
+//! SQLite Mirror — inline materialized view writer.
 //!
-//! Ported from Go internal/sqlite/mirror.go.
-//! Receives operations from the engine post-commit pipeline and
-//! batches them into SQLite transactions.
+//! Receives operations from the pipeline thread post-commit and
+//! flushes them to SQLite inline (same thread, no background work).
 //!
 //! The mirror is NOT the source of truth — KV is. SQLite is a
 //! read-optimized materialized view for the API/dashboard.
 //!
 //! Flow:
-//!   engine.apply() → mirror.enqueue(op) → [batch queue] → flush to SQLite
+//!   pipeline.apply() → mirror.enqueue(op) → buffer
+//!   pipeline.tick()  → mirror.flushAll()  → SQLite transaction
 
 const std = @import("std");
 const assert_mod = @import("assert.zig");
@@ -24,9 +24,7 @@ const keys = @import("keys.zig");
 // Config
 // ============================================================================
 
-const mirror_queue_capacity = 131_072;
-const max_batch_size = 4_096;
-const flush_interval_ms = 50;
+const mirror_queue_capacity: u32 = 131_072;
 
 // ============================================================================
 // MirrorOp — queued operation
@@ -370,95 +368,65 @@ pub const MirrorOp = struct {
 pub const Mirror = struct {
     db: sqlite.DB,
     allocator: std.mem.Allocator,
-    running: bool = false,
-    thread: ?std.Thread = null,
 
-    // Stats
-    queued: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    committed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    dropped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // Stats (plain u64 — single-threaded, no atomics needed).
+    queued: u64 = 0,
+    committed: u64 = 0,
+    dropped: u64 = 0,
+    rebuilds: u64 = 0,
 
-    // Ring buffer for ops — heap-allocated, lock-free SPSC.
-    // Producer: engine thread (enqueue). Consumer: mirror thread (flush).
-    ring: []MirrorOp,
-    write_pos: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    read_pos: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // Inline op buffer — pipeline thread only, no ring, no atomics.
+    buf: []MirrorOp,
+    buf_len: u32 = 0,
+
+    // Overflow rebuild: set when buffer drops ops, cleared after full KV→SQLite rebuild.
+    needs_rebuild: bool = false,
+    // KV stores for rebuild-on-overflow. Set by main after init.
+    kv_stores: ?[]kv.Store = null,
 
     // Prepared statements (lazily initialized on first flush).
     stmts: ?MirrorStmts = null,
 
-    // KV stores for rebuild-on-overflow. Set by main after init.
-    // Null in tests/simulator where overflow rebuild isn't needed.
-    kv_stores: ?[]kv.Store = null,
-
-    // Overflow rebuild: set when ring drops ops, cleared after full KV→SQLite rebuild.
-    needs_rebuild: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    rebuilds: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-
     pub fn init(allocator: std.mem.Allocator, db_path: [*:0]const u8) !Mirror {
         var db = try sqlite.DB.open(db_path, .{});
         try schema.createSchema(&db);
-        const ring = try allocator.alloc(MirrorOp, mirror_queue_capacity);
+        const buf = try allocator.alloc(MirrorOp, mirror_queue_capacity);
         return .{
             .db = db,
             .allocator = allocator,
-            .ring = ring,
+            .buf = buf,
         };
     }
 
     pub fn initInMemory(allocator: std.mem.Allocator) !Mirror {
         var db = try sqlite.DB.open(":memory:", .{});
         try schema.createSchema(&db);
-        const ring = try allocator.alloc(MirrorOp, mirror_queue_capacity);
+        const buf = try allocator.alloc(MirrorOp, mirror_queue_capacity);
         return .{
             .db = db,
             .allocator = allocator,
-            .ring = ring,
+            .buf = buf,
         };
     }
 
     pub fn deinit(self: *Mirror) void {
-        self.stop();
+        self.flush() catch {};
         if (self.stmts) |*s| s.deinit();
         self.db.close();
-        self.allocator.free(self.ring);
+        self.allocator.free(self.buf);
     }
 
-    /// Start the background flush thread.
-    pub fn start(self: *Mirror) !void {
-        if (self.running) return;
-        self.running = true;
-        self.thread = try std.Thread.spawn(.{}, flushLoop, .{self});
-    }
-
-    /// Stop the background flush thread and drain remaining ops.
-    pub fn stop(self: *Mirror) void {
-        if (!self.running) return;
-        self.running = false;
-        if (self.thread) |t| {
-            t.join();
-            self.thread = null;
-        }
-        // Final drain.
-        self.flush() catch {};
-    }
-
-    /// Enqueue an operation for async mirror write. Non-blocking.
-    /// Drops the op if the queue is full and sets needs_rebuild.
+    /// Append an operation to the buffer. Called inline from pipeline thread.
+    /// Drops the op if the buffer is full and flags for rebuild on next read.
     pub fn enqueue(self: *Mirror, op: MirrorOp) void {
-        const wp = self.write_pos.load(.monotonic);
-        const rp = self.read_pos.load(.acquire);
-
-        // Ring full — drop op and flag for rebuild on next flushAll().
-        if (wp -% rp >= mirror_queue_capacity) {
-            _ = self.dropped.fetchAdd(1, .monotonic);
-            self.needs_rebuild.store(true, .release);
+        if (self.buf_len >= mirror_queue_capacity) {
+            self.dropped += 1;
+            self.needs_rebuild = true;
             return;
         }
-
-        self.ring[wp % mirror_queue_capacity] = op;
-        self.write_pos.store(wp +% 1, .release);
-        _ = self.queued.fetchAdd(1, .monotonic);
+        self.buf[self.buf_len] = op;
+        self.buf_len += 1;
+        self.queued += 1;
     }
 
     /// Enqueue a simple enqueue op from apply result.
@@ -704,44 +672,28 @@ pub const Mirror = struct {
     }
 
     // ========================================================================
-    // Flush loop (runs on background thread)
+    // Flush — drain buffer to SQLite (called inline from pipeline thread)
     // ========================================================================
 
-    fn flushLoop(self: *Mirror) void {
-        while (self.running) {
-            std.Thread.sleep(flush_interval_ms * std.time.ns_per_ms);
-            self.flush() catch {};
-        }
-    }
-
-    /// Flush pending ops to SQLite in a single transaction.
-    /// Drain the entire ring buffer synchronously. Called before reads
-    /// that need strong consistency (e.g. GetJob after Enqueue).
-    /// If overflow was detected (needs_rebuild), does a full KV→SQLite
-    /// rebuild instead of draining the ring.
+    /// Flush all pending ops to SQLite. Called before HTTP reads for
+    /// strong consistency. If overflow was detected, rebuilds from KV.
     pub fn flushAll(self: *Mirror) void {
-        if (self.needs_rebuild.load(.acquire)) {
+        if (self.needs_rebuild) {
             self.rebuildFromKV();
             return;
         }
-        while (true) {
-            const wp = self.write_pos.load(.acquire);
-            const rp = self.read_pos.load(.monotonic);
-            if (wp == rp) return;
+        while (self.buf_len > 0) {
             self.flush() catch return;
         }
     }
 
+    /// Flush up to flush_batch_size ops to SQLite in a single transaction.
+    /// Shifts remaining ops to the front of the buffer.
     pub fn flush(self: *Mirror) !void {
-        if (self.needs_rebuild.load(.acquire)) return; // Rebuild pending — skip partial flushes.
+        if (self.buf_len == 0) return;
 
-        const wp = self.write_pos.load(.acquire);
-        const rp = self.read_pos.load(.monotonic);
-        if (wp == rp) return; // Nothing to flush.
+        const count = @min(self.buf_len, flush_batch_size);
 
-        const count = @min(wp -% rp, max_batch_size);
-
-        // Ensure prepared statements.
         if (self.stmts == null) {
             self.stmts = try MirrorStmts.init(&self.db);
         }
@@ -750,48 +702,50 @@ pub const Mirror = struct {
         try self.db.begin();
         errdefer self.db.rollback();
 
-        var i: u64 = 0;
-        while (i < count) : (i += 1) {
-            const idx = (rp +% i) % mirror_queue_capacity;
-            const op = &self.ring[idx];
+        for (self.buf[0..count]) |*op| {
             self.applyOp(stmts, op) catch {
-                _ = self.dropped.fetchAdd(1, .monotonic);
+                self.dropped += 1;
                 continue;
             };
         }
 
         try self.db.commit();
-        self.read_pos.store(rp +% count, .release);
-        _ = self.committed.fetchAdd(count, .monotonic);
+        self.committed += count;
+
+        // Shift remaining ops forward.
+        const remaining = self.buf_len - count;
+        if (remaining > 0) {
+            std.mem.copyForwards(MirrorOp, self.buf[0..remaining], self.buf[count..self.buf_len]);
+        }
+        self.buf_len = remaining;
     }
+
+    const flush_batch_size: u32 = 512;
 
     // ========================================================================
     // Rebuild from KV (overflow recovery)
     // ========================================================================
 
-    /// Full KV→SQLite rebuild. Called when ring buffer overflow is detected.
+    /// Full KV→SQLite rebuild. Called when buffer overflow is detected.
     /// Drops all SQLite tables, scans KV stores, and re-inserts everything.
-    /// Runs on the pipeline thread (same thread as flushAll).
     fn rebuildFromKV(self: *Mirror) void {
         const stores = self.kv_stores orelse {
-            // No KV stores (simulator/tests) — clear flag, best-effort drain.
-            self.needs_rebuild.store(false, .release);
+            self.needs_rebuild = false;
+            self.buf_len = 0;
             return;
         };
 
-        std.debug.print("mirror: rebuilding from KV (dropped={d})...\n", .{self.dropped.load(.monotonic)});
+        std.debug.print("mirror: rebuilding from KV (dropped={d})...\n", .{self.dropped});
 
-        // Invalidate cached prepared statements — tables will be dropped.
         if (self.stmts) |*s| {
             s.deinit();
             self.stmts = null;
         }
 
-        // Reset ring buffer — discard pending ops (incomplete due to drops).
-        const wp = self.write_pos.load(.acquire);
-        self.read_pos.store(wp, .release);
+        // Discard buffer — incomplete due to drops.
+        self.buf_len = 0;
 
-        // Drop and recreate all tables for a clean slate.
+        // Drop and recreate all tables.
         self.db.execMulti(
             "DROP TABLE IF EXISTS jobs_fts;" ++
                 "DROP TABLE IF EXISTS job_payloads;" ++
@@ -807,7 +761,6 @@ pub const Mirror = struct {
         ) catch return;
         schema.createSchema(&self.db) catch return;
 
-        // Scan each KV store and rebuild all entity types.
         for (stores) |*store| {
             self.rebuildJobs(store);
             self.rebuildPayloads(store);
@@ -819,25 +772,20 @@ pub const Mirror = struct {
             self.rebuildBudgets(store);
         }
 
-        // Clear flag and bump counter.
-        self.needs_rebuild.store(false, .release);
-        _ = self.rebuilds.fetchAdd(1, .monotonic);
+        self.needs_rebuild = false;
+        self.rebuilds += 1;
         std.debug.print("mirror: rebuild complete\n", .{});
     }
 
-    /// Scan j| prefix — rebuild jobs table + auto-create queues.
     fn rebuildJobs(self: *Mirror, store: *kv.Store) void {
         var batch = store.newBatch();
         defer batch.close();
-
         var lower_buf: keys.KeyBuf = undefined;
         var upper_buf: keys.KeyBuf = undefined;
         @memcpy(lower_buf[0..keys.prefix_job.len], keys.prefix_job);
         const upper = keys.prefixEnd(&upper_buf, lower_buf[0..keys.prefix_job.len]) orelse return;
-
         var iter = batch.newIter(lower_buf[0..keys.prefix_job.len], upper);
         defer iter.close();
-
         if (!iter.first()) return;
 
         var insert_job = self.db.prepare(
@@ -851,7 +799,6 @@ pub const Mirror = struct {
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         ) catch return;
         defer insert_job.finalize();
-
         var insert_queue = self.db.prepare(
             "INSERT OR IGNORE INTO queues (name, created_at) VALUES (?, ?)",
         ) catch return;
@@ -859,12 +806,9 @@ pub const Mirror = struct {
 
         var count: u32 = 0;
         self.db.begin() catch return;
-
         while (true) {
             const val = iter.value();
             const job = codec.decodeJob(val);
-
-            // Bind all 31 params.
             var ts: [7][32]u8 = undefined;
             insert_job.bindText(1, job.id);
             insert_job.bindText(2, job.queue);
@@ -897,288 +841,187 @@ pub const Mirror = struct {
             bindTimestamp(&insert_job, 29, job.started_at_ns, &ts[4]);
             bindTimestamp(&insert_job, 30, job.completed_at_ns, &ts[5]);
             bindTimestamp(&insert_job, 31, job.failed_at_ns, &ts[6]);
-
-            insert_job.exec() catch {
-                insert_job.reset();
-                if (!iter.next()) break;
-                continue;
-            };
+            insert_job.exec() catch { insert_job.reset(); if (!iter.next()) break; continue; };
             insert_job.reset();
-
-            // Auto-create queue.
             insert_queue.bindText(1, job.queue);
             var qts: [32]u8 = undefined;
             insert_queue.bindText(2, formatNs(&qts, job.created_at_ns));
             insert_queue.exec() catch {};
             insert_queue.reset();
-
             count += 1;
-            if (count % max_batch_size == 0) {
-                self.db.commit() catch return;
-                self.db.begin() catch return;
-            }
+            if (count % flush_batch_size == 0) { self.db.commit() catch return; self.db.begin() catch return; }
             if (!iter.next()) break;
         }
-
         self.db.commit() catch {};
-        if (count > 0) std.debug.print("mirror: rebuilt {d} jobs\n", .{count});
     }
 
-    /// Scan jp| prefix — rebuild job_payloads + FTS index.
     fn rebuildPayloads(self: *Mirror, store: *kv.Store) void {
         var batch = store.newBatch();
         defer batch.close();
-
         var lower_buf: keys.KeyBuf = undefined;
         var upper_buf: keys.KeyBuf = undefined;
         const pfx = keys.prefix_job_payload;
         @memcpy(lower_buf[0..pfx.len], pfx);
         const upper = keys.prefixEnd(&upper_buf, lower_buf[0..pfx.len]) orelse return;
-
         var iter = batch.newIter(lower_buf[0..pfx.len], upper);
         defer iter.close();
-
         if (!iter.first()) return;
 
-        var insert_payload = self.db.prepare(
-            "INSERT OR REPLACE INTO job_payloads (job_id, payload) VALUES (?, ?)",
-        ) catch return;
+        var insert_payload = self.db.prepare("INSERT OR REPLACE INTO job_payloads (job_id, payload) VALUES (?, ?)") catch return;
         defer insert_payload.finalize();
-
-        var insert_fts = self.db.prepare(
-            "INSERT INTO jobs_fts (job_id, payload) VALUES (?, ?)",
-        ) catch return;
+        var insert_fts = self.db.prepare("INSERT INTO jobs_fts (job_id, payload) VALUES (?, ?)") catch return;
         defer insert_fts.finalize();
 
         var count: u32 = 0;
         self.db.begin() catch return;
-
         while (true) {
             const k = iter.key();
             const val = iter.value();
-
-            // Extract job_id from key: jp|{job_id}
             const job_id = k[pfx.len..];
-
             insert_payload.bindText(1, job_id);
             insert_payload.bindText(2, val);
             insert_payload.exec() catch {};
             insert_payload.reset();
-
-            // Payload preview for FTS (truncate to 4096 for search index).
             const preview_len = @min(val.len, 4096);
             insert_fts.bindText(1, job_id);
             insert_fts.bindText(2, val[0..preview_len]);
             insert_fts.exec() catch {};
             insert_fts.reset();
-
             count += 1;
-            if (count % max_batch_size == 0) {
-                self.db.commit() catch return;
-                self.db.begin() catch return;
-            }
+            if (count % flush_batch_size == 0) { self.db.commit() catch return; self.db.begin() catch return; }
             if (!iter.next()) break;
         }
-
         self.db.commit() catch {};
-        if (count > 0) std.debug.print("mirror: rebuilt {d} payloads\n", .{count});
     }
 
-    /// Scan je| prefix — rebuild job_errors table.
-    /// Key: je|{job_id}\x00{attempt:4BE}, Value: JSON with error + created_at_ns.
     fn rebuildErrors(self: *Mirror, store: *kv.Store) void {
         var batch = store.newBatch();
         defer batch.close();
-
         var lower_buf: keys.KeyBuf = undefined;
         var upper_buf: keys.KeyBuf = undefined;
         const pfx = keys.prefix_job_error;
         @memcpy(lower_buf[0..pfx.len], pfx);
         const upper = keys.prefixEnd(&upper_buf, lower_buf[0..pfx.len]) orelse return;
-
         var iter = batch.newIter(lower_buf[0..pfx.len], upper);
         defer iter.close();
-
         if (!iter.first()) return;
 
-        var stmt = self.db.prepare(
-            "INSERT INTO job_errors (job_id, attempt, error, backtrace, created_at) VALUES (?, ?, ?, ?, ?)",
-        ) catch return;
+        var stmt = self.db.prepare("INSERT INTO job_errors (job_id, attempt, error, backtrace, created_at) VALUES (?, ?, ?, ?, ?)") catch return;
         defer stmt.finalize();
-
         self.db.begin() catch return;
         var count: u32 = 0;
-
         while (true) {
             const k = iter.key();
             const val = iter.value();
-
-            // Key: je|{job_id}\x00{attempt:4BE} — min length = prefix + 1 + 1 + 4
-            if (k.len <= pfx.len + 5) {
-                if (!iter.next()) break;
-                continue;
-            }
+            if (k.len <= pfx.len + 5) { if (!iter.next()) break; continue; }
             const job_id = k[pfx.len .. k.len - 5];
             const attempt = keys.getU32BE(k[k.len - 4 ..][0..4]);
-
-            // Extract fields from JSON value.
             const error_msg = extractJsonStr(val, "\"error\":\"");
             const backtrace = extractJsonStr(val, "\"backtrace\":\"");
             const created_ns = extractJsonNum(val, "\"created_at_ns\":");
-
             stmt.bindText(1, job_id);
             stmt.bindInt(2, @intCast(attempt));
             if (error_msg) |msg| stmt.bindText(3, msg) else stmt.bindNull(3);
             if (backtrace) |bt| stmt.bindText(4, bt) else stmt.bindNull(4);
-            if (created_ns) |ns| {
-                var ts: [32]u8 = undefined;
-                stmt.bindText(5, formatNs(&ts, ns));
-            } else {
-                stmt.bindText(5, "0");
-            }
-
+            if (created_ns) |ns| { var tsbuf: [32]u8 = undefined; stmt.bindText(5, formatNs(&tsbuf, ns)); } else stmt.bindText(5, "0");
             stmt.exec() catch {};
             stmt.reset();
             count += 1;
-
-            if (count % max_batch_size == 0) {
-                self.db.commit() catch return;
-                self.db.begin() catch return;
-            }
+            if (count % flush_batch_size == 0) { self.db.commit() catch return; self.db.begin() catch return; }
             if (!iter.next()) break;
         }
-
         self.db.commit() catch {};
-        if (count > 0) std.debug.print("mirror: rebuilt {d} errors\n", .{count});
     }
 
-    /// Scan qc| prefix — rebuild queues table with config.
     fn rebuildQueues(self: *Mirror, store: *kv.Store) void {
         var batch = store.newBatch();
         defer batch.close();
-
         var lower_buf: keys.KeyBuf = undefined;
         var upper_buf: keys.KeyBuf = undefined;
         const pfx = keys.prefix_queue_config;
         @memcpy(lower_buf[0..pfx.len], pfx);
         const upper = keys.prefixEnd(&upper_buf, lower_buf[0..pfx.len]) orelse return;
-
         var iter = batch.newIter(lower_buf[0..pfx.len], upper);
         defer iter.close();
-
         if (!iter.first()) return;
 
         var stmt = self.db.prepare(
-            "INSERT OR REPLACE INTO queues (name, paused, max_concurrency, rate_limit, rate_window_ms, created_at)" ++
-                " VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO queues (name, paused, max_concurrency, rate_limit, rate_window_ms, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         ) catch return;
         defer stmt.finalize();
-
         self.db.begin() catch return;
-        var count: u32 = 0;
-
         while (true) {
             const val = iter.value();
             const queue = codec.decodeQueue(val);
             var ts: [32]u8 = undefined;
-
             stmt.bindText(1, queue.name);
             stmt.bindInt(2, if (queue.paused) 1 else 0);
             if (queue.max_concurrency > 0) stmt.bindInt(3, @intCast(queue.max_concurrency)) else stmt.bindNull(3);
             if (queue.rate_limit > 0) stmt.bindInt(4, @intCast(queue.rate_limit)) else stmt.bindNull(4);
             if (queue.rate_window_ms > 0) stmt.bindInt(5, @intCast(queue.rate_window_ms)) else stmt.bindNull(5);
             if (queue.created_at_ns > 0) stmt.bindText(6, formatNs(&ts, queue.created_at_ns)) else stmt.bindNull(6);
-
             stmt.exec() catch {};
             stmt.reset();
-            count += 1;
             if (!iter.next()) break;
         }
-
         self.db.commit() catch {};
-        if (count > 0) std.debug.print("mirror: rebuilt {d} queues\n", .{count});
     }
 
-    /// Scan w| prefix — rebuild workers table.
     fn rebuildWorkers(self: *Mirror, store: *kv.Store) void {
         var batch = store.newBatch();
         defer batch.close();
-
         var lower_buf: keys.KeyBuf = undefined;
         var upper_buf: keys.KeyBuf = undefined;
         const pfx = keys.prefix_worker;
         @memcpy(lower_buf[0..pfx.len], pfx);
         const upper = keys.prefixEnd(&upper_buf, lower_buf[0..pfx.len]) orelse return;
-
         var iter = batch.newIter(lower_buf[0..pfx.len], upper);
         defer iter.close();
-
         if (!iter.first()) return;
 
-        var stmt = self.db.prepare(
-            "INSERT OR REPLACE INTO workers (id, hostname, queues, last_heartbeat, started_at)" ++
-                " VALUES (?, ?, ?, ?, ?)",
-        ) catch return;
+        var stmt = self.db.prepare("INSERT OR REPLACE INTO workers (id, hostname, queues, last_heartbeat, started_at) VALUES (?, ?, ?, ?, ?)") catch return;
         defer stmt.finalize();
-
         self.db.begin() catch return;
-        var count: u32 = 0;
-
         while (true) {
             const val = iter.value();
             const worker = codec.decodeWorker(val);
             var ts1: [32]u8 = undefined;
             var ts2: [32]u8 = undefined;
-
             stmt.bindText(1, worker.id);
             bindOptText(&stmt, 2, worker.hostname);
             bindOptText(&stmt, 3, worker.queues);
             bindTimestamp(&stmt, 4, worker.last_heartbeat_ns, &ts1);
             bindTimestamp(&stmt, 5, worker.started_at_ns, &ts2);
-
             stmt.exec() catch {};
             stmt.reset();
-            count += 1;
             if (!iter.next()) break;
         }
-
         self.db.commit() catch {};
-        if (count > 0) std.debug.print("mirror: rebuilt {d} workers\n", .{count});
     }
 
-    /// Scan sc| prefix — rebuild crons table.
     fn rebuildCrons(self: *Mirror, store: *kv.Store) void {
         var batch = store.newBatch();
         defer batch.close();
-
         var lower_buf: keys.KeyBuf = undefined;
         var upper_buf: keys.KeyBuf = undefined;
         const pfx = keys.prefix_cron;
         @memcpy(lower_buf[0..pfx.len], pfx);
         const upper = keys.prefixEnd(&upper_buf, lower_buf[0..pfx.len]) orelse return;
-
         var iter = batch.newIter(lower_buf[0..pfx.len], upper);
         defer iter.close();
-
         if (!iter.first()) return;
 
         var stmt = self.db.prepare(
-            "INSERT OR REPLACE INTO crons (id, name, queue, schedule, timezone, payload," ++
-                " unique_key, max_retries, enabled, next_run_at, last_run_at, created_at)" ++
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO crons (id, name, queue, schedule, timezone, payload, unique_key, max_retries, enabled, next_run_at, last_run_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         ) catch return;
         defer stmt.finalize();
-
         self.db.begin() catch return;
-        var count: u32 = 0;
-
         while (true) {
             const val = iter.value();
             const cron = codec.decodeCron(val);
             var ts1: [32]u8 = undefined;
             var ts2: [32]u8 = undefined;
             var ts3: [32]u8 = undefined;
-
             stmt.bindText(1, cron.id);
             stmt.bindText(2, cron.name);
             stmt.bindText(3, cron.queue);
@@ -1191,48 +1034,34 @@ pub const Mirror = struct {
             if (cron.next_run_ns > 0) stmt.bindText(10, formatI64(&ts1, cron.next_run_ns)) else stmt.bindNull(10);
             if (cron.last_run_ns > 0) stmt.bindText(11, formatI64(&ts2, cron.last_run_ns)) else stmt.bindNull(11);
             if (cron.created_at_ns > 0) stmt.bindText(12, formatNs(&ts3, cron.created_at_ns)) else stmt.bindNull(12);
-
             stmt.exec() catch {};
             stmt.reset();
-            count += 1;
             if (!iter.next()) break;
         }
-
         self.db.commit() catch {};
-        if (count > 0) std.debug.print("mirror: rebuilt {d} crons\n", .{count});
     }
 
-    /// Scan b| prefix — rebuild batches table.
     fn rebuildBatches(self: *Mirror, store: *kv.Store) void {
         var batch_kv = store.newBatch();
         defer batch_kv.close();
-
         var lower_buf: keys.KeyBuf = undefined;
         var upper_buf: keys.KeyBuf = undefined;
         const pfx = keys.prefix_batch;
         @memcpy(lower_buf[0..pfx.len], pfx);
         const upper = keys.prefixEnd(&upper_buf, lower_buf[0..pfx.len]) orelse return;
-
         var iter = batch_kv.newIter(lower_buf[0..pfx.len], upper);
         defer iter.close();
-
         if (!iter.first()) return;
 
         var stmt = self.db.prepare(
-            "INSERT OR REPLACE INTO batches (id, open, total, pending, succeeded, failed," ++
-                " callback_queue, callback_payload, created_at)" ++
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO batches (id, open, total, pending, succeeded, failed, callback_queue, callback_payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         ) catch return;
         defer stmt.finalize();
-
         self.db.begin() catch return;
-        var count: u32 = 0;
-
         while (true) {
             const val = iter.value();
             const b = codec.decodeBatch(val);
             var ts: [32]u8 = undefined;
-
             stmt.bindText(1, b.id);
             stmt.bindInt(2, if (b.open) 1 else 0);
             stmt.bindInt(3, @intCast(b.total));
@@ -1242,49 +1071,35 @@ pub const Mirror = struct {
             bindOptText(&stmt, 7, b.callback_queue);
             bindOptText(&stmt, 8, b.callback_payload);
             if (b.created_at_ns > 0) stmt.bindText(9, formatNs(&ts, b.created_at_ns)) else stmt.bindNull(9);
-
             stmt.exec() catch {};
             stmt.reset();
-            count += 1;
             if (!iter.next()) break;
         }
-
         self.db.commit() catch {};
-        if (count > 0) std.debug.print("mirror: rebuilt {d} batches\n", .{count});
     }
 
-    /// Scan bg| prefix — rebuild budgets table.
     fn rebuildBudgets(self: *Mirror, store: *kv.Store) void {
         var batch = store.newBatch();
         defer batch.close();
-
         var lower_buf: keys.KeyBuf = undefined;
         var upper_buf: keys.KeyBuf = undefined;
         const pfx = keys.prefix_budget;
         @memcpy(lower_buf[0..pfx.len], pfx);
         const upper = keys.prefixEnd(&upper_buf, lower_buf[0..pfx.len]) orelse return;
-
         var iter = batch.newIter(lower_buf[0..pfx.len], upper);
         defer iter.close();
-
         if (!iter.first()) return;
 
         var stmt = self.db.prepare(
-            "INSERT OR REPLACE INTO budgets (id, scope, target, daily_usd, per_job_usd, on_exceed, created_at)" ++
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO budgets (id, scope, target, daily_usd, per_job_usd, on_exceed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         ) catch return;
         defer stmt.finalize();
-
         self.db.begin() catch return;
-        var count: u32 = 0;
-
         while (true) {
             const k = iter.key();
             const val = iter.value();
             const bg = codec.decodeBudget(val);
             var ts: [32]u8 = undefined;
-
-            // Budget id = KV key (bg|{scope}\x00{target}).
             stmt.bindText(1, k);
             stmt.bindText(2, bg.scope);
             stmt.bindText(3, bg.target);
@@ -1292,15 +1107,11 @@ pub const Mirror = struct {
             stmt.bindDouble(5, bg.per_job_usd);
             stmt.bindText(6, bg.on_exceed);
             if (bg.created_at_ns > 0) stmt.bindText(7, formatNs(&ts, bg.created_at_ns)) else stmt.bindNull(7);
-
             stmt.exec() catch {};
             stmt.reset();
-            count += 1;
             if (!iter.next()) break;
         }
-
         self.db.commit() catch {};
-        if (count > 0) std.debug.print("mirror: rebuilt {d} budgets\n", .{count});
     }
 
     fn applyOp(self: *Mirror, stmts: *MirrorStmts, op: *const MirrorOp) !void {
@@ -1545,10 +1356,10 @@ pub const Mirror = struct {
 
     pub fn stats(self: *const Mirror) MirrorStats {
         return .{
-            .queued = self.queued.load(.monotonic),
-            .committed = self.committed.load(.monotonic),
-            .dropped = self.dropped.load(.monotonic),
-            .rebuilds = self.rebuilds.load(.monotonic),
+            .queued = self.queued,
+            .committed = self.committed,
+            .dropped = self.dropped,
+            .rebuilds = self.rebuilds,
         };
     }
 
@@ -2012,13 +1823,11 @@ fn formatNs(buf: *[32]u8, ns: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}", .{ns}) catch "0";
 }
 
-/// Format signed i64 nanoseconds (used for cron next_run_ns/last_run_ns).
 fn formatI64(buf: *[32]u8, ns: i64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}", .{ns}) catch "0";
 }
 
-/// Bind an optional text field — NULL if null, text if non-null.
-fn bindOptText(stmt: *sqlite.Stmt, idx: c_int, val: ?[]const u8) void {
+fn bindOptText(stmt: *sqlite.Stmt, idx: i32, val: ?[]const u8) void {
     if (val) |v| {
         if (v.len > 0) stmt.bindText(idx, v) else stmt.bindNull(idx);
     } else {
@@ -2026,8 +1835,7 @@ fn bindOptText(stmt: *sqlite.Stmt, idx: c_int, val: ?[]const u8) void {
     }
 }
 
-/// Bind a u64 timestamp — NULL if zero, formatted nanosecond string otherwise.
-fn bindTimestamp(stmt: *sqlite.Stmt, idx: c_int, ns: u64, buf: *[32]u8) void {
+fn bindTimestamp(stmt: *sqlite.Stmt, idx: i32, ns: u64, buf: *[32]u8) void {
     if (ns > 0) {
         stmt.bindText(idx, formatNs(buf, ns));
     } else {
@@ -2035,12 +1843,6 @@ fn bindTimestamp(stmt: *sqlite.Stmt, idx: c_int, ns: u64, buf: *[32]u8) void {
     }
 }
 
-// ============================================================================
-// JSON field extraction (for je| error values during rebuild)
-// ============================================================================
-
-/// Find `needle` (e.g. `"error":"`) in json and return the string value
-/// up to the next unescaped `"`. Returns null if not found.
 fn extractJsonStr(json: []const u8, needle: []const u8) ?[]const u8 {
     const pos = std.mem.indexOf(u8, json, needle) orelse return null;
     const start = pos + needle.len;
@@ -2049,7 +1851,6 @@ fn extractJsonStr(json: []const u8, needle: []const u8) ?[]const u8 {
     return json[start..end];
 }
 
-/// Find `needle` (e.g. `"created_at_ns":`) in json and parse the u64 that follows.
 fn extractJsonNum(json: []const u8, needle: []const u8) ?u64 {
     const pos = std.mem.indexOf(u8, json, needle) orelse return null;
     const start = pos + needle.len;
