@@ -1,48 +1,44 @@
-//! Embedded UI assets — compile-time embedded SPA dashboard.
+//! Embedded UI assets — HTMX + Tailwind CSS dashboard.
 //!
-//! Uses @embedFile to include the pre-built UI from ui/dist/ at compile time.
-//! Serves at /ui/* with SPA fallback (non-file paths return index.html).
-//!
-//! This file lives at the project root so @embedFile can reach ui/dist/.
+//! Static assets are pre-gzipped at build time and served with
+//! Content-Encoding: gzip. This keeps send_buf small.
 
 const std = @import("std");
 
-// Embedded assets (relative to this file at project root).
-const index_html = @embedFile("ui/dist/index.html");
-const favicon_svg = @embedFile("ui/dist/favicon.svg");
-const logo_full_svg = @embedFile("ui/dist/logo-full.svg");
-const index_js = @embedFile("ui/dist/assets/index-B_kZ96MS.js");
-const index_css = @embedFile("ui/dist/assets/index-DqOUNrgT.css");
+// Embedded assets — pre-gzipped.
+const htmx_js_gz = @embedFile("ui/htmx.min.js.gz");
+const tailwind_css_gz = @embedFile("ui/tailwind.css.gz");
+const favicon_svg_gz = @embedFile("ui/dist/favicon.svg.gz");
+const logo_full_svg_gz = @embedFile("ui/dist/logo-full.svg.gz");
+
+/// Largest embedded asset size. send_buf must fit this + HTTP headers (~200B).
+pub const max_asset_size: usize = htmx_js_gz.len;
+
+comptime {
+    // Verify htmx is actually the largest.
+    std.debug.assert(htmx_js_gz.len >= tailwind_css_gz.len);
+    std.debug.assert(htmx_js_gz.len >= favicon_svg_gz.len);
+    std.debug.assert(htmx_js_gz.len >= logo_full_svg_gz.len);
+}
 
 pub const EmbeddedFile = struct {
     data: []const u8,
     content_type: []const u8,
+    gzipped: bool,
 };
 
-/// Look up an embedded UI file by path (relative to /ui/).
-/// Returns null if not found — caller should fall back to index.html for SPA routing.
+/// Look up a static asset by path (relative to /ui/).
+/// Returns null for paths that should be server-rendered HTML pages.
 pub fn lookup(path: []const u8) ?EmbeddedFile {
-    if (eql(path, "/") or eql(path, "/index.html") or path.len == 0) {
-        return .{ .data = index_html, .content_type = "text/html; charset=utf-8" };
-    }
-    if (eql(path, "/favicon.svg")) {
-        return .{ .data = favicon_svg, .content_type = "image/svg+xml" };
-    }
-    if (eql(path, "/logo-full.svg")) {
-        return .{ .data = logo_full_svg, .content_type = "image/svg+xml" };
-    }
-    if (eql(path, "/assets/index-B_kZ96MS.js")) {
-        return .{ .data = index_js, .content_type = "application/javascript" };
-    }
-    if (eql(path, "/assets/index-DqOUNrgT.css")) {
-        return .{ .data = index_css, .content_type = "text/css" };
-    }
+    if (eql(path, "/htmx.min.js"))
+        return .{ .data = htmx_js_gz, .content_type = "application/javascript", .gzipped = true };
+    if (eql(path, "/tailwind.css"))
+        return .{ .data = tailwind_css_gz, .content_type = "text/css", .gzipped = true };
+    if (eql(path, "/favicon.svg"))
+        return .{ .data = favicon_svg_gz, .content_type = "image/svg+xml", .gzipped = true };
+    if (eql(path, "/logo-full.svg"))
+        return .{ .data = logo_full_svg_gz, .content_type = "image/svg+xml", .gzipped = true };
     return null;
-}
-
-/// SPA fallback — returns index.html for any unrecognized path.
-pub fn indexHtml() EmbeddedFile {
-    return .{ .data = index_html, .content_type = "text/html; charset=utf-8" };
 }
 
 fn eql(a: []const u8, b: []const u8) bool {

@@ -543,7 +543,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
             const clean_path = if (std.mem.indexOfScalar(u8, req.path, '?')) |qi| req.path[0..qi] else req.path;
             const skip_auth = std.mem.eql(u8, clean_path, "/healthz") or
                 std.mem.eql(u8, clean_path, "/api/v1/auth/status") or
-                std.mem.eql(u8, clean_path, "/metrics");
+                std.mem.eql(u8, clean_path, "/metrics") or
+                std.mem.eql(u8, clean_path, "/ui") or
+                std.mem.startsWith(u8, clean_path, "/ui/");
             if (!skip_auth) {
                 const auth_result = http.checkAuth(req.api_key, req.method, self.reader);
                 if (auth_result != .ok) {

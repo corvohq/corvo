@@ -7,6 +7,9 @@ const std = @import("std");
 const http = @import("http.zig");
 const json = @import("json_writer.zig");
 const sqlite_read = @import("sqlite_read.zig");
+const http_ui = @import("http_ui.zig");
+const ui_embed = @import("ui_embed");
+
 
 // ============================================================================
 // Dispatch
@@ -28,6 +31,16 @@ pub fn dispatch(
     // Health check (outside /api/v1/).
     if (std.mem.eql(u8, clean, "/healthz"))
         return http.writeResponse(send_buf, 200, "{\"status\":\"ok\"}");
+
+    // UI routes — static assets and server-rendered pages.
+    if (std.mem.eql(u8, clean, "/ui") or std.mem.startsWith(u8, clean, "/ui/")) {
+        const ui_path = if (clean.len > 3) clean[3..] else "/";
+        // Try static asset first.
+        if (ui_embed.lookup(ui_path)) |file|
+            return http.writeResponseStatic(send_buf, file.data, file.content_type, file.gzipped);
+        // Server-rendered HTML page.
+        return http_ui.dispatch(ui_path, send_buf, reader);
+    }
 
     if (!std.mem.startsWith(u8, clean, "/api/v1/")) return 0;
     const api = clean["/api/v1".len..];

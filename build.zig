@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     corvo_mod.addImport("talon", talon_mod);
+    corvo_mod.addAnonymousImport("ui_embed", .{ .root_source_file = b.path("ui_embed.zig") });
     corvo_mod.link_libc = true;
     corvo_mod.linkSystemLibrary("sqlite3", .{});
 
@@ -35,6 +36,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_mod.addImport("talon", talon_mod);
+    test_mod.addAnonymousImport("ui_embed", .{ .root_source_file = b.path("ui_embed.zig") });
     test_mod.link_libc = true;
     test_mod.linkSystemLibrary("sqlite3", .{});
     const tests = b.addTest(.{

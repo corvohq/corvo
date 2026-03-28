@@ -174,6 +174,29 @@ pub fn writeResponseText(send_buf: []u8, status: u16, text_body: []const u8) u32
     return writeResponseInner(send_buf, status, "text/plain; charset=utf-8", text_body);
 }
 
+/// Write an HTTP/1.1 HTML response into send_buf. Returns bytes written.
+pub fn writeResponseHtml(send_buf: []u8, status: u16, html_body: []const u8) u32 {
+    return writeResponseInner(send_buf, status, "text/html; charset=utf-8", html_body);
+}
+
+/// Write an HTTP/1.1 response for a static embedded file.
+/// If gzipped=true, adds Content-Encoding: gzip header.
+pub fn writeResponseStatic(send_buf: []u8, data: []const u8, content_type: []const u8, gzipped: bool) u32 {
+    var stream = std.io.fixedBufferStream(send_buf);
+    const w = stream.writer();
+
+    w.writeAll("HTTP/1.1 200 OK\r\n") catch return 0;
+    w.print("Content-Type: {s}\r\n", .{content_type}) catch return 0;
+    w.print("Content-Length: {d}\r\n", .{data.len}) catch return 0;
+    if (gzipped) w.writeAll("Content-Encoding: gzip\r\n") catch return 0;
+    w.writeAll("Cache-Control: public, max-age=31536000, immutable\r\n") catch return 0;
+    w.writeAll("Connection: keep-alive\r\n") catch return 0;
+    w.writeAll("\r\n") catch return 0;
+    w.writeAll(data) catch return 0;
+
+    return @intCast(stream.pos);
+}
+
 fn writeResponseInner(send_buf: []u8, status: u16, content_type: []const u8, body: []const u8) u32 {
     var stream = std.io.fixedBufferStream(send_buf);
     const w = stream.writer();
@@ -278,6 +301,7 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
     if (!std.mem.startsWith(u8, clean, "/api/v1/")) {
         if (std.mem.eql(u8, clean, "/healthz")) return .read;
         if (std.mem.eql(u8, clean, "/metrics")) return .read;
+        if (std.mem.eql(u8, clean, "/ui") or std.mem.startsWith(u8, clean, "/ui/")) return .read;
         return .not_found;
     }
 
