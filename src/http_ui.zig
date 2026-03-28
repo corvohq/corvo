@@ -384,30 +384,34 @@ fn jobDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, job_id: []const u
 }
 
 fn workersPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    const rdr = reader orelse return renderPage(send_buf, "Workers", "<p class=\"text-gray-500\">No data available</p>");
+    const WorkerView = struct {
+        id: []const u8,
+        hostname: []const u8,
+        queues: []const u8,
+        last_heartbeat: []const u8,
+        started_at: []const u8,
+    };
 
     var worker_buf: [64]sqlite_read.WorkerRow = undefined;
-    const count = rdr.getWorkers(&worker_buf) catch 0;
+    const count: usize = if (reader) |rdr| rdr.getWorkers(&worker_buf) catch 0 else 0;
 
-    if (count == 0) return renderPage(send_buf, "Workers", "<p class=\"text-gray-500\">No workers connected</p>");
-
-    var rows_buf: [page_buf_size]u8 = undefined;
-    var hw = html.HtmlWriter.init(&rows_buf);
+    var views: [64]WorkerView = undefined;
     for (0..count) |i| {
         const wk = &worker_buf[i];
-        hw.open("tr");
-        hw.attr("class", "hover:bg-gray-50");
-        tableCell(&hw, wk.idSlice());
-        tableCell(&hw, wk.hostnameSlice());
-        tableCell(&hw, wk.queuesSlice());
-        timestampCell(&hw, wk.lastHeartbeatSlice());
-        timestampCell(&hw, wk.startedAtSlice());
-        hw.close("tr");
+        views[i] = .{
+            .id = wk.idSlice(),
+            .hostname = wk.hostnameSlice(),
+            .queues = wk.queuesSlice(),
+            .last_heartbeat = wk.lastHeartbeatSlice(),
+            .started_at = wk.startedAtSlice(),
+        };
     }
 
     var content_buf: [page_buf_size]u8 = undefined;
-    const content = workers_tmpl.render(&content_buf, .{ .rows = hw.getWritten() }) catch
-        return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
+    const workers: []const WorkerView = views[0..count];
+    const content = workers_tmpl.render(&content_buf, .{
+        .workers = workers,
+    }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Workers", content);
 }
 

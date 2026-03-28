@@ -1,16 +1,27 @@
-<div class="bg-white border border-gray-200 rounded-lg overflow-x-auto">
+<div class="rounded-xl border border-zinc-200 bg-white shadow-sm overflow-x-auto">
 <table class="w-full text-sm">
 <thead>
-<tr class="border-b border-gray-200 bg-gray-50">
-  <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID</th>
-  <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Hostname</th>
-  <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Queues</th>
-  <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Heartbeat</th>
-  <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Started</th>
+<tr class="border-b border-zinc-200">
+  <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">ID</th>
+  <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Hostname</th>
+  <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Queues</th>
+  <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Last Heartbeat</th>
+  <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Started</th>
 </tr>
 </thead>
-<tbody class="divide-y divide-gray-100">
-{{{rows}}}
+<tbody class="divide-y divide-zinc-100">
+{{#workers}}
+<tr class="hover:bg-zinc-50">
+  <td class="px-6 py-3 text-zinc-700">{{id}}</td>
+  <td class="px-6 py-3 text-zinc-700">{{hostname}}</td>
+  <td class="px-6 py-3 text-zinc-700">{{queues}}</td>
+  <td class="px-6 py-3 text-zinc-700"><time data-ts="{{last_heartbeat}}">{{last_heartbeat}}</time></td>
+  <td class="px-6 py-3 text-zinc-700"><time data-ts="{{started_at}}">{{started_at}}</time></td>
+</tr>
+{{/workers}}
+{{^workers}}
+<tr><td colspan="5" class="px-6 py-8 text-center text-zinc-500">No workers connected</td></tr>
+{{/workers}}
 </tbody>
 </table>
 </div>
