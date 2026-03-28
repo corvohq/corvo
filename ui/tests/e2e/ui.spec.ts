@@ -1,14 +1,8 @@
-import { test, expect, Page } from "@playwright/test";
-
-// Wait for the page to finish loading (no "Loading..." spinners).
-async function waitForLoad(page: Page) {
-  await expect(page.getByText("Loading...")).toHaveCount(0, { timeout: 10_000 });
-}
+import { test, expect } from "@playwright/test";
 
 test.describe("Dashboard", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/ui/");
-    await waitForLoad(page);
   });
 
   test("renders heading", async ({ page }) => {
@@ -16,194 +10,137 @@ test.describe("Dashboard", () => {
   });
 
   test("shows seeded queue names", async ({ page }) => {
-    await expect(page.getByText("emails.send")).toBeVisible();
-    await expect(page.getByText("reports.generate")).toBeVisible();
+    await expect(page.getByText("emails")).toBeVisible();
+    await expect(page.getByText("payments")).toBeVisible();
   });
 
   test("shows summary stat cards", async ({ page }) => {
-    // Stat cards are rendered when queues data arrives.
-    await expect(page.getByText("Total Pending")).toBeVisible();
-    await expect(page.getByText("Max Latency")).toBeVisible();
-    // "Queues" appears only in the stat card (not in sidebar or table headers).
-    await expect(page.getByText("Queues").first()).toBeVisible();
+    await expect(page.getByText("Pending")).toBeVisible();
+    await expect(page.getByText("Active")).toBeVisible();
+    await expect(page.getByText("Workers")).toBeVisible();
   });
 
   test("Enqueue Job button is present", async ({ page }) => {
     await expect(page.getByRole("button", { name: /enqueue job/i })).toBeVisible();
+  });
+
+  test("sidebar navigation links present", async ({ page }) => {
+    await expect(page.getByRole("link", { name: "Dashboard" })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Queues" })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Workers" })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Cluster" })).toBeVisible();
   });
 });
 
 test.describe("Queues page", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/ui/queues");
-    await waitForLoad(page);
   });
 
   test("renders heading", async ({ page }) => {
     await expect(page.getByRole("heading", { name: "Queues" })).toBeVisible();
   });
 
-  test("shows seeded queues", async ({ page }) => {
-    await expect(page.getByText("emails.send")).toBeVisible();
-    await expect(page.getByText("reports.generate")).toBeVisible();
-    await expect(page.getByText("agents.research")).toBeVisible();
+  test("shows seeded queues in table", async ({ page }) => {
+    await expect(page.getByRole("link", { name: "emails" })).toBeVisible();
+    await expect(page.getByRole("link", { name: "payments" })).toBeVisible();
+    await expect(page.getByRole("link", { name: "reports" })).toBeVisible();
   });
 
-  test("shows queue count", async ({ page }) => {
-    // The count span like "(7)" appears next to the "All Queues" title.
-    await expect(page.getByText(/all queues/i)).toBeVisible();
+  test("queue links navigate to detail page", async ({ page }) => {
+    await page.getByRole("link", { name: "emails" }).click();
+    await expect(page).toHaveURL(/\/ui\/queues\/emails/);
+    await expect(page.getByText("emails")).toBeVisible();
   });
 });
 
 test.describe("Queue detail", () => {
-  test("loads the emails.send queue page", async ({ page }) => {
-    await page.goto("/ui/queues/emails.send");
-    await waitForLoad(page);
-    await expect(page.getByText("emails.send")).toBeVisible();
+  test("shows queue name and action buttons", async ({ page }) => {
+    await page.goto("/ui/queues/emails");
+    await expect(page.getByText("emails")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Pause" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Resume" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Drain" })).toBeVisible();
   });
 
-  test("clicking a queue row navigates to its detail page", async ({ page }) => {
-    await page.goto("/ui/queues");
-    await waitForLoad(page);
-    await page.getByText("emails.send").first().click();
-    await expect(page).toHaveURL(/\/ui\/queues\/emails\.send/);
-    await waitForLoad(page);
-    await expect(page.getByText("emails.send")).toBeVisible();
-  });
-});
-
-test.describe("Dead Letter Queue", () => {
-  test.beforeEach(async ({ page }) => {
-    await page.goto("/ui/dead-letter");
-    await waitForLoad(page);
-  });
-
-  test("renders heading", async ({ page }) => {
-    await expect(page.getByRole("heading", { name: /dead letter/i })).toBeVisible();
-  });
-
-  test("shows dead jobs seeded by demo command", async ({ page }) => {
-    // Seed creates dead jobs — verify at least one row is present.
-    await expect(page.locator("table tbody tr").first()).toBeVisible();
-  });
-
-  test("job rows are present in the table", async ({ page }) => {
+  test("shows jobs in table with action buttons", async ({ page }) => {
+    await page.goto("/ui/queues/emails");
     const rows = page.locator("table tbody tr");
     await expect(rows.first()).toBeVisible();
+    // Row has Cancel and Delete action buttons.
+    await expect(rows.first().getByRole("button", { name: "Cancel" })).toBeVisible();
+    await expect(rows.first().getByRole("button", { name: "Delete" })).toBeVisible();
+  });
+
+  test("has select-all checkbox and bulk bar appears", async ({ page }) => {
+    await page.goto("/ui/queues/emails");
+    const selectAll = page.locator("#select-all");
+    await expect(selectAll).toBeVisible();
+    await selectAll.check();
+    await expect(page.getByText(/\d+ selected/)).toBeVisible();
   });
 });
 
-test.describe("Job Detail", () => {
-  test("navigating into a dead job shows its detail", async ({ page }) => {
+test.describe("Dead Letter", () => {
+  test("renders heading", async ({ page }) => {
     await page.goto("/ui/dead-letter");
-    await waitForLoad(page);
-
-    // Click the first job row to open its detail page.
-    const firstRow = page.locator("table tbody tr").first();
-    await firstRow.click();
-
-    await expect(page).toHaveURL(/\/ui\/jobs\//);
-    await waitForLoad(page);
-
-    // URL check above confirms navigation. Just verify no error state.
-    await expect(page.getByText("Job not found")).not.toBeVisible();
+    await expect(page.getByRole("heading", { name: /dead letter/i })).toBeVisible();
   });
 });
 
 test.describe("Held Jobs", () => {
-  test.beforeEach(async ({ page }) => {
-    await page.goto("/ui/held");
-    await waitForLoad(page);
-  });
-
   test("renders heading", async ({ page }) => {
+    await page.goto("/ui/held");
     await expect(page.getByRole("heading", { name: "Held Jobs" })).toBeVisible();
-  });
-
-  test("shows held jobs from seed", async ({ page }) => {
-    // Seed creates at least one manually-held job.
-    // Either the held card renders, or the "No held jobs" empty state appears.
-    // In either case the page must not crash.
-    const noJobs = page.getByText("No held jobs");
-    const heldJob = page.locator("[data-testid='held-card']");
-    await expect(noJobs.or(heldJob).first()).toBeVisible({ timeout: 8_000 });
   });
 });
 
 test.describe("Scheduled Jobs", () => {
-  test.beforeEach(async ({ page }) => {
-    await page.goto("/ui/scheduled");
-    await waitForLoad(page);
-  });
-
   test("renders heading", async ({ page }) => {
-    await expect(
-      page.getByRole("heading", { name: /scheduled/i })
-    ).toBeVisible();
+    await page.goto("/ui/scheduled");
+    await expect(page.getByRole("heading", { name: /scheduled/i })).toBeVisible();
   });
+});
 
-  test("shows scheduled jobs from seed", async ({ page }) => {
-    // Seed creates scheduled jobs, but the "Run Now" action test may have
-    // consumed them. Accept either table rows or the "No jobs found" state.
-    const row = page.locator("table tbody tr").first();
-    const empty = page.getByText("No jobs found");
-    await expect(row.or(empty)).toBeVisible({ timeout: 8_000 });
+test.describe("Job Detail", () => {
+  test("navigating to a job shows its detail", async ({ page }) => {
+    await page.goto("/ui/queues/emails");
+    // Click the first job link.
+    const jobLink = page.locator("table tbody tr a").first();
+    await jobLink.click();
+    await expect(page).toHaveURL(/\/ui\/jobs\//);
+    // Should show job detail with action buttons.
+    await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Cancel" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Delete" })).toBeVisible();
+    // Should show job metadata.
+    await expect(page.getByText("Queue")).toBeVisible();
+    await expect(page.getByText("State")).toBeVisible();
+    await expect(page.getByText("Priority")).toBeVisible();
   });
 });
 
 test.describe("Workers", () => {
-  test.beforeEach(async ({ page }) => {
-    await page.goto("/ui/workers");
-    await waitForLoad(page);
-  });
-
   test("renders heading", async ({ page }) => {
+    await page.goto("/ui/workers");
     await expect(page.getByRole("heading", { name: "Workers" })).toBeVisible();
   });
 
-  test("page renders without crashing", async ({ page }) => {
-    // Workers may be empty (seed-worker disconnects after seeding).
-    // The page should render the Active Workers card either way.
-    await expect(page.getByText(/active workers/i)).toBeVisible();
+  test("shows empty state when no workers", async ({ page }) => {
+    await page.goto("/ui/workers");
+    await expect(page.getByText("No workers connected")).toBeVisible();
   });
 });
 
 test.describe("Cluster Status", () => {
-  test.beforeEach(async ({ page }) => {
+  test("renders heading", async ({ page }) => {
     await page.goto("/ui/cluster");
-    await waitForLoad(page);
+    await expect(page.getByRole("heading", { name: "Cluster" })).toBeVisible();
   });
 
-  test("renders heading", async ({ page }) => {
-    await expect(page.getByRole("heading", { name: "Cluster Status" })).toBeVisible();
-  });
-
-  test("shows cluster node info", async ({ page }) => {
-    // Single-node bootstrap: should show Leader state.
-    await expect(page.getByText(/leader/i).first()).toBeVisible({ timeout: 8_000 });
-  });
-});
-
-test.describe("Cost Dashboard", () => {
-  test("renders heading", async ({ page }) => {
-    await page.goto("/ui/cost");
-    await waitForLoad(page);
-    await expect(page.getByRole("heading", { name: /cost|usage/i })).toBeVisible();
-  });
-});
-
-test.describe("API Keys", () => {
-  test("renders heading", async ({ page }) => {
-    await page.goto("/ui/api-keys");
-    await waitForLoad(page);
-    await expect(page.getByRole("heading", { name: /api keys/i })).toBeVisible();
-  });
-});
-
-test.describe("Events", () => {
-  test("renders heading", async ({ page }) => {
-    await page.goto("/ui/events");
-    await waitForLoad(page);
-    await expect(page.getByRole("heading", { name: /events/i })).toBeVisible();
+  test("shows standalone mode", async ({ page }) => {
+    await page.goto("/ui/cluster");
+    await expect(page.getByText("Standalone Mode")).toBeVisible();
+    await expect(page.getByText("leader")).toBeVisible();
   });
 });

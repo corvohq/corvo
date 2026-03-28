@@ -5,9 +5,9 @@ import * as net from "net";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CORVO_BIN = path.resolve(__dirname, "../../../bin/corvo");
+const CORVO_BIN = path.resolve(__dirname, "../../../zig-out/bin/corvo");
 const DATA_DIR = "/tmp/corvo-e2e-data";
-const SERVER_PORT = 8080;
+const SERVER_PORT = 18080;
 const SERVER_URL = `http://localhost:${SERVER_PORT}`;
 
 function waitForPort(port: number, timeout = 15_000): Promise<void> {
@@ -32,25 +32,40 @@ function waitForPort(port: number, timeout = 15_000): Promise<void> {
   });
 }
 
+async function seedData() {
+  const enqueue = (queue: string, payload: object) =>
+    fetch(`${SERVER_URL}/api/v1/enqueue`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ queue, payload }),
+    });
+
+  // Seed queues with jobs.
+  for (let i = 0; i < 5; i++) {
+    await enqueue("emails", { to: `user${i}@test.com` });
+    await enqueue("payments", { amount: i * 10 });
+  }
+  for (let i = 0; i < 3; i++) {
+    await enqueue("reports", { type: "monthly" });
+  }
+}
+
 export default async function globalSetup() {
-  // Always start from a clean slate: kill anything on the port, wipe data.
-  // This avoids stale state (e.g. leftover API keys) from previous test runs.
+  // Kill anything on the port, wipe data.
   console.log(`[e2e] Killing any process on :${SERVER_PORT}...`);
   try {
     execSync(`lsof -ti:${SERVER_PORT} | xargs kill -9`, { stdio: "ignore" });
-    // Give the old process a moment to release the port.
     await new Promise((r) => setTimeout(r, 500));
   } catch {
-    // Nothing was running — that's fine.
+    // Nothing was running.
   }
 
   await rm(DATA_DIR, { recursive: true, force: true });
 
   const server = spawn(CORVO_BIN, [
-    "server",
     "--data-dir", DATA_DIR,
-    "--bind", `:${SERVER_PORT}`,
-    "--log-level", "warn",
+    "--port", String(SERVER_PORT),
+    "--max-conns", "64",
   ], { detached: false, stdio: "ignore" });
 
   server.on("error", (err) => {
@@ -58,24 +73,14 @@ export default async function globalSetup() {
     process.exit(1);
   });
 
-  // Store PID so teardown can kill it.
   process.env._CORVO_E2E_SERVER_PID = String(server.pid);
-  // Keep a reference so Node doesn't GC it.
   (globalThis as any).__corvoE2EServer = server;
 
   console.log(`[e2e] Started corvo server (pid ${server.pid}), waiting for :${SERVER_PORT}...`);
   await waitForPort(SERVER_PORT);
   console.log(`[e2e] Server ready`);
 
-  // Seed demo data.
   console.log("[e2e] Seeding demo data...");
-  try {
-    execSync(
-      `${CORVO_BIN} seed demo --count 20 --server ${SERVER_URL}`,
-      { stdio: "pipe" },
-    );
-    console.log("[e2e] Seed complete");
-  } catch (err: any) {
-    console.warn("[e2e] Seed warning:", err.stderr?.toString() ?? err.message);
-  }
+  await seedData();
+  console.log("[e2e] Seed complete");
 }

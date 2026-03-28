@@ -509,7 +509,7 @@ fn layoutEnd(hw: *html.HtmlWriter) void {
     hw.close("main");
     hw.close("div"); // flex shell
 
-    // Toast script: show success/error after HTMX POST actions.
+    // UI scripts: toast feedback + bulk selection.
     hw.open("script");
     hw.raw(
         \\document.body.addEventListener('htmx:afterRequest',function(e){
@@ -519,7 +519,26 @@ fn layoutEnd(hw: *html.HtmlWriter) void {
         \\var m=ok?'Done':'Error';
         \\t.innerHTML='<div class="'+c+' text-white px-4 py-2 rounded shadow text-sm">'+m+'</div>';
         \\setTimeout(function(){t.innerHTML=''},2000)
-        \\})
+        \\});
+        \\function corvoToggleAll(c){
+        \\document.querySelectorAll('.job-cb').forEach(function(cb){cb.checked=c});
+        \\corvoUpdateBulk()
+        \\}
+        \\function corvoUpdateBulk(){
+        \\var n=document.querySelectorAll('.job-cb:checked').length;
+        \\var bar=document.getElementById('bulk-bar');
+        \\var cnt=document.getElementById('bulk-count');
+        \\if(bar){bar.classList.toggle('hidden',n===0)}
+        \\if(cnt){cnt.textContent=n+' selected'}
+        \\}
+        \\function corvoBulkAction(action){
+        \\var ids=[];
+        \\document.querySelectorAll('.job-cb:checked').forEach(function(cb){ids.push(cb.dataset.id)});
+        \\if(!ids.length)return;
+        \\fetch('/api/v1/jobs/bulk',{method:'POST',headers:{'Content-Type':'application/json'},
+        \\body:JSON.stringify({action:action,job_ids:ids})})
+        \\.then(function(){location.reload()})
+        \\}
     );
     hw.close("script");
 
@@ -830,6 +849,38 @@ fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow, actions
         return;
     }
 
+    // Bulk action bar (hidden by default, shown via JS when checkboxes selected).
+    if (actions != .none) {
+        hw.open("div");
+        hw.attr("id", "bulk-bar");
+        hw.attr("class", "hidden mb-3 p-3 bg-blue-50 border border-blue-200 rounded-lg flex items-center gap-3");
+        hw.open("span");
+        hw.attr("id", "bulk-count");
+        hw.attr("class", "text-sm font-medium text-blue-800");
+        hw.text("0 selected");
+        hw.close("span");
+        switch (actions) {
+            .dead => {
+                bulkButton(hw, "retry", "Retry All", "bg-blue-600 hover:bg-blue-700");
+                bulkButton(hw, "delete", "Delete All", "bg-red-600 hover:bg-red-700");
+            },
+            .held => {
+                bulkButton(hw, "approve", "Approve All", "bg-green-600 hover:bg-green-700");
+                bulkButton(hw, "reject", "Reject All", "bg-red-600 hover:bg-red-700");
+            },
+            .scheduled => {
+                bulkButton(hw, "run", "Run All", "bg-blue-600 hover:bg-blue-700");
+                bulkButton(hw, "delete", "Delete All", "bg-red-600 hover:bg-red-700");
+            },
+            .queue_detail => {
+                bulkButton(hw, "cancel", "Cancel All", "bg-yellow-600 hover:bg-yellow-700");
+                bulkButton(hw, "delete", "Delete All", "bg-red-600 hover:bg-red-700");
+            },
+            .none => {},
+        }
+        hw.close("div");
+    }
+
     hw.open("div");
     hw.attr("class", "bg-white border border-gray-200 rounded-lg overflow-hidden");
     hw.open("table");
@@ -837,6 +888,17 @@ fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow, actions
     hw.open("thead");
     hw.open("tr");
     hw.attr("class", "border-b border-gray-200 bg-gray-50");
+    // Select-all checkbox.
+    if (actions != .none) {
+        hw.open("th");
+        hw.attr("class", "px-4 py-2 w-8");
+        hw.voidElem("input");
+        hw.attr("type", "checkbox");
+        hw.attr("id", "select-all");
+        hw.attr("class", "rounded");
+        hw.attr("onchange", "corvoToggleAll(this.checked)");
+        hw.close("th");
+    }
     tableHeader(hw, "ID");
     tableHeader(hw, "Queue");
     tableHeader(hw, "State");
@@ -851,6 +913,17 @@ fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow, actions
     for (jobs) |*j| {
         hw.open("tr");
         hw.attr("class", "hover:bg-gray-50");
+        // Row checkbox.
+        if (actions != .none) {
+            hw.open("td");
+            hw.attr("class", "px-4 py-2");
+            hw.voidElem("input");
+            hw.attr("type", "checkbox");
+            hw.attr("class", "job-cb rounded");
+            hw.attrFmt("data-id", "{s}", .{j.idSlice()});
+            hw.attr("onchange", "corvoUpdateBulk()");
+            hw.close("td");
+        }
         // Job ID as link.
         hw.open("td");
         hw.attr("class", "px-4 py-2 font-mono text-xs");
@@ -905,6 +978,14 @@ fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow, actions
     hw.close("tbody");
     hw.close("table");
     hw.close("div");
+}
+
+fn bulkButton(hw: *html.HtmlWriter, action: []const u8, label: []const u8, btn_class: []const u8) void {
+    hw.open("button");
+    hw.attrFmt("onclick", "corvoBulkAction('{s}')", .{action});
+    hw.attrFmt("class", "px-3 py-1 text-xs font-medium text-white rounded {s}", .{btn_class});
+    hw.text(label);
+    hw.close("button");
 }
 
 fn rowAction(hw: *html.HtmlWriter, job_id: []const u8, action: []const u8, label: []const u8, class: []const u8) void {
