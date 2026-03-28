@@ -811,6 +811,7 @@ pub const Mirror = struct {
         for (stores) |*store| {
             self.rebuildJobs(store);
             self.rebuildPayloads(store);
+            self.rebuildErrors(store);
             self.rebuildQueues(store);
             self.rebuildWorkers(store);
             self.rebuildCrons(store);
@@ -981,6 +982,74 @@ pub const Mirror = struct {
 
         self.db.commit() catch {};
         if (count > 0) std.debug.print("mirror: rebuilt {d} payloads\n", .{count});
+    }
+
+    /// Scan je| prefix — rebuild job_errors table.
+    /// Key: je|{job_id}\x00{attempt:4BE}, Value: JSON with error + created_at_ns.
+    fn rebuildErrors(self: *Mirror, store: *kv.Store) void {
+        var batch = store.newBatch();
+        defer batch.close();
+
+        var lower_buf: keys.KeyBuf = undefined;
+        var upper_buf: keys.KeyBuf = undefined;
+        const pfx = keys.prefix_job_error;
+        @memcpy(lower_buf[0..pfx.len], pfx);
+        const upper = keys.prefixEnd(&upper_buf, lower_buf[0..pfx.len]) orelse return;
+
+        var iter = batch.newIter(lower_buf[0..pfx.len], upper);
+        defer iter.close();
+
+        if (!iter.first()) return;
+
+        var stmt = self.db.prepare(
+            "INSERT INTO job_errors (job_id, attempt, error, backtrace, created_at) VALUES (?, ?, ?, ?, ?)",
+        ) catch return;
+        defer stmt.finalize();
+
+        self.db.begin() catch return;
+        var count: u32 = 0;
+
+        while (true) {
+            const k = iter.key();
+            const val = iter.value();
+
+            // Key: je|{job_id}\x00{attempt:4BE} — min length = prefix + 1 + 1 + 4
+            if (k.len <= pfx.len + 5) {
+                if (!iter.next()) break;
+                continue;
+            }
+            const job_id = k[pfx.len .. k.len - 5];
+            const attempt = keys.getU32BE(k[k.len - 4 ..][0..4]);
+
+            // Extract fields from JSON value.
+            const error_msg = extractJsonStr(val, "\"error\":\"");
+            const backtrace = extractJsonStr(val, "\"backtrace\":\"");
+            const created_ns = extractJsonNum(val, "\"created_at_ns\":");
+
+            stmt.bindText(1, job_id);
+            stmt.bindInt(2, @intCast(attempt));
+            if (error_msg) |msg| stmt.bindText(3, msg) else stmt.bindNull(3);
+            if (backtrace) |bt| stmt.bindText(4, bt) else stmt.bindNull(4);
+            if (created_ns) |ns| {
+                var ts: [32]u8 = undefined;
+                stmt.bindText(5, formatNs(&ts, ns));
+            } else {
+                stmt.bindText(5, "0");
+            }
+
+            stmt.exec() catch {};
+            stmt.reset();
+            count += 1;
+
+            if (count % max_batch_size == 0) {
+                self.db.commit() catch return;
+                self.db.begin() catch return;
+            }
+            if (!iter.next()) break;
+        }
+
+        self.db.commit() catch {};
+        if (count > 0) std.debug.print("mirror: rebuilt {d} errors\n", .{count});
     }
 
     /// Scan qc| prefix — rebuild queues table with config.
@@ -1964,6 +2033,31 @@ fn bindTimestamp(stmt: *sqlite.Stmt, idx: c_int, ns: u64, buf: *[32]u8) void {
     } else {
         stmt.bindNull(idx);
     }
+}
+
+// ============================================================================
+// JSON field extraction (for je| error values during rebuild)
+// ============================================================================
+
+/// Find `needle` (e.g. `"error":"`) in json and return the string value
+/// up to the next unescaped `"`. Returns null if not found.
+fn extractJsonStr(json: []const u8, needle: []const u8) ?[]const u8 {
+    const pos = std.mem.indexOf(u8, json, needle) orelse return null;
+    const start = pos + needle.len;
+    if (start >= json.len) return null;
+    const end = std.mem.indexOfPos(u8, json, start, "\"") orelse return null;
+    return json[start..end];
+}
+
+/// Find `needle` (e.g. `"created_at_ns":`) in json and parse the u64 that follows.
+fn extractJsonNum(json: []const u8, needle: []const u8) ?u64 {
+    const pos = std.mem.indexOf(u8, json, needle) orelse return null;
+    const start = pos + needle.len;
+    if (start >= json.len) return null;
+    var end = start;
+    while (end < json.len and json[end] >= '0' and json[end] <= '9') : (end += 1) {}
+    if (end == start) return null;
+    return std.fmt.parseInt(u64, json[start..end], 10) catch null;
 }
 
 // ============================================================================
