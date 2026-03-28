@@ -298,118 +298,87 @@ fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, 
 }
 
 fn jobDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, job_id: []const u8) u32 {
-    const rdr = reader orelse return renderPage(send_buf, "Job Detail", "<p class=\"text-gray-500\">No data available</p>");
-    const j = (rdr.getJob(job_id) catch null) orelse return renderPage(send_buf, "Job Detail", "<p class=\"text-red-500\">Job not found</p>");
+    const rdr = reader orelse return renderPage(send_buf, "Job Detail", "<p class=\"text-zinc-500 dark:text-zinc-400\">No data available</p>");
+    const j = (rdr.getJob(job_id) catch null) orelse return renderPage(send_buf, "Job Detail", "<p class=\"text-red-500 dark:text-red-400\">Job not found</p>");
 
-    // Action buttons.
-    var btn_buf: [4096]u8 = undefined;
-    var btn_hw = html.HtmlWriter.init(&btn_buf);
-    writeJobActionButton(&btn_hw, job_id, "retry", "Retry", "bg-blue-500 hover:bg-blue-600");
-    writeJobActionButton(&btn_hw, job_id, "cancel", "Cancel", "bg-yellow-500 hover:bg-yellow-600");
-    writeJobActionButton(&btn_hw, job_id, "delete", "Delete", "bg-red-500 hover:bg-red-600");
+    // Properties.
+    var props: [5]PropView = undefined;
+    var prop_count: usize = 0;
+    var pri_buf: [16]u8 = undefined;
+    var attempt_buf: [16]u8 = undefined;
 
-    // Properties table rows.
-    var props_buf: [4096]u8 = undefined;
-    var props_hw = html.HtmlWriter.init(&props_buf);
-    detailRow(&props_hw, "Queue", j.queueSlice());
-    detailRow(&props_hw, "State", j.stateSlice());
-    detailRowFmt(&props_hw, "Priority", "{d}", .{j.priority});
-    detailRowFmt(&props_hw, "Attempt", "{d}/{d}", .{ j.attempt, j.max_retries });
-    if (j.worker_id_len > 0) detailRow(&props_hw, "Worker", j.workerIdSlice());
+    var pri_s = std.io.fixedBufferStream(&pri_buf);
+    pri_s.writer().print("{d}", .{j.priority}) catch {};
+    var att_s = std.io.fixedBufferStream(&attempt_buf);
+    att_s.writer().print("{d}/{d}", .{ j.attempt, j.max_retries }) catch {};
 
-    // Timeline entries.
-    var time_buf: [4096]u8 = undefined;
-    var time_hw = html.HtmlWriter.init(&time_buf);
-    if (j.created_at_len > 0) timelineEntry(&time_hw, "Created", j.createdAtSlice());
-    if (j.scheduled_at_len > 0) timelineEntry(&time_hw, "Scheduled", j.scheduledAtSlice());
-    if (j.started_at_len > 0) timelineEntry(&time_hw, "Started", j.startedAtSlice());
-    if (j.completed_at_len > 0) timelineEntry(&time_hw, "Completed", j.completedAtSlice());
-    if (j.failed_at_len > 0) timelineEntry(&time_hw, "Failed", j.failedAtSlice());
-
-    // Payload section.
-    var payload_buf: [8192]u8 = undefined;
-    var payload_hw = html.HtmlWriter.init(&payload_buf);
-    var raw_payload: [4096]u8 = undefined;
-    if (rdr.getJobPayload(job_id, &raw_payload) catch null) |payload| {
-        payload_hw.open("div");
-        payload_hw.attr("class", "bg-white border border-gray-200 rounded-lg");
-        payload_hw.open("div");
-        payload_hw.attr("class", "px-4 py-3 border-b border-gray-200 flex items-center justify-between");
-        payload_hw.open("h3");
-        payload_hw.attr("class", "text-sm font-semibold text-gray-900");
-        payload_hw.text("Payload");
-        payload_hw.close("h3");
-        payload_hw.open("button");
-        payload_hw.attr("onclick", "corvoPayloadCopy(this)");
-        payload_hw.attr("class", "text-xs text-gray-500 hover:text-gray-700 font-medium");
-        payload_hw.text("Copy");
-        payload_hw.close("button");
-        payload_hw.close("div");
-        payload_hw.open("pre");
-        payload_hw.attr("id", "job-payload");
-        payload_hw.attr("class", "p-4 text-xs font-mono overflow-x-auto text-gray-800 bg-gray-50 rounded-b-lg");
-        payload_hw.text(payload);
-        payload_hw.close("pre");
-        payload_hw.close("div");
+    props[0] = .{ .label = "Queue", .value = j.queueSlice() };
+    props[1] = .{ .label = "State", .value = j.stateSlice() };
+    props[2] = .{ .label = "Priority", .value = pri_s.getWritten() };
+    props[3] = .{ .label = "Attempt", .value = att_s.getWritten() };
+    prop_count = 4;
+    if (j.worker_id_len > 0) {
+        props[4] = .{ .label = "Worker", .value = j.workerIdSlice() };
+        prop_count = 5;
     }
 
-    // Error history section.
-    var errors_buf: [8192]u8 = undefined;
-    var errors_hw = html.HtmlWriter.init(&errors_buf);
+    // Timeline.
+    var timeline: [5]TimelineView = undefined;
+    var tl_count: usize = 0;
+    if (j.created_at_len > 0) {
+        timeline[tl_count] = .{ .label = "Created", .timestamp = j.createdAtSlice(), .dot_class = "bg-blue-500" };
+        tl_count += 1;
+    }
+    if (j.scheduled_at_len > 0) {
+        timeline[tl_count] = .{ .label = "Scheduled", .timestamp = j.scheduledAtSlice(), .dot_class = "bg-purple-500" };
+        tl_count += 1;
+    }
+    if (j.started_at_len > 0) {
+        timeline[tl_count] = .{ .label = "Started", .timestamp = j.startedAtSlice(), .dot_class = "bg-emerald-500" };
+        tl_count += 1;
+    }
+    if (j.completed_at_len > 0) {
+        timeline[tl_count] = .{ .label = "Completed", .timestamp = j.completedAtSlice(), .dot_class = "bg-zinc-500" };
+        tl_count += 1;
+    }
+    if (j.failed_at_len > 0) {
+        timeline[tl_count] = .{ .label = "Failed", .timestamp = j.failedAtSlice(), .dot_class = "bg-red-500" };
+        tl_count += 1;
+    }
+
+    // Payload.
+    var raw_payload: [4096]u8 = undefined;
+    const payload = rdr.getJobPayload(job_id, &raw_payload) catch null;
+
+    // Errors.
     var err_rows: [16]sqlite_read.JobError = undefined;
     const err_count = rdr.getJobErrors(job_id, &err_rows) catch 0;
-    if (err_count > 0) {
-        errors_hw.open("div");
-        errors_hw.attr("class", "bg-white border border-gray-200 rounded-lg");
-        errors_hw.open("div");
-        errors_hw.attr("class", "px-4 py-3 border-b border-gray-200");
-        errors_hw.open("h3");
-        errors_hw.attr("class", "text-sm font-semibold text-gray-900");
-        errors_hw.text("Error History");
-        errors_hw.close("h3");
-        errors_hw.close("div");
-        errors_hw.open("div");
-        errors_hw.attr("class", "divide-y divide-gray-100");
-        for (0..err_count) |i| {
-            const err = &err_rows[i];
-            errors_hw.open("div");
-            errors_hw.attr("class", "px-4 py-3");
-            errors_hw.open("div");
-            errors_hw.attr("class", "flex items-center gap-2 mb-1");
-            errors_hw.open("span");
-            errors_hw.attr("class", "text-xs font-medium text-gray-500");
-            errors_hw.textFmt("Attempt {d}", .{err.attempt});
-            errors_hw.close("span");
-            if (err.created_at_len > 0) {
-                errors_hw.open("span");
-                errors_hw.attr("class", "text-xs text-gray-400");
-                errors_hw.open("time");
-                errors_hw.attr("data-ts", err.created_at[0..err.created_at_len]);
-                errors_hw.text(err.created_at[0..err.created_at_len]);
-                errors_hw.close("time");
-                errors_hw.close("span");
-            }
-            errors_hw.close("div");
-            errors_hw.open("pre");
-            errors_hw.attr("class", "text-xs text-red-700 bg-red-50 rounded p-2 overflow-x-auto");
-            errors_hw.text(err.errorSlice());
-            errors_hw.close("pre");
-            errors_hw.close("div");
-        }
-        errors_hw.close("div");
-        errors_hw.close("div");
+    var error_views: [16]ErrorView = undefined;
+    for (0..err_count) |i| {
+        const err = &err_rows[i];
+        error_views[i] = .{
+            .attempt = err.attempt,
+            .message = err.errorSlice(),
+            .created_at = err.created_at[0..err.created_at_len],
+            .has_timestamp = err.created_at_len > 0,
+        };
     }
+
+    const properties: []const PropView = props[0..prop_count];
+    const tl: []const TimelineView = timeline[0..tl_count];
+    const errors: []const ErrorView = error_views[0..err_count];
 
     var content_buf: [page_buf_size]u8 = undefined;
     const content = job_detail_tmpl.render(&content_buf, .{
         .job_id = j.idSlice(),
         .state = j.stateSlice(),
-        .state_badge_class = stateBadgeClass(j.stateSlice()),
-        .action_buttons = btn_hw.getWritten(),
-        .properties = props_hw.getWritten(),
-        .timeline = time_hw.getWritten(),
-        .payload_section = payload_hw.getWritten(),
-        .errors_section = errors_hw.getWritten(),
+        .state_class = stateBadgeClassDark(j.stateSlice()),
+        .properties = properties,
+        .timeline = tl,
+        .has_payload = payload != null,
+        .payload = if (payload) |p| p else "",
+        .has_errors = err_count > 0,
+        .errors = errors,
     }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Job Detail", content);
 }
@@ -564,6 +533,24 @@ const JobView = struct {
     created_at: []const u8,
     has_cb: bool,
     actions: []const JobAction,
+};
+
+const PropView = struct {
+    label: []const u8,
+    value: []const u8,
+};
+
+const TimelineView = struct {
+    label: []const u8,
+    timestamp: []const u8,
+    dot_class: []const u8,
+};
+
+const ErrorView = struct {
+    attempt: i32,
+    message: []const u8,
+    created_at: []const u8,
+    has_timestamp: bool,
 };
 
 const FilterTabView = struct {
