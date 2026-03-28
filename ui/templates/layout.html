@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{title}} - Corvo</title>
+  <link rel="icon" href="/ui/favicon.svg">
+  <link rel="stylesheet" href="/ui/tailwind.css">
+  <script src="/ui/htmx.min.js"></script>
+</head>
+<body class="bg-gray-50 text-gray-900 min-h-screen">
+<div class="flex min-h-screen">
+
+<div id="toast" class="fixed top-4 right-4 z-50"></div>
+
+<!-- Sidebar (desktop) -->
+<aside class="hidden md:flex w-56 bg-white border-r border-gray-200 flex-col min-h-screen">
+  <div class="h-14 flex items-center px-4 border-b border-gray-200">
+    <a href="/ui/" class="flex items-center gap-2">
+      <img src="/ui/logo-full.svg" alt="Corvo" class="h-6">
+    </a>
+  </div>
+  <nav class="flex-1 px-3 py-4 space-y-1">
+    <a href="/ui/" data-nav="/" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Dashboard</a>
+    <a href="/ui/queues" data-nav="/queues" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Queues</a>
+    <a href="/ui/scheduled" data-nav="/scheduled" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Scheduled</a>
+    <a href="/ui/dead-letter" data-nav="/dead-letter" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Dead Letter</a>
+    <a href="/ui/held" data-nav="/held" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Held Jobs</a>
+    <a href="/ui/workers" data-nav="/workers" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Workers</a>
+    <a href="/ui/cluster" data-nav="/cluster" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Cluster</a>
+  </nav>
+</aside>
+
+<!-- Mobile sidebar overlay -->
+<div id="mobile-sidebar" class="fixed inset-0 z-40 hidden">
+  <div class="fixed inset-0 bg-black bg-opacity-50" onclick="document.getElementById('mobile-sidebar').classList.add('hidden')"></div>
+  <div class="fixed inset-y-0 left-0 w-56 bg-white border-r border-gray-200 flex flex-col z-50">
+    <div class="h-14 flex items-center px-4 border-b border-gray-200">
+      <a href="/ui/" class="flex items-center gap-2">
+        <img src="/ui/logo-full.svg" alt="Corvo" class="h-6">
+      </a>
+    </div>
+    <nav class="flex-1 px-3 py-4 space-y-1">
+      <a href="/ui/" data-nav="/" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Dashboard</a>
+      <a href="/ui/queues" data-nav="/queues" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Queues</a>
+      <a href="/ui/scheduled" data-nav="/scheduled" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Scheduled</a>
+      <a href="/ui/dead-letter" data-nav="/dead-letter" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Dead Letter</a>
+      <a href="/ui/held" data-nav="/held" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Held Jobs</a>
+      <a href="/ui/workers" data-nav="/workers" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Workers</a>
+      <a href="/ui/cluster" data-nav="/cluster" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Cluster</a>
+    </nav>
+  </div>
+</div>
+
+<!-- Main content -->
+<main class="flex-1 p-4 md:p-6 min-w-0">
+<div class="max-w-7xl mx-auto">
+  <div class="flex items-center justify-between mb-6">
+    <div class="flex items-center gap-3">
+      <button class="md:hidden p-1 text-gray-600" onclick="document.getElementById('mobile-sidebar').classList.remove('hidden')">
+        <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+      <h1 class="text-xl md:text-2xl font-bold text-gray-900">{{title}}</h1>
+    </div>
+    <button hx-get="/ui/partials/enqueue-form" hx-target="#modal" hx-swap="innerHTML"
+      class="px-3 py-1.5 md:px-4 md:py-2 text-xs md:text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700">Enqueue</button>
+  </div>
+  <div id="modal"></div>
+{{content}}
+</div>
+</main>
+
+</div>
+
+<script>
+document.body.addEventListener('htmx:afterRequest',function(e){
+if(e.detail.verb==='get')return;
+var t=document.getElementById('toast');if(!t)return;
+var ok=e.detail.successful;
+var c=ok?'bg-green-600':'bg-red-600';
+var m=ok?'Done':'Error';
+t.innerHTML='<div class="'+c+' text-white px-4 py-2 rounded shadow text-sm">'+m+'</div>';
+setTimeout(function(){t.innerHTML=''},2000)
+});
+function corvoToggleAll(c){
+document.querySelectorAll('.job-cb').forEach(function(cb){cb.checked=c});
+corvoUpdateBulk()
+}
+function corvoUpdateBulk(){
+var n=document.querySelectorAll('.job-cb:checked').length;
+var bar=document.getElementById('bulk-bar');
+var cnt=document.getElementById('bulk-count');
+if(bar){bar.classList.toggle('hidden',n===0)}
+if(cnt){cnt.textContent=n+' selected'}
+}
+function corvoBulkAction(action){
+var ids=[];
+document.querySelectorAll('.job-cb:checked').forEach(function(cb){ids.push(cb.dataset.id)});
+if(!ids.length)return;
+fetch('/api/v1/jobs/bulk',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({action:action,job_ids:ids})})
+.then(function(){location.reload()})
+}
+(function(){
+var p=location.pathname.replace(/^\/ui/,'').replace(/\/$/,'')||'/';
+document.querySelectorAll('[data-nav]').forEach(function(a){
+var d=a.dataset.nav;
+if(d==='/'?(p==='/'||p===''):p.indexOf(d)===0)
+a.className=a.className.replace('text-gray-600 hover:bg-gray-50 hover:text-gray-900','bg-indigo-50 text-indigo-700');
+});
+})();
+function corvoPayloadCopy(btn){
+var el=document.getElementById('job-payload');
+if(!el)return;
+navigator.clipboard.writeText(el.textContent).then(function(){
+btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy'},1500);
+});
+}
+function corvoFilterRows(q){
+var rows=document.querySelectorAll('#queue-jobs tbody tr');
+q=q.toLowerCase();
+rows.forEach(function(r){r.style.display=r.textContent.toLowerCase().indexOf(q)>=0?'':'none'});
+}
+</script>
+</body>
+</html>

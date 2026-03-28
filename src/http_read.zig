@@ -38,8 +38,9 @@ pub fn dispatch(
         // Try static asset first.
         if (ui_embed.lookup(ui_path)) |file|
             return http.writeResponseStatic(send_buf, file.data, file.content_type, file.gzipped);
-        // Server-rendered HTML page.
-        return http_ui.dispatch(ui_path, send_buf, reader);
+        // Server-rendered HTML page. Pass query string for filter/search params.
+        const query = if (std.mem.indexOfScalar(u8, path, '?')) |qi| path[qi + 1 ..] else "";
+        return http_ui.dispatch(ui_path, query, send_buf, reader);
     }
 
     if (!std.mem.startsWith(u8, clean, "/api/v1/")) return 0;

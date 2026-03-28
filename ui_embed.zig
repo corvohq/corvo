@@ -11,6 +11,9 @@ const tailwind_css_gz = @embedFile("ui/tailwind.css.gz");
 const favicon_svg_gz = @embedFile("ui/dist/favicon.svg.gz");
 const logo_full_svg_gz = @embedFile("ui/dist/logo-full.svg.gz");
 
+// HTML templates.
+pub const layout_html = @embedFile("ui/templates/layout.html");
+
 /// Largest embedded asset size. send_buf must fit this + HTTP headers (~200B).
 pub const max_asset_size: usize = htmx_js_gz.len;
 
