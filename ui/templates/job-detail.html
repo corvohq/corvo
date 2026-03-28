@@ -4,7 +4,7 @@
       <h2 class="text-xl font-semibold text-gray-900 font-mono">{{job_id}}</h2>
       <span class="{{state_badge_class}}">{{state}}</span>
     </div>
-    <div class="flex gap-2">{{action_buttons}}</div>
+    <div class="flex gap-2">{{{action_buttons}}}</div>
   </div>
   <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
     <div class="bg-white border border-gray-200 rounded-lg">
@@ -12,7 +12,7 @@
         <h3 class="text-sm font-semibold text-gray-900">Properties</h3>
       </div>
       <table class="w-full text-sm">
-        <tbody class="divide-y divide-gray-100">{{properties}}</tbody>
+        <tbody class="divide-y divide-gray-100">{{{properties}}}</tbody>
       </table>
     </div>
     <div class="bg-white border border-gray-200 rounded-lg">
@@ -20,10 +20,10 @@
         <h3 class="text-sm font-semibold text-gray-900">Timeline</h3>
       </div>
       <div class="p-4">
-        <ol class="relative border-l border-gray-200 ml-3 space-y-4">{{timeline}}</ol>
+        <ol class="relative border-l border-gray-200 ml-3 space-y-4">{{{timeline}}}</ol>
       </div>
     </div>
   </div>
-{{payload_section}}
-{{errors_section}}
+{{{payload_section}}}
+{{{errors_section}}}
 </div>

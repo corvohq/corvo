@@ -5,6 +5,7 @@
 //! splices it into templates via {{placeholder}} substitution.
 
 const std = @import("std");
+const zigstache = @import("zigstache");
 const http = @import("http.zig");
 const html = @import("html_writer.zig");
 const sqlite_read = @import("sqlite_read.zig");
@@ -21,25 +22,14 @@ const render_buf_size = 65000;
 /// Max table rows per page. Keeps HTML under page_buf_size.
 const max_table_rows = 25;
 
-/// Layout template — full page shell with {{title}} and {{content}} placeholders.
-const layout_template = ui_embed.layout_html;
-
-// Compile-time template validation: all {{ have matching }}, all keys are known.
-comptime {
-    @setEvalBranchQuota(layout_template.len * 2);
-    var pos: usize = 0;
-    while (pos < layout_template.len -| 1) : (pos += 1) {
-        if (layout_template[pos] == '{' and layout_template[pos + 1] == '{') {
-            const close = std.mem.indexOfPos(u8, layout_template, pos + 2, "}}") orelse
-                @compileError("layout.html: unclosed {{ placeholder");
-            const key = layout_template[pos + 2 .. close];
-            if (!std.mem.eql(u8, key, "title") and !std.mem.eql(u8, key, "content")) {
-                @compileError("layout.html: unknown placeholder: " ++ key);
-            }
-            pos = close + 1;
-        }
-    }
-}
+/// Comptime-parsed Mustache templates.
+const layout_tmpl = zigstache.Template.parse(ui_embed.layout_html) catch unreachable;
+const dashboard_tmpl = zigstache.Template.parse(ui_embed.dashboard_html) catch unreachable;
+const queues_tmpl = zigstache.Template.parse(ui_embed.queues_html) catch unreachable;
+const queue_detail_tmpl = zigstache.Template.parse(ui_embed.queue_detail_html) catch unreachable;
+const job_list_tmpl = zigstache.Template.parse(ui_embed.job_list_html) catch unreachable;
+const job_detail_tmpl = zigstache.Template.parse(ui_embed.job_detail_html) catch unreachable;
+const workers_tmpl = zigstache.Template.parse(ui_embed.workers_html) catch unreachable;
 
 // ============================================================================
 // Dispatch
@@ -70,32 +60,12 @@ pub fn dispatch(path: []const u8, query: []const u8, send_buf: []u8, reader: ?*s
 // Template Engine
 // ============================================================================
 
-/// Substitute {{key}} placeholders in a template with corresponding values.
-fn renderTemplate(template: []const u8, keys: []const []const u8, values: []const []const u8, out: []u8) []const u8 {
-    var stream = std.io.fixedBufferStream(out);
-    const w = stream.writer();
-    var pos: usize = 0;
-
-    while (std.mem.indexOfPos(u8, template, pos, "{{")) |start| {
-        w.writeAll(template[pos..start]) catch return stream.getWritten();
-        const close = (std.mem.indexOfPos(u8, template, start + 2, "}}") orelse break) + 2;
-        const key = template[start + 2 .. close - 2];
-        for (keys, values) |k, v| {
-            if (eql(key, k)) {
-                w.writeAll(v) catch return stream.getWritten();
-                break;
-            }
-        }
-        pos = close;
-    }
-    w.writeAll(template[pos..]) catch {};
-    return stream.getWritten();
-}
-
 /// Splice title and content into the layout template, then write the HTTP response.
 fn renderPage(send_buf: []u8, title: []const u8, content: []const u8) u32 {
     var buf: [render_buf_size]u8 = undefined;
-    const rendered = renderTemplate(layout_template, &.{ "title", "content" }, &.{ title, content }, &buf);
+    const rendered = layout_tmpl.render(&buf, .{ .title = title, .content = content }) catch |err| switch (err) {
+        error.BufferOverflow => return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>"),
+    };
     return http.writeResponseHtml(send_buf, 200, rendered);
 }
 
@@ -109,7 +79,8 @@ fn dashboard(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
     writeDashboardStats(&hw, reader);
 
     var content_buf: [page_buf_size]u8 = undefined;
-    const content = renderTemplate(ui_embed.dashboard_html, &.{"stats"}, &.{hw.getWritten()}, &content_buf);
+    const content = dashboard_tmpl.render(&content_buf, .{ .stats = hw.getWritten() }) catch
+        return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Dashboard", content);
 }
 
@@ -119,7 +90,8 @@ fn queuesPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
     writeQueuesTable(&hw, reader);
 
     var content_buf: [page_buf_size]u8 = undefined;
-    const content = renderTemplate(ui_embed.queues_html, &.{"table"}, &.{hw.getWritten()}, &content_buf);
+    const content = queues_tmpl.render(&content_buf, .{ .table = hw.getWritten() }) catch
+        return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Queues", content);
 }
 
@@ -133,10 +105,16 @@ fn queueDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, queue_name: []c
 
     const rdr = reader orelse {
         var content_buf: [page_buf_size]u8 = undefined;
-        const content = renderTemplate(ui_embed.queue_detail_html,
-            &.{ "queue_name", "status_badge", "action_buttons", "export_buttons", "stats_bar", "filter_section", "job_table", "pagination" },
-            &.{ queue_name, "", btn_hw.getWritten(), "", "", "", "<p class=\"text-gray-500\">No data available</p>", "" },
-            &content_buf);
+        const content = queue_detail_tmpl.render(&content_buf, .{
+            .queue_name = queue_name,
+            .status_badge = "",
+            .action_buttons = btn_hw.getWritten(),
+            .export_buttons = "",
+            .stats_bar = "",
+            .filter_section = "",
+            .job_table = "<p class=\"text-gray-500\">No data available</p>",
+            .pagination = "",
+        }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
         return renderPage(send_buf, "Queue Detail", content);
     };
 
@@ -219,10 +197,16 @@ fn queueDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, queue_name: []c
     writePagination(&pag_hw, url_stream.getWritten(), page, total_pages);
 
     var content_buf: [page_buf_size]u8 = undefined;
-    const content = renderTemplate(ui_embed.queue_detail_html,
-        &.{ "queue_name", "status_badge", "action_buttons", "export_buttons", "stats_bar", "filter_section", "job_table", "pagination" },
-        &.{ queue_name, status_badge, btn_hw.getWritten(), export_hw.getWritten(), stats_hw.getWritten(), filter_hw.getWritten(), table_hw.getWritten(), pag_hw.getWritten() },
-        &content_buf);
+    const content = queue_detail_tmpl.render(&content_buf, .{
+        .queue_name = queue_name,
+        .status_badge = status_badge,
+        .action_buttons = btn_hw.getWritten(),
+        .export_buttons = export_hw.getWritten(),
+        .stats_bar = stats_hw.getWritten(),
+        .filter_section = filter_hw.getWritten(),
+        .job_table = table_hw.getWritten(),
+        .pagination = pag_hw.getWritten(),
+    }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Queue Detail", content);
 }
 
@@ -274,10 +258,11 @@ fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, 
     writePagination(&pag_hw, url_stream.getWritten(), page, total_pages);
 
     var content_buf: [page_buf_size]u8 = undefined;
-    const content = renderTemplate(ui_embed.job_list_html,
-        &.{ "export_buttons", "job_table", "pagination" },
-        &.{ export_hw.getWritten(), table_hw.getWritten(), pag_hw.getWritten() },
-        &content_buf);
+    const content = job_list_tmpl.render(&content_buf, .{
+        .export_buttons = export_hw.getWritten(),
+        .job_table = table_hw.getWritten(),
+        .pagination = pag_hw.getWritten(),
+    }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, title, content);
 }
 
@@ -385,10 +370,16 @@ fn jobDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, job_id: []const u
     }
 
     var content_buf: [page_buf_size]u8 = undefined;
-    const content = renderTemplate(ui_embed.job_detail_html,
-        &.{ "job_id", "state", "state_badge_class", "action_buttons", "properties", "timeline", "payload_section", "errors_section" },
-        &.{ j.idSlice(), j.stateSlice(), stateBadgeClass(j.stateSlice()), btn_hw.getWritten(), props_hw.getWritten(), time_hw.getWritten(), payload_hw.getWritten(), errors_hw.getWritten() },
-        &content_buf);
+    const content = job_detail_tmpl.render(&content_buf, .{
+        .job_id = j.idSlice(),
+        .state = j.stateSlice(),
+        .state_badge_class = stateBadgeClass(j.stateSlice()),
+        .action_buttons = btn_hw.getWritten(),
+        .properties = props_hw.getWritten(),
+        .timeline = time_hw.getWritten(),
+        .payload_section = payload_hw.getWritten(),
+        .errors_section = errors_hw.getWritten(),
+    }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Job Detail", content);
 }
 
@@ -415,7 +406,8 @@ fn workersPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
     }
 
     var content_buf: [page_buf_size]u8 = undefined;
-    const content = renderTemplate(ui_embed.workers_html, &.{"rows"}, &.{hw.getWritten()}, &content_buf);
+    const content = workers_tmpl.render(&content_buf, .{ .rows = hw.getWritten() }) catch
+        return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Workers", content);
 }
 
