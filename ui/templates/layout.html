@@ -8,27 +8,27 @@
   <link rel="stylesheet" href="/ui/tailwind.css">
   <script src="/ui/htmx.min.js"></script>
 </head>
-<body class="bg-gray-50 text-gray-900 min-h-screen">
+<body class="bg-zinc-50 text-zinc-900 min-h-screen">
 
 <div id="toast" class="fixed top-4 right-4 z-50"></div>
 
-<!-- Mobile sidebar overlay — outside flex wrapper so fixed positioning works reliably -->
-<div id="mobile-sidebar" class="fixed inset-0 z-40 hidden">
-  <div class="absolute inset-0 bg-black bg-opacity-50" onclick="document.getElementById('mobile-sidebar').classList.add('hidden')"></div>
-  <div class="absolute inset-y-0 left-0 w-56 bg-white border-r border-gray-200 flex flex-col z-50">
-    <div class="h-14 flex items-center px-4 border-b border-gray-200">
+<!-- Mobile sidebar overlay — md:hidden ensures it never shows on desktop -->
+<div id="mobile-sidebar" class="fixed inset-0 z-40 hidden md:hidden">
+  <div class="absolute inset-0 bg-black/50" onclick="document.getElementById('mobile-sidebar').classList.add('hidden')"></div>
+  <div class="absolute inset-y-0 left-0 w-56 bg-zinc-950 flex flex-col z-50">
+    <div class="h-14 flex items-center px-4 border-b border-zinc-800">
       <a href="/ui/" class="flex items-center gap-2">
-        <img src="/ui/logo-full.svg" alt="Corvo" class="h-6">
+        <img src="/ui/logo-full.svg" alt="Corvo" class="h-6 brightness-0 invert">
       </a>
     </div>
     <nav class="flex-1 px-3 py-4 space-y-1">
-      <a href="/ui/" data-nav="/" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Dashboard</a>
-      <a href="/ui/queues" data-nav="/queues" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Queues</a>
-      <a href="/ui/scheduled" data-nav="/scheduled" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Scheduled</a>
-      <a href="/ui/dead-letter" data-nav="/dead-letter" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Dead Letter</a>
-      <a href="/ui/held" data-nav="/held" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Held Jobs</a>
-      <a href="/ui/workers" data-nav="/workers" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Workers</a>
-      <a href="/ui/cluster" data-nav="/cluster" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Cluster</a>
+      <a href="/ui/" data-nav="/" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Dashboard</a>
+      <a href="/ui/queues" data-nav="/queues" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Queues</a>
+      <a href="/ui/scheduled" data-nav="/scheduled" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Scheduled</a>
+      <a href="/ui/dead-letter" data-nav="/dead-letter" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Dead Letter</a>
+      <a href="/ui/held" data-nav="/held" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Held Jobs</a>
+      <a href="/ui/workers" data-nav="/workers" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Workers</a>
+      <a href="/ui/cluster" data-nav="/cluster" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Cluster</a>
     </nav>
   </div>
 </div>
@@ -36,20 +36,20 @@
 <div class="flex min-h-screen">
 
 <!-- Sidebar (desktop) -->
-<aside class="hidden md:flex w-56 bg-white border-r border-gray-200 flex-col min-h-screen">
-  <div class="h-14 flex items-center px-4 border-b border-gray-200">
+<aside class="hidden md:flex w-56 bg-zinc-950 flex-col min-h-screen">
+  <div class="h-14 flex items-center px-4 border-b border-zinc-800">
     <a href="/ui/" class="flex items-center gap-2">
-      <img src="/ui/logo-full.svg" alt="Corvo" class="h-6">
+      <img src="/ui/logo-full.svg" alt="Corvo" class="h-6 brightness-0 invert">
     </a>
   </div>
   <nav class="flex-1 px-3 py-4 space-y-1">
-    <a href="/ui/" data-nav="/" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Dashboard</a>
-    <a href="/ui/queues" data-nav="/queues" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Queues</a>
-    <a href="/ui/scheduled" data-nav="/scheduled" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Scheduled</a>
-    <a href="/ui/dead-letter" data-nav="/dead-letter" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Dead Letter</a>
-    <a href="/ui/held" data-nav="/held" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Held Jobs</a>
-    <a href="/ui/workers" data-nav="/workers" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Workers</a>
-    <a href="/ui/cluster" data-nav="/cluster" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Cluster</a>
+    <a href="/ui/" data-nav="/" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Dashboard</a>
+    <a href="/ui/queues" data-nav="/queues" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Queues</a>
+    <a href="/ui/scheduled" data-nav="/scheduled" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Scheduled</a>
+    <a href="/ui/dead-letter" data-nav="/dead-letter" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Dead Letter</a>
+    <a href="/ui/held" data-nav="/held" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Held Jobs</a>
+    <a href="/ui/workers" data-nav="/workers" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Workers</a>
+    <a href="/ui/cluster" data-nav="/cluster" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Cluster</a>
   </nav>
 </aside>
 
@@ -58,13 +58,13 @@
 <div class="max-w-7xl mx-auto">
   <div class="flex items-center justify-between mb-6">
     <div class="flex items-center gap-3">
-      <button class="md:hidden p-1 text-gray-600" onclick="document.getElementById('mobile-sidebar').classList.remove('hidden')">
+      <button class="md:hidden p-1 text-zinc-600" onclick="document.getElementById('mobile-sidebar').classList.remove('hidden')">
         <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
       </button>
-      <h1 class="text-xl md:text-2xl font-bold text-gray-900">{{title}}</h1>
+      <h1 class="text-xl md:text-2xl font-bold tracking-tight text-zinc-900">{{title}}</h1>
     </div>
     <button hx-get="/ui/partials/enqueue-form" hx-target="#modal" hx-swap="innerHTML"
-      class="px-3 py-1.5 md:px-4 md:py-2 text-xs md:text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700">Enqueue</button>
+      class="bg-zinc-900 text-white hover:bg-zinc-800 rounded-md px-3 py-1.5 md:px-4 md:py-2 text-xs md:text-sm font-medium">Enqueue</button>
   </div>
   <div id="modal"></div>
 {{{content}}}
@@ -108,7 +108,7 @@ var p=location.pathname.replace(/^\/ui/,'').replace(/\/$/,'')||'/';
 document.querySelectorAll('[data-nav]').forEach(function(a){
 var d=a.dataset.nav;
 if(d==='/'?(p==='/'||p===''):p.indexOf(d)===0)
-a.className=a.className.replace('text-gray-600 hover:bg-gray-50 hover:text-gray-900','bg-indigo-50 text-indigo-700');
+a.className=a.className.replace('text-zinc-400 hover:bg-zinc-800 hover:text-white','bg-zinc-800 text-white');
 });
 })();
 function corvoFmtDur(ms){
