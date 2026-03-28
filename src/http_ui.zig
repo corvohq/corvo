@@ -1,10 +1,8 @@
 //! Server-rendered HTML UI — HTMX + Tailwind CSS dashboard.
 //!
-//! Pure functions: take send_buf + reader, return response length.
-//! Renders complete HTML pages or HTMX partial fragments.
-//!
-//! Layout shell (sidebar, header, scripts) lives in ui/templates/layout.html.
-//! Page functions render only their content, then splice it into the template.
+//! Page structure lives in ui/templates/*.html files.
+//! Zig code renders only dynamic content (data tables, stats, charts) and
+//! splices it into templates via {{placeholder}} substitution.
 
 const std = @import("std");
 const http = @import("http.zig");
@@ -15,6 +13,10 @@ const ui_embed = @import("ui_embed");
 /// Max HTML body size. Pages render into a buffer of this size.
 /// With HTTP headers (~200 bytes), total response stays under 33KB.
 const page_buf_size = 32768;
+
+/// Layout-expanded page buffer. Must fit layout template + page content + HTTP headers
+/// within send_buf (~66KB). Layout is ~4KB, headers ~200B.
+const render_buf_size = 65000;
 
 /// Max table rows per page. Keeps HTML under page_buf_size.
 const max_table_rows = 25;
@@ -49,9 +51,9 @@ pub fn dispatch(path: []const u8, query: []const u8, send_buf: []u8, reader: ?*s
     if (eql(path, "/") or eql(path, "")) return dashboard(send_buf, reader);
     if (eql(path, "/queues")) return queuesPage(send_buf, reader);
     if (std.mem.startsWith(u8, path, "/queues/")) return queueDetailPage(send_buf, reader, path["/queues/".len..], query);
-    if (eql(path, "/dead-letter")) return deadLetterPage(send_buf, reader);
-    if (eql(path, "/held")) return heldJobsPage(send_buf, reader);
-    if (eql(path, "/scheduled")) return scheduledJobsPage(send_buf, reader);
+    if (eql(path, "/dead-letter")) return deadLetterPage(send_buf, reader, query);
+    if (eql(path, "/held")) return heldJobsPage(send_buf, reader, query);
+    if (eql(path, "/scheduled")) return scheduledJobsPage(send_buf, reader, query);
     if (std.mem.startsWith(u8, path, "/jobs/")) return jobDetailPage(send_buf, reader, path["/jobs/".len..]);
     if (eql(path, "/workers")) return workersPage(send_buf, reader);
     if (eql(path, "/cluster")) return clusterPage(send_buf, reader);
@@ -65,30 +67,36 @@ pub fn dispatch(path: []const u8, query: []const u8, send_buf: []u8, reader: ?*s
 }
 
 // ============================================================================
-// Template Rendering
+// Template Engine
 // ============================================================================
 
-/// Splice title and content into the layout template, then write the HTTP response.
-fn renderPage(send_buf: []u8, title: []const u8, content: []const u8) u32 {
-    var buf: [page_buf_size]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+/// Substitute {{key}} placeholders in a template with corresponding values.
+fn renderTemplate(template: []const u8, keys: []const []const u8, values: []const []const u8, out: []u8) []const u8 {
+    var stream = std.io.fixedBufferStream(out);
     const w = stream.writer();
     var pos: usize = 0;
 
-    while (std.mem.indexOfPos(u8, layout_template, pos, "{{")) |start| {
-        w.writeAll(layout_template[pos..start]) catch unreachable;
-        const close = (std.mem.indexOfPos(u8, layout_template, start + 2, "}}") orelse unreachable) + 2;
-        const key = layout_template[start + 2 .. close - 2];
-        if (eql(key, "title")) {
-            w.writeAll(title) catch unreachable;
-        } else if (eql(key, "content")) {
-            w.writeAll(content) catch unreachable;
+    while (std.mem.indexOfPos(u8, template, pos, "{{")) |start| {
+        w.writeAll(template[pos..start]) catch return stream.getWritten();
+        const close = (std.mem.indexOfPos(u8, template, start + 2, "}}") orelse break) + 2;
+        const key = template[start + 2 .. close - 2];
+        for (keys, values) |k, v| {
+            if (eql(key, k)) {
+                w.writeAll(v) catch return stream.getWritten();
+                break;
+            }
         }
         pos = close;
     }
-    w.writeAll(layout_template[pos..]) catch unreachable;
+    w.writeAll(template[pos..]) catch {};
+    return stream.getWritten();
+}
 
-    return http.writeResponseHtml(send_buf, 200, stream.getWritten());
+/// Splice title and content into the layout template, then write the HTTP response.
+fn renderPage(send_buf: []u8, title: []const u8, content: []const u8) u32 {
+    var buf: [render_buf_size]u8 = undefined;
+    const rendered = renderTemplate(layout_template, &.{ "title", "content" }, &.{ title, content }, &buf);
+    return http.writeResponseHtml(send_buf, 200, rendered);
 }
 
 // ============================================================================
@@ -96,418 +104,323 @@ fn renderPage(send_buf: []u8, title: []const u8, content: []const u8) u32 {
 // ============================================================================
 
 fn dashboard(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    var content_buf: [page_buf_size]u8 = undefined;
-    var hw = html.HtmlWriter.init(&content_buf);
-
-    // Stats cards container — auto-refreshes via HTMX.
-    hw.open("div");
-    hw.attr("id", "dashboard-stats");
-    hw.attr("hx-get", "/ui/partials/dashboard-stats");
-    hw.attr("hx-trigger", "every 5s");
-    hw.attr("hx-swap", "innerHTML");
+    var stats_buf: [page_buf_size]u8 = undefined;
+    var hw = html.HtmlWriter.init(&stats_buf);
     writeDashboardStats(&hw, reader);
-    hw.close("div");
 
-    return renderPage(send_buf, "Dashboard", hw.getWritten());
+    var content_buf: [page_buf_size]u8 = undefined;
+    const content = renderTemplate(ui_embed.dashboard_html, &.{"stats"}, &.{hw.getWritten()}, &content_buf);
+    return renderPage(send_buf, "Dashboard", content);
 }
 
 fn queuesPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    var content_buf: [page_buf_size]u8 = undefined;
-    var hw = html.HtmlWriter.init(&content_buf);
-
-    hw.open("div");
-    hw.attr("id", "queues-table");
-    hw.attr("hx-get", "/ui/partials/queues-table");
-    hw.attr("hx-trigger", "every 5s");
-    hw.attr("hx-swap", "innerHTML");
+    var table_buf: [page_buf_size]u8 = undefined;
+    var hw = html.HtmlWriter.init(&table_buf);
     writeQueuesTable(&hw, reader);
-    hw.close("div");
 
-    return renderPage(send_buf, "Queues", hw.getWritten());
+    var content_buf: [page_buf_size]u8 = undefined;
+    const content = renderTemplate(ui_embed.queues_html, &.{"table"}, &.{hw.getWritten()}, &content_buf);
+    return renderPage(send_buf, "Queues", content);
 }
 
 fn queueDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, queue_name: []const u8, query: []const u8) u32 {
-    var content_buf: [page_buf_size]u8 = undefined;
-    var hw = html.HtmlWriter.init(&content_buf);
+    // Action buttons (always shown).
+    var btn_buf: [4096]u8 = undefined;
+    var btn_hw = html.HtmlWriter.init(&btn_buf);
+    writeQueueActionButton(&btn_hw, queue_name, "pause", "Pause", "bg-yellow-500 hover:bg-yellow-600");
+    writeQueueActionButton(&btn_hw, queue_name, "resume", "Resume", "bg-green-500 hover:bg-green-600");
+    writeQueueActionButton(&btn_hw, queue_name, "drain", "Drain", "bg-blue-500 hover:bg-blue-600");
 
-    const state_filter = getQueryParam(query, "state");
-
-    hw.open("div");
-    hw.attr("class", "space-y-6");
-
-    // Queue header with actions.
-    hw.open("div");
-    hw.attr("class", "flex items-center justify-between");
-    hw.open("h2");
-    hw.attr("class", "text-xl font-semibold text-gray-900");
-    hw.text(queue_name);
-    hw.close("h2");
-    hw.open("div");
-    hw.attr("class", "flex gap-2");
-    writeQueueActionButton(&hw, queue_name, "pause", "Pause", "bg-yellow-500 hover:bg-yellow-600");
-    writeQueueActionButton(&hw, queue_name, "resume", "Resume", "bg-green-500 hover:bg-green-600");
-    writeQueueActionButton(&hw, queue_name, "drain", "Drain", "bg-blue-500 hover:bg-blue-600");
-    hw.close("div");
-    hw.close("div");
-
-    // Stats bar — per-state counts for this queue.
     const rdr = reader orelse {
-        hw.open("p");
-        hw.attr("class", "text-gray-500");
-        hw.text("No data available");
-        hw.close("p");
-        hw.close("div");
-        return renderPage(send_buf, "Queue Detail", hw.getWritten());
+        var content_buf: [page_buf_size]u8 = undefined;
+        const content = renderTemplate(ui_embed.queue_detail_html,
+            &.{ "queue_name", "status_badge", "action_buttons", "export_buttons", "stats_bar", "filter_section", "job_table", "pagination" },
+            &.{ queue_name, "", btn_hw.getWritten(), "", "", "", "<p class=\"text-gray-500\">No data available</p>", "" },
+            &content_buf);
+        return renderPage(send_buf, "Queue Detail", content);
     };
 
-    var queue_buf: [64]sqlite_read.QueueStats = undefined;
-    const q_count = rdr.getQueueStats(&queue_buf) catch 0;
+    const state_filter = getQueryParam(query, "state");
+    const page = parsePageParam(query);
+    const offset: u32 = page * max_table_rows;
+
+    // Stats bar.
+    var stats_buf: [4096]u8 = undefined;
+    var stats_hw = html.HtmlWriter.init(&stats_buf);
+    var queue_stats_buf: [64]sqlite_read.QueueStats = undefined;
+    const q_count = rdr.getQueueStats(&queue_stats_buf) catch 0;
     var qs: ?*const sqlite_read.QueueStats = null;
     for (0..q_count) |i| {
-        if (eql(queue_buf[i].nameSlice(), queue_name)) {
-            qs = &queue_buf[i];
+        if (eql(queue_stats_buf[i].nameSlice(), queue_name)) {
+            qs = &queue_stats_buf[i];
             break;
         }
     }
+    const paused = if (qs) |q| q.paused else false;
+    const status_badge: []const u8 = if (paused)
+        "<span class=\"inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800\">Paused</span>"
+    else
+        "<span class=\"inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800\">Active</span>";
 
     if (qs) |q| {
-        hw.open("div");
-        hw.attr("class", "grid grid-cols-2 md:grid-cols-4 gap-4");
-        statCard(&hw, "Pending", q.pending, "text-blue-700");
-        statCard(&hw, "Active", q.active, "text-green-700");
-        statCard(&hw, "Dead", q.dead, "text-red-600");
-        statCardInt(&hw, "Completed", q.completed, "text-gray-900");
-        hw.close("div");
+        stats_hw.open("div");
+        stats_hw.attr("class", "grid grid-cols-2 md:grid-cols-4 gap-4");
+        statCard(&stats_hw, "Pending", q.pending, "text-blue-700");
+        statCard(&stats_hw, "Active", q.active, "text-green-700");
+        statCard(&stats_hw, "Dead", q.dead, "text-red-600");
+        statCardInt(&stats_hw, "Completed", q.completed, "text-gray-900");
+        stats_hw.close("div");
     }
 
-    // Filter tabs + search bar.
-    hw.open("div");
-    hw.attr("class", "flex flex-col sm:flex-row sm:items-center gap-3");
+    // Filter section (tabs + search).
+    var filter_buf: [4096]u8 = undefined;
+    var filter_hw = html.HtmlWriter.init(&filter_buf);
+    filter_hw.open("div");
+    filter_hw.attr("class", "flex flex-col sm:flex-row sm:items-center gap-3");
+    filter_hw.open("div");
+    filter_hw.attr("class", "flex flex-wrap gap-1");
+    filterTab(&filter_hw, queue_name, null, "All", state_filter, qs);
+    filterTab(&filter_hw, queue_name, "pending", "Pending", state_filter, qs);
+    filterTab(&filter_hw, queue_name, "active", "Active", state_filter, qs);
+    filterTab(&filter_hw, queue_name, "retrying", "Retrying", state_filter, qs);
+    filterTab(&filter_hw, queue_name, "dead", "Dead", state_filter, qs);
+    filterTab(&filter_hw, queue_name, "completed", "Completed", state_filter, qs);
+    filterTab(&filter_hw, queue_name, "scheduled", "Scheduled", state_filter, qs);
+    filterTab(&filter_hw, queue_name, "held", "Held", state_filter, qs);
+    filter_hw.close("div");
+    filter_hw.voidElem("input");
+    filter_hw.attr("type", "text");
+    filter_hw.attr("placeholder", "Filter jobs...");
+    filter_hw.attr("class", "px-3 py-1.5 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 sm:ml-auto w-full sm:w-48");
+    filter_hw.attr("oninput", "corvoFilterRows(this.value)");
+    filter_hw.close("div");
 
-    // Tabs.
-    hw.open("div");
-    hw.attr("class", "flex flex-wrap gap-1");
-    filterTab(&hw, queue_name, null, "All", state_filter, qs);
-    filterTab(&hw, queue_name, "pending", "Pending", state_filter, qs);
-    filterTab(&hw, queue_name, "active", "Active", state_filter, qs);
-    filterTab(&hw, queue_name, "retrying", "Retrying", state_filter, qs);
-    filterTab(&hw, queue_name, "dead", "Dead", state_filter, qs);
-    filterTab(&hw, queue_name, "completed", "Completed", state_filter, qs);
-    filterTab(&hw, queue_name, "scheduled", "Scheduled", state_filter, qs);
-    filterTab(&hw, queue_name, "held", "Held", state_filter, qs);
-    hw.close("div");
+    // Export buttons.
+    var export_buf: [4096]u8 = undefined;
+    var export_hw = html.HtmlWriter.init(&export_buf);
+    writeExportButtons(&export_hw, state_filter, queue_name);
 
-    // Search bar.
-    hw.voidElem("input");
-    hw.attr("type", "text");
-    hw.attr("placeholder", "Filter jobs...");
-    hw.attr("class", "px-3 py-1.5 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 sm:ml-auto w-full sm:w-48");
-    hw.attr("oninput", "corvoFilterRows(this.value)");
-
-    hw.close("div");
-
-    // Job table — filtered by state.
-    hw.open("div");
-    hw.attr("id", "queue-jobs");
+    // Job table.
+    var table_buf: [page_buf_size]u8 = undefined;
+    var table_hw = html.HtmlWriter.init(&table_buf);
     var job_buf: [max_table_rows]sqlite_read.JobRow = undefined;
-    const count = rdr.queryJobsByQueueState(queue_name, state_filter, max_table_rows, 0, &job_buf) catch 0;
-    writeJobTable(&hw, job_buf[0..count], .queue_detail);
-    hw.close("div");
+    const count = rdr.queryJobsByQueueState(queue_name, state_filter, max_table_rows, offset, &job_buf) catch 0;
+    writeJobTable(&table_hw, job_buf[0..count], .queue_detail);
 
-    hw.close("div");
+    // Pagination.
+    var pag_buf: [4096]u8 = undefined;
+    var pag_hw = html.HtmlWriter.init(&pag_buf);
+    const total: u32 = if (qs) |q| queueStateCount(q, state_filter) else 0;
+    const total_pages = if (total > 0) (total + max_table_rows - 1) / max_table_rows else 1;
+    var url_buf: [256]u8 = undefined;
+    var url_stream = std.io.fixedBufferStream(&url_buf);
+    url_stream.writer().print("/ui/queues/{s}?", .{queue_name}) catch {};
+    if (state_filter) |sf| url_stream.writer().print("state={s}&", .{sf}) catch {};
+    writePagination(&pag_hw, url_stream.getWritten(), page, total_pages);
 
-    return renderPage(send_buf, "Queue Detail", hw.getWritten());
-}
-
-fn deadLetterPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    return jobListPage(send_buf, reader, "Dead Letter", "dead", .dead);
-}
-
-fn heldJobsPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    return jobListPage(send_buf, reader, "Held Jobs", "held", .held);
-}
-
-fn scheduledJobsPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    return jobListPage(send_buf, reader, "Scheduled Jobs", "scheduled", .scheduled);
-}
-
-fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, state: []const u8, actions: RowActions) u32 {
     var content_buf: [page_buf_size]u8 = undefined;
-    var hw = html.HtmlWriter.init(&content_buf);
+    const content = renderTemplate(ui_embed.queue_detail_html,
+        &.{ "queue_name", "status_badge", "action_buttons", "export_buttons", "stats_bar", "filter_section", "job_table", "pagination" },
+        &.{ queue_name, status_badge, btn_hw.getWritten(), export_hw.getWritten(), stats_hw.getWritten(), filter_hw.getWritten(), table_hw.getWritten(), pag_hw.getWritten() },
+        &content_buf);
+    return renderPage(send_buf, "Queue Detail", content);
+}
 
-    const rdr = reader orelse {
-        hw.open("p");
-        hw.attr("class", "text-gray-500");
-        hw.text("No data available");
-        hw.close("p");
-        return renderPage(send_buf, title, hw.getWritten());
-    };
+fn deadLetterPage(send_buf: []u8, reader: ?*sqlite_read.Reader, query: []const u8) u32 {
+    return jobListPage(send_buf, reader, "Dead Letter", "dead", .dead, "/ui/dead-letter", query);
+}
 
+fn heldJobsPage(send_buf: []u8, reader: ?*sqlite_read.Reader, query: []const u8) u32 {
+    return jobListPage(send_buf, reader, "Held Jobs", "held", .held, "/ui/held", query);
+}
+
+fn scheduledJobsPage(send_buf: []u8, reader: ?*sqlite_read.Reader, query: []const u8) u32 {
+    return jobListPage(send_buf, reader, "Scheduled Jobs", "scheduled", .scheduled, "/ui/scheduled", query);
+}
+
+fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, state: []const u8, actions: RowActions, base_path: []const u8, query: []const u8) u32 {
+    const rdr = reader orelse return renderPage(send_buf, title, "<p class=\"text-gray-500\">No data available</p>");
+
+    const page = parsePageParam(query);
+    const queue_filter = getQueryParam(query, "queue");
+    const offset: u32 = page * max_table_rows;
+
+    // Total count for pagination.
+    const total: u32 = @intCast(@max(if (queue_filter) |qf|
+        rdr.countJobsByQueueState(qf, state) catch @as(i32, 0)
+    else
+        rdr.countJobsByState(state) catch @as(i32, 0), 0));
+    const total_pages = if (total > 0) (total + max_table_rows - 1) / max_table_rows else 1;
+
+    // Export buttons.
+    var export_buf: [4096]u8 = undefined;
+    var export_hw = html.HtmlWriter.init(&export_buf);
+    writeExportButtons(&export_hw, state, if (queue_filter) |qf| qf else null);
+
+    // Job table.
+    var table_buf: [page_buf_size]u8 = undefined;
+    var table_hw = html.HtmlWriter.init(&table_buf);
     var job_buf: [max_table_rows]sqlite_read.JobRow = undefined;
-    const count = rdr.queryJobsByQueueState(null, state, max_table_rows, 0, &job_buf) catch 0;
+    const count = rdr.queryJobsByQueueState(queue_filter, state, max_table_rows, offset, &job_buf) catch 0;
+    writeJobTable(&table_hw, job_buf[0..count], actions);
 
-    writeJobTable(&hw, job_buf[0..count], actions);
+    // Pagination.
+    var pag_buf: [4096]u8 = undefined;
+    var pag_hw = html.HtmlWriter.init(&pag_buf);
+    var url_buf: [256]u8 = undefined;
+    var url_stream = std.io.fixedBufferStream(&url_buf);
+    url_stream.writer().print("{s}?", .{base_path}) catch {};
+    if (queue_filter) |qf| url_stream.writer().print("queue={s}&", .{qf}) catch {};
+    writePagination(&pag_hw, url_stream.getWritten(), page, total_pages);
 
-    return renderPage(send_buf, title, hw.getWritten());
+    var content_buf: [page_buf_size]u8 = undefined;
+    const content = renderTemplate(ui_embed.job_list_html,
+        &.{ "export_buttons", "job_table", "pagination" },
+        &.{ export_hw.getWritten(), table_hw.getWritten(), pag_hw.getWritten() },
+        &content_buf);
+    return renderPage(send_buf, title, content);
 }
 
 fn jobDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, job_id: []const u8) u32 {
-    var content_buf: [page_buf_size]u8 = undefined;
-    var hw = html.HtmlWriter.init(&content_buf);
+    const rdr = reader orelse return renderPage(send_buf, "Job Detail", "<p class=\"text-gray-500\">No data available</p>");
+    const j = (rdr.getJob(job_id) catch null) orelse return renderPage(send_buf, "Job Detail", "<p class=\"text-red-500\">Job not found</p>");
 
-    const rdr = reader orelse {
-        hw.open("p");
-        hw.attr("class", "text-gray-500");
-        hw.text("No data available");
-        hw.close("p");
-        return renderPage(send_buf, "Job Detail", hw.getWritten());
-    };
+    // Action buttons.
+    var btn_buf: [4096]u8 = undefined;
+    var btn_hw = html.HtmlWriter.init(&btn_buf);
+    writeJobActionButton(&btn_hw, job_id, "retry", "Retry", "bg-blue-500 hover:bg-blue-600");
+    writeJobActionButton(&btn_hw, job_id, "cancel", "Cancel", "bg-yellow-500 hover:bg-yellow-600");
+    writeJobActionButton(&btn_hw, job_id, "delete", "Delete", "bg-red-500 hover:bg-red-600");
 
-    const j = (rdr.getJob(job_id) catch null) orelse {
-        hw.open("p");
-        hw.attr("class", "text-red-500");
-        hw.text("Job not found");
-        hw.close("p");
-        return renderPage(send_buf, "Job Detail", hw.getWritten());
-    };
+    // Properties table rows.
+    var props_buf: [4096]u8 = undefined;
+    var props_hw = html.HtmlWriter.init(&props_buf);
+    detailRow(&props_hw, "Queue", j.queueSlice());
+    detailRow(&props_hw, "State", j.stateSlice());
+    detailRowFmt(&props_hw, "Priority", "{d}", .{j.priority});
+    detailRowFmt(&props_hw, "Attempt", "{d}/{d}", .{ j.attempt, j.max_retries });
+    if (j.worker_id_len > 0) detailRow(&props_hw, "Worker", j.workerIdSlice());
 
-    hw.open("div");
-    hw.attr("class", "space-y-6");
+    // Timeline entries.
+    var time_buf: [4096]u8 = undefined;
+    var time_hw = html.HtmlWriter.init(&time_buf);
+    if (j.created_at_len > 0) timelineEntry(&time_hw, "Created", j.createdAtSlice());
+    if (j.scheduled_at_len > 0) timelineEntry(&time_hw, "Scheduled", j.scheduledAtSlice());
+    if (j.started_at_len > 0) timelineEntry(&time_hw, "Started", j.startedAtSlice());
+    if (j.completed_at_len > 0) timelineEntry(&time_hw, "Completed", j.completedAtSlice());
+    if (j.failed_at_len > 0) timelineEntry(&time_hw, "Failed", j.failedAtSlice());
 
-    // Header: job ID + state badge + actions.
-    hw.open("div");
-    hw.attr("class", "flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3");
-    hw.open("div");
-    hw.attr("class", "flex items-center gap-3");
-    hw.open("h2");
-    hw.attr("class", "text-xl font-semibold text-gray-900 font-mono");
-    hw.text(j.idSlice());
-    hw.close("h2");
-    hw.open("span");
-    hw.attr("class", stateBadgeClass(j.stateSlice()));
-    hw.text(j.stateSlice());
-    hw.close("span");
-    hw.close("div");
-    hw.open("div");
-    hw.attr("class", "flex gap-2");
-    writeJobActionButton(&hw, job_id, "retry", "Retry", "bg-blue-500 hover:bg-blue-600");
-    writeJobActionButton(&hw, job_id, "cancel", "Cancel", "bg-yellow-500 hover:bg-yellow-600");
-    writeJobActionButton(&hw, job_id, "delete", "Delete", "bg-red-500 hover:bg-red-600");
-    hw.close("div");
-    hw.close("div");
-
-    // Metadata grid — 2-column layout.
-    hw.open("div");
-    hw.attr("class", "grid grid-cols-1 md:grid-cols-2 gap-6");
-
-    // Left column: job properties.
-    hw.open("div");
-    hw.attr("class", "bg-white border border-gray-200 rounded-lg");
-    hw.open("div");
-    hw.attr("class", "px-4 py-3 border-b border-gray-200");
-    hw.open("h3");
-    hw.attr("class", "text-sm font-semibold text-gray-900");
-    hw.text("Properties");
-    hw.close("h3");
-    hw.close("div");
-    hw.open("table");
-    hw.attr("class", "w-full text-sm");
-    hw.open("tbody");
-    hw.attr("class", "divide-y divide-gray-100");
-    detailRow(&hw, "Queue", j.queueSlice());
-    detailRow(&hw, "State", j.stateSlice());
-    detailRowFmt(&hw, "Priority", "{d}", .{j.priority});
-    detailRowFmt(&hw, "Attempt", "{d}/{d}", .{ j.attempt, j.max_retries });
-    if (j.worker_id_len > 0) detailRow(&hw, "Worker", j.workerIdSlice());
-    hw.close("tbody");
-    hw.close("table");
-    hw.close("div");
-
-    // Right column: timestamps.
-    hw.open("div");
-    hw.attr("class", "bg-white border border-gray-200 rounded-lg");
-    hw.open("div");
-    hw.attr("class", "px-4 py-3 border-b border-gray-200");
-    hw.open("h3");
-    hw.attr("class", "text-sm font-semibold text-gray-900");
-    hw.text("Timeline");
-    hw.close("h3");
-    hw.close("div");
-    hw.open("div");
-    hw.attr("class", "p-4");
-    hw.open("ol");
-    hw.attr("class", "relative border-l border-gray-200 ml-3 space-y-4");
-    if (j.created_at_len > 0) timelineEntry(&hw, "Created", j.createdAtSlice(), "bg-blue-500");
-    if (j.scheduled_at_len > 0) timelineEntry(&hw, "Scheduled", j.scheduledAtSlice(), "bg-purple-500");
-    if (j.started_at_len > 0) timelineEntry(&hw, "Started", j.startedAtSlice(), "bg-green-500");
-    if (j.completed_at_len > 0) timelineEntry(&hw, "Completed", j.completedAtSlice(), "bg-gray-500");
-    if (j.failed_at_len > 0) timelineEntry(&hw, "Failed", j.failedAtSlice(), "bg-red-500");
-    hw.close("ol");
-    hw.close("div");
-    hw.close("div");
-
-    hw.close("div"); // grid
-
-    // Payload with copy button.
-    var payload_buf: [4096]u8 = undefined;
-    if (rdr.getJobPayload(job_id, &payload_buf) catch null) |payload| {
-        hw.open("div");
-        hw.attr("class", "bg-white border border-gray-200 rounded-lg");
-        hw.open("div");
-        hw.attr("class", "px-4 py-3 border-b border-gray-200 flex items-center justify-between");
-        hw.open("h3");
-        hw.attr("class", "text-sm font-semibold text-gray-900");
-        hw.text("Payload");
-        hw.close("h3");
-        hw.open("button");
-        hw.attr("onclick", "corvoPayloadCopy(this)");
-        hw.attr("class", "text-xs text-gray-500 hover:text-gray-700 font-medium");
-        hw.text("Copy");
-        hw.close("button");
-        hw.close("div");
-        hw.open("pre");
-        hw.attr("id", "job-payload");
-        hw.attr("class", "p-4 text-xs font-mono overflow-x-auto text-gray-800 bg-gray-50 rounded-b-lg");
-        hw.text(payload);
-        hw.close("pre");
-        hw.close("div");
+    // Payload section.
+    var payload_buf: [8192]u8 = undefined;
+    var payload_hw = html.HtmlWriter.init(&payload_buf);
+    var raw_payload: [4096]u8 = undefined;
+    if (rdr.getJobPayload(job_id, &raw_payload) catch null) |payload| {
+        payload_hw.open("div");
+        payload_hw.attr("class", "bg-white border border-gray-200 rounded-lg");
+        payload_hw.open("div");
+        payload_hw.attr("class", "px-4 py-3 border-b border-gray-200 flex items-center justify-between");
+        payload_hw.open("h3");
+        payload_hw.attr("class", "text-sm font-semibold text-gray-900");
+        payload_hw.text("Payload");
+        payload_hw.close("h3");
+        payload_hw.open("button");
+        payload_hw.attr("onclick", "corvoPayloadCopy(this)");
+        payload_hw.attr("class", "text-xs text-gray-500 hover:text-gray-700 font-medium");
+        payload_hw.text("Copy");
+        payload_hw.close("button");
+        payload_hw.close("div");
+        payload_hw.open("pre");
+        payload_hw.attr("id", "job-payload");
+        payload_hw.attr("class", "p-4 text-xs font-mono overflow-x-auto text-gray-800 bg-gray-50 rounded-b-lg");
+        payload_hw.text(payload);
+        payload_hw.close("pre");
+        payload_hw.close("div");
     }
 
-    // Error history.
-    var err_buf: [16]sqlite_read.JobError = undefined;
-    const err_count = rdr.getJobErrors(job_id, &err_buf) catch 0;
+    // Error history section.
+    var errors_buf: [8192]u8 = undefined;
+    var errors_hw = html.HtmlWriter.init(&errors_buf);
+    var err_rows: [16]sqlite_read.JobError = undefined;
+    const err_count = rdr.getJobErrors(job_id, &err_rows) catch 0;
     if (err_count > 0) {
-        hw.open("div");
-        hw.attr("class", "bg-white border border-gray-200 rounded-lg");
-        hw.open("div");
-        hw.attr("class", "px-4 py-3 border-b border-gray-200");
-        hw.open("h3");
-        hw.attr("class", "text-sm font-semibold text-gray-900");
-        hw.text("Error History");
-        hw.close("h3");
-        hw.close("div");
-        hw.open("div");
-        hw.attr("class", "divide-y divide-gray-100");
+        errors_hw.open("div");
+        errors_hw.attr("class", "bg-white border border-gray-200 rounded-lg");
+        errors_hw.open("div");
+        errors_hw.attr("class", "px-4 py-3 border-b border-gray-200");
+        errors_hw.open("h3");
+        errors_hw.attr("class", "text-sm font-semibold text-gray-900");
+        errors_hw.text("Error History");
+        errors_hw.close("h3");
+        errors_hw.close("div");
+        errors_hw.open("div");
+        errors_hw.attr("class", "divide-y divide-gray-100");
         for (0..err_count) |i| {
-            const err = &err_buf[i];
-            hw.open("div");
-            hw.attr("class", "px-4 py-3");
-            hw.open("div");
-            hw.attr("class", "flex items-center gap-2 mb-1");
-            hw.open("span");
-            hw.attr("class", "text-xs font-medium text-gray-500");
-            hw.textFmt("Attempt {d}", .{err.attempt});
-            hw.close("span");
+            const err = &err_rows[i];
+            errors_hw.open("div");
+            errors_hw.attr("class", "px-4 py-3");
+            errors_hw.open("div");
+            errors_hw.attr("class", "flex items-center gap-2 mb-1");
+            errors_hw.open("span");
+            errors_hw.attr("class", "text-xs font-medium text-gray-500");
+            errors_hw.textFmt("Attempt {d}", .{err.attempt});
+            errors_hw.close("span");
             if (err.created_at_len > 0) {
-                hw.open("span");
-                hw.attr("class", "text-xs text-gray-400");
-                hw.text(err.created_at[0..err.created_at_len]);
-                hw.close("span");
+                errors_hw.open("span");
+                errors_hw.attr("class", "text-xs text-gray-400");
+                errors_hw.open("time");
+                errors_hw.attr("data-ts", err.created_at[0..err.created_at_len]);
+                errors_hw.text(err.created_at[0..err.created_at_len]);
+                errors_hw.close("time");
+                errors_hw.close("span");
             }
-            hw.close("div");
-            hw.open("pre");
-            hw.attr("class", "text-xs text-red-700 bg-red-50 rounded p-2 overflow-x-auto");
-            hw.text(err.errorSlice());
-            hw.close("pre");
-            hw.close("div");
+            errors_hw.close("div");
+            errors_hw.open("pre");
+            errors_hw.attr("class", "text-xs text-red-700 bg-red-50 rounded p-2 overflow-x-auto");
+            errors_hw.text(err.errorSlice());
+            errors_hw.close("pre");
+            errors_hw.close("div");
         }
-        hw.close("div");
-        hw.close("div");
+        errors_hw.close("div");
+        errors_hw.close("div");
     }
 
-    hw.close("div"); // space-y-6
-
-    return renderPage(send_buf, "Job Detail", hw.getWritten());
+    var content_buf: [page_buf_size]u8 = undefined;
+    const content = renderTemplate(ui_embed.job_detail_html,
+        &.{ "job_id", "state", "state_badge_class", "action_buttons", "properties", "timeline", "payload_section", "errors_section" },
+        &.{ j.idSlice(), j.stateSlice(), stateBadgeClass(j.stateSlice()), btn_hw.getWritten(), props_hw.getWritten(), time_hw.getWritten(), payload_hw.getWritten(), errors_hw.getWritten() },
+        &content_buf);
+    return renderPage(send_buf, "Job Detail", content);
 }
 
 fn workersPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    var content_buf: [page_buf_size]u8 = undefined;
-    var hw = html.HtmlWriter.init(&content_buf);
-
-    const rdr = reader orelse {
-        hw.open("p");
-        hw.attr("class", "text-gray-500");
-        hw.text("No data available");
-        hw.close("p");
-        return renderPage(send_buf, "Workers", hw.getWritten());
-    };
+    const rdr = reader orelse return renderPage(send_buf, "Workers", "<p class=\"text-gray-500\">No data available</p>");
 
     var worker_buf: [64]sqlite_read.WorkerRow = undefined;
     const count = rdr.getWorkers(&worker_buf) catch 0;
 
-    if (count == 0) {
-        hw.open("p");
-        hw.attr("class", "text-gray-500");
-        hw.text("No workers connected");
-        hw.close("p");
-    } else {
-        hw.open("div");
-        hw.attr("class", "bg-white border border-gray-200 rounded-lg overflow-x-auto");
-        hw.open("table");
-        hw.attr("class", "w-full text-sm");
-        hw.open("thead");
+    if (count == 0) return renderPage(send_buf, "Workers", "<p class=\"text-gray-500\">No workers connected</p>");
+
+    var rows_buf: [page_buf_size]u8 = undefined;
+    var hw = html.HtmlWriter.init(&rows_buf);
+    for (0..count) |i| {
+        const wk = &worker_buf[i];
         hw.open("tr");
-        hw.attr("class", "border-b border-gray-200 bg-gray-50");
-        tableHeader(&hw, "ID");
-        tableHeader(&hw, "Hostname");
-        tableHeader(&hw, "Queues");
-        tableHeader(&hw, "Last Heartbeat");
-        tableHeader(&hw, "Started");
+        hw.attr("class", "hover:bg-gray-50");
+        tableCell(&hw, wk.idSlice());
+        tableCell(&hw, wk.hostnameSlice());
+        tableCell(&hw, wk.queuesSlice());
+        timestampCell(&hw, wk.lastHeartbeatSlice());
+        timestampCell(&hw, wk.startedAtSlice());
         hw.close("tr");
-        hw.close("thead");
-        hw.open("tbody");
-        hw.attr("class", "divide-y divide-gray-100");
-        for (0..count) |i| {
-            const wk = &worker_buf[i];
-            hw.open("tr");
-            hw.attr("class", "hover:bg-gray-50");
-            tableCell(&hw, wk.idSlice());
-            tableCell(&hw, wk.hostnameSlice());
-            tableCell(&hw, wk.queuesSlice());
-            tableCell(&hw, wk.lastHeartbeatSlice());
-            tableCell(&hw, wk.startedAtSlice());
-            hw.close("tr");
-        }
-        hw.close("tbody");
-        hw.close("table");
-        hw.close("div");
     }
 
-    return renderPage(send_buf, "Workers", hw.getWritten());
+    var content_buf: [page_buf_size]u8 = undefined;
+    const content = renderTemplate(ui_embed.workers_html, &.{"rows"}, &.{hw.getWritten()}, &content_buf);
+    return renderPage(send_buf, "Workers", content);
 }
 
 fn clusterPage(send_buf: []u8, _: ?*sqlite_read.Reader) u32 {
-    var content_buf: [page_buf_size]u8 = undefined;
-    var hw = html.HtmlWriter.init(&content_buf);
-
-    hw.open("div");
-    hw.attr("class", "bg-white border border-gray-200 rounded-lg overflow-x-auto");
-
-    // Status header.
-    hw.open("div");
-    hw.attr("class", "px-6 py-4 border-b border-gray-200 flex items-center gap-2");
-    hw.open("span");
-    hw.attr("class", "inline-block w-2.5 h-2.5 rounded-full bg-green-500");
-    hw.close("span");
-    hw.open("span");
-    hw.attr("class", "text-sm font-medium text-gray-900");
-    hw.text("Standalone Mode");
-    hw.close("span");
-    hw.close("div");
-
-    // Details table.
-    hw.open("table");
-    hw.attr("class", "w-full text-sm");
-    hw.open("tbody");
-    hw.attr("class", "divide-y divide-gray-100");
-    detailRow(&hw, "Node ID", "node-1");
-    detailRow(&hw, "State", "leader");
-    detailRow(&hw, "Status", "healthy");
-    hw.close("tbody");
-    hw.close("table");
-    hw.close("div");
-
-    return renderPage(send_buf, "Cluster", hw.getWritten());
+    return renderPage(send_buf, "Cluster", ui_embed.cluster_html);
 }
 
 // ============================================================================
@@ -529,91 +442,11 @@ fn queuesTablePartial(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
 }
 
 fn enqueueFormPartial(send_buf: []u8) u32 {
-    var buf: [page_buf_size]u8 = undefined;
-    var hw = html.HtmlWriter.init(&buf);
-
-    // Modal backdrop.
-    hw.open("div");
-    hw.attr("class", "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50");
-    hw.attr("onclick", "if(event.target===this)document.getElementById('modal').innerHTML=''");
-
-    // Modal content.
-    hw.open("div");
-    hw.attr("class", "bg-white rounded-lg shadow-xl w-full max-w-lg p-6");
-
-    hw.open("div");
-    hw.attr("class", "flex items-center justify-between mb-4");
-    hw.elem("h2", "Enqueue Job");
-    hw.open("button");
-    hw.attr("onclick", "document.getElementById('modal').innerHTML=''");
-    hw.attr("class", "text-gray-400 hover:text-gray-600 text-xl");
-    hw.raw("&times;");
-    hw.close("button");
-    hw.close("div");
-
-    hw.open("form");
-    hw.attr("hx-post", "/api/v1/enqueue");
-    hw.attr("hx-swap", "none");
-    hw.attr("hx-on::after-request", "if(event.detail.successful)document.getElementById('modal').innerHTML=''");
-
-    formField(&hw, "queue", "Queue", "text", "default");
-    formTextarea(&hw, "payload", "Payload (JSON)", "{\"key\": \"value\"}");
-
-    hw.open("div");
-    hw.attr("class", "flex gap-2 mt-4");
-    hw.open("button");
-    hw.attr("type", "submit");
-    hw.attr("class", "px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700");
-    hw.text("Enqueue");
-    hw.close("button");
-    hw.open("button");
-    hw.attr("type", "button");
-    hw.attr("onclick", "document.getElementById('modal').innerHTML=''");
-    hw.attr("class", "px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200");
-    hw.text("Cancel");
-    hw.close("button");
-    hw.close("div");
-
-    hw.close("form");
-    hw.close("div"); // modal content
-    hw.close("div"); // backdrop
-
-    return http.writeResponseHtml(send_buf, 200, hw.getWritten());
-}
-
-fn formField(hw: *html.HtmlWriter, name: []const u8, label_text: []const u8, input_type: []const u8, placeholder: []const u8) void {
-    hw.open("div");
-    hw.attr("class", "mb-3");
-    hw.open("label");
-    hw.attr("class", "block text-sm font-medium text-gray-700 mb-1");
-    hw.text(label_text);
-    hw.close("label");
-    hw.voidElem("input");
-    hw.attr("type", input_type);
-    hw.attr("name", name);
-    hw.attr("placeholder", placeholder);
-    hw.attr("class", "w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500");
-    hw.close("div");
-}
-
-fn formTextarea(hw: *html.HtmlWriter, name: []const u8, label_text: []const u8, placeholder: []const u8) void {
-    hw.open("div");
-    hw.attr("class", "mb-3");
-    hw.open("label");
-    hw.attr("class", "block text-sm font-medium text-gray-700 mb-1");
-    hw.text(label_text);
-    hw.close("label");
-    hw.open("textarea");
-    hw.attr("name", name);
-    hw.attr("rows", "4");
-    hw.attr("placeholder", placeholder);
-    hw.attr("class", "w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 font-mono");
-    hw.close("textarea");
-    hw.close("div");
+    return http.writeResponseHtml(send_buf, 200, ui_embed.enqueue_form_html);
 }
 
 // ============================================================================
-// Shared Components
+// Dynamic Content Writers
 // ============================================================================
 
 fn writeDashboardStats(hw: *html.HtmlWriter, reader: ?*sqlite_read.Reader) void {
@@ -684,7 +517,6 @@ fn writeDashboardStats(hw: *html.HtmlWriter, reader: ?*sqlite_read.Reader) void 
 }
 
 fn writeQueueBarChart(hw: *html.HtmlWriter, queues: []const sqlite_read.QueueStats) void {
-    // Find max value for scaling.
     var max_val: i64 = 1;
     for (queues) |q| {
         const total = q.pending + q.active + q.retrying;
@@ -711,7 +543,6 @@ fn writeQueueBarChart(hw: *html.HtmlWriter, queues: []const sqlite_read.QueueSta
         const x: u32 = @as(u32, @intCast(i)) * (bar_w + bar_gap);
         const y: u32 = chart_h - bar_h;
 
-        // Bar.
         hw.open("rect");
         hw.attrFmt("x", "{d}", .{x});
         hw.attrFmt("y", "{d}", .{y});
@@ -721,7 +552,6 @@ fn writeQueueBarChart(hw: *html.HtmlWriter, queues: []const sqlite_read.QueueSta
         hw.attr("rx", "2");
         hw.close("rect");
 
-        // Label.
         hw.open("text");
         hw.attrFmt("x", "{d}", .{x + bar_w / 2});
         hw.attrFmt("y", "{d}", .{chart_h + 16});
@@ -730,7 +560,6 @@ fn writeQueueBarChart(hw: *html.HtmlWriter, queues: []const sqlite_read.QueueSta
         hw.text(q.nameSlice());
         hw.close("text");
 
-        // Value on top.
         if (total > 0) {
             hw.open("text");
             hw.attrFmt("x", "{d}", .{x + bar_w / 2});
@@ -743,34 +572,6 @@ fn writeQueueBarChart(hw: *html.HtmlWriter, queues: []const sqlite_read.QueueSta
     }
 
     hw.close("svg");
-    hw.close("div");
-}
-
-fn statCard(hw: *html.HtmlWriter, label: []const u8, value: i64, text_class: []const u8) void {
-    hw.open("div");
-    hw.attr("class", "bg-white rounded-lg border border-gray-200 p-4");
-    hw.open("div");
-    hw.attr("class", "text-xs font-medium text-gray-500 uppercase tracking-wider");
-    hw.text(label);
-    hw.close("div");
-    hw.open("div");
-    hw.attrFmt("class", "mt-1 text-2xl font-semibold {s}", .{text_class});
-    hw.textFmt("{d}", .{value});
-    hw.close("div");
-    hw.close("div");
-}
-
-fn statCardInt(hw: *html.HtmlWriter, label: []const u8, value: i32, text_class: []const u8) void {
-    hw.open("div");
-    hw.attr("class", "bg-white rounded-lg border border-gray-200 p-4");
-    hw.open("div");
-    hw.attr("class", "text-xs font-medium text-gray-500 uppercase tracking-wider");
-    hw.text(label);
-    hw.close("div");
-    hw.open("div");
-    hw.attrFmt("class", "mt-1 text-2xl font-semibold {s}", .{text_class});
-    hw.textFmt("{d}", .{value});
-    hw.close("div");
     hw.close("div");
 }
 
@@ -811,7 +612,6 @@ fn writeQueuesTable(hw: *html.HtmlWriter, reader: ?*sqlite_read.Reader) void {
         const q = &queue_buf[i];
         hw.open("tr");
         hw.attr("class", "hover:bg-gray-50");
-        // Queue name as link.
         hw.open("td");
         hw.attr("class", "px-4 py-2 font-medium");
         hw.open("a");
@@ -827,7 +627,6 @@ fn writeQueuesTable(hw: *html.HtmlWriter, reader: ?*sqlite_read.Reader) void {
         tableCellInt(hw, q.completed);
         tableCellInt(hw, q.scheduled);
         tableCellInt(hw, q.held);
-        // Status badge.
         hw.open("td");
         hw.attr("class", "px-4 py-2");
         hw.open("span");
@@ -845,7 +644,6 @@ fn writeQueuesTable(hw: *html.HtmlWriter, reader: ?*sqlite_read.Reader) void {
     hw.close("div");
 }
 
-
 const RowActions = enum { none, dead, held, scheduled, queue_detail };
 
 fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow, actions: RowActions) void {
@@ -857,7 +655,7 @@ fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow, actions
         return;
     }
 
-    // Bulk action bar (hidden by default, shown via JS when checkboxes selected).
+    // Bulk action bar.
     if (actions != .none) {
         hw.open("div");
         hw.attr("id", "bulk-bar");
@@ -896,7 +694,6 @@ fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow, actions
     hw.open("thead");
     hw.open("tr");
     hw.attr("class", "border-b border-gray-200 bg-gray-50");
-    // Select-all checkbox.
     if (actions != .none) {
         hw.open("th");
         hw.attr("class", "px-4 py-2 w-8");
@@ -921,7 +718,6 @@ fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow, actions
     for (jobs) |*j| {
         hw.open("tr");
         hw.attr("class", "hover:bg-gray-50");
-        // Row checkbox.
         if (actions != .none) {
             hw.open("td");
             hw.attr("class", "px-4 py-2");
@@ -932,7 +728,6 @@ fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow, actions
             hw.attr("onchange", "corvoUpdateBulk()");
             hw.close("td");
         }
-        // Job ID as link.
         hw.open("td");
         hw.attr("class", "px-4 py-2 font-mono text-xs");
         hw.open("a");
@@ -942,7 +737,6 @@ fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow, actions
         hw.close("a");
         hw.close("td");
         tableCell(hw, j.queueSlice());
-        // State badge.
         hw.open("td");
         hw.attr("class", "px-4 py-2");
         hw.open("span");
@@ -952,8 +746,7 @@ fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow, actions
         hw.close("td");
         tableCellFmt(hw, "{d}", .{j.priority});
         tableCellFmt(hw, "{d}/{d}", .{ j.attempt, j.max_retries });
-        tableCell(hw, j.createdAtSlice());
-        // Row actions.
+        timestampCell(hw, j.createdAtSlice());
         if (actions != .none) {
             hw.open("td");
             hw.attr("class", "px-4 py-2");
@@ -988,6 +781,38 @@ fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow, actions
     hw.close("div");
 }
 
+// ============================================================================
+// Reusable HTML Helpers
+// ============================================================================
+
+fn statCard(hw: *html.HtmlWriter, label: []const u8, value: i64, text_class: []const u8) void {
+    hw.open("div");
+    hw.attr("class", "bg-white rounded-lg border border-gray-200 p-4");
+    hw.open("div");
+    hw.attr("class", "text-xs font-medium text-gray-500 uppercase tracking-wider");
+    hw.text(label);
+    hw.close("div");
+    hw.open("div");
+    hw.attrFmt("class", "mt-1 text-2xl font-semibold {s}", .{text_class});
+    hw.textFmt("{d}", .{value});
+    hw.close("div");
+    hw.close("div");
+}
+
+fn statCardInt(hw: *html.HtmlWriter, label: []const u8, value: i32, text_class: []const u8) void {
+    hw.open("div");
+    hw.attr("class", "bg-white rounded-lg border border-gray-200 p-4");
+    hw.open("div");
+    hw.attr("class", "text-xs font-medium text-gray-500 uppercase tracking-wider");
+    hw.text(label);
+    hw.close("div");
+    hw.open("div");
+    hw.attrFmt("class", "mt-1 text-2xl font-semibold {s}", .{text_class});
+    hw.textFmt("{d}", .{value});
+    hw.close("div");
+    hw.close("div");
+}
+
 fn bulkButton(hw: *html.HtmlWriter, action: []const u8, label: []const u8, btn_class: []const u8) void {
     hw.open("button");
     hw.attrFmt("onclick", "corvoBulkAction('{s}')", .{action});
@@ -1005,10 +830,6 @@ fn rowAction(hw: *html.HtmlWriter, job_id: []const u8, action: []const u8, label
     hw.close("button");
 }
 
-// ============================================================================
-// Reusable HTML Helpers
-// ============================================================================
-
 fn tableHeader(hw: *html.HtmlWriter, label: []const u8) void {
     hw.open("th");
     hw.attr("class", "px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider");
@@ -1023,9 +844,19 @@ fn tableCell(hw: *html.HtmlWriter, value: []const u8) void {
     hw.close("td");
 }
 
+fn timestampCell(hw: *html.HtmlWriter, value: []const u8) void {
+    hw.open("td");
+    hw.attr("class", "px-4 py-2 text-gray-700");
+    hw.open("time");
+    hw.attr("data-ts", value);
+    hw.text(value);
+    hw.close("time");
+    hw.close("td");
+}
+
 fn tableCellInt(hw: *html.HtmlWriter, value: i64) void {
     hw.open("td");
-    hw.attr("class", "px-4 py-2 text-gray-700 tabular-nums");
+    hw.attr("class", "px-4 py-2 text-right text-gray-700 tabular-nums");
     hw.textFmt("{d}", .{value});
     hw.close("td");
 }
@@ -1063,7 +894,13 @@ fn detailRowFmt(hw: *html.HtmlWriter, label: []const u8, comptime fmt: []const u
     hw.close("tr");
 }
 
-fn timelineEntry(hw: *html.HtmlWriter, label: []const u8, timestamp: []const u8, dot_color: []const u8) void {
+fn timelineEntry(hw: *html.HtmlWriter, label: []const u8, timestamp: []const u8) void {
+    const dot_color = if (eql(label, "Created")) "bg-blue-500"
+        else if (eql(label, "Scheduled")) "bg-purple-500"
+        else if (eql(label, "Started")) "bg-green-500"
+        else if (eql(label, "Completed")) "bg-gray-500"
+        else if (eql(label, "Failed")) "bg-red-500"
+        else "bg-gray-400";
     hw.open("li");
     hw.attr("class", "ml-6");
     hw.open("span");
@@ -1075,7 +912,10 @@ fn timelineEntry(hw: *html.HtmlWriter, label: []const u8, timestamp: []const u8,
     hw.close("div");
     hw.open("div");
     hw.attr("class", "text-xs text-gray-500");
+    hw.open("time");
+    hw.attr("data-ts", timestamp);
     hw.text(timestamp);
+    hw.close("time");
     hw.close("div");
     hw.close("li");
 }
@@ -1106,9 +946,8 @@ fn filterTab(hw: *html.HtmlWriter, queue_name: []const u8, state: ?[]const u8, l
         "px-3 py-1.5 text-sm font-medium rounded-md text-gray-600 hover:bg-gray-100");
     hw.text(label);
 
-    // Count badge.
     if (qs) |q| {
-        const count: i32 = if (state) |s| blk: {
+        const cnt: i32 = if (state) |s| blk: {
             if (eql(s, "pending")) break :blk q.pending;
             if (eql(s, "active")) break :blk q.active;
             if (eql(s, "retrying")) break :blk q.retrying;
@@ -1121,11 +960,104 @@ fn filterTab(hw: *html.HtmlWriter, queue_name: []const u8, state: ?[]const u8, l
 
         hw.open("span");
         hw.attr("class", "ml-1 text-xs opacity-70");
-        hw.textFmt("{d}", .{count});
+        hw.textFmt("{d}", .{cnt});
         hw.close("span");
     }
 
     hw.close("a");
+}
+
+fn writePagination(hw: *html.HtmlWriter, base_url: []const u8, page: u32, total_pages: u32) void {
+    if (total_pages <= 1) return;
+
+    hw.open("div");
+    hw.attr("class", "flex items-center justify-between mt-4");
+
+    hw.open("span");
+    hw.attr("class", "text-sm text-gray-500");
+    hw.textFmt("Page {d} of {d}", .{ page + 1, total_pages });
+    hw.close("span");
+
+    hw.open("div");
+    hw.attr("class", "flex gap-2");
+
+    if (page > 0) {
+        hw.open("a");
+        hw.attrFmt("href", "{s}page={d}", .{ base_url, page - 1 });
+        hw.attr("class", "px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50");
+        hw.raw("&larr; Previous");
+        hw.close("a");
+    }
+
+    if (page + 1 < total_pages) {
+        hw.open("a");
+        hw.attrFmt("href", "{s}page={d}", .{ base_url, page + 1 });
+        hw.attr("class", "px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50");
+        hw.raw("Next &rarr;");
+        hw.close("a");
+    }
+
+    hw.close("div");
+    hw.close("div");
+}
+
+fn writeExportButtons(hw: *html.HtmlWriter, state: ?[]const u8, queue: ?[]const u8) void {
+    hw.open("button");
+    hw.attrFmt("onclick", "corvoExport('json','{s}','{s}')", .{ state orelse "", queue orelse "" });
+    hw.attr("class", "px-2 py-1 text-xs font-medium text-gray-600 bg-white border border-gray-300 rounded hover:bg-gray-50");
+    hw.text("JSON");
+    hw.close("button");
+    hw.open("button");
+    hw.attrFmt("onclick", "corvoExport('csv','{s}','{s}')", .{ state orelse "", queue orelse "" });
+    hw.attr("class", "px-2 py-1 text-xs font-medium text-gray-600 bg-white border border-gray-300 rounded hover:bg-gray-50");
+    hw.text("CSV");
+    hw.close("button");
+}
+
+fn writeQueueFilter(hw: *html.HtmlWriter, rdr: *sqlite_read.Reader, base_path: []const u8, current_queue: ?[]const u8) void {
+    var queue_buf: [64]sqlite_read.QueueStats = undefined;
+    const count = rdr.getQueueStats(&queue_buf) catch 0;
+    if (count == 0) return;
+
+    hw.open("select");
+    hw.attr("class", "px-3 py-1.5 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500");
+    hw.attrFmt("onchange", "location.href=this.value?'{s}?queue='+this.value:'{s}'", .{ base_path, base_path });
+
+    hw.open("option");
+    hw.attr("value", "");
+    hw.text("All Queues");
+    hw.close("option");
+
+    for (0..count) |i| {
+        hw.open("option");
+        hw.attr("value", queue_buf[i].nameSlice());
+        if (current_queue) |cq| {
+            if (eql(cq, queue_buf[i].nameSlice())) hw.attrBool("selected");
+        }
+        hw.text(queue_buf[i].nameSlice());
+        hw.close("option");
+    }
+
+    hw.close("select");
+}
+
+fn queueStateCount(q: *const sqlite_read.QueueStats, state: ?[]const u8) u32 {
+    const val: i32 = if (state) |s| blk: {
+        if (eql(s, "pending")) break :blk q.pending;
+        if (eql(s, "active")) break :blk q.active;
+        if (eql(s, "retrying")) break :blk q.retrying;
+        if (eql(s, "dead")) break :blk q.dead;
+        if (eql(s, "completed")) break :blk q.completed;
+        if (eql(s, "scheduled")) break :blk q.scheduled;
+        if (eql(s, "held")) break :blk q.held;
+        break :blk 0;
+    } else q.pending + q.active + q.retrying + q.dead + q.completed + q.scheduled + q.held;
+    return @intCast(@max(val, 0));
+}
+
+fn parsePageParam(query: []const u8) u32 {
+    const page_str = getQueryParam(query, "page") orelse return 0;
+    return std.fmt.parseInt(u32, page_str, 10) catch 0;
 }
 
 fn getQueryParam(query: []const u8, key: []const u8) ?[]const u8 {

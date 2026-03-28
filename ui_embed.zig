@@ -13,6 +13,14 @@ const logo_full_svg_gz = @embedFile("ui/dist/logo-full.svg.gz");
 
 // HTML templates.
 pub const layout_html = @embedFile("ui/templates/layout.html");
+pub const enqueue_form_html = @embedFile("ui/templates/enqueue-form.html");
+pub const dashboard_html = @embedFile("ui/templates/dashboard.html");
+pub const queues_html = @embedFile("ui/templates/queues.html");
+pub const queue_detail_html = @embedFile("ui/templates/queue-detail.html");
+pub const job_list_html = @embedFile("ui/templates/job-list.html");
+pub const job_detail_html = @embedFile("ui/templates/job-detail.html");
+pub const workers_html = @embedFile("ui/templates/workers.html");
+pub const cluster_html = @embedFile("ui/templates/cluster.html");
 
 /// Largest embedded asset size. send_buf must fit this + HTTP headers (~200B).
 pub const max_asset_size: usize = htmx_js_gz.len;

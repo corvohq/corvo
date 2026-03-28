@@ -137,13 +137,19 @@ ui/favicon.svg            — existing favicon
 
 17. ~~Job detail: 2-column grid (properties + timeline), payload with copy button, error history~~
 
-### Remaining
-18. Enqueue dialog: add priority, max retries, scheduled at, unique key fields
-19. Pagination on all job tables (currently capped at 25 rows)
-20. Date formatting: relative timestamps ("1m ago") instead of raw ISO strings
-21. Job search/filters: search bar + state/queue filter dropdowns
-    (check git history for full filter set from React UI)
-22. Throughput chart: time-series line chart (enqueued/completed/failed) —
-    requires wiring up metrics/throughput endpoint with real data
-23. Export: JSON/CSV export buttons on job tables
-24. Mobile responsive: hamburger menu, collapsible sidebar, scrollable tables
+18. ~~Enqueue dialog: add priority, max retries, scheduled at, unique key fields~~
+    ~~+ fixed form to submit JSON (was sending form-encoded, API expects JSON)~~
+    ~~+ collapsible "Advanced Options" section with priority select, max retries, scheduled at, unique key~~
+    ~~+ moved all pages to HTML templates with {{placeholder}} substitution~~
+    ~~+ renderTemplate engine, 9 template files (layout, dashboard, queues, queue-detail,~~
+    ~~  job-list, job-detail, workers, cluster, enqueue-form)~~
+    ~~+ HtmlWriter only for dynamic content (table rows, stats, charts)~~
+
+19. ~~Pagination on all job tables (prev/next, "Page X of Y", offset queries)~~
+20. ~~Date formatting: `<time data-ts>` elements + JS relative timestamps ("1m ago")~~
+21. ~~Job search/filters: queue dropdown on dead letter/held/scheduled pages,~~
+    ~~state filter tabs on queue detail (already done in step 16)~~
+22. Throughput chart — **deferred**: requires backend metrics/throughput endpoint
+23. ~~Export: JSON/CSV buttons on all job tables (client-side fetch + download)~~
+24. ~~Mobile responsive: hamburger menu, collapsible sidebar, scrollable tables~~
+    ~~(done in step 17 commit, verified responsive classes on all templates)~~

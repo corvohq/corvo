@@ -40,6 +40,23 @@ test.describe("Enqueue Job dialog", () => {
     await page.getByRole("button", { name: "Cancel" }).click();
     await expect(page.locator("#modal form")).not.toBeVisible();
   });
+
+  test("advanced options expand and submit", async ({ page }) => {
+    await page.goto("/ui/");
+    await page.getByRole("button", { name: /enqueue job/i }).click();
+    await expect(page.locator("#modal form")).toBeVisible({ timeout: 3_000 });
+
+    await page.locator("input[name='queue']").fill("test.advanced");
+    // Open advanced options.
+    await page.locator("details summary").click();
+    await page.locator("select[name='priority']").selectOption("high");
+    await page.locator("input[name='max_retries']").fill("5");
+    await page.locator("input[name='unique_key']").fill("my-unique-key");
+
+    await page.getByRole("button", { name: "Enqueue" }).click();
+    await expectToast(page);
+    await expect(page.locator("#modal form")).not.toBeVisible();
+  });
 });
 
 // ─── Queue actions ────────────────────────────────────────────────────────────

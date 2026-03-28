@@ -9,9 +9,31 @@
   <script src="/ui/htmx.min.js"></script>
 </head>
 <body class="bg-gray-50 text-gray-900 min-h-screen">
-<div class="flex min-h-screen">
 
 <div id="toast" class="fixed top-4 right-4 z-50"></div>
+
+<!-- Mobile sidebar overlay — outside flex wrapper so fixed positioning works reliably -->
+<div id="mobile-sidebar" class="fixed inset-0 z-40 hidden">
+  <div class="absolute inset-0 bg-black bg-opacity-50" onclick="document.getElementById('mobile-sidebar').classList.add('hidden')"></div>
+  <div class="absolute inset-y-0 left-0 w-56 bg-white border-r border-gray-200 flex flex-col z-50">
+    <div class="h-14 flex items-center px-4 border-b border-gray-200">
+      <a href="/ui/" class="flex items-center gap-2">
+        <img src="/ui/logo-full.svg" alt="Corvo" class="h-6">
+      </a>
+    </div>
+    <nav class="flex-1 px-3 py-4 space-y-1">
+      <a href="/ui/" data-nav="/" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Dashboard</a>
+      <a href="/ui/queues" data-nav="/queues" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Queues</a>
+      <a href="/ui/scheduled" data-nav="/scheduled" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Scheduled</a>
+      <a href="/ui/dead-letter" data-nav="/dead-letter" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Dead Letter</a>
+      <a href="/ui/held" data-nav="/held" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Held Jobs</a>
+      <a href="/ui/workers" data-nav="/workers" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Workers</a>
+      <a href="/ui/cluster" data-nav="/cluster" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Cluster</a>
+    </nav>
+  </div>
+</div>
+
+<div class="flex min-h-screen">
 
 <!-- Sidebar (desktop) -->
 <aside class="hidden md:flex w-56 bg-white border-r border-gray-200 flex-col min-h-screen">
@@ -30,27 +52,6 @@
     <a href="/ui/cluster" data-nav="/cluster" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Cluster</a>
   </nav>
 </aside>
-
-<!-- Mobile sidebar overlay -->
-<div id="mobile-sidebar" class="fixed inset-0 z-40 hidden">
-  <div class="fixed inset-0 bg-black bg-opacity-50" onclick="document.getElementById('mobile-sidebar').classList.add('hidden')"></div>
-  <div class="fixed inset-y-0 left-0 w-56 bg-white border-r border-gray-200 flex flex-col z-50">
-    <div class="h-14 flex items-center px-4 border-b border-gray-200">
-      <a href="/ui/" class="flex items-center gap-2">
-        <img src="/ui/logo-full.svg" alt="Corvo" class="h-6">
-      </a>
-    </div>
-    <nav class="flex-1 px-3 py-4 space-y-1">
-      <a href="/ui/" data-nav="/" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Dashboard</a>
-      <a href="/ui/queues" data-nav="/queues" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Queues</a>
-      <a href="/ui/scheduled" data-nav="/scheduled" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Scheduled</a>
-      <a href="/ui/dead-letter" data-nav="/dead-letter" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Dead Letter</a>
-      <a href="/ui/held" data-nav="/held" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Held Jobs</a>
-      <a href="/ui/workers" data-nav="/workers" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Workers</a>
-      <a href="/ui/cluster" data-nav="/cluster" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-gray-600 hover:bg-gray-50 hover:text-gray-900">Cluster</a>
-    </nav>
-  </div>
-</div>
 
 <!-- Main content -->
 <main class="flex-1 p-4 md:p-6 min-w-0">
@@ -74,7 +75,8 @@
 
 <script>
 document.body.addEventListener('htmx:afterRequest',function(e){
-if(e.detail.verb==='get')return;
+var v=e.detail.requestConfig&&e.detail.requestConfig.verb;
+if(!v||v==='get')return;
 var t=document.getElementById('toast');if(!t)return;
 var ok=e.detail.successful;
 var c=ok?'bg-green-600':'bg-red-600';
@@ -109,6 +111,43 @@ if(d==='/'?(p==='/'||p===''):p.indexOf(d)===0)
 a.className=a.className.replace('text-gray-600 hover:bg-gray-50 hover:text-gray-900','bg-indigo-50 text-indigo-700');
 });
 })();
+function corvoFmtDur(ms){
+if(ms<60000)return Math.floor(ms/1000)+'s';
+if(ms<3600000)return Math.floor(ms/60000)+'m';
+if(ms<86400000)return Math.floor(ms/3600000)+'h';
+return Math.floor(ms/86400000)+'d';
+}
+function corvoFormatTimes(){
+var now=Date.now();
+document.querySelectorAll('time[data-ts]').forEach(function(el){
+var ns=el.dataset.ts;if(!ns||ns.length<13)return;
+var ms=Number(ns.slice(0,13));if(!ms)return;
+var diff=now-ms;
+el.textContent=diff<0?'in '+corvoFmtDur(-diff):corvoFmtDur(diff)+' ago';
+el.title=new Date(ms).toISOString();
+});
+}
+corvoFormatTimes();
+document.body.addEventListener('htmx:afterSwap',corvoFormatTimes);
+function corvoExport(fmt,state,queue){
+var body={limit:500};
+if(state)body.state=[state];
+if(queue)body.queue=queue;
+fetch('/api/v1/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+.then(function(r){return r.json()})
+.then(function(data){
+var jobs=data.jobs||[];
+if(fmt==='csv'){
+var csv='id,queue,state,priority,attempt,max_retries,created_at\n';
+jobs.forEach(function(j){csv+=[j.id,j.queue,j.state,j.priority,j.attempt,j.max_retries,j.created_at].join(',')+'\n'});
+corvoDownload(csv,'jobs.csv','text/csv');
+}else{corvoDownload(JSON.stringify(jobs,null,2),'jobs.json','application/json')}
+});
+}
+function corvoDownload(content,name,type){
+var b=new Blob([content],{type:type});
+var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=name;a.click();
+}
 function corvoPayloadCopy(btn){
 var el=document.getElementById('job-payload');
 if(!el)return;
@@ -120,6 +159,28 @@ function corvoFilterRows(q){
 var rows=document.querySelectorAll('#queue-jobs tbody tr');
 q=q.toLowerCase();
 rows.forEach(function(r){r.style.display=r.textContent.toLowerCase().indexOf(q)>=0?'':'none'});
+}
+function corvoEnqueue(form){
+var d=new FormData(form);
+var body={queue:d.get('queue')||'default'};
+var pl=d.get('payload');
+if(pl){try{body.payload=JSON.parse(pl)}catch(e){body.payload=pl}}
+var pri=d.get('priority');if(pri)body.priority=pri;
+var mr=d.get('max_retries');if(mr!=='')body.max_retries=parseInt(mr,10);
+var sa=d.get('scheduled_at');if(sa)body.scheduled_at=new Date(sa).toISOString();
+var uk=d.get('unique_key');if(uk)body.unique_key=uk;
+fetch('/api/v1/enqueue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+.then(function(r){
+var t=document.getElementById('toast');
+if(r.ok){
+document.getElementById('modal').innerHTML='';
+if(t)t.innerHTML='<div class="bg-green-600 text-white px-4 py-2 rounded shadow text-sm">Done</div>';
+}else{
+if(t)t.innerHTML='<div class="bg-red-600 text-white px-4 py-2 rounded shadow text-sm">Error</div>';
+}
+if(t)setTimeout(function(){t.innerHTML=''},2000);
+});
+return false;
 }
 </script>
 </body>
