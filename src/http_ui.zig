@@ -308,20 +308,30 @@ fn clusterPage(send_buf: []u8, _: ?*sqlite_read.Reader) u32 {
     layoutStart(&hw, "Cluster", "/cluster");
 
     hw.open("div");
-    hw.attr("class", "bg-white border border-gray-200 rounded-lg p-6");
+    hw.attr("class", "bg-white border border-gray-200 rounded-lg overflow-hidden");
+
+    // Status header.
     hw.open("div");
-    hw.attr("class", "space-y-4");
-    hw.open("div");
-    hw.attr("class", "flex items-center gap-2");
+    hw.attr("class", "px-6 py-4 border-b border-gray-200 flex items-center gap-2");
     hw.open("span");
-    hw.attr("class", "inline-block w-2 h-2 rounded-full bg-green-500");
+    hw.attr("class", "inline-block w-2.5 h-2.5 rounded-full bg-green-500");
     hw.close("span");
-    hw.elem("span", "Standalone Mode");
+    hw.open("span");
+    hw.attr("class", "text-sm font-medium text-gray-900");
+    hw.text("Standalone Mode");
+    hw.close("span");
     hw.close("div");
+
+    // Details table.
+    hw.open("table");
+    hw.attr("class", "w-full text-sm");
+    hw.open("tbody");
+    hw.attr("class", "divide-y divide-gray-100");
     detailRow(&hw, "Node ID", "node-1");
     detailRow(&hw, "State", "leader");
     detailRow(&hw, "Status", "healthy");
-    hw.close("div");
+    hw.close("tbody");
+    hw.close("table");
     hw.close("div");
 
     layoutEnd(&hw);
@@ -513,6 +523,7 @@ fn layoutEnd(hw: *html.HtmlWriter) void {
     hw.open("script");
     hw.raw(
         \\document.body.addEventListener('htmx:afterRequest',function(e){
+        \\if(e.detail.verb==='get')return;
         \\var t=document.getElementById('toast');if(!t)return;
         \\var ok=e.detail.successful;
         \\var c=ok?'bg-green-600':'bg-red-600';
@@ -555,6 +566,7 @@ fn writeSidebar(hw: *html.HtmlWriter, current_path: []const u8) void {
     hw.attr("class", "h-14 flex items-center px-4 border-b border-gray-200");
     hw.open("a");
     hw.attr("href", "/ui/");
+    hw.attr("class", "flex items-center gap-2");
     hw.voidElem("img");
     hw.attr("src", "/ui/logo-full.svg");
     hw.attr("alt", "Corvo");
@@ -564,7 +576,7 @@ fn writeSidebar(hw: *html.HtmlWriter, current_path: []const u8) void {
 
     // Nav links.
     hw.open("nav");
-    hw.attr("class", "flex-1 p-3 space-y-1");
+    hw.attr("class", "flex-1 px-3 py-4 space-y-1");
     navLink(hw, "/ui/", "Dashboard", current_path);
     navLink(hw, "/ui/queues", "Queues", current_path);
     navLink(hw, "/ui/scheduled", "Scheduled", current_path);
@@ -578,11 +590,10 @@ fn writeSidebar(hw: *html.HtmlWriter, current_path: []const u8) void {
 }
 
 const nav_base = "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors ";
-const nav_active = nav_base ++ "bg-gray-100 text-gray-900";
-const nav_inactive = nav_base ++ "text-gray-500 hover:bg-gray-50 hover:text-gray-900";
+const nav_active = nav_base ++ "bg-indigo-50 text-indigo-700";
+const nav_inactive = nav_base ++ "text-gray-600 hover:bg-gray-50 hover:text-gray-900";
 
 fn navLink(hw: *html.HtmlWriter, href: []const u8, label: []const u8, current_path: []const u8) void {
-    // Match: "/ui/" is active only for exact "/", others match prefix.
     const full_current = current_path;
     const active = if (eql(href, "/ui/"))
         eql(full_current, "/") or eql(full_current, "")
@@ -631,11 +642,11 @@ fn writeDashboardStats(hw: *html.HtmlWriter, reader: ?*sqlite_read.Reader) void 
     // Stats grid.
     hw.open("div");
     hw.attr("class", "grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6");
-    statCard(hw, "Pending", total_pending, "text-blue-600", "bg-blue-50");
-    statCard(hw, "Active", total_active, "text-green-600", "bg-green-50");
-    statCard(hw, "Completed", total_completed, "text-gray-600", "bg-gray-50");
-    statCard(hw, "Dead", total_dead, "text-red-600", "bg-red-50");
-    statCardInt(hw, "Workers", worker_count, "text-purple-600", "bg-purple-50");
+    statCard(hw, "Total Pending", total_pending, "text-gray-900");
+    statCard(hw, "Active", total_active, "text-gray-900");
+    statCard(hw, "Dead", total_dead, "text-red-600");
+    statCard(hw, "Queues", @as(i64, @intCast(count)), "text-gray-900");
+    statCardInt(hw, "Workers", worker_count, "text-gray-900");
     hw.close("div");
 
     // SVG bar chart — queue sizes at a glance.
@@ -732,29 +743,29 @@ fn writeQueueBarChart(hw: *html.HtmlWriter, queues: []const sqlite_read.QueueSta
     hw.close("div");
 }
 
-fn statCard(hw: *html.HtmlWriter, label: []const u8, value: i64, text_class: []const u8, bg_class: []const u8) void {
+fn statCard(hw: *html.HtmlWriter, label: []const u8, value: i64, text_class: []const u8) void {
     hw.open("div");
-    hw.attrFmt("class", "rounded-lg border border-gray-200 p-4 {s}", .{bg_class});
+    hw.attr("class", "bg-white rounded-lg border border-gray-200 p-4");
     hw.open("div");
     hw.attr("class", "text-xs font-medium text-gray-500 uppercase tracking-wider");
     hw.text(label);
     hw.close("div");
     hw.open("div");
-    hw.attrFmt("class", "mt-1 text-2xl font-bold {s}", .{text_class});
+    hw.attrFmt("class", "mt-1 text-2xl font-semibold {s}", .{text_class});
     hw.textFmt("{d}", .{value});
     hw.close("div");
     hw.close("div");
 }
 
-fn statCardInt(hw: *html.HtmlWriter, label: []const u8, value: i32, text_class: []const u8, bg_class: []const u8) void {
+fn statCardInt(hw: *html.HtmlWriter, label: []const u8, value: i32, text_class: []const u8) void {
     hw.open("div");
-    hw.attrFmt("class", "rounded-lg border border-gray-200 p-4 {s}", .{bg_class});
+    hw.attr("class", "bg-white rounded-lg border border-gray-200 p-4");
     hw.open("div");
     hw.attr("class", "text-xs font-medium text-gray-500 uppercase tracking-wider");
     hw.text(label);
     hw.close("div");
     hw.open("div");
-    hw.attrFmt("class", "mt-1 text-2xl font-bold {s}", .{text_class});
+    hw.attrFmt("class", "mt-1 text-2xl font-semibold {s}", .{text_class});
     hw.textFmt("{d}", .{value});
     hw.close("div");
     hw.close("div");
