@@ -20,6 +20,7 @@ pub const queues_html = @embedFile("ui/templates/queues.html");
 pub const queues_table_html = @embedFile("ui/templates/queues-table.html");
 pub const queue_detail_html = @embedFile("ui/templates/queue-detail.html");
 pub const job_list_html = @embedFile("ui/templates/job-list.html");
+pub const job_table_html = @embedFile("ui/templates/job-table.html");
 pub const job_detail_html = @embedFile("ui/templates/job-detail.html");
 pub const workers_html = @embedFile("ui/templates/workers.html");
 pub const cluster_html = @embedFile("ui/templates/cluster.html");

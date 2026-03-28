@@ -30,6 +30,7 @@ const queues_tmpl = zigstache.Template.parse(ui_embed.queues_html) catch unreach
 const queues_table_tmpl = zigstache.Template.parse(ui_embed.queues_table_html) catch unreachable;
 const queue_detail_tmpl = zigstache.Template.parse(ui_embed.queue_detail_html) catch unreachable;
 const job_list_tmpl = zigstache.Template.parse(ui_embed.job_list_html) catch unreachable;
+const job_table_tmpl = zigstache.Template.parse(ui_embed.job_table_html) catch unreachable;
 const job_detail_tmpl = zigstache.Template.parse(ui_embed.job_detail_html) catch unreachable;
 const workers_tmpl = zigstache.Template.parse(ui_embed.workers_html) catch unreachable;
 
@@ -263,7 +264,7 @@ fn scheduledJobsPage(send_buf: []u8, reader: ?*sqlite_read.Reader, query: []cons
 }
 
 fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, state: []const u8, actions: RowActions, base_path: []const u8, query: []const u8) u32 {
-    const rdr = reader orelse return renderPage(send_buf, title, "<p class=\"text-gray-500\">No data available</p>");
+    const rdr = reader orelse return renderPage(send_buf, title, "<p class=\"text-zinc-500 dark:text-zinc-400\">No data available</p>");
 
     const page = parsePageParam(query);
     const queue_filter = getQueryParam(query, "queue");
@@ -276,33 +277,47 @@ fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, 
         rdr.countJobsByState(state) catch @as(i32, 0), 0));
     const total_pages = if (total > 0) (total + max_table_rows - 1) / max_table_rows else 1;
 
-    // Export buttons.
-    var export_buf: [4096]u8 = undefined;
-    var export_hw = html.HtmlWriter.init(&export_buf);
-    writeExportButtons(&export_hw, state, if (queue_filter) |qf| qf else null);
-
-    // Job table.
-    var table_buf: [page_buf_size]u8 = undefined;
-    var table_hw = html.HtmlWriter.init(&table_buf);
+    // Job views.
     var job_buf: [max_table_rows]sqlite_read.JobRow = undefined;
+    var job_views: [max_table_rows]JobView = undefined;
+    var action_buf: [max_table_rows * 2]JobAction = undefined;
     const count = rdr.queryJobsByQueueState(queue_filter, state, max_table_rows, offset, &job_buf) catch 0;
-    writeJobTable(&table_hw, job_buf[0..count], actions);
+    const jobs = getJobViews(job_buf[0..count], &job_views, &action_buf, actions);
 
-    // Pagination.
-    var pag_buf: [4096]u8 = undefined;
-    var pag_hw = html.HtmlWriter.init(&pag_buf);
-    var url_buf: [256]u8 = undefined;
-    var url_stream = std.io.fixedBufferStream(&url_buf);
-    url_stream.writer().print("{s}?", .{base_path}) catch {};
-    if (queue_filter) |qf| url_stream.writer().print("queue={s}&", .{qf}) catch {};
-    writePagination(&pag_hw, url_stream.getWritten(), page, total_pages);
+    var bulk_buf: [2]BulkAction = undefined;
+    const bulk_actions = getBulkActions(actions, &bulk_buf);
+
+    // Pagination URLs.
+    var prev_url_buf: [256]u8 = undefined;
+    var next_url_buf: [256]u8 = undefined;
+    var prev_s = std.io.fixedBufferStream(&prev_url_buf);
+    var next_s = std.io.fixedBufferStream(&next_url_buf);
+    prev_s.writer().print("{s}?", .{base_path}) catch {};
+    next_s.writer().print("{s}?", .{base_path}) catch {};
+    if (queue_filter) |qf| {
+        prev_s.writer().print("queue={s}&", .{qf}) catch {};
+        next_s.writer().print("queue={s}&", .{qf}) catch {};
+    }
+    prev_s.writer().print("page={d}", .{page -| 1}) catch {};
+    next_s.writer().print("page={d}", .{page + 1}) catch {};
 
     var content_buf: [page_buf_size]u8 = undefined;
-    const content = job_list_tmpl.render(&content_buf, .{
-        .export_buttons = export_hw.getWritten(),
-        .job_table = table_hw.getWritten(),
-        .pagination = pag_hw.getWritten(),
-    }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
+    const content = job_list_tmpl.renderWithPartials(&content_buf, .{
+        .export_state = state,
+        .export_queue = if (queue_filter) |qf| qf else "",
+        .has_bulk = actions != .none,
+        .bulk_actions = bulk_actions,
+        .has_jobs = count > 0,
+        .jobs = jobs,
+        .has_pages = total_pages > 1,
+        .page_display = page + 1,
+        .total_pages = total_pages,
+        .has_prev = page > 0,
+        .prev_url = prev_s.getWritten(),
+        .has_next = page + 1 < total_pages,
+        .next_url = next_s.getWritten(),
+    }, .{ .job_table = &job_table_tmpl }) catch
+        return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, title, content);
 }
 
@@ -549,6 +564,32 @@ const FailureView = struct {
     created_at: []const u8,
 };
 
+const JobAction = struct {
+    job_id: []const u8,
+    action: []const u8,
+    label: []const u8,
+    class: []const u8,
+};
+
+const BulkAction = struct {
+    action: []const u8,
+    label: []const u8,
+    class: []const u8,
+};
+
+const JobView = struct {
+    id: []const u8,
+    queue: []const u8,
+    state: []const u8,
+    state_class: []const u8,
+    priority: i32,
+    attempt: i32,
+    max_retries: i32,
+    created_at: []const u8,
+    has_cb: bool,
+    actions: []const JobAction,
+};
+
 const QueueView = struct {
     name: []const u8,
     pending: i32,
@@ -579,6 +620,89 @@ fn getQueueViews(reader: ?*sqlite_read.Reader, queue_buf: *[64]sqlite_read.Queue
         };
     }
     return views[0..count];
+}
+
+fn getJobViews(
+    jobs: []const sqlite_read.JobRow,
+    views: *[max_table_rows]JobView,
+    action_buf: *[max_table_rows * 2]JobAction,
+    actions: RowActions,
+) []const JobView {
+    const has_cb = actions != .none;
+    var action_idx: usize = 0;
+
+    for (jobs, 0..) |*j, i| {
+        const action_start = action_idx;
+        const id = j.idSlice();
+
+        switch (actions) {
+            .dead => {
+                action_buf[action_idx] = .{ .job_id = id, .action = "retry", .label = "Retry", .class = "text-indigo-600 dark:text-indigo-400 hover:text-indigo-800" };
+                action_idx += 1;
+                action_buf[action_idx] = .{ .job_id = id, .action = "delete", .label = "Delete", .class = "text-red-600 dark:text-red-400 hover:text-red-800" };
+                action_idx += 1;
+            },
+            .held => {
+                action_buf[action_idx] = .{ .job_id = id, .action = "approve", .label = "Approve", .class = "text-emerald-600 dark:text-emerald-400 hover:text-emerald-800" };
+                action_idx += 1;
+                action_buf[action_idx] = .{ .job_id = id, .action = "reject", .label = "Reject", .class = "text-red-600 dark:text-red-400 hover:text-red-800" };
+                action_idx += 1;
+            },
+            .scheduled => {
+                action_buf[action_idx] = .{ .job_id = id, .action = "run", .label = "Run Now", .class = "text-indigo-600 dark:text-indigo-400 hover:text-indigo-800" };
+                action_idx += 1;
+                action_buf[action_idx] = .{ .job_id = id, .action = "delete", .label = "Delete", .class = "text-red-600 dark:text-red-400 hover:text-red-800" };
+                action_idx += 1;
+            },
+            .queue_detail => {
+                action_buf[action_idx] = .{ .job_id = id, .action = "cancel", .label = "Cancel", .class = "text-amber-600 dark:text-amber-400 hover:text-amber-800" };
+                action_idx += 1;
+                action_buf[action_idx] = .{ .job_id = id, .action = "delete", .label = "Delete", .class = "text-red-600 dark:text-red-400 hover:text-red-800" };
+                action_idx += 1;
+            },
+            .none => {},
+        }
+
+        views[i] = .{
+            .id = id,
+            .queue = j.queueSlice(),
+            .state = j.stateSlice(),
+            .state_class = stateBadgeClassDark(j.stateSlice()),
+            .priority = j.priority,
+            .attempt = j.attempt,
+            .max_retries = j.max_retries,
+            .created_at = j.createdAtSlice(),
+            .has_cb = has_cb,
+            .actions = action_buf[action_start..action_idx],
+        };
+    }
+    return views[0..jobs.len];
+}
+
+fn getBulkActions(actions: RowActions, buf: *[2]BulkAction) []const BulkAction {
+    return switch (actions) {
+        .dead => blk: {
+            buf[0] = .{ .action = "retry", .label = "Retry All", .class = "bg-indigo-600 hover:bg-indigo-700" };
+            buf[1] = .{ .action = "delete", .label = "Delete All", .class = "bg-red-600 hover:bg-red-700" };
+            break :blk buf[0..2];
+        },
+        .held => blk: {
+            buf[0] = .{ .action = "approve", .label = "Approve All", .class = "bg-emerald-600 hover:bg-emerald-700" };
+            buf[1] = .{ .action = "reject", .label = "Reject All", .class = "bg-red-600 hover:bg-red-700" };
+            break :blk buf[0..2];
+        },
+        .scheduled => blk: {
+            buf[0] = .{ .action = "run", .label = "Run All", .class = "bg-indigo-600 hover:bg-indigo-700" };
+            buf[1] = .{ .action = "delete", .label = "Delete All", .class = "bg-red-600 hover:bg-red-700" };
+            break :blk buf[0..2];
+        },
+        .queue_detail => blk: {
+            buf[0] = .{ .action = "cancel", .label = "Cancel All", .class = "bg-amber-600 hover:bg-amber-700" };
+            buf[1] = .{ .action = "delete", .label = "Delete All", .class = "bg-red-600 hover:bg-red-700" };
+            break :blk buf[0..2];
+        },
+        .none => buf[0..0],
+    };
 }
 
 fn buildBarViews(queues: []const sqlite_read.QueueStats, bars: *[64]BarView) []const BarView {
@@ -1114,6 +1238,17 @@ fn stateBadgeClass(state: []const u8) []const u8 {
     if (eql(state, "scheduled")) return "inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-purple-100 text-purple-800";
     if (eql(state, "held")) return "inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800";
     return "inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-800";
+}
+
+fn stateBadgeClassDark(state: []const u8) []const u8 {
+    if (eql(state, "pending")) return "inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-400";
+    if (eql(state, "active")) return "inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-emerald-50 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-400";
+    if (eql(state, "completed")) return "inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-400";
+    if (eql(state, "dead")) return "inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-red-50 dark:bg-red-950 text-red-700 dark:text-red-400";
+    if (eql(state, "retrying")) return "inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-orange-50 dark:bg-orange-950 text-orange-700 dark:text-orange-400";
+    if (eql(state, "scheduled")) return "inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-purple-50 dark:bg-purple-950 text-purple-700 dark:text-purple-400";
+    if (eql(state, "held")) return "inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-amber-50 dark:bg-amber-950 text-amber-700 dark:text-amber-400";
+    return "inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-400";
 }
 
 fn filterTab(hw: *html.HtmlWriter, queue_name: []const u8, state: ?[]const u8, label: []const u8, current_filter: ?[]const u8, qs: ?*const sqlite_read.QueueStats) void {
