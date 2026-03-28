@@ -26,6 +26,7 @@ const max_table_rows = 25;
 const layout_tmpl = zigstache.Template.parse(ui_embed.layout_html) catch unreachable;
 const dashboard_tmpl = zigstache.Template.parse(ui_embed.dashboard_html) catch unreachable;
 const queues_tmpl = zigstache.Template.parse(ui_embed.queues_html) catch unreachable;
+const queues_table_tmpl = zigstache.Template.parse(ui_embed.queues_table_html) catch unreachable;
 const queue_detail_tmpl = zigstache.Template.parse(ui_embed.queue_detail_html) catch unreachable;
 const job_list_tmpl = zigstache.Template.parse(ui_embed.job_list_html) catch unreachable;
 const job_detail_tmpl = zigstache.Template.parse(ui_embed.job_detail_html) catch unreachable;
@@ -85,12 +86,14 @@ fn dashboard(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
 }
 
 fn queuesPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    var table_buf: [page_buf_size]u8 = undefined;
-    var hw = html.HtmlWriter.init(&table_buf);
-    writeQueuesTable(&hw, reader);
+    var queue_buf: [64]sqlite_read.QueueStats = undefined;
+    var views: [64]QueueView = undefined;
+    const queues = getQueueViews(reader, &queue_buf, &views);
 
     var content_buf: [page_buf_size]u8 = undefined;
-    const content = queues_tmpl.render(&content_buf, .{ .table = hw.getWritten() }) catch
+    const content = queues_tmpl.renderWithPartials(&content_buf, .{
+        .queues = queues,
+    }, .{ .table = &queues_table_tmpl }) catch
         return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Queues", content);
 }
@@ -431,10 +434,15 @@ fn dashboardStatsPartial(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
 }
 
 fn queuesTablePartial(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
+    var queue_buf: [64]sqlite_read.QueueStats = undefined;
+    var views: [64]QueueView = undefined;
+    const queues = getQueueViews(reader, &queue_buf, &views);
+
     var buf: [page_buf_size]u8 = undefined;
-    var hw = html.HtmlWriter.init(&buf);
-    writeQueuesTable(&hw, reader);
-    return http.writeResponseHtml(send_buf, 200, hw.getWritten());
+    const result = queues_table_tmpl.render(&buf, .{
+        .queues = queues,
+    }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
+    return http.writeResponseHtml(send_buf, 200, result);
 }
 
 fn enqueueFormPartial(send_buf: []u8) u32 {
@@ -442,7 +450,43 @@ fn enqueueFormPartial(send_buf: []u8) u32 {
 }
 
 // ============================================================================
-// Dynamic Content Writers
+// View Structs + Data Builders
+// ============================================================================
+
+const QueueView = struct {
+    name: []const u8,
+    pending: i32,
+    active: i32,
+    retrying: i32,
+    dead: i32,
+    completed: i32,
+    scheduled: i32,
+    held: i32,
+    paused: bool,
+};
+
+fn getQueueViews(reader: ?*sqlite_read.Reader, queue_buf: *[64]sqlite_read.QueueStats, views: *[64]QueueView) []const QueueView {
+    const rdr = reader orelse return views[0..0];
+    const count = rdr.getQueueStats(queue_buf) catch return views[0..0];
+    for (0..count) |i| {
+        const q = &queue_buf[i];
+        views[i] = .{
+            .name = q.nameSlice(),
+            .pending = q.pending,
+            .active = q.active,
+            .retrying = q.retrying,
+            .dead = q.dead,
+            .completed = q.completed,
+            .scheduled = q.scheduled,
+            .held = q.held,
+            .paused = q.paused,
+        };
+    }
+    return views[0..count];
+}
+
+// ============================================================================
+// Dynamic Content Writers (HtmlWriter — pending migration)
 // ============================================================================
 
 fn writeDashboardStats(hw: *html.HtmlWriter, reader: ?*sqlite_read.Reader) void {

@@ -16,6 +16,7 @@ pub const layout_html = @embedFile("ui/templates/layout.html");
 pub const enqueue_form_html = @embedFile("ui/templates/enqueue-form.html");
 pub const dashboard_html = @embedFile("ui/templates/dashboard.html");
 pub const queues_html = @embedFile("ui/templates/queues.html");
+pub const queues_table_html = @embedFile("ui/templates/queues-table.html");
 pub const queue_detail_html = @embedFile("ui/templates/queue-detail.html");
 pub const job_list_html = @embedFile("ui/templates/job-list.html");
 pub const job_detail_html = @embedFile("ui/templates/job-detail.html");
