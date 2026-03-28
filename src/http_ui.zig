@@ -12,11 +12,11 @@ const html = @import("html_writer.zig");
 const sqlite_read = @import("sqlite_read.zig");
 
 /// Max HTML body size. Pages render into a buffer of this size.
-/// With HTTP headers (~200 bytes), total response stays under 17KB.
-const page_buf_size = 16384;
+/// With HTTP headers (~200 bytes), total response stays under 33KB.
+const page_buf_size = 32768;
 
 /// Max table rows per page. Keeps HTML under page_buf_size.
-const max_table_rows = 50;
+const max_table_rows = 25;
 
 // ============================================================================
 // Dispatch
@@ -38,6 +38,7 @@ pub fn dispatch(path: []const u8, send_buf: []u8, reader: ?*sqlite_read.Reader) 
     // HTMX partial routes (fragments, no layout).
     if (eql(path, "/partials/dashboard-stats")) return dashboardStatsPartial(send_buf, reader);
     if (eql(path, "/partials/queues-table")) return queuesTablePartial(send_buf, reader);
+    if (eql(path, "/partials/enqueue-form")) return enqueueFormPartial(send_buf);
 
     return http.writeResponseHtml(send_buf, 404, "<h1>Not Found</h1>");
 }
@@ -50,7 +51,7 @@ fn dashboard(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
     var buf: [page_buf_size]u8 = undefined;
     var hw = html.HtmlWriter.init(&buf);
 
-    layoutStart(&hw, "Dashboard");
+    layoutStart(&hw, "Dashboard", "/");
 
     // Stats cards container — auto-refreshes via HTMX.
     hw.open("div");
@@ -69,7 +70,7 @@ fn queuesPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
     var buf: [page_buf_size]u8 = undefined;
     var hw = html.HtmlWriter.init(&buf);
 
-    layoutStart(&hw, "Queues");
+    layoutStart(&hw, "Queues", "/queues");
 
     hw.open("div");
     hw.attr("id", "queues-table");
@@ -87,7 +88,7 @@ fn queueDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, queue_name: []c
     var buf: [page_buf_size]u8 = undefined;
     var hw = html.HtmlWriter.init(&buf);
 
-    layoutStart(&hw, "Queue Detail");
+    layoutStart(&hw, "Queue Detail", "/queues");
 
     hw.open("div");
     hw.attr("class", "space-y-6");
@@ -117,22 +118,22 @@ fn queueDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, queue_name: []c
 }
 
 fn deadLetterPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    return jobListPage(send_buf, reader, "Dead Letter", "dead");
+    return jobListPage(send_buf, reader, "Dead Letter", "dead", "/dead-letter", .dead);
 }
 
 fn heldJobsPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    return jobListPage(send_buf, reader, "Held Jobs", "held");
+    return jobListPage(send_buf, reader, "Held Jobs", "held", "/held", .held);
 }
 
 fn scheduledJobsPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    return jobListPage(send_buf, reader, "Scheduled Jobs", "scheduled");
+    return jobListPage(send_buf, reader, "Scheduled Jobs", "scheduled", "/scheduled", .scheduled);
 }
 
-fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, state: []const u8) u32 {
+fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, state: []const u8, nav_path: []const u8, actions: RowActions) u32 {
     var buf: [page_buf_size]u8 = undefined;
     var hw = html.HtmlWriter.init(&buf);
 
-    layoutStart(&hw, title);
+    layoutStart(&hw, title, nav_path);
 
     const rdr = reader orelse {
         hw.open("p");
@@ -146,7 +147,7 @@ fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, 
     var job_buf: [max_table_rows]sqlite_read.JobRow = undefined;
     const count = rdr.queryJobsByQueueState(null, state, max_table_rows, 0, &job_buf) catch 0;
 
-    writeJobTable(&hw, job_buf[0..count]);
+    writeJobTable(&hw, job_buf[0..count], actions);
 
     layoutEnd(&hw);
     return http.writeResponseHtml(send_buf, 200, hw.getWritten());
@@ -156,7 +157,7 @@ fn jobDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, job_id: []const u
     var buf: [page_buf_size]u8 = undefined;
     var hw = html.HtmlWriter.init(&buf);
 
-    layoutStart(&hw, "Job Detail");
+    layoutStart(&hw, "Job Detail", "/jobs");
 
     const rdr = reader orelse {
         hw.open("p");
@@ -244,7 +245,7 @@ fn workersPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
     var buf: [page_buf_size]u8 = undefined;
     var hw = html.HtmlWriter.init(&buf);
 
-    layoutStart(&hw, "Workers");
+    layoutStart(&hw, "Workers", "/workers");
 
     const rdr = reader orelse {
         hw.open("p");
@@ -304,7 +305,7 @@ fn clusterPage(send_buf: []u8, _: ?*sqlite_read.Reader) u32 {
     var buf: [page_buf_size]u8 = undefined;
     var hw = html.HtmlWriter.init(&buf);
 
-    layoutStart(&hw, "Cluster");
+    layoutStart(&hw, "Cluster", "/cluster");
 
     hw.open("div");
     hw.attr("class", "bg-white border border-gray-200 rounded-lg p-6");
@@ -345,11 +346,95 @@ fn queuesTablePartial(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
     return http.writeResponseHtml(send_buf, 200, hw.getWritten());
 }
 
+fn enqueueFormPartial(send_buf: []u8) u32 {
+    var buf: [page_buf_size]u8 = undefined;
+    var hw = html.HtmlWriter.init(&buf);
+
+    // Modal backdrop.
+    hw.open("div");
+    hw.attr("class", "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50");
+    hw.attr("onclick", "if(event.target===this)document.getElementById('modal').innerHTML=''");
+
+    // Modal content.
+    hw.open("div");
+    hw.attr("class", "bg-white rounded-lg shadow-xl w-full max-w-lg p-6");
+
+    hw.open("div");
+    hw.attr("class", "flex items-center justify-between mb-4");
+    hw.elem("h2", "Enqueue Job");
+    hw.open("button");
+    hw.attr("onclick", "document.getElementById('modal').innerHTML=''");
+    hw.attr("class", "text-gray-400 hover:text-gray-600 text-xl");
+    hw.raw("&times;");
+    hw.close("button");
+    hw.close("div");
+
+    hw.open("form");
+    hw.attr("hx-post", "/api/v1/enqueue");
+    hw.attr("hx-swap", "none");
+    hw.attr("hx-on::after-request", "if(event.detail.successful)document.getElementById('modal').innerHTML=''");
+
+    formField(&hw, "queue", "Queue", "text", "default");
+    formTextarea(&hw, "payload", "Payload (JSON)", "{\"key\": \"value\"}");
+
+    hw.open("div");
+    hw.attr("class", "flex gap-2 mt-4");
+    hw.open("button");
+    hw.attr("type", "submit");
+    hw.attr("class", "px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700");
+    hw.text("Enqueue");
+    hw.close("button");
+    hw.open("button");
+    hw.attr("type", "button");
+    hw.attr("onclick", "document.getElementById('modal').innerHTML=''");
+    hw.attr("class", "px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200");
+    hw.text("Cancel");
+    hw.close("button");
+    hw.close("div");
+
+    hw.close("form");
+    hw.close("div"); // modal content
+    hw.close("div"); // backdrop
+
+    return http.writeResponseHtml(send_buf, 200, hw.getWritten());
+}
+
+fn formField(hw: *html.HtmlWriter, name: []const u8, label_text: []const u8, input_type: []const u8, placeholder: []const u8) void {
+    hw.open("div");
+    hw.attr("class", "mb-3");
+    hw.open("label");
+    hw.attr("class", "block text-sm font-medium text-gray-700 mb-1");
+    hw.text(label_text);
+    hw.close("label");
+    hw.voidElem("input");
+    hw.attr("type", input_type);
+    hw.attr("name", name);
+    hw.attr("placeholder", placeholder);
+    hw.attr("class", "w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500");
+    hw.close("div");
+}
+
+fn formTextarea(hw: *html.HtmlWriter, name: []const u8, label_text: []const u8, placeholder: []const u8) void {
+    hw.open("div");
+    hw.attr("class", "mb-3");
+    hw.open("label");
+    hw.attr("class", "block text-sm font-medium text-gray-700 mb-1");
+    hw.text(label_text);
+    hw.close("label");
+    hw.open("textarea");
+    hw.attr("name", name);
+    hw.attr("rows", "4");
+    hw.attr("placeholder", placeholder);
+    hw.attr("class", "w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 font-mono");
+    hw.close("textarea");
+    hw.close("div");
+}
+
 // ============================================================================
 // Layout
 // ============================================================================
 
-fn layoutStart(hw: *html.HtmlWriter, title: []const u8) void {
+fn layoutStart(hw: *html.HtmlWriter, title: []const u8, current_path: []const u8) void {
     hw.doctype();
     hw.open("html");
     hw.attr("lang", "en");
@@ -381,8 +466,14 @@ fn layoutStart(hw: *html.HtmlWriter, title: []const u8) void {
     hw.open("div");
     hw.attr("class", "flex min-h-screen");
 
+    // Toast container for HTMX action feedback.
+    hw.open("div");
+    hw.attr("id", "toast");
+    hw.attr("class", "fixed top-4 right-4 z-50");
+    hw.close("div");
+
     // Sidebar.
-    writeSidebar(hw);
+    writeSidebar(hw, current_path);
 
     // Main content area.
     hw.open("main");
@@ -391,22 +482,52 @@ fn layoutStart(hw: *html.HtmlWriter, title: []const u8) void {
     hw.open("div");
     hw.attr("class", "max-w-7xl mx-auto");
 
-    // Page title.
+    // Page header with enqueue button.
+    hw.open("div");
+    hw.attr("class", "flex items-center justify-between mb-6");
     hw.open("h1");
-    hw.attr("class", "text-2xl font-bold text-gray-900 mb-6");
+    hw.attr("class", "text-2xl font-bold text-gray-900");
     hw.text(title);
     hw.close("h1");
+    hw.open("button");
+    hw.attr("hx-get", "/ui/partials/enqueue-form");
+    hw.attr("hx-target", "#modal");
+    hw.attr("hx-swap", "innerHTML");
+    hw.attr("class", "px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700");
+    hw.text("Enqueue Job");
+    hw.close("button");
+    hw.close("div");
+
+    // Modal container.
+    hw.open("div");
+    hw.attr("id", "modal");
+    hw.close("div");
 }
 
 fn layoutEnd(hw: *html.HtmlWriter) void {
     hw.close("div"); // max-w-7xl
     hw.close("main");
     hw.close("div"); // flex shell
+
+    // Toast script: show success/error after HTMX POST actions.
+    hw.open("script");
+    hw.raw(
+        \\document.body.addEventListener('htmx:afterRequest',function(e){
+        \\var t=document.getElementById('toast');if(!t)return;
+        \\var ok=e.detail.successful;
+        \\var c=ok?'bg-green-600':'bg-red-600';
+        \\var m=ok?'Done':'Error';
+        \\t.innerHTML='<div class="'+c+' text-white px-4 py-2 rounded shadow text-sm">'+m+'</div>';
+        \\setTimeout(function(){t.innerHTML=''},2000)
+        \\})
+    );
+    hw.close("script");
+
     hw.close("body");
     hw.close("html");
 }
 
-fn writeSidebar(hw: *html.HtmlWriter) void {
+fn writeSidebar(hw: *html.HtmlWriter, current_path: []const u8) void {
     hw.open("aside");
     hw.attr("class", "w-56 bg-white border-r border-gray-200 flex flex-col min-h-screen");
 
@@ -425,22 +546,35 @@ fn writeSidebar(hw: *html.HtmlWriter) void {
     // Nav links.
     hw.open("nav");
     hw.attr("class", "flex-1 p-3 space-y-1");
-    navLink(hw, "/ui/", "Dashboard");
-    navLink(hw, "/ui/queues", "Queues");
-    navLink(hw, "/ui/scheduled", "Scheduled");
-    navLink(hw, "/ui/dead-letter", "Dead Letter");
-    navLink(hw, "/ui/held", "Held Jobs");
-    navLink(hw, "/ui/workers", "Workers");
-    navLink(hw, "/ui/cluster", "Cluster");
+    navLink(hw, "/ui/", "Dashboard", current_path);
+    navLink(hw, "/ui/queues", "Queues", current_path);
+    navLink(hw, "/ui/scheduled", "Scheduled", current_path);
+    navLink(hw, "/ui/dead-letter", "Dead Letter", current_path);
+    navLink(hw, "/ui/held", "Held Jobs", current_path);
+    navLink(hw, "/ui/workers", "Workers", current_path);
+    navLink(hw, "/ui/cluster", "Cluster", current_path);
     hw.close("nav");
 
     hw.close("aside");
 }
 
-fn navLink(hw: *html.HtmlWriter, href: []const u8, label: []const u8) void {
+const nav_base = "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors ";
+const nav_active = nav_base ++ "bg-gray-100 text-gray-900";
+const nav_inactive = nav_base ++ "text-gray-500 hover:bg-gray-50 hover:text-gray-900";
+
+fn navLink(hw: *html.HtmlWriter, href: []const u8, label: []const u8, current_path: []const u8) void {
+    // Match: "/ui/" is active only for exact "/", others match prefix.
+    const full_current = current_path;
+    const active = if (eql(href, "/ui/"))
+        eql(full_current, "/") or eql(full_current, "")
+    else blk: {
+        const nav_path = href["/ui".len..];
+        break :blk eql(full_current, nav_path) or std.mem.startsWith(u8, full_current, nav_path);
+    };
+
     hw.open("a");
     hw.attr("href", href);
-    hw.attr("class", "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 hover:text-gray-900 transition-colors");
+    hw.attr("class", if (active) nav_active else nav_inactive);
     hw.text(label);
     hw.close("a");
 }
@@ -485,10 +619,98 @@ fn writeDashboardStats(hw: *html.HtmlWriter, reader: ?*sqlite_read.Reader) void 
     statCardInt(hw, "Workers", worker_count, "text-purple-600", "bg-purple-50");
     hw.close("div");
 
+    // SVG bar chart — queue sizes at a glance.
+    if (count > 0) {
+        writeQueueBarChart(hw, queue_buf[0..count]);
+    }
+
+    // Recent failures.
+    {
+        var dead_buf: [10]sqlite_read.JobRow = undefined;
+        const dead_count = rdr.queryJobsByQueueState(null, "dead", 10, 0, &dead_buf) catch 0;
+        if (dead_count > 0) {
+            hw.open("div");
+            hw.attr("class", "mb-6");
+            hw.open("h2");
+            hw.attr("class", "text-lg font-semibold text-gray-900 mb-3");
+            hw.text("Recent Failures");
+            hw.close("h2");
+            writeJobTable(hw, dead_buf[0..dead_count], .dead);
+            hw.close("div");
+        }
+    }
+
     // Queue summary table.
     if (count > 0) {
+        hw.open("h2");
+        hw.attr("class", "text-lg font-semibold text-gray-900 mb-3");
+        hw.text("Queues");
+        hw.close("h2");
         writeQueuesTable(hw, reader);
     }
+}
+
+fn writeQueueBarChart(hw: *html.HtmlWriter, queues: []const sqlite_read.QueueStats) void {
+    // Find max value for scaling.
+    var max_val: i64 = 1;
+    for (queues) |q| {
+        const total = q.pending + q.active + q.retrying;
+        if (total > max_val) max_val = total;
+    }
+
+    const chart_w: u32 = 600;
+    const chart_h: u32 = 160;
+    const bar_gap: u32 = 4;
+    const n: u32 = @intCast(queues.len);
+    const bar_w: u32 = if (n > 0) @min((chart_w - (n - 1) * bar_gap) / n, 60) else 40;
+
+    hw.open("div");
+    hw.attr("class", "bg-white border border-gray-200 rounded-lg p-4 mb-6");
+    hw.open("svg");
+    hw.attrFmt("width", "{d}", .{chart_w});
+    hw.attrFmt("height", "{d}", .{chart_h + 30});
+    hw.attr("class", "w-full");
+    hw.attrFmt("viewBox", "0 0 {d} {d}", .{ chart_w, chart_h + 30 });
+
+    for (queues, 0..) |q, i| {
+        const total = q.pending + q.active + q.retrying;
+        const bar_h: u32 = if (max_val > 0) @intCast(@divTrunc(total * chart_h, max_val)) else 0;
+        const x: u32 = @as(u32, @intCast(i)) * (bar_w + bar_gap);
+        const y: u32 = chart_h - bar_h;
+
+        // Bar.
+        hw.open("rect");
+        hw.attrFmt("x", "{d}", .{x});
+        hw.attrFmt("y", "{d}", .{y});
+        hw.attrFmt("width", "{d}", .{bar_w});
+        hw.attrFmt("height", "{d}", .{bar_h});
+        hw.attr("fill", "#3b82f6");
+        hw.attr("rx", "2");
+        hw.close("rect");
+
+        // Label.
+        hw.open("text");
+        hw.attrFmt("x", "{d}", .{x + bar_w / 2});
+        hw.attrFmt("y", "{d}", .{chart_h + 16});
+        hw.attr("text-anchor", "middle");
+        hw.attr("class", "text-xs fill-gray-500");
+        hw.text(q.nameSlice());
+        hw.close("text");
+
+        // Value on top.
+        if (total > 0) {
+            hw.open("text");
+            hw.attrFmt("x", "{d}", .{x + bar_w / 2});
+            hw.attrFmt("y", "{d}", .{y -| 4});
+            hw.attr("text-anchor", "middle");
+            hw.attr("class", "text-xs fill-gray-700 font-medium");
+            hw.textFmt("{d}", .{total});
+            hw.close("text");
+        }
+    }
+
+    hw.close("svg");
+    hw.close("div");
 }
 
 fn statCard(hw: *html.HtmlWriter, label: []const u8, value: i64, text_class: []const u8, bg_class: []const u8) void {
@@ -594,10 +816,12 @@ fn writeQueueJobsTable(hw: *html.HtmlWriter, reader: ?*sqlite_read.Reader, queue
     const rdr = reader orelse return;
     var job_buf: [max_table_rows]sqlite_read.JobRow = undefined;
     const count = rdr.queryJobsByQueueState(queue_name, null, max_table_rows, 0, &job_buf) catch 0;
-    writeJobTable(hw, job_buf[0..count]);
+    writeJobTable(hw, job_buf[0..count], .queue_detail);
 }
 
-fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow) void {
+const RowActions = enum { none, dead, held, scheduled, queue_detail };
+
+fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow, actions: RowActions) void {
     if (jobs.len == 0) {
         hw.open("p");
         hw.attr("class", "text-gray-500");
@@ -619,6 +843,7 @@ fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow) void {
     tableHeader(hw, "Priority");
     tableHeader(hw, "Attempt");
     tableHeader(hw, "Created");
+    if (actions != .none) tableHeader(hw, "Actions");
     hw.close("tr");
     hw.close("thead");
     hw.open("tbody");
@@ -647,11 +872,48 @@ fn writeJobTable(hw: *html.HtmlWriter, jobs: []const sqlite_read.JobRow) void {
         tableCellFmt(hw, "{d}", .{j.priority});
         tableCellFmt(hw, "{d}/{d}", .{ j.attempt, j.max_retries });
         tableCell(hw, j.createdAtSlice());
+        // Row actions.
+        if (actions != .none) {
+            hw.open("td");
+            hw.attr("class", "px-4 py-2");
+            hw.open("div");
+            hw.attr("class", "flex gap-1");
+            switch (actions) {
+                .dead => {
+                    rowAction(hw, j.idSlice(), "retry", "Retry", "text-blue-600 hover:text-blue-800");
+                    rowAction(hw, j.idSlice(), "delete", "Delete", "text-red-600 hover:text-red-800");
+                },
+                .held => {
+                    rowAction(hw, j.idSlice(), "approve", "Approve", "text-green-600 hover:text-green-800");
+                    rowAction(hw, j.idSlice(), "reject", "Reject", "text-red-600 hover:text-red-800");
+                },
+                .scheduled => {
+                    rowAction(hw, j.idSlice(), "run", "Run Now", "text-blue-600 hover:text-blue-800");
+                    rowAction(hw, j.idSlice(), "delete", "Delete", "text-red-600 hover:text-red-800");
+                },
+                .queue_detail => {
+                    rowAction(hw, j.idSlice(), "cancel", "Cancel", "text-yellow-600 hover:text-yellow-800");
+                    rowAction(hw, j.idSlice(), "delete", "Delete", "text-red-600 hover:text-red-800");
+                },
+                .none => {},
+            }
+            hw.close("div");
+            hw.close("td");
+        }
         hw.close("tr");
     }
     hw.close("tbody");
     hw.close("table");
     hw.close("div");
+}
+
+fn rowAction(hw: *html.HtmlWriter, job_id: []const u8, action: []const u8, label: []const u8, class: []const u8) void {
+    hw.open("button");
+    hw.attrFmt("hx-post", "/api/v1/jobs/{s}/{s}", .{ job_id, action });
+    hw.attr("hx-swap", "none");
+    hw.attrFmt("class", "text-xs font-medium {s}", .{class});
+    hw.text(label);
+    hw.close("button");
 }
 
 // ============================================================================
