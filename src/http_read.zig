@@ -15,6 +15,8 @@ pub const ClusterInfo = struct {
     node_id: []const u8,
     is_leader: *const std.atomic.Value(bool),
     election: *@import("election.zig").Election,
+    events: *metrics_mod.ClusterEventRing,
+    peer_count: u32,
 };
 
 pub var g_cluster_info: ?*const ClusterInfo = null;
@@ -34,6 +36,7 @@ pub fn dispatch(
     body: []const u8,
     send_buf: []u8,
     reader: ?*kv_read.Reader,
+    server_metrics: ?*const metrics_mod.ServerMetrics,
 ) u32 {
     // Strip query string for route matching.
     const clean = if (std.mem.indexOfScalar(u8, path, '?')) |qi| path[0..qi] else path;
@@ -82,12 +85,9 @@ pub fn dispatch(
     if (std.mem.eql(u8, api, "/api-keys")) return apiKeys(send_buf, rdr);
     if (std.mem.eql(u8, api, "/approval-policies")) return approvalPolicies(send_buf, rdr);
     if (std.mem.eql(u8, api, "/cluster/events"))
-        return http.writeResponse(send_buf, 200, "{\"events\":[]}");
+        return clusterEvents(send_buf);
     if (std.mem.eql(u8, api, "/metrics/throughput"))
-        return http.writeResponse(send_buf, 200, "{\"enqueued\":0,\"completed\":0,\"failed\":0}");
-    if (std.mem.eql(u8, api, "/events"))
-        return http.writeResponse(send_buf, 200, "{\"error\":\"SSE not yet supported\"}");
-
+        return throughputMetrics(send_buf, server_metrics);
     return writeError(send_buf, 404, "not found");
 }
 
@@ -146,6 +146,31 @@ pub fn metrics(send_buf: []u8, reader: ?*kv_read.Reader, server_metrics: ?*const
         ) catch &[0]u8{}).len;
     }
 
+    // Cluster metrics gauges.
+    if (g_cluster_info) |ci| {
+        const es = ci.election.currentState();
+        const state_val: u8 = @intFromEnum(es.state);
+        const now_i: i64 = @intCast(@as(i128, std.time.nanoTimestamp()));
+        const lease_valid: u8 = if (ci.election.leaseValid(now_i)) 1 else 0;
+
+        pos += (std.fmt.bufPrint(
+            body_buf[pos..],
+            "# HELP corvo_cluster_state Node role (0=follower, 1=candidate, 2=leader)\n" ++
+                "# TYPE corvo_cluster_state gauge\n" ++
+                "corvo_cluster_state {d}\n" ++
+                "# HELP corvo_cluster_epoch Current election epoch\n" ++
+                "# TYPE corvo_cluster_epoch gauge\n" ++
+                "corvo_cluster_epoch {d}\n" ++
+                "# HELP corvo_cluster_lease_valid Whether leader lease is valid (1=yes, 0=no)\n" ++
+                "# TYPE corvo_cluster_lease_valid gauge\n" ++
+                "corvo_cluster_lease_valid {d}\n" ++
+                "# HELP corvo_cluster_peers_total Number of cluster peers\n" ++
+                "# TYPE corvo_cluster_peers_total gauge\n" ++
+                "corvo_cluster_peers_total {d}\n",
+            .{ state_val, es.epoch, lease_valid, ci.peer_count },
+        ) catch &[0]u8{}).len;
+    }
+
     return http.writeResponseText(send_buf, 200, body_buf[0..pos]);
 }
 
@@ -182,6 +207,72 @@ fn clusterStatus(send_buf: []u8) u32 {
     return http.writeResponse(send_buf, 200, w.getWritten());
 }
 
+
+fn clusterEvents(send_buf: []u8) u32 {
+    var body_buf: [8192]u8 = undefined;
+    var w = json.JsonWriter.init(&body_buf);
+
+    w.beginObject();
+    w.beginArrayField("events");
+
+    const ci = g_cluster_info orelse {
+        w.endArray();
+        w.endObject();
+        return http.writeResponse(send_buf, 200, w.getWritten());
+    };
+
+    var event_buf: [64]metrics_mod.ClusterEvent = undefined;
+    const count = ci.events.snapshot(&event_buf);
+    for (0..count) |i| {
+        const ev = &event_buf[i];
+        w.beginObject();
+        w.fieldStr("type", ev.typeStr());
+        w.fieldInt("epoch", ev.epoch);
+        w.fieldInt("timestamp_ns", ev.timestamp_ns);
+        if (ev.detail_len > 0) w.fieldStr("detail", ev.detailSlice());
+        w.endObject();
+    }
+
+    w.endArray();
+    w.endObject();
+    return http.writeResponse(send_buf, 200, w.getWritten());
+}
+
+fn throughputMetrics(send_buf: []u8, server_metrics: ?*const metrics_mod.ServerMetrics) u32 {
+    var body_buf: [8192]u8 = undefined;
+    var w = json.JsonWriter.init(&body_buf);
+
+    const sm = server_metrics orelse {
+        w.beginObject();
+        w.fieldInt("enqueue_rate", 0);
+        w.fieldInt("complete_rate", 0);
+        w.fieldInt("fail_rate", 0);
+        w.fieldInt("window_seconds", 60);
+        w.endObject();
+        return http.writeResponse(send_buf, 200, w.getWritten());
+    };
+
+    // Use current time for the snapshot window.
+    const now_ns: u64 = @intCast(@as(i128, std.time.nanoTimestamp()));
+    const snap = sm.throughput.snapshot(now_ns);
+
+    w.beginObject();
+    w.fieldInt("enqueue_rate", snap.enqueue_rate);
+    w.fieldInt("complete_rate", snap.complete_rate);
+    w.fieldInt("fail_rate", snap.fail_rate);
+    w.fieldInt("window_seconds", snap.seconds);
+    w.beginArrayField("per_second");
+    for (0..snap.seconds) |i| {
+        w.beginObject();
+        w.fieldInt("enqueued", snap.per_second[i].enqueued);
+        w.fieldInt("completed", snap.per_second[i].completed);
+        w.fieldInt("failed", snap.per_second[i].failed);
+        w.endObject();
+    }
+    w.endArray();
+    w.endObject();
+    return http.writeResponse(send_buf, 200, w.getWritten());
+}
 
 // ============================================================================
 // Individual read handlers

@@ -199,16 +199,13 @@
       "post": { "summary": "Enqueue via webhook", "tags": ["Webhooks"], "parameters": [{ "name": "queue", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "201": { "description": "Job created" } } }
     },
     "/api/v1/metrics/throughput": {
-      "get": { "summary": "Throughput metrics (60-min ring)", "tags": ["Metrics"], "responses": { "200": { "description": "Throughput data" } } }
+      "get": { "summary": "Throughput metrics (rolling 60-second window with per-second ops/sec)", "tags": ["Metrics"], "responses": { "200": { "description": "Throughput rates and per-second breakdown" } } }
     },
-    "/api/v1/events": {
-      "get": { "summary": "SSE event stream", "tags": ["Events"], "responses": { "200": { "description": "Server-sent events stream" } } }
+    "/api/v1/cluster/events": {
+      "get": { "summary": "Recent cluster state transition events (leader elected, stepped down, snapshots)", "tags": ["Cluster"], "responses": { "200": { "description": "Array of cluster events" } } }
     },
     "/api/v1/info": {
       "get": { "summary": "Server info", "tags": ["System"], "responses": { "200": { "description": "Version and engine info" } } }
-    },
-    "/api/v1/admin/rebuild-sqlite": {
-      "post": { "summary": "Rebuild SQLite mirror from KV", "tags": ["Admin"], "responses": { "200": { "description": "OK" } } }
     },
     "/api/v1/debug/runtime": {
       "get": { "summary": "Runtime debug info", "tags": ["Admin"], "responses": { "200": { "description": "Debug info" } } }

@@ -170,7 +170,7 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
         self.incrQueueCounter(b, job.queue, job.state);
 
         self.verifyJobIndexes(b, &job, "enqueue");
-        self.metrics.recordEnqueue(job.queue, 1);
+        self.metrics.recordEnqueue(job.queue, 1, op.now_ns);
         affected += 1;
     }
 

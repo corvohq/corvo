@@ -580,6 +580,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         req.body,
                         c.send_buf,
                         self.reader,
+                        &self.handler.metrics,
                     );
                     if (resp_len > 0) {
                         c.send_len = resp_len;

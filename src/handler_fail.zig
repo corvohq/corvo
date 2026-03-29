@@ -102,7 +102,7 @@ pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops
             job.state = .dead;
             job.completed_at_ns = op.now_ns;
             job.failed_at_ns = op.now_ns;
-            self.metrics.recordFail(job.queue);
+            self.metrics.recordFail(job.queue, op.now_ns);
             job.worker_id = null;
             job.hostname = null;
             job.lease_expires_at_ns = 0;

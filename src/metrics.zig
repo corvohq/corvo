@@ -7,6 +7,188 @@
 const std = @import("std");
 
 // ============================================================================
+// Throughput ring — rolling 60-second window of ops/sec
+// ============================================================================
+
+pub const ThroughputRing = struct {
+    const window = 60;
+
+    enqueued: [window]u32 = [_]u32{0} ** window,
+    completed: [window]u32 = [_]u32{0} ** window,
+    failed: [window]u32 = [_]u32{0} ** window,
+    head_second: u64 = 0,
+
+    /// Advance the ring to the current second, zeroing skipped slots.
+    fn advance(self: *ThroughputRing, second: u64) usize {
+        if (self.head_second == 0) {
+            self.head_second = second;
+            return second % window;
+        }
+        if (second <= self.head_second) {
+            return self.head_second % window;
+        }
+        const gap = @min(second - self.head_second, window);
+        for (1..gap + 1) |i| {
+            const idx = (self.head_second + i) % window;
+            self.enqueued[idx] = 0;
+            self.completed[idx] = 0;
+            self.failed[idx] = 0;
+        }
+        self.head_second = second;
+        return second % window;
+    }
+
+    pub fn recordEnqueue(self: *ThroughputRing, now_ns: u64, count: u32) void {
+        const idx = self.advance(now_ns / 1_000_000_000);
+        self.enqueued[idx] += count;
+    }
+
+    pub fn recordComplete(self: *ThroughputRing, now_ns: u64) void {
+        const idx = self.advance(now_ns / 1_000_000_000);
+        self.completed[idx] += 1;
+    }
+
+    pub fn recordFail(self: *ThroughputRing, now_ns: u64) void {
+        const idx = self.advance(now_ns / 1_000_000_000);
+        self.failed[idx] += 1;
+    }
+
+    pub const Snapshot = struct {
+        enqueue_rate: u64,
+        complete_rate: u64,
+        fail_rate: u64,
+        seconds: u32,
+        per_second: [window]PerSecond,
+
+        pub const PerSecond = struct {
+            enqueued: u32,
+            completed: u32,
+            failed: u32,
+        };
+    };
+
+    /// Return a snapshot of the last `window` seconds of throughput data.
+    pub fn snapshot(self: *const ThroughputRing, now_ns: u64) Snapshot {
+        const now_sec = now_ns / 1_000_000_000;
+        var snap = Snapshot{
+            .enqueue_rate = 0,
+            .complete_rate = 0,
+            .fail_rate = 0,
+            .seconds = 0,
+            .per_second = undefined,
+        };
+
+        if (self.head_second == 0) {
+            for (&snap.per_second) |*s| s.* = .{ .enqueued = 0, .completed = 0, .failed = 0 };
+            return snap;
+        }
+
+        // Count active seconds (from head_second back, max window).
+        const start_sec = if (now_sec >= window) now_sec - window + 1 else 1;
+        const actual_start = @max(start_sec, if (self.head_second >= window) self.head_second - window + 1 else 1);
+        var total_e: u64 = 0;
+        var total_c: u64 = 0;
+        var total_f: u64 = 0;
+        var count: u32 = 0;
+
+        for (0..window) |i| {
+            const sec = actual_start + i;
+            if (sec > now_sec) break;
+            const idx = sec % window;
+            // Only include slots that haven't been overwritten by future data.
+            if (sec > self.head_second) {
+                snap.per_second[i] = .{ .enqueued = 0, .completed = 0, .failed = 0 };
+            } else {
+                snap.per_second[i] = .{
+                    .enqueued = self.enqueued[idx],
+                    .completed = self.completed[idx],
+                    .failed = self.failed[idx],
+                };
+                total_e += self.enqueued[idx];
+                total_c += self.completed[idx];
+                total_f += self.failed[idx];
+            }
+            count += 1;
+        }
+
+        snap.seconds = count;
+        const divisor = @max(count, 1);
+        snap.enqueue_rate = total_e / divisor;
+        snap.complete_rate = total_c / divisor;
+        snap.fail_rate = total_f / divisor;
+        return snap;
+    }
+};
+
+// ============================================================================
+// Cluster event ring — recent cluster state transitions
+// ============================================================================
+
+pub const ClusterEventType = enum(u8) {
+    leader_elected = 1,
+    leader_stepped_down = 2,
+    follower_started = 3,
+    snapshot_sent = 4,
+    snapshot_received = 5,
+};
+
+pub const ClusterEvent = struct {
+    type_: ClusterEventType = .leader_elected,
+    epoch: u64 = 0,
+    timestamp_ns: u64 = 0,
+    detail_buf: [128]u8 = undefined,
+    detail_len: u8 = 0,
+
+    pub fn detailSlice(self: *const ClusterEvent) []const u8 {
+        return self.detail_buf[0..self.detail_len];
+    }
+
+    pub fn typeStr(self: *const ClusterEvent) []const u8 {
+        return switch (self.type_) {
+            .leader_elected => "leader_elected",
+            .leader_stepped_down => "leader_stepped_down",
+            .follower_started => "follower_started",
+            .snapshot_sent => "snapshot_sent",
+            .snapshot_received => "snapshot_received",
+        };
+    }
+};
+
+pub const ClusterEventRing = struct {
+    const capacity = 64;
+
+    events: [capacity]ClusterEvent = [_]ClusterEvent{.{}} ** capacity,
+    count: u32 = 0,
+    head: u32 = 0,
+    mu: std.Thread.Mutex = .{},
+
+    pub fn push(self: *ClusterEventRing, event: ClusterEvent) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.events[self.head] = event;
+        self.head = (self.head + 1) % capacity;
+        if (self.count < capacity) self.count += 1;
+    }
+
+    /// Copy recent events into `out` in chronological order (oldest first).
+    /// Returns the number of events written.
+    pub fn snapshot(self: *ClusterEventRing, out: []ClusterEvent) u32 {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const n = @min(self.count, @as(u32, @intCast(out.len)));
+        if (n == 0) return 0;
+        // Oldest event is at (head - count) % capacity.
+        const start = (self.head + capacity - self.count) % capacity;
+        // Copy the last `n` events (most recent).
+        const offset = self.count - n;
+        for (0..n) |i| {
+            out[i] = self.events[(start + offset + i) % capacity];
+        }
+        return n;
+    }
+};
+
+// ============================================================================
 // Latency histogram — fixed Prometheus-style buckets
 // ============================================================================
 
@@ -118,6 +300,9 @@ pub const ServerMetrics = struct {
     delivery: LatencyHistogram = .{},
     e2e: LatencyHistogram = .{},
 
+    // Rolling throughput window (60s).
+    throughput: ThroughputRing = .{},
+
     // Per-queue metrics (fixed-size array, no allocations).
     queue_names: [max_tracked_queues][64]u8 = undefined,
     queue_name_lens: [max_tracked_queues]u8 = [_]u8{0} ** max_tracked_queues,
@@ -151,13 +336,15 @@ pub const ServerMetrics = struct {
 
     // --- Recording helpers (called from handlers) ---
 
-    pub fn recordEnqueue(self: *ServerMetrics, queue: []const u8, count: u32) void {
+    pub fn recordEnqueue(self: *ServerMetrics, queue: []const u8, count: u32, now_ns: u64) void {
         self.enqueued_total += count;
+        self.throughput.recordEnqueue(now_ns, count);
         if (self.getQueue(queue)) |qm| qm.enqueued += count;
     }
 
     pub fn recordComplete(self: *ServerMetrics, queue: []const u8, created_at_ns: u64, started_at_ns: u64, completed_at_ns: u64) void {
         self.completed_total += 1;
+        self.throughput.recordComplete(completed_at_ns);
 
         // Delivery latency: enqueue → fetch.
         if (started_at_ns > created_at_ns) {
@@ -176,8 +363,9 @@ pub const ServerMetrics = struct {
         if (self.getQueue(queue)) |qm| qm.completed += 1;
     }
 
-    pub fn recordFail(self: *ServerMetrics, queue: []const u8) void {
+    pub fn recordFail(self: *ServerMetrics, queue: []const u8, now_ns: u64) void {
         self.failed_total += 1;
+        self.throughput.recordFail(now_ns);
         if (self.getQueue(queue)) |qm| qm.failed += 1;
     }
 

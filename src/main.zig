@@ -418,6 +418,8 @@ pub fn main() !void {
             .node_id = config.node_id,
             .is_leader = &cn.is_leader_flag,
             .election = &cn.election,
+            .events = &cn.events,
+            .peer_count = @intCast(cn.config.peer_ids.len),
         };
         http_read.g_cluster_info = &cluster_info;
     }

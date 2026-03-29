@@ -15,6 +15,7 @@ const transport_mod = @import("transport.zig");
 const tcp_mod = @import("tcp_transport.zig");
 const pipeline_mod = @import("pipeline.zig");
 const handler_mod = @import("handler.zig");
+const metrics_mod = @import("metrics.zig");
 
 // ============================================================================
 // Config
@@ -57,6 +58,9 @@ pub const ClusterNode = struct {
     tick_counter: u64 = 0,
     /// Latest oplog sequence seen (updated on every replicate call).
     last_oplog_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    // Cluster event log for monitoring.
+    events: metrics_mod.ClusterEventRing = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -303,6 +307,15 @@ pub const ClusterNode = struct {
             self.config.node_id, state.epoch,
         });
 
+        var ev = metrics_mod.ClusterEvent{
+            .type_ = .leader_elected,
+            .epoch = state.epoch,
+            .timestamp_ns = @intCast(@as(i128, std.time.nanoTimestamp())),
+        };
+        const detail = std.fmt.bufPrint(&ev.detail_buf, "{s}", .{self.config.node_id}) catch "";
+        ev.detail_len = @intCast(detail.len);
+        self.events.push(ev);
+
         // Clean up old replicator
         if (self.replicator) |r| {
             r.deinit();
@@ -334,6 +347,16 @@ pub const ClusterNode = struct {
 
     fn stepDown(self: *ClusterNode) void {
         std.debug.print("cluster: {s} stepped down\n", .{self.config.node_id});
+
+        var ev = metrics_mod.ClusterEvent{
+            .type_ = .leader_stepped_down,
+            .epoch = self.election.currentState().epoch,
+            .timestamp_ns = @intCast(@as(i128, std.time.nanoTimestamp())),
+        };
+        const detail = std.fmt.bufPrint(&ev.detail_buf, "{s}", .{self.config.node_id}) catch "";
+        ev.detail_len = @intCast(detail.len);
+        self.events.push(ev);
+
         self.is_leader_flag.store(false, .monotonic);
 
         if (self.replicator) |r| {
@@ -344,13 +367,23 @@ pub const ClusterNode = struct {
 
         // Re-enable follower mode
         const f = self.allocator.create(follower_mod.Follower) catch unreachable;
+        const fstate = self.election.currentState();
         f.* = follower_mod.Follower.init(
             self.config.node_id,
-            self.election.currentState().epoch,
+            fstate.epoch,
             0,
             self.kv_applier.applier(),
         );
         self.follower = f;
+
+        var fev = metrics_mod.ClusterEvent{
+            .type_ = .follower_started,
+            .epoch = fstate.epoch,
+            .timestamp_ns = @intCast(@as(i128, std.time.nanoTimestamp())),
+        };
+        const fdetail = std.fmt.bufPrint(&fev.detail_buf, "{s}", .{self.config.node_id}) catch "";
+        fev.detail_len = @intCast(fdetail.len);
+        self.events.push(fev);
     }
 
     // ========================================================================
@@ -434,6 +467,15 @@ pub const ClusterNode = struct {
                             h.rebuildState(self.shards);
                         }
                         std.debug.print("cluster: {s} restored snapshot at seq={d}\n", .{ self.config.node_id, rmsg.seq });
+
+                        var sev = metrics_mod.ClusterEvent{
+                            .type_ = .snapshot_received,
+                            .epoch = rmsg.epoch,
+                            .timestamp_ns = @intCast(@as(i128, std.time.nanoTimestamp())),
+                        };
+                        const sdetail = std.fmt.bufPrint(&sev.detail_buf, "seq={d} from={s}", .{ rmsg.seq, from }) catch "";
+                        sev.detail_len = @intCast(sdetail.len);
+                        self.events.push(sev);
                     }
                 }
 
@@ -517,6 +559,15 @@ pub const ClusterNode = struct {
                 .data = snap_buf,
             },
         });
+
+        var ssev = metrics_mod.ClusterEvent{
+            .type_ = .snapshot_sent,
+            .epoch = epoch,
+            .timestamp_ns = @intCast(@as(i128, std.time.nanoTimestamp())),
+        };
+        const ssdetail = std.fmt.bufPrint(&ssev.detail_buf, "to={s} size={d}", .{ peer_id, total_len }) catch "";
+        ssev.detail_len = @intCast(ssdetail.len);
+        self.events.push(ssev);
     }
 
     fn sendElectionMsgs(self: *ClusterNode, msgs: []const election_mod.Message) void {
