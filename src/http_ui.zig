@@ -189,15 +189,11 @@ fn queueDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, queue_name: []c
     var pag_base_s = std.io.fixedBufferStream(&pag_base_buf);
     pag_base_s.writer().print("/ui/queues/{s}?", .{queue_name}) catch {};
     if (state_filter) |sf| pag_base_s.writer().print("state={s}&", .{sf}) catch {};
-    var prev_url_buf: [256]u8 = undefined;
-    var next_url_buf: [256]u8 = undefined;
-    var prev_s = std.io.fixedBufferStream(&prev_url_buf);
-    var next_s = std.io.fixedBufferStream(&next_url_buf);
-    prev_s.writer().print("{s}page={d}", .{ pag_base_s.getWritten(), page -| 1 }) catch {};
-    next_s.writer().print("{s}page={d}", .{ pag_base_s.getWritten(), page + 1 }) catch {};
+    var nav_bufs: [4][256]u8 = undefined;
     var page_links: [10]PageLink = undefined;
     var page_url_bufs: [10][256]u8 = undefined;
-    const pg: []const PageLink = buildPageLinks(pag_base_s.getWritten(), page, total_pages, &page_links, &page_url_bufs);
+    const base = pag_base_s.getWritten();
+    const pag = buildPaginationData(base, page, total_pages, &nav_bufs, &page_links, &page_url_bufs);
 
     const tabs: []const FilterTabView = &filter_tabs;
     var content_buf: [page_buf_size]u8 = undefined;
@@ -215,14 +211,16 @@ fn queueDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, queue_name: []c
         .bulk_actions = bulk_actions,
         .has_jobs = count > 0,
         .jobs = jobs,
-        .has_pages = total_pages > 1,
-        .page_display = page + 1,
-        .total_pages = total_pages,
-        .has_prev = page > 0,
-        .prev_url = prev_s.getWritten(),
-        .has_next = page + 1 < total_pages,
-        .next_url = next_s.getWritten(),
-        .pages = pg,
+        .has_pages = pag.has_pages,
+        .page_display = pag.page_display,
+        .total_pages = pag.total_pages,
+        .has_prev = pag.has_prev,
+        .prev_url = pag.prev_url,
+        .first_url = pag.first_url,
+        .has_next = pag.has_next,
+        .next_url = pag.next_url,
+        .last_url = pag.last_url,
+        .pages = pag.pages,
     }, .{ .job_table = &job_table_tmpl, .pagination = &pagination_tmpl }) catch
         return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Queue Detail", content);
@@ -268,15 +266,11 @@ fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, 
     var pag_base_s = std.io.fixedBufferStream(&pag_base_buf);
     pag_base_s.writer().print("{s}?", .{base_path}) catch {};
     if (queue_filter) |qf| pag_base_s.writer().print("queue={s}&", .{qf}) catch {};
-    var prev_url_buf: [256]u8 = undefined;
-    var next_url_buf: [256]u8 = undefined;
-    var prev_s = std.io.fixedBufferStream(&prev_url_buf);
-    var next_s = std.io.fixedBufferStream(&next_url_buf);
-    prev_s.writer().print("{s}page={d}", .{ pag_base_s.getWritten(), page -| 1 }) catch {};
-    next_s.writer().print("{s}page={d}", .{ pag_base_s.getWritten(), page + 1 }) catch {};
+    var nav_bufs: [4][256]u8 = undefined;
     var page_links: [10]PageLink = undefined;
     var page_url_bufs: [10][256]u8 = undefined;
-    const pages = buildPageLinks(pag_base_s.getWritten(), page, total_pages, &page_links, &page_url_bufs);
+    const base = pag_base_s.getWritten();
+    const pag = buildPaginationData(base, page, total_pages, &nav_bufs, &page_links, &page_url_bufs);
 
     var content_buf: [page_buf_size]u8 = undefined;
     const content = job_list_tmpl.renderWithPartials(&content_buf, .{
@@ -286,14 +280,16 @@ fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, 
         .bulk_actions = bulk_actions,
         .has_jobs = count > 0,
         .jobs = jobs,
-        .has_pages = total_pages > 1,
-        .page_display = page + 1,
-        .total_pages = total_pages,
-        .has_prev = page > 0,
-        .prev_url = prev_s.getWritten(),
-        .has_next = page + 1 < total_pages,
-        .next_url = next_s.getWritten(),
-        .pages = pages,
+        .has_pages = pag.has_pages,
+        .page_display = pag.page_display,
+        .total_pages = pag.total_pages,
+        .has_prev = pag.has_prev,
+        .prev_url = pag.prev_url,
+        .first_url = pag.first_url,
+        .has_next = pag.has_next,
+        .next_url = pag.next_url,
+        .last_url = pag.last_url,
+        .pages = pag.pages,
     }, .{ .job_table = &job_table_tmpl, .pagination = &pagination_tmpl }) catch
         return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, title, content);
@@ -539,7 +535,6 @@ const PageLink = struct {
     label: u32,
     url: []const u8,
     is_current: bool,
-    is_ellipsis: bool,
 };
 
 const PropView = struct {
@@ -656,37 +651,52 @@ fn getBulkActions(actions: RowActions, buf: *[2]BulkAction) []const BulkAction {
     };
 }
 
+const PaginationData = struct {
+    has_pages: bool,
+    page_display: u32,
+    total_pages: u32,
+    has_prev: bool,
+    prev_url: []const u8,
+    first_url: []const u8,
+    has_next: bool,
+    next_url: []const u8,
+    last_url: []const u8,
+    pages: []const PageLink,
+};
+
+fn buildPaginationData(base_url: []const u8, page: u32, total_pages: u32, nav_bufs: *[4][256]u8, links: *[10]PageLink, url_bufs: *[10][256]u8) PaginationData {
+    var first_s = std.io.fixedBufferStream(&nav_bufs[0]);
+    var prev_s = std.io.fixedBufferStream(&nav_bufs[1]);
+    var next_s = std.io.fixedBufferStream(&nav_bufs[2]);
+    var last_s = std.io.fixedBufferStream(&nav_bufs[3]);
+    first_s.writer().print("{s}page=0", .{base_url}) catch {};
+    prev_s.writer().print("{s}page={d}", .{ base_url, page -| 1 }) catch {};
+    next_s.writer().print("{s}page={d}", .{ base_url, page + 1 }) catch {};
+    last_s.writer().print("{s}page={d}", .{ base_url, total_pages -| 1 }) catch {};
+    return .{
+        .has_pages = total_pages > 1,
+        .page_display = page + 1,
+        .total_pages = total_pages,
+        .has_prev = page > 0,
+        .prev_url = prev_s.getWritten(),
+        .first_url = first_s.getWritten(),
+        .has_next = page + 1 < total_pages,
+        .next_url = next_s.getWritten(),
+        .last_url = last_s.getWritten(),
+        .pages = buildPageLinks(base_url, page, total_pages, links, url_bufs),
+    };
+}
+
+/// Sliding window: up to 6 consecutive pages starting at current.
 fn buildPageLinks(base_url: []const u8, page: u32, total_pages: u32, links: *[10]PageLink, url_bufs: *[10][256]u8) []const PageLink {
+    const window = 6;
+    const win_end = @min(page + window, total_pages);
     var count: usize = 0;
-    var url_idx: usize = 0;
-
-    const addPage = struct {
-        fn f(ls: *[10]PageLink, c: *usize, bufs: *[10][256]u8, idx: *usize, base: []const u8, p: u32, current: u32) void {
-            var s = std.io.fixedBufferStream(&bufs[idx.*]);
-            s.writer().print("{s}page={d}", .{ base, p }) catch {};
-            ls[c.*] = .{ .label = p + 1, .url = s.getWritten(), .is_current = p == current, .is_ellipsis = false };
-            c.* += 1;
-            idx.* += 1;
-        }
-    }.f;
-
-    const addEllipsis = struct {
-        fn f(ls: *[10]PageLink, c: *usize) void {
-            ls[c.*] = .{ .label = 0, .url = "", .is_current = false, .is_ellipsis = true };
-            c.* += 1;
-        }
-    }.f;
-
-    if (total_pages <= 7) {
-        for (0..total_pages) |i| addPage(links, &count, url_bufs, &url_idx, base_url, @intCast(i), page);
-    } else {
-        addPage(links, &count, url_bufs, &url_idx, base_url, 0, page);
-        const win_start = if (page > 2) page - 1 else @as(u32, 1);
-        const win_end = @min(page + 2, total_pages - 1);
-        if (win_start > 1) addEllipsis(links, &count);
-        for (win_start..win_end) |i| addPage(links, &count, url_bufs, &url_idx, base_url, @intCast(i), page);
-        if (win_end < total_pages - 1) addEllipsis(links, &count);
-        addPage(links, &count, url_bufs, &url_idx, base_url, total_pages - 1, page);
+    for (page..win_end) |p| {
+        var s = std.io.fixedBufferStream(&url_bufs[count]);
+        s.writer().print("{s}page={d}", .{ base_url, p }) catch {};
+        links[count] = .{ .label = @as(u32, @intCast(p)) + 1, .url = s.getWritten(), .is_current = p == page };
+        count += 1;
     }
     return links[0..count];
 }
