@@ -36,10 +36,14 @@
 
 ## Docs & Site
 
-- [ ] API documentation — endpoint reference, RPC protocol spec, SDK usage guides
-- [ ] Getting started guide — install, run, enqueue/fetch/ack walkthrough
-- [ ] Update `../site` — Zig rewrite, new architecture, updated benchmarks (pipelined prepares, sync-repl scaling)
-- [ ] Configuration reference — all CLI flags, config file keys, maintenance intervals
+- [x] API documentation — endpoint reference, RPC protocol spec, SDK usage guides
+- [x] Getting started guide — install, run, enqueue/fetch/ack walkthrough
+- [x] Update `../site` — Zig rewrite, new architecture, updated benchmarks (pipelined prepares, sync-repl scaling)
+- [x] Configuration reference — all CLI flags, config file keys, maintenance intervals
+
+## Server
+
+- [ ] Admin password auth — `--admin-password` flag, UI login form + session cookie, HTTP Bearer auth. Bootstrap key: locks system, then create scoped API keys. Layers: no auth (dev) → admin password (simple) → API keys (enterprise/roles).
 
 ## V1 Release
 
@@ -48,8 +52,12 @@
 
 ## TigerStyle Audit (last)
 
-- [ ] Full audit — memory allocation audit done (step 13), but need to check: infinite loops (all while loops bounded?), exhaustive switches, assertion coverage, resource limit enforcement, no unbounded retries
-- [ ] Dead code cleanup — `rpc.zig` exports, unused helpers, stale function signatures across codebase
+- [x] Loop bounds — all 32 `while(true)` loops verified bounded (iterators, counters, break conditions)
+- [x] Exhaustive switches — 10 `else =>` catch-alls replaced with explicit enum variants across handler_bulk.zig, handler.zig, tcp_transport.zig, sim/invariants.zig, pipeline.zig
+- [x] Assertion coverage — 6 missing assertions added: heartbeat parallel slice precondition, fetch array bounds (normal + fairness), fairness candidate bounds, counter overflow/underflow
+- [x] Resource limit enforcement — 10 collection bounds assertions across handler.zig (max_queues on active_counts/fairness maps, max_namespaces on ns_rate_limits), pending_index.zig, notify.zig, replicator.zig (max_waiters), election.zig (max_peers)
+- [x] Dead code — none found (all pub fns, consts, imports actively used)
+- [ ] Dead code cleanup — `rpc.zig` exports, unused helpers, stale function signatures across codebase (audit found nothing, but worth a manual pass)
 
 ## Cancellable Jobs
 
