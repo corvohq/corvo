@@ -33,6 +33,7 @@ const oplog_mod = corvo.oplog;
 const notify_mod = corvo.notify;
 const mirror_mod = corvo.mirror;
 const sqlite_read = corvo.sqlite_read;
+const http_read = corvo.http_read;
 const pipeline_mod = corvo.pipeline;
 const cluster_mod = corvo.cluster;
 
@@ -423,6 +424,7 @@ pub fn main() !void {
     std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
 
     // Wait for leader election if in cluster mode.
+    var cluster_info: http_read.ClusterInfo = undefined;
     if (cluster_node) |*cn| {
         std.debug.print("corvo: waiting for leader election...\n", .{});
         if (!cn.waitForLeader(30000)) {
@@ -433,6 +435,12 @@ pub fn main() !void {
         std.debug.print("corvo: leader elected (epoch={d}, leader={s})\n", .{
             state.epoch, if (state.leader_id.len > 0) state.leader_id else "(self)",
         });
+        cluster_info = .{
+            .node_id = config.node_id,
+            .is_leader = &cn.is_leader_flag,
+            .election = &cn.election,
+        };
+        http_read.g_cluster_info = &cluster_info;
     }
 
     std.debug.print("corvo: listening on {s}:{d} (rpc+http)\n", .{ config.bind, config.port });

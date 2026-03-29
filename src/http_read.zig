@@ -8,6 +8,15 @@ const http = @import("http.zig");
 const json = @import("json_writer.zig");
 const sqlite_read = @import("sqlite_read.zig");
 const http_ui = @import("http_ui.zig");
+
+/// Cluster info for /cluster/status. Set by main.zig after election.
+pub const ClusterInfo = struct {
+    node_id: []const u8,
+    is_leader: *const std.atomic.Value(bool),
+    election: *@import("election.zig").Election,
+};
+
+pub var g_cluster_info: ?*const ClusterInfo = null;
 const ui_embed = @import("ui_embed");
 
 
@@ -51,7 +60,7 @@ pub fn dispatch(
         return http.writeResponse(send_buf, 200, "{\"version\":\"0.1.0b\",\"engine\":\"zig\"}");
     if (std.mem.eql(u8, api, "/debug/runtime")) return debugRuntime(send_buf);
     if (std.mem.eql(u8, api, "/cluster/status"))
-        return http.writeResponse(send_buf, 200, "{\"mode\":\"standalone\",\"status\":\"healthy\",\"state\":\"leader\",\"node_id\":\"node-1\",\"leader\":\"node-1\"}");
+        return clusterStatus(send_buf);
     if (std.mem.eql(u8, api, "/auth/status"))
         return http.writeResponse(send_buf, 200, "{\"admin_password_set\":false}");
 
@@ -102,13 +111,10 @@ pub fn metrics(send_buf: []u8, mirror_stats: ?MirrorStats, reader: ?*sqlite_read
                 "# HELP corvo_mirror_dropped_total Operations dropped due to full queue\n" ++
                 "# TYPE corvo_mirror_dropped_total counter\n" ++
                 "corvo_mirror_dropped_total {d}\n" ++
-                "# HELP corvo_mirror_rebuilds_total Full KV-to-SQLite rebuilds triggered by overflow\n" ++
-                "# TYPE corvo_mirror_rebuilds_total counter\n" ++
-                "corvo_mirror_rebuilds_total {d}\n" ++
                 "# HELP corvo_mirror_lag Operations pending in mirror queue\n" ++
                 "# TYPE corvo_mirror_lag gauge\n" ++
                 "corvo_mirror_lag {d}\n",
-            .{ ms.queued, ms.committed, ms.dropped, ms.rebuilds, lag },
+            .{ ms.queued, ms.committed, ms.dropped, lag },
         ) catch &[0]u8{}).len;
     }
 
@@ -154,6 +160,39 @@ pub fn metrics(send_buf: []u8, mirror_stats: ?MirrorStats, reader: ?*sqlite_read
     }
 
     return http.writeResponseText(send_buf, 200, body_buf[0..pos]);
+}
+
+fn clusterStatus(send_buf: []u8) u32 {
+    var body_buf: [512]u8 = undefined;
+    var w = json.JsonWriter.init(&body_buf);
+
+    const ci = g_cluster_info orelse {
+        w.beginObject();
+        w.fieldStr("mode", "standalone");
+        w.fieldStr("status", "healthy");
+        w.fieldStr("state", "leader");
+        w.fieldStr("node_id", "standalone");
+        w.fieldStr("leader", "standalone");
+        w.endObject();
+        return http.writeResponse(send_buf, 200, w.getWritten());
+    };
+
+    const es = ci.election.currentState();
+    const state_str = switch (es.state) {
+        .leader => "leader",
+        .follower => "follower",
+        .candidate => "candidate",
+    };
+
+    w.beginObject();
+    w.fieldStr("mode", "cluster");
+    w.fieldStr("status", "healthy");
+    w.fieldStr("state", state_str);
+    w.fieldStr("node_id", ci.node_id);
+    w.fieldStr("leader", es.leader_id);
+    w.fieldInt("epoch", es.epoch);
+    w.endObject();
+    return http.writeResponse(send_buf, 200, w.getWritten());
 }
 
 pub const MirrorStats = struct {
