@@ -16,6 +16,7 @@ pub const QueueNotifier = struct {
     /// Per-queue FIFO of waiting workers. Key is queue name (not owned).
     waiters: std.StringHashMap(std.ArrayList(*Waiter)),
     allocator: std.mem.Allocator,
+    max_queues: u32 = 100,
 
     pub fn init(allocator: std.mem.Allocator) QueueNotifier {
         return .{
@@ -87,7 +88,10 @@ pub const QueueNotifier = struct {
         defer self.mu.unlock();
         for (queues) |q| {
             const list = self.waiters.getOrPut(q) catch unreachable;
-            if (!list.found_existing) list.value_ptr.* = .{};
+            if (!list.found_existing) {
+                assert.check(self.waiters.count() <= self.max_queues + 1, "QueueNotifier: queue count ({d}) exceeds max_queues ({d})", .{ self.waiters.count(), self.max_queues });
+                list.value_ptr.* = .{};
+            }
             list.value_ptr.append(self.allocator, waiter) catch unreachable;
         }
     }

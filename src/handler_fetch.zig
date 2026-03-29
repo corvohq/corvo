@@ -183,6 +183,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             self.verifyJobIndexes(b, &job, "fetch");
 
             // Store fetch result inline (no allocation).
+            assert.check(result.affected < ops.OpResult.max_inline_fetch, "fetch: result.affected ({d}) >= max_inline_fetch", .{result.affected});
             var f = &result.fetched[result.affected];
             const il = @min(job_id.len, f.id_buf.len);
             @memcpy(f.id_buf[0..il], job_id[0..il]);
@@ -256,6 +257,7 @@ fn fetchWithFairness(
             const job = codec.decodeJob(job_bytes.?);
             if (job.state != .pending) continue;
 
+            assert.check(num_candidates < max_candidates, "fetch-fairness: num_candidates ({d}) >= max_candidates", .{num_candidates});
             candidates[num_candidates] = entry;
             if (job.group) |g| {
                 const gl: u8 = @intCast(@min(g.len, 64));
@@ -350,6 +352,7 @@ fn fetchWithFairness(
         self.transitionReadIndexes(b, &job, .pending, .active);
         self.verifyJobIndexes(b, &job, "fetch-fairness");
 
+        assert.check(result.affected < ops.OpResult.max_inline_fetch, "fetch-fairness: result.affected ({d}) >= max_inline_fetch", .{result.affected});
         var f = &result.fetched[result.affected];
         const il = @min(sel_job_id.len, f.id_buf.len);
         @memcpy(f.id_buf[0..il], sel_job_id[0..il]);

@@ -355,7 +355,7 @@ fn checkJobsHaveIndexKeys(store: *kv.Store, tick: u32, seed: u64) CheckResult {
                             .active => hasActiveKey(&batch, job.queue, job_id),
                             .scheduled => hasScheduledKey(&batch, job.queue),
                             .retrying => hasRetryingKey(&batch, job.queue),
-                            else => true,
+                            .pending, .completed, .dead, .cancelled, .held => unreachable,
                         };
                         if (!has_index) {
                             return makeErrorFmt("job-index-missing", tick, seed,

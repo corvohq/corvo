@@ -9,6 +9,7 @@
 //! fetch pops an entry, checks if the job is still pending in KV, skips if not.
 
 const std = @import("std");
+const assert = @import("assert.zig");
 const keys = @import("keys.zig");
 const codec = @import("codec.zig");
 const kv = @import("kv.zig");
@@ -35,6 +36,7 @@ const PendingHeap = std.PriorityQueue(PendingEntry, void, PendingEntry.order);
 pub const PendingIndex = struct {
     queues: std.StringHashMap(PendingHeap),
     allocator: std.mem.Allocator,
+    max_queues: u32 = 100,
 
     pub fn init(allocator: std.mem.Allocator) PendingIndex {
         return .{
@@ -58,6 +60,7 @@ pub const PendingIndex = struct {
 
         const heap = self.queues.getOrPut(queue) catch unreachable;
         if (!heap.found_existing) {
+            assert.check(self.queues.count() <= self.max_queues + 1, "PendingIndex: queue count ({d}) exceeds max_queues ({d})", .{ self.queues.count(), self.max_queues });
             heap.key_ptr.* = self.allocator.dupe(u8, queue) catch unreachable;
             heap.value_ptr.* = PendingHeap.init(self.allocator, {});
         }

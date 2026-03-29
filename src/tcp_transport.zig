@@ -328,7 +328,7 @@ pub const TcpTransport = struct {
                         }
                     }
                 },
-                else => {},
+                .election => {},
             }
 
             self.pushInbox(from_id, decoded.msg, decoded.data);
@@ -365,7 +365,7 @@ pub const TcpTransport = struct {
             // Update the msg's data pointer to the owned copy
             switch (self.inbox[self.tail].msg) {
                 .repl => |*r| r.data = d,
-                else => {},
+                .election => {},
             }
         } else {
             self.repl_data_bufs[self.tail] = "";

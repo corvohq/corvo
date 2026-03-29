@@ -287,6 +287,7 @@ pub fn main() !void {
     var handler = handler_mod.OpHandler.init(allocator);
     handler.max_queues = config.max_queues;
     handler.max_tags_per_queue = config.max_tags_per_queue;
+    handler.pending.max_queues = config.max_queues;
     defer handler.deinit();
     handler.rebuildState(&stores);
 
@@ -302,6 +303,7 @@ pub fn main() !void {
 
     // --- QueueNotifier ---
     var notify = notify_mod.QueueNotifier.init(allocator);
+    notify.max_queues = config.max_queues;
     defer notify.deinit();
 
     // --- KV reader (reads directly from Talon KV store) ---

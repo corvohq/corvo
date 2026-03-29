@@ -156,6 +156,7 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
                 assert.check(batch_bytes != null, "batch disappeared between validation and update", .{});
                 var batch = codec.decodeBatch(batch_bytes.?);
                 assert.check(batch.open, "batch sealed between validation and update", .{});
+                assert.check(batch.total < std.math.maxInt(u32), "enqueue: batch total overflow", .{});
                 batch.total += 1;
                 batch.pending += 1;
                 assert.check(batch.pending <= batch.total, "enqueue: batch {s} pending ({d}) > total ({d})", .{ batch_id, batch.pending, batch.total });

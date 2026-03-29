@@ -75,6 +75,7 @@ pub const Replicator = struct {
     followers: std.StringHashMap(PeerState),
     max_lag: u64,
     waiters: std.ArrayList(AckWaiter),
+    max_waiters: u32 = 4096,
     allocator: std.mem.Allocator,
 
     /// Create a new replicator for a leader at the given epoch.
@@ -305,6 +306,7 @@ pub const Replicator = struct {
             }
         }
 
+        assert.check(self.waiters.items.len < self.max_waiters, "Replicator: waiter count ({d}) exceeds max_waiters ({d})", .{ self.waiters.items.len, self.max_waiters });
         self.waiters.append(self.allocator, .{ .seq = seq, .event = event }) catch unreachable;
     }
 

@@ -12,6 +12,8 @@ const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
 
 pub fn applyHeartbeat(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.HeartbeatOp) ops.OpResult {
+    assert.check(op.job_ids.len == op.job_ops.len, "heartbeat: job_ids.len ({d}) != job_ops.len ({d})", .{ op.job_ids.len, op.job_ops.len });
+
     const lease_expires_ns = op.now_ns + 60 * 1_000_000_000;
     var affected: u32 = 0;
 

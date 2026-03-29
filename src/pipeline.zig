@@ -1148,6 +1148,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 rpc.MSG_CRON_UPDATE,
                 rpc.MSG_CRON_DELETE,
                 rpc.MSG_CRON_TRIGGER,
+                rpc.MSG_SET_BUDGET,
+                rpc.MSG_DELETE_BUDGET,
+                rpc.MSG_MODIFY_ENT_SETTING,
+                rpc.MSG_GLOBAL_CONFIG,
                 => rpc.management.encodeGenericResp(writer, result),
                 else => {
                     if (result.err) |msg| {
@@ -1507,7 +1511,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                                     }
                                 }
                             },
-                            else => {},
+                            .expire, .purge, .unique, .rate_limit, .workers, .batches => {},
                         }
                     }
                 },

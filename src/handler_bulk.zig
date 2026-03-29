@@ -119,7 +119,8 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                         var rk_buf: keys.KeyBuf = undefined;
                         b.delete(OpHandler.jobRetryingKey(&rk_buf, &job));
                     },
-                    else => {},
+                    .active => unreachable, // filtered by continue above
+                    .completed, .dead, .cancelled, .held => {},
                 }
                 // Adjust batch counters for non-terminal jobs.
                 if (job.batch_id) |bid| {
@@ -156,7 +157,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
             .cancel => {
                 switch (job.state) {
                     .pending, .active, .scheduled, .retrying => {},
-                    else => continue,
+                    .completed, .dead, .cancelled, .held => continue,
                 }
                 // Record cancel signal for active jobs BEFORE clearing worker_id.
                 // Also notify the queue so fetch subscribers can fill the freed slot.
@@ -233,7 +234,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                         var nrk_buf: keys.KeyBuf = undefined;
                         b.set(keys.retryingKey(&nrk_buf, move_to, job.scheduled_at_ns, job_id), "");
                     },
-                    else => continue,
+                    .active, .completed, .dead, .cancelled, .held => continue,
                 }
                 // Transfer unique lock
                 var uk_buf: keys.KeyBuf = undefined;
@@ -267,7 +268,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
             .hold => {
                 switch (job.state) {
                     .pending, .scheduled, .retrying => {},
-                    else => continue,
+                    .active, .completed, .dead, .cancelled, .held => continue,
                 }
                 switch (job.state) {
                     .pending => {

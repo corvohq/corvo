@@ -468,6 +468,7 @@ pub const Election = struct {
             return self.out_buf[0..0];
         }
 
+        assert.check(self.votes_received.count() <= max_peers, "election: votes_received exceeds max_peers", .{});
         self.votes_received.put(msg.from, true) catch unreachable;
 
         if (self.votes_received.count() >= self.majority()) {
@@ -535,6 +536,7 @@ pub const Election = struct {
             return self.out_buf[0..0];
         }
 
+        assert.check(self.heartbeat_acks.count() <= max_peers, "election: heartbeat_acks exceeds max_peers", .{});
         self.heartbeat_acks.put(msg.from, true) catch unreachable;
 
         const ack_count = self.heartbeat_acks.count() + 1; // +1 for self

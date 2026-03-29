@@ -79,6 +79,7 @@ pub const OpHandler = struct {
     // Explicit resource limits (TigerStyle: all collections must have bounds).
     max_queues: u32 = 100,
     max_tags_per_queue: u32 = 1000,
+    max_namespaces: u32 = 64,
 
 
     pub const NsRateLimit = struct {
@@ -309,7 +310,7 @@ pub const OpHandler = struct {
                         if (job.group) |g| self.incrFairnessActive(job.queue, g);
                         active_count += 1;
                     },
-                    else => {},
+                    .retrying, .completed, .dead, .cancelled, .scheduled, .held => {},
                 }
 
                 if (!iter.next()) break;
@@ -512,6 +513,7 @@ pub const OpHandler = struct {
     pub fn incrActiveCount(self: *OpHandler, queue: []const u8) void {
         const entry = self.active_counts.getOrPut(queue) catch unreachable;
         if (!entry.found_existing) {
+            assert.check(self.active_counts.count() <= self.max_queues + 1, "incrActiveCount: queue count ({d}) exceeds max_queues ({d})", .{ self.active_counts.count(), self.max_queues });
             entry.key_ptr.* = self.allocator.dupe(u8, queue) catch unreachable;
             entry.value_ptr.* = 0;
         }
@@ -530,6 +532,7 @@ pub const OpHandler = struct {
         if (group.len == 0) return;
         const qmap = self.fairness_active.getOrPut(queue) catch unreachable;
         if (!qmap.found_existing) {
+            assert.check(self.fairness_active.count() <= self.max_queues + 1, "incrFairnessActive: queue count exceeds max_queues", .{});
             qmap.key_ptr.* = self.allocator.dupe(u8, queue) catch unreachable;
             qmap.value_ptr.* = std.StringHashMap(i32).init(self.allocator);
         }
@@ -549,6 +552,7 @@ pub const OpHandler = struct {
         if (group.len == 0) return;
         if (self.fairness_active.getPtr(queue)) |qmap| {
             if (qmap.getPtr(group)) |count| {
+                assert.check(count.* > 0, "decrFairnessActive: underflow for queue={s} group={s}", .{ queue, group });
                 count.* -= 1;
             }
         }
@@ -558,6 +562,7 @@ pub const OpHandler = struct {
         if (group.len == 0) return;
         const qmap = self.fairness_served.getOrPut(queue) catch unreachable;
         if (!qmap.found_existing) {
+            assert.check(self.fairness_served.count() <= self.max_queues + 1, "incrFairnessServed: queue count exceeds max_queues", .{});
             qmap.key_ptr.* = self.allocator.dupe(u8, queue) catch unreachable;
             qmap.value_ptr.* = std.StringHashMap(i32).init(self.allocator);
         }
@@ -916,6 +921,7 @@ pub const OpHandler = struct {
     pub fn putNsRateLimit(self: *OpHandler, namespace: []const u8, rl: NsRateLimit) void {
         const entry = self.ns_rate_limits.getOrPut(namespace) catch unreachable;
         if (!entry.found_existing) {
+            assert.check(self.ns_rate_limits.count() <= self.max_namespaces + 1, "putNsRateLimit: namespace count ({d}) exceeds max_namespaces ({d})", .{ self.ns_rate_limits.count(), self.max_namespaces });
             entry.key_ptr.* = self.allocator.dupe(u8, namespace) catch unreachable;
         }
         entry.value_ptr.* = rl;
