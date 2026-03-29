@@ -29,6 +29,7 @@ pub const sqlite = @import("sqlite.zig");
 pub const schema = @import("schema.zig");
 pub const mirror = @import("mirror.zig");
 pub const sqlite_read = @import("sqlite_read.zig");
+pub const http_read = @import("http_read.zig");
 
 // IO backend (io_uring / kqueue / sim)
 pub const io = @import("io.zig");

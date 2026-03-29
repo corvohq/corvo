@@ -38,6 +38,9 @@ pub const prefix_expire = "x|"; // x|{expireAtNs:8BE}{jobID}
 pub const prefix_dead = "d|"; // d|{terminalAtNs:8BE}{jobID}
 pub const prefix_queue_append = "qa|"; // qa|{queue}\x00{created_ns:8BE}{job_id}
 pub const prefix_queue_cursor = "qac|"; // qac|{queue}
+pub const prefix_global_rate_limit = "gl|"; // gl|{fetched_ns:8BE}{random:8BE}
+pub const key_global_config = "g|rl"; // singleton: [rate:u32LE][window_ms:u32LE]
+pub const prefix_ns_rate_limit = "nl|"; // nl|{namespace}\x00{fetched_ns:8BE}{random:8BE}
 
 // Enterprise prefixes
 pub const prefix_ent_ns = "ent_ns|";
@@ -281,6 +284,70 @@ pub fn rateLimitPrefix(buf: *KeyBuf, queue: []const u8) []const u8 {
 pub fn rateLimitWindowStart(buf: *KeyBuf, queue: []const u8, window_start_ns: u64) []const u8 {
     var pos = copyPrefix(buf, prefix_rate_limit);
     pos = copyStr(buf, pos, queue);
+    pos = putU8(buf, pos, sep);
+    pos = putU64BE(buf, pos, window_start_ns);
+    return buf[0..pos];
+}
+
+// ============================================================================
+// Global rate limit keys
+// ============================================================================
+
+/// gl|{fetched_ns:8BE}{random:8BE}
+pub fn globalRateLimitKey(buf: *KeyBuf, fetched_ns: u64, random: u64) []const u8 {
+    var pos = copyPrefix(buf, prefix_global_rate_limit);
+    pos = putU64BE(buf, pos, fetched_ns);
+    pos = putU64BE(buf, pos, random);
+    return buf[0..pos];
+}
+
+/// gl|
+pub fn globalRateLimitPrefix(buf: *KeyBuf) []const u8 {
+    const p = prefix_global_rate_limit;
+    @memcpy(buf[0..p.len], p);
+    return buf[0..p.len];
+}
+
+/// gl|{windowStartNs:8BE}
+pub fn globalRateLimitWindowStart(buf: *KeyBuf, window_start_ns: u64) []const u8 {
+    var pos = copyPrefix(buf, prefix_global_rate_limit);
+    pos = putU64BE(buf, pos, window_start_ns);
+    return buf[0..pos];
+}
+
+/// g|rl (singleton)
+pub fn globalConfigKey(buf: *KeyBuf) []const u8 {
+    const k = key_global_config;
+    @memcpy(buf[0..k.len], k);
+    return buf[0..k.len];
+}
+
+// ============================================================================
+// Namespace rate limit keys
+// ============================================================================
+
+/// nl|{namespace}\x00{fetched_ns:8BE}{random:8BE}
+pub fn nsRateLimitKey(buf: *KeyBuf, namespace: []const u8, fetched_ns: u64, random: u64) []const u8 {
+    var pos = copyPrefix(buf, prefix_ns_rate_limit);
+    pos = copyStr(buf, pos, namespace);
+    pos = putU8(buf, pos, sep);
+    pos = putU64BE(buf, pos, fetched_ns);
+    pos = putU64BE(buf, pos, random);
+    return buf[0..pos];
+}
+
+/// nl|{namespace}\x00
+pub fn nsRateLimitPrefix(buf: *KeyBuf, namespace: []const u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_ns_rate_limit);
+    pos = copyStr(buf, pos, namespace);
+    pos = putU8(buf, pos, sep);
+    return buf[0..pos];
+}
+
+/// nl|{namespace}\x00{windowStartNs:8BE}
+pub fn nsRateLimitWindowStart(buf: *KeyBuf, namespace: []const u8, window_start_ns: u64) []const u8 {
+    var pos = copyPrefix(buf, prefix_ns_rate_limit);
+    pos = copyStr(buf, pos, namespace);
     pos = putU8(buf, pos, sep);
     pos = putU64BE(buf, pos, window_start_ns);
     return buf[0..pos];

@@ -155,6 +155,7 @@ pub fn mirrorFromOp(m: *Mirror, op_type: ops.OpType, data: *const ops.OpData, re
         },
         .cron_trigger => {}, // Triggered job mirrored via handler side_effects.
         .modify_ent_setting => {},
+        .global_config => {},
         .multi => {},
     }
 }

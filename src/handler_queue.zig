@@ -47,6 +47,10 @@ pub fn applyQueueConfig(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Queu
         .throttle => {
             queue.rate_limit = op.rate_limit;
             queue.rate_window_ms = op.rate_window_ms;
+            self.recomputeMaxRateWindow();
+        },
+        .namespace => {
+            queue.namespace = op.namespace;
         },
         .clear, .delete => {
             assert.fail("clear/delete should not use applyQueueConfig", .{});

@@ -101,7 +101,7 @@ fn extractQueues(op_type: ops.OpType, data: *const ops.OpData) QueueExtract {
         .delete_queue => QueueExtract{ .kind = .single, .first = data.delete_queue.queue },
         .maintenance => QueueExtract{ .kind = .broadcast, .first = "" },
         // Global ops: cron, batch, budget, enterprise, multi
-        .batch_create, .batch_seal, .cron_create, .cron_update, .cron_delete, .cron_trigger, .set_budget, .delete_budget, .modify_ent_setting, .multi => QueueExtract{ .kind = .global, .first = "" },
+        .batch_create, .batch_seal, .cron_create, .cron_update, .cron_delete, .cron_trigger, .set_budget, .delete_budget, .modify_ent_setting, .global_config, .multi => QueueExtract{ .kind = .global, .first = "" },
     };
 }
 

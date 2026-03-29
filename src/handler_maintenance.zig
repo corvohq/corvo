@@ -227,7 +227,6 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
                     var dk_buf: keys.KeyBuf = undefined;
                     b.set(keys.deadKey(&dk_buf, now_ns, job_id), "");
-                    self.dead_since_purge += 1;
 
                     // Batch failure tracking.
                     if (job.batch_id) |bid| {
@@ -351,7 +350,6 @@ fn applyExpire(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                 self.verifyJobIndexes(b, &job, "expire");
                 var dk_buf: keys.KeyBuf = undefined;
                 b.set(keys.deadKey(&dk_buf, now_ns, job_id), "");
-                self.dead_since_purge += 1;
                 self.recordBulkResult(job_id, .update_state, "dead", "", now_ns);
 
                 affected += 1;
@@ -491,7 +489,46 @@ fn applyCleanRateLimit(b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult {
         }
     }
 
+    // Clean global rate limit entries (gl| prefix).
+    cleanRateLimitPrefix(b, keys.prefix_global_rate_limit, cutoff_ns);
+
+    // Clean namespace rate limit entries (nl| prefix).
+    cleanRateLimitPrefix(b, keys.prefix_ns_rate_limit, cutoff_ns);
+
     return .{};
+}
+
+/// Generic rate limit prefix cleaner for gl| and nl| keys.
+/// gl| keys: prefix{fetched_ns:8BE}{random:8BE} — timestamp immediately after prefix.
+/// nl| keys: prefix{namespace}\x00{fetched_ns:8BE}{random:8BE} — timestamp after separator.
+fn cleanRateLimitPrefix(b: *kv.WriteBatch, prefix: []const u8, cutoff_ns: u64) void {
+    var p_buf: keys.KeyBuf = undefined;
+    var pe_buf: keys.KeyBuf = undefined;
+    @memcpy(p_buf[0..prefix.len], prefix);
+    const end = keys.prefixEnd(&pe_buf, p_buf[0..prefix.len]) orelse return;
+
+    var iter = b.newIter(p_buf[0..prefix.len], end);
+    defer iter.close();
+
+    if (!iter.first()) return;
+    while (true) {
+        const key = iter.key();
+        // Find timestamp position: after \x00 separator if present, else directly after prefix.
+        const ts_pos = if (std.mem.indexOfScalarPos(u8, key, prefix.len, 0x00)) |sep|
+            sep + 1
+        else
+            prefix.len;
+
+        if (ts_pos + 8 <= key.len) {
+            const fetched_ns = keys.getU64BE(key[ts_pos .. ts_pos + 8]);
+            if (fetched_ns >= cutoff_ns) {
+                if (!iter.next()) break;
+                continue;
+            }
+        }
+        b.delete(key);
+        if (!iter.next()) break;
+    }
 }
 
 // ============================================================================
