@@ -687,12 +687,15 @@ fn buildPaginationData(base_url: []const u8, page: u32, total_pages: u32, nav_bu
     };
 }
 
-/// Sliding window: up to 6 consecutive pages starting at current.
+/// Sliding window: 5 pages centered on current.
 fn buildPageLinks(base_url: []const u8, page: u32, total_pages: u32, links: *[10]PageLink, url_bufs: *[10][256]u8) []const PageLink {
-    const window = 6;
-    const win_end = @min(page + window, total_pages);
+    const window = 5;
+    const half = window / 2;
+    // Clamp window so current is centered (or as close as possible at edges).
+    const win_start = if (page >= half) @min(page - half, total_pages -| window) else 0;
+    const win_end = @min(win_start + window, total_pages);
     var count: usize = 0;
-    for (page..win_end) |p| {
+    for (win_start..win_end) |p| {
         var s = std.io.fixedBufferStream(&url_bufs[count]);
         s.writer().print("{s}page={d}", .{ base_url, p }) catch {};
         links[count] = .{ .label = @as(u32, @intCast(p)) + 1, .url = s.getWritten(), .is_current = p == page };
