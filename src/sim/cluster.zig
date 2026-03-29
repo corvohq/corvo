@@ -479,7 +479,6 @@ pub const SimCluster = struct {
                 &leader.oplog,
                 &leader.notify,
                 null,
-                null,
                 .{
                     .clock_fn = &globalClockNow,
                     .repl_hook = .{

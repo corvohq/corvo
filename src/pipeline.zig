@@ -1612,7 +1612,6 @@ const TestContext = struct {
             &self.oplog,
             &self.notify,
             null,
-            null,
             .{ .clock_fn = &testClockFn },
         );
     }

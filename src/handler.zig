@@ -40,8 +40,7 @@ pub const OpHandler = struct {
     lease_counter: u64 = 0,
     requeue_counter: u64 = 0,
     // Effect buffers — accumulated during apply, drained by pipeline after commit.
-    side_effects: [max_side_effects]mirror_mod.MirrorOp.EnqueuePayload = undefined,
-    side_effect_count: u8 = 0,
+    side_effect_count: u8 = 0, // kept for pipeline.resetEffects compat
     fail_results: [max_fail_results]FailResult = undefined,
     fail_result_count: u16 = 0,
     bulk_results: [max_bulk_results]BulkResult = undefined,
@@ -75,7 +74,6 @@ pub const OpHandler = struct {
     max_queues: u32 = 100,
     max_tags_per_queue: u32 = 1000,
 
-    const mirror_mod = @import("mirror.zig");
 
     pub const NsRateLimit = struct {
         rate_limit: u32 = 0,
@@ -396,47 +394,8 @@ pub const OpHandler = struct {
         return self.promote_queue_slices[0..self.promote_queue_count];
     }
 
-    pub fn recordSideEffect(self: *OpHandler, job: *const ops.EnqueueJob) void {
-        assert.check(self.side_effect_count < max_side_effects, "recordSideEffect: overflow ({d})", .{self.side_effect_count});
-        var p = mirror_mod.MirrorOp.EnqueuePayload{
-            .state = job.state,
-            .priority = job.priority,
-            .max_retries = job.max_retries,
-            .created_at_ns = job.created_at_ns,
-        };
-        inline for (.{
-            .{ &p.job_id, &p.job_id_len, job.job_id },
-            .{ &p.queue, &p.queue_len, job.queue },
-        }) |t| {
-            const dst, const dst_len, const src = t;
-            const l: u8 = @intCast(@min(src.len, dst.len));
-            @memcpy(dst[0..l], src[0..l]);
-            dst_len.* = l;
-        }
-        if (job.payload) |pl| {
-            const l: u16 = @intCast(@min(pl.len, p.payload_preview.len));
-            @memcpy(p.payload_preview[0..l], pl[0..l]);
-            p.payload_preview_len = l;
-        }
-        if (job.tags) |t| {
-            const l: u8 = @intCast(@min(t.len, p.tags.len));
-            @memcpy(p.tags[0..l], t[0..l]);
-            p.tags_len = l;
-        }
-        if (job.parent_id) |pid| {
-            const l: u8 = @intCast(@min(pid.len, p.parent_id.len));
-            @memcpy(p.parent_id[0..l], pid[0..l]);
-            p.parent_id_len = l;
-        }
-        if (job.chain_id) |cid| {
-            const l: u8 = @intCast(@min(cid.len, p.chain_id.len));
-            @memcpy(p.chain_id[0..l], cid[0..l]);
-            p.chain_id_len = l;
-        }
-        p.chain_step = job.chain_step;
-        self.side_effects[self.side_effect_count] = p;
-        self.side_effect_count += 1;
-    }
+    /// No-op — mirror removed. Side effects were only consumed by mirror_events.
+    pub fn recordSideEffect(_: *OpHandler, _: *const ops.EnqueueJob) void {}
 
     pub fn recordFailResult(self: *OpHandler, job_id: []const u8, error_msg: []const u8, backtrace: ?[]const u8, new_state: types.JobState, attempt: u16, retry_at_ns: u64, now_ns: u64) void {
         assert.check(self.fail_result_count < max_fail_results, "recordFailResult: overflow ({d})", .{self.fail_result_count});
