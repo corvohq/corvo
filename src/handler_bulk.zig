@@ -45,6 +45,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
         if (job_bytes == null) continue;
 
         var job = codec.decodeJob(job_bytes.?);
+        const old_state = job.state;
 
         switch (op.action) {
             .requeue => {
@@ -134,6 +135,10 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                         if (std.mem.eql(u8, decoded.job_id, job.id)) b.delete(ukey);
                     }
                 }
+                OpHandler.deleteReadIndexes(b, &job);
+                OpHandler.deleteTagIndexes(b, &job);
+                self.decrQueueCounter(b, job.queue, job.state);
+
                 b.delete(keys.jobKey(&jk_buf, job_id));
                 var jpk_buf: keys.KeyBuf = undefined;
                 b.delete(keys.jobPayloadKey(&jpk_buf, job_id));
@@ -321,6 +326,11 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 }
                 self.recordBulkResult(job_id, .update_state, "dead", "", op.now_ns);
             },
+        }
+
+        // Update read indexes if state changed
+        if (job.state != old_state) {
+            self.transitionReadIndexes(b, &job, old_state, job.state);
         }
 
         // Write updated job (for non-delete actions)

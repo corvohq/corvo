@@ -179,6 +179,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
                 b.set(keys.nsRateLimitKey(&ns_rlk_buf, queue.namespace, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected)) +% 0x40000000), "");
             }
 
+            self.transitionReadIndexes(b, &job, .pending, .active);
             self.verifyJobIndexes(b, &job, "fetch");
 
             // Store fetch result inline (no allocation).
@@ -346,6 +347,7 @@ fn fetchWithFairness(
             b.set(keys.nsRateLimitKey(&ns_rlk_buf, namespace, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected)) +% 0x40000000), "");
         }
 
+        self.transitionReadIndexes(b, &job, .pending, .active);
         self.verifyJobIndexes(b, &job, "fetch-fairness");
 
         var f = &result.fetched[result.affected];

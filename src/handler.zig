@@ -666,6 +666,150 @@ pub const OpHandler = struct {
     }
 
     // ========================================================================
+    // Read Index Maintenance
+    // ========================================================================
+
+    /// Write all read indexes for a newly created job.
+    pub fn writeReadIndexes(b: *kv.WriteBatch, job: *const types.Job) void {
+        var jt_buf: keys.KeyBuf = undefined;
+        var jq_buf: keys.KeyBuf = undefined;
+        var js_buf: keys.KeyBuf = undefined;
+        var jqs_buf: keys.KeyBuf = undefined;
+        const state_byte = @intFromEnum(job.state);
+
+        b.set(keys.jobTimeKey(&jt_buf, job.created_at_ns, job.id), "");
+        b.set(keys.jobQueueKey(&jq_buf, job.queue, job.created_at_ns, job.id), "");
+        b.set(keys.jobStateKey(&js_buf, state_byte, job.created_at_ns, job.id), "");
+        b.set(keys.jobQueueStateKey(&jqs_buf, job.queue, state_byte, job.created_at_ns, job.id), "");
+    }
+
+    /// Delete all read indexes for a purged job.
+    pub fn deleteReadIndexes(b: *kv.WriteBatch, job: *const types.Job) void {
+        var jt_buf: keys.KeyBuf = undefined;
+        var jq_buf: keys.KeyBuf = undefined;
+        var js_buf: keys.KeyBuf = undefined;
+        var jqs_buf: keys.KeyBuf = undefined;
+        const state_byte = @intFromEnum(job.state);
+
+        b.delete(keys.jobTimeKey(&jt_buf, job.created_at_ns, job.id));
+        b.delete(keys.jobQueueKey(&jq_buf, job.queue, job.created_at_ns, job.id));
+        b.delete(keys.jobStateKey(&js_buf, state_byte, job.created_at_ns, job.id));
+        b.delete(keys.jobQueueStateKey(&jqs_buf, job.queue, state_byte, job.created_at_ns, job.id));
+    }
+
+    /// Update read indexes when a job transitions state.
+    /// Deletes old state entries, writes new state entries, updates queue counters.
+    pub fn transitionReadIndexes(self: *OpHandler, b: *kv.WriteBatch, job: *const types.Job, old_state: types.JobState, new_state: types.JobState) void {
+        const old_byte = @intFromEnum(old_state);
+        const new_byte = @intFromEnum(new_state);
+
+        // Delete old state-dependent indexes
+        var old_js_buf: keys.KeyBuf = undefined;
+        var old_jqs_buf: keys.KeyBuf = undefined;
+        b.delete(keys.jobStateKey(&old_js_buf, old_byte, job.created_at_ns, job.id));
+        b.delete(keys.jobQueueStateKey(&old_jqs_buf, job.queue, old_byte, job.created_at_ns, job.id));
+
+        // Write new state-dependent indexes
+        var new_js_buf: keys.KeyBuf = undefined;
+        var new_jqs_buf: keys.KeyBuf = undefined;
+        b.set(keys.jobStateKey(&new_js_buf, new_byte, job.created_at_ns, job.id), "");
+        b.set(keys.jobQueueStateKey(&new_jqs_buf, job.queue, new_byte, job.created_at_ns, job.id), "");
+
+        // Update queue counters
+        self.updateQueueCounter(b, job.queue, old_state, new_state);
+    }
+
+    /// Write tag index entries for a job. Parses JSON object tags.
+    pub fn writeTagIndexes(b: *kv.WriteBatch, job: *const types.Job) void {
+        const tag_str = job.tags orelse return;
+        if (tag_str.len < 2) return;
+
+        // Parse simple JSON object: {"key":"value","key2":"value2"}
+        var pos: usize = 0;
+        while (pos < tag_str.len) {
+            // Find key
+            const k_start = std.mem.indexOfScalarPos(u8, tag_str, pos, '"') orelse break;
+            const k_end = std.mem.indexOfScalarPos(u8, tag_str, k_start + 1, '"') orelse break;
+            const tag_key = tag_str[k_start + 1 .. k_end];
+
+            // Find value — skip colon
+            const colon = std.mem.indexOfScalarPos(u8, tag_str, k_end + 1, ':') orelse break;
+            const v_start = std.mem.indexOfScalarPos(u8, tag_str, colon + 1, '"') orelse break;
+            const v_end = std.mem.indexOfScalarPos(u8, tag_str, v_start + 1, '"') orelse break;
+            const tag_value = tag_str[v_start + 1 .. v_end];
+
+            var ti_buf: keys.KeyBuf = undefined;
+            b.set(keys.tagIndexKey(&ti_buf, tag_key, tag_value, job.id), "");
+
+            pos = v_end + 1;
+        }
+    }
+
+    /// Delete tag index entries for a job (mirror of writeTagIndexes).
+    pub fn deleteTagIndexes(b: *kv.WriteBatch, job: *const types.Job) void {
+        const tag_str = job.tags orelse return;
+        if (tag_str.len < 2) return;
+
+        var pos: usize = 0;
+        while (pos < tag_str.len) {
+            const k_start = std.mem.indexOfScalarPos(u8, tag_str, pos, '"') orelse break;
+            const k_end = std.mem.indexOfScalarPos(u8, tag_str, k_start + 1, '"') orelse break;
+            const tag_key = tag_str[k_start + 1 .. k_end];
+
+            const colon = std.mem.indexOfScalarPos(u8, tag_str, k_end + 1, ':') orelse break;
+            const v_start = std.mem.indexOfScalarPos(u8, tag_str, colon + 1, '"') orelse break;
+            const v_end = std.mem.indexOfScalarPos(u8, tag_str, v_start + 1, '"') orelse break;
+            const tag_value = tag_str[v_start + 1 .. v_end];
+
+            var ti_buf: keys.KeyBuf = undefined;
+            b.delete(keys.tagIndexKey(&ti_buf, tag_key, tag_value, job.id));
+
+            pos = v_end + 1;
+        }
+    }
+
+    /// Increment counter for new_state, decrement for old_state on a queue.
+    fn updateQueueCounter(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, old_state: types.JobState, new_state: types.JobState) void {
+        var qc_buf: keys.KeyBuf = undefined;
+        var qc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
+        const qc_key = keys.queueConfigKey(&qc_buf, queue);
+        const qc_bytes = b.getInto(qc_key, &qc_val_buf) orelse return;
+        var q = codec.decodeQueue(qc_bytes);
+        q.decrState(old_state);
+        q.incrState(new_state);
+        // Re-encode with updated name pointer (decodeQueue returns slice into qc_val_buf)
+        var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
+        b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
+        _ = self.putQueueConfig(queue, q);
+    }
+
+    /// Increment a single state counter on a queue (for enqueue).
+    pub fn incrQueueCounter(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, state: types.JobState) void {
+        var qc_buf: keys.KeyBuf = undefined;
+        var qc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
+        const qc_key = keys.queueConfigKey(&qc_buf, queue);
+        const qc_bytes = b.getInto(qc_key, &qc_val_buf) orelse return;
+        var q = codec.decodeQueue(qc_bytes);
+        q.incrState(state);
+        var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
+        b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
+        _ = self.putQueueConfig(queue, q);
+    }
+
+    /// Decrement a single state counter on a queue (for purge).
+    pub fn decrQueueCounter(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, state: types.JobState) void {
+        var qc_buf: keys.KeyBuf = undefined;
+        var qc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
+        const qc_key = keys.queueConfigKey(&qc_buf, queue);
+        const qc_bytes = b.getInto(qc_key, &qc_val_buf) orelse return;
+        var q = codec.decodeQueue(qc_bytes);
+        q.decrState(state);
+        var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
+        b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
+        _ = self.putQueueConfig(queue, q);
+    }
+
+    // ========================================================================
     // Verification
     // ========================================================================
 
