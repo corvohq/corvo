@@ -54,7 +54,7 @@ pub const ConnState = struct {
     queue_count: u8 = 0,
     worker_id_buf: [128]u8 = undefined,
     worker_id_len: u8 = 0,
-    credits: u32 = 0,
+    prefetch: u32 = 0,
     lease_ms: u32 = 30_000,
     waiting: bool = false,
     last_req_id: u32 = 0,
@@ -72,7 +72,7 @@ pub const ConnState = struct {
         self.send_len = 0;
         self.queue_count = 0;
         self.worker_id_len = 0;
-        self.credits = 0;
+        self.prefetch = 0;
         self.waiting = false;
         self.last_req_id = 0;
     }

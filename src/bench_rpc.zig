@@ -19,6 +19,23 @@ const net = std.net;
 const corvo = @import("corvo");
 const rpc = corvo.rpc;
 
+/// Write a complete RPC frame (header + payload) to a blocking TCP stream.
+fn writeFrame(stream: net.Stream, msg_type: u8, req_id: u32, payload: []const u8) !void {
+    var buf: [rpc.FRAME_HEADER_SIZE]u8 = undefined;
+    buf[0] = msg_type;
+    std.mem.writeInt(u32, buf[1..5], req_id, .little);
+    std.mem.writeInt(u32, buf[5..9], @intCast(payload.len), .little);
+    if (payload.len > 0) {
+        var iov = [_]std.posix.iovec_const{
+            .{ .base = &buf, .len = rpc.FRAME_HEADER_SIZE },
+            .{ .base = payload.ptr, .len = payload.len },
+        };
+        stream.writevAll(&iov) catch return error.ConnectionClosed;
+    } else {
+        stream.writeAll(&buf) catch return error.ConnectionClosed;
+    }
+}
+
 // ============================================================================
 // Config
 // ============================================================================
@@ -102,7 +119,7 @@ const RpcClient = struct {
             w.writeU16(0);
         }
 
-        try rpc.writeFrame(self.stream, rpc.MSG_ENQUEUE_BATCH, self.req_id, w.written());
+        try writeFrame(self.stream, rpc.MSG_ENQUEUE_BATCH, self.req_id, w.written());
 
         // Read response.
         const header = try rpc.readHeader(self.stream);
@@ -139,7 +156,7 @@ const RpcClient = struct {
         w.writeU8(1); // queue_count
         w.writePrefixed(queue);
 
-        try rpc.writeFrame(self.stream, rpc.MSG_FETCH_BATCH, self.req_id, w.written());
+        try writeFrame(self.stream, rpc.MSG_FETCH_BATCH, self.req_id, w.written());
 
         const header = try rpc.readHeader(self.stream);
         if (header.msg_type == rpc.MSG_ERROR) {
@@ -192,7 +209,7 @@ const RpcClient = struct {
             w.writeU8(0); // flags: no optional fields
         }
 
-        try rpc.writeFrame(self.stream, rpc.MSG_ACK_BATCH, self.req_id, w.written());
+        try writeFrame(self.stream, rpc.MSG_ACK_BATCH, self.req_id, w.written());
 
         const header = try rpc.readHeader(self.stream);
         if (header.msg_type == rpc.MSG_ERROR) {

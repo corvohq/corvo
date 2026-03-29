@@ -1223,7 +1223,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             @memcpy(c.worker_id_buf[0..wlen], sub.worker_id[0..wlen]);
             c.worker_id_len = wlen;
 
-            c.credits = sub.credits;
+            c.prefetch = sub.prefetch;
             c.lease_ms = sub.lease_ms;
             c.last_req_id = frame.req_id;
             c.waiting = true;
@@ -1289,11 +1289,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
             if (self.notified_queue_count == 0) return;
             if (self.waiting_conn_count == 0) return;
 
-            // We may modify waiting_conns during iteration (removeWaitingConn uses swap-remove),
-            // so iterate by index and handle carefully.
-            var fulfilled: [max_waiting_conns]u16 = undefined;
-            var fulfilled_count: u32 = 0;
-
             var kv_batch = self.stores[0].newBatch();
             defer kv_batch.close();
             var did_fulfill = false;
@@ -1306,14 +1301,22 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
             defer if (record_mutations) kv_batch.freeMutations();
 
-            for (self.waiting_conns[0..self.waiting_conn_count]) |conn_id| {
+            // Partition: served connections move behind a shrinking boundary.
+            // After the loop, served connections are at [end..waiting_conn_count],
+            // un-served at [0..end]. Next tick, un-served get priority.
+            var i: u32 = 0;
+            var end: u32 = self.waiting_conn_count;
+
+            while (i < end) {
+                const conn_id = self.waiting_conns[i];
                 const c = self.io.conn(conn_id);
-                if (c.phase == .free or !c.waiting) continue;
+                if (c.phase == .free or !c.waiting or c.prefetch == 0 or
+                    !self.hasQueueOverlap(c))
+                {
+                    i += 1;
+                    continue;
+                }
 
-                // Check if any subscribed queue was notified this tick.
-                if (!self.hasQueueOverlap(c)) continue;
-
-                // Try to fetch jobs for this subscription.
                 var queue_slices: [16][]const u8 = undefined;
                 for (0..c.queue_count) |qi| {
                     queue_slices[qi] = c.queue_bufs[qi][0..c.queue_lens[qi]];
@@ -1323,18 +1326,20 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     .queues = queue_slices[0..c.queue_count],
                     .worker_id = c.worker_id_buf[0..c.worker_id_len],
                     .lease_duration_ms = c.lease_ms,
-                    .count = c.credits,
+                    .count = c.prefetch,
                     .now_ns = self.nowNs(),
                 } };
 
                 const result = self.handler.apply(&kv_batch, .fetch, &op_data);
 
-                if (result.affected == 0) continue; // jobs taken by someone else
+                if (result.affected == 0) {
+                    i += 1;
+                    continue;
+                }
 
                 did_fulfill = true;
                 self.emitMirrorOp(.fetch, &op_data, &result);
 
-                // Encode MSG_FETCH_BATCH_RESP into send_buf.
                 const write_start = c.send_len;
                 var writer = BufWriter{ .buf = c.send_buf[write_start..] };
                 writer.pos = rpc.FRAME_HEADER_SIZE;
@@ -1352,16 +1357,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 c.send_len += @intCast(writer.pos);
                 self.trackSendConn(conn_id);
 
-                // Clear subscription.
-                c.waiting = false;
-                c.queue_count = 0;
-                c.credits = 0;
+                c.prefetch -= result.affected;
                 self.subscriptions_fulfilled += 1;
 
-                // Mark for removal from waiting list.
-                assert.check(fulfilled_count < max_waiting_conns, "pipeline: fulfilled overflow", .{});
-                fulfilled[fulfilled_count] = conn_id;
-                fulfilled_count += 1;
+                // Swap served connection behind the boundary.
+                end -= 1;
+                self.waiting_conns[i] = self.waiting_conns[end];
+                self.waiting_conns[end] = conn_id;
+                // Don't increment i — check the swapped-in connection.
             }
 
             if (did_fulfill) {
@@ -1369,11 +1372,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 if (record_mutations and self.mut_list.items.len > 0) {
                     self.recordOplog();
                 }
-            }
-
-            // Remove fulfilled connections from waiting list.
-            for (fulfilled[0..fulfilled_count]) |conn_id| {
-                self.removeWaitingConn(conn_id);
             }
         }
 
@@ -1432,6 +1430,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         for (parsed.op.acks) |ack| {
                             self.notify.notify(ack.queue);
                             self.recordNotifiedQueue(ack.queue);
+                        }
+                        // Replenish prefetch — acked jobs free capacity for more pushes.
+                        const c = self.io.conn(frame.conn_id);
+                        if (c.waiting) {
+                            c.prefetch += result.affected;
                         }
                     } else {
                         var reader = BufReader{ .data = frame.payload };
@@ -1504,7 +1507,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
         fn requeueRecvs(self: *Self, recv_conns: []const u16) void {
             for (recv_conns) |conn_id| {
                 const c = self.io.conn(conn_id);
-                if (c.waiting) continue;
                 if (c.phase == .ready and c.recv_pos < c.recv_buf.len) {
                     self.io.queueRecv(conn_id);
                 }
@@ -1527,7 +1529,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
             for (slot.recv_conns[0..slot.recv_conn_count]) |conn_id| {
                 const c = self.io.conn(conn_id);
-                if (c.waiting) continue;
                 if (c.phase == .ready and c.recv_pos < c.recv_buf.len) {
                     self.io.queueRecv(conn_id);
                 }
@@ -2015,7 +2016,7 @@ test "fetch with no jobs stores subscription (no response)" {
     try testing.expect(c.waiting);
     try testing.expectEqual(@as(u8, 1), c.queue_count);
     try testing.expectEqualStrings("empty-queue", c.queue_bufs[0][0..c.queue_lens[0]]);
-    try testing.expectEqual(@as(u32, 1), c.credits);
+    try testing.expectEqual(@as(u32, 1), c.prefetch);
     try testing.expectEqual(@as(u32, 10), c.last_req_id);
 
     // Pipeline should track the waiting connection.
@@ -2088,10 +2089,107 @@ test "enqueue fulfills waiting fetch subscription" {
     const job_id = try r.readPrefixed();
     try testing.expectEqualStrings("pushed-job-1", job_id);
 
-    // Subscription should be cleared.
-    try testing.expect(!fetch_c.waiting);
-    try testing.expectEqual(@as(u32, 0), ctx.pipeline.waiting_conn_count);
+    // Subscription stays active (permanent), but prefetch exhausted.
+    try testing.expect(fetch_c.waiting);
+    try testing.expectEqual(@as(u32, 0), fetch_c.prefetch);
+    try testing.expectEqual(@as(u32, 1), ctx.pipeline.waiting_conn_count);
     try testing.expectEqual(@as(u64, 1), ctx.pipeline.subscriptions_fulfilled);
+}
+
+test "ack replenishes prefetch and triggers second push" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-ack-replenish");
+    defer ctx.destroy();
+
+    const fetch_conn = ctx.backend.connect().?;
+    const enq_conn = ctx.backend.connect().?;
+
+    // 1. Subscribe with prefetch=1.
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1); // prefetch
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("replenish-queue");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 5, fw.written());
+    ctx.pipeline.tick();
+
+    // Drain send_done.
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // 2. Enqueue job-1 → should push to subscriber.
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("replenish-queue");
+    ew.writePrefixed("job-1");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0);
+
+    ctx.injectFrame(enq_conn, rpc.MSG_ENQUEUE_BATCH, 6, ew.written());
+    ctx.pipeline.tick();
+
+    // Verify: pushed job-1, prefetch=0.
+    const fetch_c = ctx.backend.conn(fetch_conn);
+    try testing.expect(fetch_c.send_len > 0);
+    try testing.expectEqual(@as(u32, 0), fetch_c.prefetch);
+    try testing.expect(fetch_c.waiting);
+
+    // Drain sends.
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // 3. Ack job-1 → should replenish prefetch to 1.
+    var ack_buf: [256]u8 = undefined;
+    var aw = BufWriter{ .buf = &ack_buf };
+    aw.writeU16(1); // count
+    aw.writePrefixed("job-1"); // job_id
+    aw.writePrefixed("replenish-queue"); // queue
+    aw.writeU8(0); // ack_status (done)
+    aw.writeU8(0); // flags
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_ACK_BATCH, 7, aw.written());
+    ctx.pipeline.tick();
+
+    // Verify: prefetch replenished.
+    try testing.expectEqual(@as(u32, 1), fetch_c.prefetch);
+
+    // Drain sends.
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // 4. Enqueue job-2 → should push again (prefetch=1).
+    ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("replenish-queue");
+    ew.writePrefixed("job-2");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0);
+
+    ctx.injectFrame(enq_conn, rpc.MSG_ENQUEUE_BATCH, 8, ew.written());
+    ctx.pipeline.tick();
+
+    // Should have pushed job-2.
+    try testing.expectEqual(@as(u64, 2), ctx.pipeline.subscriptions_fulfilled);
+    try testing.expectEqual(@as(u32, 0), fetch_c.prefetch);
 }
 
 test "fetch subscription not fulfilled for unrelated queue" {
@@ -2266,8 +2364,9 @@ test "maintenance promote wakes fetch subscription" {
 
     // Promote should have fired and found the scheduled job.
     try testing.expect(ctx.pipeline.maintenance_runs >= 1);
-    // Job should now be pending — fetch subscription fulfilled.
-    try testing.expect(!ctx.backend.conn(fetch_conn).waiting);
+    // Job should now be pending — fetch subscription fulfilled, but subscription stays active.
+    try testing.expect(ctx.backend.conn(fetch_conn).waiting);
+    try testing.expectEqual(@as(u32, 0), ctx.backend.conn(fetch_conn).prefetch);
     try testing.expectEqual(@as(u64, 1), ctx.pipeline.subscriptions_fulfilled);
 }
 

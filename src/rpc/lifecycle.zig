@@ -196,14 +196,14 @@ pub const FetchSubscription = struct {
     queues: [16][]const u8 = undefined,
     queue_count: u8 = 0,
     worker_id: []const u8 = "",
-    credits: u32 = 0,
+    prefetch: u32 = 0,
     lease_ms: u32 = 0,
 };
 
 pub fn parseFetchSubscribe(reader: *BufReader) ParseError!FetchSubscription {
     var sub = FetchSubscription{};
 
-    sub.credits = try reader.readU16();
+    sub.prefetch = try reader.readU16();
     sub.lease_ms = try reader.readU32();
     sub.worker_id = try reader.readPrefixed();
 
@@ -368,7 +368,7 @@ test "parseFetchSubscribe roundtrip" {
     var r = BufReader{ .data = w.written() };
     const result = try parseFetchSubscribe(&r);
 
-    try std.testing.expectEqual(@as(u32, 10), result.credits);
+    try std.testing.expectEqual(@as(u32, 10), result.prefetch);
     try std.testing.expectEqual(@as(u32, 30000), result.lease_ms);
     try std.testing.expectEqualStrings("worker-1", result.worker_id);
     try std.testing.expectEqual(@as(u8, 2), result.queue_count);

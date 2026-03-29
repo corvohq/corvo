@@ -71,6 +71,23 @@ const FetchedId = struct {
 
 const CLIENT_BUF_SIZE = 65536;
 
+/// Write a complete RPC frame (header + payload) to a blocking TCP stream.
+fn writeFrame(stream: net.Stream, msg_type: u8, req_id: u32, payload: []const u8) !void {
+    var buf: [rpc.FRAME_HEADER_SIZE]u8 = undefined;
+    buf[0] = msg_type;
+    std.mem.writeInt(u32, buf[1..5], req_id, .little);
+    std.mem.writeInt(u32, buf[5..9], @intCast(payload.len), .little);
+    if (payload.len > 0) {
+        var iov = [_]std.posix.iovec_const{
+            .{ .base = &buf, .len = rpc.FRAME_HEADER_SIZE },
+            .{ .base = payload.ptr, .len = payload.len },
+        };
+        stream.writevAll(&iov) catch return error.ConnectionClosed;
+    } else {
+        stream.writeAll(&buf) catch return error.ConnectionClosed;
+    }
+}
+
 const RpcClient = struct {
     stream: net.Stream,
     req_id: u32 = 0,
@@ -109,7 +126,7 @@ const RpcClient = struct {
             w.writeU16(0); // chain_step
             w.writeU16(0); // flags
         }
-        try rpc.writeFrame(self.stream, rpc.MSG_ENQUEUE_BATCH, self.req_id, w.written());
+        try writeFrame(self.stream, rpc.MSG_ENQUEUE_BATCH, self.req_id, w.written());
         const header = try rpc.readHeader(self.stream);
         if (header.msg_type == rpc.MSG_ERROR) {
             if (header.payload_len > 0) try rpc.readExact(self.stream, self.recv_buf[0..header.payload_len]);
@@ -128,7 +145,7 @@ const RpcClient = struct {
         w.writePrefixed("bench-worker");
         w.writeU8(1);
         w.writePrefixed(queue_name);
-        try rpc.writeFrame(self.stream, rpc.MSG_FETCH_BATCH, self.req_id, w.written());
+        try writeFrame(self.stream, rpc.MSG_FETCH_BATCH, self.req_id, w.written());
         const header = try rpc.readHeader(self.stream);
         if (header.msg_type == rpc.MSG_ERROR) {
             if (header.payload_len > 0) try rpc.readExact(self.stream, self.recv_buf[0..header.payload_len]);
@@ -167,7 +184,7 @@ const RpcClient = struct {
             w.writeU8(0);
             w.writeU8(0);
         }
-        try rpc.writeFrame(self.stream, rpc.MSG_ACK_BATCH, self.req_id, w.written());
+        try writeFrame(self.stream, rpc.MSG_ACK_BATCH, self.req_id, w.written());
         const header = try rpc.readHeader(self.stream);
         if (header.msg_type == rpc.MSG_ERROR) {
             if (header.payload_len > 0) try rpc.readExact(self.stream, self.recv_buf[0..header.payload_len]);
@@ -383,7 +400,6 @@ fn rpcLifecycleWorker(config: BenchConfig, _: u32) WorkerResult {
     var client = RpcClient.connect(config.host, config.port) catch return .{ .errors = 1 };
     defer client.close();
 
-    // Recv timeout for readPushedJobs — allows checking g_lifecycle_done.
     const timeval = std.posix.timeval{ .sec = 1, .usec = 0 };
     std.posix.setsockopt(client.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
 
@@ -393,72 +409,72 @@ fn rpcLifecycleWorker(config: BenchConfig, _: u32) WorkerResult {
     var fetched_buf: [512]FetchedId = undefined;
     var empty_streak: u32 = 0;
 
+    // Subscribe once — server pushes up to prefetch jobs, replenishes on ack.
+    const prefetch: u16 = @intCast(@min(config.batch_size, 512));
+    rpcSendSubscribe(&client, config.queue, prefetch) catch return .{ .errors = 1 };
+
+    // Message loop: server can push FETCH_BATCH_RESP at any time (persistent
+    // subscription), interleaved with ACK_BATCH_RESP. Read whatever arrives,
+    // dispatch by type.
     while (g_lifecycle_done.load(.monotonic) < g_lifecycle_target) {
-        const batch: u16 = @intCast(@min(config.batch_size, 512));
-
-        // Step 1: Subscribe — send fetch frame (fire-and-forget, no read).
-        rpcSendSubscribe(&client, config.queue, batch) catch {
-            total_errors += 1;
-            // Reconnect.
-            client.close();
-            client = RpcClient.connect(config.host, config.port) catch return .{
-                .ops = total_ops, .errors = total_errors + 1,
-            };
-            std.posix.setsockopt(client.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
-            continue;
-        };
-
-        // Step 2: Read pushed jobs (blocks up to 1s timeout).
-        const fetched = rpcReadPushedJobs(&client, &fetched_buf) catch {
-            // Timeout or error — check if done.
+        const header = rpc.readHeader(client.stream) catch {
             if (g_lifecycle_done.load(.monotonic) >= g_lifecycle_target) break;
             empty_streak += 1;
             if (empty_streak > 5) break;
-            // Don't reconnect — re-subscribe on same connection.
             continue;
         };
 
-        if (fetched == 0) {
-            empty_streak += 1;
-            if (empty_streak > 5) break;
-            continue;
+        if (header.payload_len > 0) {
+            rpc.readExact(client.stream, client.recv_buf[0..header.payload_len]) catch break;
         }
-        empty_streak = 0;
 
-        // Step 3: Ack.
-        const acked = client.ackBatch(fetched_buf[0..fetched]) catch {
-            total_errors += 1;
-            break;
-        };
-        total_ops += acked;
-        _ = g_lifecycle_done.fetchAdd(@intCast(acked), .monotonic);
+        switch (header.msg_type) {
+            rpc.MSG_FETCH_BATCH_RESP => {
+                const fetched = parseFetchPayload(client.recv_buf[0..header.payload_len], &fetched_buf);
+                if (fetched == 0) {
+                    empty_streak += 1;
+                    if (empty_streak > 5) break;
+                    continue;
+                }
+                empty_streak = 0;
+
+                // Send ack (fire-and-forget — response handled by this loop).
+                rpcSendAck(&client, fetched_buf[0..fetched]) catch {
+                    total_errors += 1;
+                    break;
+                };
+                total_ops += fetched;
+                _ = g_lifecycle_done.fetchAdd(@intCast(fetched), .monotonic);
+            },
+            rpc.MSG_ACK_BATCH_RESP => {},
+            rpc.MSG_ERROR => {
+                total_errors += 1;
+            },
+            else => {},
+        }
     }
 
     return .{ .ops = total_ops, .errors = total_errors, .elapsed_ns = timer.read() };
 }
 
-/// Send fetch subscribe frame — fire-and-forget, no response read.
-fn rpcSendSubscribe(client: *RpcClient, queue_name: []const u8, count: u16) !void {
+/// Send ack batch — fire-and-forget, response handled by message loop.
+fn rpcSendAck(client: *RpcClient, acks: []const FetchedId) !void {
     client.req_id +%= 1;
     var w = rpc.BufWriter{ .buf = &client.send_buf };
-    w.writeU16(count);
-    w.writeU32(30_000);
-    w.writePrefixed("bench-worker");
-    w.writeU8(1);
-    w.writePrefixed(queue_name);
-    try rpc.writeFrame(client.stream, rpc.MSG_FETCH_BATCH, client.req_id, w.written());
+    w.writeU16(@intCast(acks.len));
+    for (acks) |a| {
+        w.writePrefixed(a.id_buf[0..a.id_len]);
+        w.writePrefixed(a.queue_buf[0..a.queue_len]);
+        w.writeU8(0);
+        w.writeU8(0);
+    }
+    try writeFrame(client.stream, rpc.MSG_ACK_BATCH, client.req_id, w.written());
 }
 
-/// Read a pushed MSG_FETCH_BATCH_RESP from the server.
-fn rpcReadPushedJobs(client: *RpcClient, fetched_ids: []FetchedId) !u16 {
-    const header = try rpc.readHeader(client.stream);
-    if (header.msg_type == rpc.MSG_ERROR) {
-        if (header.payload_len > 0) try rpc.readExact(client.stream, client.recv_buf[0..header.payload_len]);
-        return 0;
-    }
-    if (header.payload_len > 0) try rpc.readExact(client.stream, client.recv_buf[0..header.payload_len]);
-    var r = rpc.BufReader{ .data = client.recv_buf[0..header.payload_len] };
-    const fetched_count = r.readU16() catch 0;
+/// Parse FETCH_BATCH_RESP payload into fetched IDs.
+fn parseFetchPayload(payload: []const u8, fetched_ids: []FetchedId) u16 {
+    var r = rpc.BufReader{ .data = payload };
+    const fetched_count = r.readU16() catch return 0;
     const n = @min(fetched_count, @as(u16, @intCast(fetched_ids.len)));
     for (0..n) |i| {
         const fid = r.readPrefixed() catch break;
@@ -478,6 +494,19 @@ fn rpcReadPushedJobs(client: *RpcClient, fetched_ids: []FetchedId) !u16 {
     }
     return n;
 }
+
+/// Send fetch subscribe frame — fire-and-forget, no response read.
+fn rpcSendSubscribe(client: *RpcClient, queue_name: []const u8, prefetch: u16) !void {
+    client.req_id +%= 1;
+    var w = rpc.BufWriter{ .buf = &client.send_buf };
+    w.writeU16(prefetch);
+    w.writeU32(30_000);
+    w.writePrefixed("bench-worker");
+    w.writeU8(1);
+    w.writePrefixed(queue_name);
+    try writeFrame(client.stream, rpc.MSG_FETCH_BATCH, client.req_id, w.written());
+}
+
 
 fn httpLifecycleWorker(config: BenchConfig, jobs_per_worker: u32) WorkerResult {
     var client = HttpClient.connect(config.host, config.port) catch return .{ .errors = 1 };

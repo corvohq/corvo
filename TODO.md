@@ -17,8 +17,8 @@
 
 ## Persistent Fetch Subscriptions (credits)
 
-- [ ] **Server**: Keep subscription alive after fulfillment — decrement credits by jobs pushed instead of clearing. If credits remain, keep connection in waiting list. Only remove when credits reach 0.
-  - Change in `pipeline.zig` `fulfillSubscriptions()` lines 1355-1364: replace `c.waiting = false; c.credits = 0;` with `c.credits -= result.affected; if (c.credits == 0) { clear + remove }`.
+- [x] **Server**: Keep subscription alive after fulfillment — decrement credits by jobs pushed instead of clearing. If credits remain, keep connection in waiting list. Only remove when credits reach 0.
+  - Change in `pipeline.zig` `fulfillSubscriptions()`: `c.credits -= result.affected; if (c.credits == 0) { clear + remove }`.
   - Eliminates subscribe-per-batch round-trip. One subscribe per connection lifetime.
   - Client sends credits via fetch frame, server pushes until credits exhausted.
   - Client acks don't need to replenish credits — client re-subscribes with new credits when ready for more.
@@ -28,7 +28,7 @@
 - [ ] **TypeScript SDK** (`~/dev/corvohq/typescript-sdk`): Same.
 - [ ] **Rust SDK** (`~/dev/corvohq/rust-sdk`): Same.
 - [ ] **Haskell SDK** (`~/dev/corvohq/haskell-sdk`): Same.
-- [ ] **Bench tool**: Update `rpcLifecycleWorker` to subscribe once with high credits, remove re-subscribe loop.
+- [x] **Bench tool**: Update `rpcLifecycleWorker` to subscribe once with high credits, remove re-subscribe loop.
 
 ## bench (saturation benchmark)
 
@@ -53,6 +53,7 @@
 ## TigerStyle Audit (last)
 
 - [ ] Full audit — memory allocation audit done (step 13), but need to check: infinite loops (all while loops bounded?), exhaustive switches, assertion coverage, resource limit enforcement, no unbounded retries
+- [ ] Dead code cleanup — `rpc.zig` exports, unused helpers, stale function signatures across codebase
 
 ## Cancellable Jobs
 

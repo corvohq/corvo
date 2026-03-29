@@ -354,22 +354,6 @@ pub fn writeHeader(stream: net.Stream, header: FrameHeader) !void {
     try stream.writeAll(&buf);
 }
 
-pub fn writeFrame(stream: net.Stream, msg_type: u8, req_id: u32, payload: []const u8) !void {
-    var buf: [FRAME_HEADER_SIZE]u8 = undefined;
-    buf[0] = msg_type;
-    std.mem.writeInt(u32, buf[1..5], req_id, .little);
-    std.mem.writeInt(u32, buf[5..9], @intCast(payload.len), .little);
-    if (payload.len > 0) {
-        const iov = [_]std.posix.iovec_const{
-            .{ .base = &buf, .len = FRAME_HEADER_SIZE },
-            .{ .base = payload.ptr, .len = payload.len },
-        };
-        _ = stream.writev(&iov) catch return error.ConnectionClosed;
-    } else {
-        try stream.writeAll(&buf);
-    }
-}
-
 // ============================================================================
 // Tests
 // ============================================================================

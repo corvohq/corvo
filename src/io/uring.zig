@@ -427,7 +427,7 @@ test "ConnState reset clears subscription fields" {
         .send_len = 200,
         .queue_count = 4,
         .worker_id_len = 10,
-        .credits = 99,
+        .prefetch = 99,
         .waiting = true,
         .last_req_id = 42,
     };
@@ -440,7 +440,7 @@ test "ConnState reset clears subscription fields" {
     try testing.expectEqual(@as(u32, 0), c.send_len);
     try testing.expectEqual(@as(u8, 0), c.queue_count);
     try testing.expectEqual(@as(u8, 0), c.worker_id_len);
-    try testing.expectEqual(@as(u32, 0), c.credits);
+    try testing.expectEqual(@as(u32, 0), c.prefetch);
     try testing.expectEqual(false, c.waiting);
     try testing.expectEqual(@as(u32, 0), c.last_req_id);
     try testing.expectEqual(@as(usize, 128), c.recv_buf.len);
