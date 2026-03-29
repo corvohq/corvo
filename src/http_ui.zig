@@ -19,9 +19,8 @@ const layout_overhead = 8400;
 const page_buf_size = send_buf_size - layout_overhead;
 const render_buf_size = send_buf_size - 200;
 
-/// Max table rows per page. Each row with SVG icons is ~1.5KB.
-/// 20 rows × 1.5KB = 30KB, leaving room for headers/filters/pagination.
-const max_table_rows = 20;
+/// Max table rows per page.
+const max_table_rows = 25;
 
 comptime {
     std.debug.assert(page_buf_size + layout_overhead <= send_buf_size);
@@ -530,12 +529,6 @@ const JobView = struct {
     max_retries: i32,
     created_at: []const u8,
     has_cb: bool,
-    has_retry: bool,
-    has_delete: bool,
-    has_cancel: bool,
-    has_approve: bool,
-    has_reject: bool,
-    has_run: bool,
 };
 
 const PageLink = struct {
@@ -621,12 +614,6 @@ fn getJobViews(
             .max_retries = j.max_retries,
             .created_at = j.createdAtSlice(),
             .has_cb = has_cb,
-            .has_retry = actions == .dead,
-            .has_delete = actions == .dead or actions == .scheduled or actions == .queue_detail,
-            .has_cancel = actions == .queue_detail,
-            .has_approve = actions == .held,
-            .has_reject = actions == .held,
-            .has_run = actions == .scheduled,
         };
     }
     return views[0..jobs.len];
