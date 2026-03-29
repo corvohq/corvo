@@ -11,8 +11,8 @@ const sqlite_read = @import("sqlite_read.zig");
 const ui_embed = @import("ui_embed");
 
 /// Max HTML body size. Pages render into a buffer of this size.
-/// Mustache templates with dark mode classes need more space than HtmlWriter.
-const page_buf_size = 49152;
+/// Mustache templates with dark mode classes + inline SVG icons need headroom.
+const page_buf_size = 57344;
 
 /// Layout-expanded page buffer. Must fit layout template + page content + HTTP headers
 /// within send_buf (~66KB). Layout is ~4KB, headers ~200B.
