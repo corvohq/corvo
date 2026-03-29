@@ -42,6 +42,13 @@ pub const prefix_global_rate_limit = "gl|"; // gl|{fetched_ns:8BE}{random:8BE}
 pub const key_global_config = "g|rl"; // singleton: [rate:u32LE][window_ms:u32LE]
 pub const prefix_ns_rate_limit = "nl|"; // nl|{namespace}\x00{fetched_ns:8BE}{random:8BE}
 
+// Read indexes (for HTTP/UI reads — written by handlers on state transitions)
+pub const prefix_job_time = "jt|"; // jt|{inv_created_ns:8BE}{job_id}
+pub const prefix_job_queue = "jq|"; // jq|{queue}\x00{inv_created_ns:8BE}{job_id}
+pub const prefix_job_state = "js|"; // js|{state:1}{inv_created_ns:8BE}{job_id}
+pub const prefix_job_queue_state = "jqs|"; // jqs|{queue}\x00{state:1}{inv_created_ns:8BE}{job_id}
+pub const prefix_tag_index = "ti|"; // ti|{tag_key}\x00{tag_value}\x00{job_id}
+
 // Enterprise prefixes
 pub const prefix_ent_ns = "ent_ns|";
 pub const prefix_ent_role = "ent_role|";
@@ -467,6 +474,153 @@ pub fn deadKey(buf: *KeyBuf, terminal_at_ns: u64, job_id: []const u8) []const u8
     return buf[0..pos];
 }
 
+// ============================================================================
+// Read Index Key Builders
+// ============================================================================
+
+/// Invert timestamp so forward iteration = newest first.
+pub fn invertTimestamp(ns: u64) u64 {
+    return std.math.maxInt(u64) - ns;
+}
+
+/// Recover original timestamp from inverted value.
+pub fn recoverTimestamp(inv: u64) u64 {
+    return std.math.maxInt(u64) - inv;
+}
+
+/// jt|{inv_created_ns:8BE}{job_id}
+pub fn jobTimeKey(buf: *KeyBuf, created_ns: u64, job_id: []const u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_job_time);
+    pos = putU64BE(buf, pos, invertTimestamp(created_ns));
+    pos = copyStr(buf, pos, job_id);
+    return buf[0..pos];
+}
+
+/// jq|{queue}\x00{inv_created_ns:8BE}{job_id}
+pub fn jobQueueKey(buf: *KeyBuf, queue: []const u8, created_ns: u64, job_id: []const u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_job_queue);
+    pos = copyStr(buf, pos, queue);
+    pos = putU8(buf, pos, sep);
+    pos = putU64BE(buf, pos, invertTimestamp(created_ns));
+    pos = copyStr(buf, pos, job_id);
+    return buf[0..pos];
+}
+
+/// jq|{queue}\x00
+pub fn jobQueuePrefix(buf: *KeyBuf, queue: []const u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_job_queue);
+    pos = copyStr(buf, pos, queue);
+    pos = putU8(buf, pos, sep);
+    return buf[0..pos];
+}
+
+/// js|{state:1}{inv_created_ns:8BE}{job_id}
+pub fn jobStateKey(buf: *KeyBuf, state: u8, created_ns: u64, job_id: []const u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_job_state);
+    pos = putU8(buf, pos, state);
+    pos = putU64BE(buf, pos, invertTimestamp(created_ns));
+    pos = copyStr(buf, pos, job_id);
+    return buf[0..pos];
+}
+
+/// js|{state:1}
+pub fn jobStatePrefix(buf: *KeyBuf, state: u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_job_state);
+    pos = putU8(buf, pos, state);
+    return buf[0..pos];
+}
+
+/// jqs|{queue}\x00{state:1}{inv_created_ns:8BE}{job_id}
+pub fn jobQueueStateKey(buf: *KeyBuf, queue: []const u8, state: u8, created_ns: u64, job_id: []const u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_job_queue_state);
+    pos = copyStr(buf, pos, queue);
+    pos = putU8(buf, pos, sep);
+    pos = putU8(buf, pos, state);
+    pos = putU64BE(buf, pos, invertTimestamp(created_ns));
+    pos = copyStr(buf, pos, job_id);
+    return buf[0..pos];
+}
+
+/// jqs|{queue}\x00{state:1}
+pub fn jobQueueStatePrefix(buf: *KeyBuf, queue: []const u8, state: u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_job_queue_state);
+    pos = copyStr(buf, pos, queue);
+    pos = putU8(buf, pos, sep);
+    pos = putU8(buf, pos, state);
+    return buf[0..pos];
+}
+
+/// jqs|{queue}\x00
+pub fn jobQueueStateQueuePrefix(buf: *KeyBuf, queue: []const u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_job_queue_state);
+    pos = copyStr(buf, pos, queue);
+    pos = putU8(buf, pos, sep);
+    return buf[0..pos];
+}
+
+/// ti|{tag_key}\x00{tag_value}\x00{job_id}
+pub fn tagIndexKey(buf: *KeyBuf, tag_key: []const u8, tag_value: []const u8, job_id: []const u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_tag_index);
+    pos = copyStr(buf, pos, tag_key);
+    pos = putU8(buf, pos, sep);
+    pos = copyStr(buf, pos, tag_value);
+    pos = putU8(buf, pos, sep);
+    pos = copyStr(buf, pos, job_id);
+    return buf[0..pos];
+}
+
+/// ti|{tag_key}\x00{tag_value}\x00
+pub fn tagIndexPrefix(buf: *KeyBuf, tag_key: []const u8, tag_value: []const u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_tag_index);
+    pos = copyStr(buf, pos, tag_key);
+    pos = putU8(buf, pos, sep);
+    pos = copyStr(buf, pos, tag_value);
+    pos = putU8(buf, pos, sep);
+    return buf[0..pos];
+}
+
+/// ti|{tag_key}\x00
+pub fn tagIndexKeyPrefix(buf: *KeyBuf, tag_key: []const u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_tag_index);
+    pos = copyStr(buf, pos, tag_key);
+    pos = putU8(buf, pos, sep);
+    return buf[0..pos];
+}
+
+/// Extract job ID from a jt| key: jt|{inv_ts:8BE}{job_id}
+pub fn jobIdFromTimeKey(k: []const u8) []const u8 {
+    return k[prefix_job_time.len + 8 ..];
+}
+
+/// Extract job ID from a jq| key: jq|{queue}\x00{inv_ts:8BE}{job_id}
+pub fn jobIdFromQueueKey(k: []const u8) ?[]const u8 {
+    const start = prefix_job_queue.len;
+    const sep_pos = std.mem.indexOfScalarPos(u8, k, start, sep) orelse return null;
+    return k[sep_pos + 1 + 8 ..]; // skip sep + 8-byte inv_ts
+}
+
+/// Extract job ID from a js| key: js|{state:1}{inv_ts:8BE}{job_id}
+pub fn jobIdFromStateKey(k: []const u8) []const u8 {
+    return k[prefix_job_state.len + 1 + 8 ..];
+}
+
+/// Extract job ID from a jqs| key: jqs|{queue}\x00{state:1}{inv_ts:8BE}{job_id}
+pub fn jobIdFromQueueStateKey(k: []const u8) ?[]const u8 {
+    const start = prefix_job_queue_state.len;
+    const sep_pos = std.mem.indexOfScalarPos(u8, k, start, sep) orelse return null;
+    return k[sep_pos + 1 + 1 + 8 ..]; // skip sep + state + 8-byte inv_ts
+}
+
+/// Extract job ID from a ti| key: ti|{tag_key}\x00{tag_value}\x00{job_id}
+pub fn jobIdFromTagKey(k: []const u8) ?[]const u8 {
+    const start = prefix_tag_index.len;
+    // Find first sep (after tag_key)
+    const sep1 = std.mem.indexOfScalarPos(u8, k, start, sep) orelse return null;
+    // Find second sep (after tag_value)
+    const sep2 = std.mem.indexOfScalarPos(u8, k, sep1 + 1, sep) orelse return null;
+    return k[sep2 + 1 ..];
+}
+
 /// Compute the key just past all keys with the given prefix.
 /// Returns the end bound for range scans.
 pub fn prefixEnd(buf: *KeyBuf, prefix: []const u8) ?[]const u8 {
@@ -602,4 +756,64 @@ test "rateLimitKey" {
     try std.testing.expect(std.mem.startsWith(u8, k, prefix_rate_limit));
     // prefix + queue + sep + 8 + 8 = 2 + 1 + 1 + 8 + 8 = 20
     try std.testing.expectEqual(prefix_rate_limit.len + 1 + 1 + 8 + 8, k.len);
+}
+
+test "invertTimestamp roundtrip" {
+    const ts: u64 = 1711670400_000_000_000;
+    const inv = invertTimestamp(ts);
+    try std.testing.expectEqual(ts, recoverTimestamp(inv));
+}
+
+test "invertTimestamp newer sorts first" {
+    var buf1: KeyBuf = undefined;
+    var buf2: KeyBuf = undefined;
+    const older: u64 = 1000;
+    const newer: u64 = 2000;
+    const k1 = jobTimeKey(&buf1, newer, "j1");
+    const k2 = jobTimeKey(&buf2, older, "j2");
+    // Newer timestamp should sort first (smaller inverted value)
+    try std.testing.expect(std.mem.order(u8, k1, k2) == .lt);
+}
+
+test "jobTimeKey extract job ID" {
+    var buf: KeyBuf = undefined;
+    const k = jobTimeKey(&buf, 5000, "my-job");
+    const id = jobIdFromTimeKey(k);
+    try std.testing.expectEqualStrings("my-job", id);
+}
+
+test "jobQueueKey and prefix" {
+    var buf: KeyBuf = undefined;
+    const k = jobQueueKey(&buf, "default", 5000, "j1");
+    try std.testing.expect(std.mem.startsWith(u8, k, prefix_job_queue));
+    const id = jobIdFromQueueKey(k).?;
+    try std.testing.expectEqualStrings("j1", id);
+}
+
+test "jobStateKey and prefix" {
+    var buf1: KeyBuf = undefined;
+    var buf2: KeyBuf = undefined;
+    const k = jobStateKey(&buf1, 0, 5000, "j1");
+    try std.testing.expect(std.mem.startsWith(u8, k, prefix_job_state));
+    const id = jobIdFromStateKey(k);
+    try std.testing.expectEqualStrings("j1", id);
+    // Different states sort into different ranges
+    const k_s0 = jobStateKey(&buf1, 0, 5000, "j1");
+    const k_s1 = jobStateKey(&buf2, 1, 5000, "j1");
+    try std.testing.expect(std.mem.order(u8, k_s0, k_s1) == .lt);
+}
+
+test "jobQueueStateKey extract job ID" {
+    var buf: KeyBuf = undefined;
+    const k = jobQueueStateKey(&buf, "payments", 2, 5000, "job-42");
+    const id = jobIdFromQueueStateKey(k).?;
+    try std.testing.expectEqualStrings("job-42", id);
+}
+
+test "tagIndexKey extract job ID" {
+    var buf: KeyBuf = undefined;
+    const k = tagIndexKey(&buf, "customer_id", "acme", "job-99");
+    try std.testing.expect(std.mem.startsWith(u8, k, prefix_tag_index));
+    const id = jobIdFromTagKey(k).?;
+    try std.testing.expectEqualStrings("job-99", id);
 }
