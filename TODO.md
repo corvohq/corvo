@@ -19,12 +19,12 @@
 
 - [x] **Server**: Permanent subscriptions with prefetch flow control. Worker subscribes once with prefetch=N, server pushes up to N jobs, acks replenish prefetch. Partition round-robin for fair distribution. 37k lifecycle/sec 4+4, 73k 1+1.
 - [x] **Bench tool**: Message loop handles interleaved FETCH_RESP/ACK_RESP, subscribe once with prefetch=batch_size.
-- [ ] **Zig SDK** (`~/dev/corvohq/zig-sdk`): Subscribe once with prefetch, message loop for push/ack interleaving.
-- [ ] **Go SDK** (`~/dev/corvohq/go-sdk`): Same.
-- [ ] **Python SDK** (`~/dev/corvohq/python-sdk`): Same.
-- [ ] **TypeScript SDK** (`~/dev/corvohq/typescript-sdk`): Same.
-- [ ] **Rust SDK** (`~/dev/corvohq/rust-sdk`): Same.
-- [ ] **Haskell SDK** (`~/dev/corvohq/haskell-sdk`): Same.
+- [x] **Zig SDK** (`~/dev/corvohq/zig-sdk`): `readFrame()` message loop dispatches FETCH_RESP/ACK_RESP/FAIL_RESP/CANCEL_SIGNAL. `sendAck()`/`sendFail()` fire-and-forget. `cancel()` via bulk action.
+- [x] **Go SDK** (`~/dev/corvohq/go-sdk`): `ReadFrame()` dispatches FETCH_RESP/ACK_RESP/FAIL_RESP/CANCEL_SIGNAL. `SendAck()`/`SendFail()` fire-and-forget. `Cancel()` via bulk action.
+- [x] **Python SDK** (`~/dev/corvohq/python-sdk`): `read_frame()` returns typed dicts. `send_ack()`/`send_fail()` fire-and-forget. `cancel()` via bulk action.
+- [x] **TypeScript SDK** (`~/dev/corvohq/typescript-sdk`): `readFrame()` returns discriminated union. `sendAck()`/`sendFail()` fire-and-forget. `cancel()` via bulk action. processFrames routes all non-pending frames to push queue.
+- [x] **Rust SDK** (`~/dev/corvohq/rust-sdk`): `read_frame()` returns `Frame` enum. `send_ack()`/`send_fail()` fire-and-forget. `cancel()` via bulk action.
+- [x] **Haskell SDK** (`~/dev/corvohq/haskell-sdk`): `readFrame` returns `Frame` ADT. `sendAck`/`sendFail` fire-and-forget. `cancel` via bulk action.
 
 ## bench (saturation benchmark)
 
@@ -53,4 +53,5 @@
 
 ## Cancellable Jobs
 
-- [ ] Cancellable jobs — allow in-flight active jobs to be cancelled. Worker receives cancel signal via heartbeat response or dedicated channel, transitions job to cancelled state. Requires cancel token propagation + SDK support.
+- [x] **Server**: Cancel signal push via `MSG_CANCEL_SIGNAL` (0x08). Handler records worker_id before transition, pipeline scans waiting_conns to push signal to worker's connection. Bulk cancel also notifies queue (frees concurrency slot for waiting subscribers). Pipeline overrides RPC bulk action `now_ns` with server clock.
+- [x] **SDK cancel signal handling**: All 6 SDKs handle CANCEL_SIGNAL in message loop (Zig, Go, Python, TypeScript, Rust, Haskell).

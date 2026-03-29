@@ -36,6 +36,7 @@ pub const MSG_ACK_BATCH: u8 = 0x03;
 pub const MSG_PING: u8 = 0x04;
 pub const MSG_HEARTBEAT: u8 = 0x06;
 pub const MSG_FAIL_BATCH: u8 = 0x07;
+pub const MSG_CANCEL_SIGNAL: u8 = 0x08; // server -> client push (no request counterpart)
 
 // Management request types
 pub const MSG_MAINTENANCE: u8 = 0x10;

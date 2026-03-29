@@ -158,6 +158,14 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                     .pending, .active, .scheduled, .retrying => {},
                     else => continue,
                 }
+                // Record cancel signal for active jobs BEFORE clearing worker_id.
+                // Also notify the queue so fetch subscribers can fill the freed slot.
+                if (job.state == .active) {
+                    if (job.worker_id) |wid| {
+                        self.recordCancelSignal(job_id, wid);
+                    }
+                    self.recordPromoteQueue(job.queue);
+                }
                 switch (job.state) {
                     .pending => {
                         if (job.expire_after_ms > 0 and job.expire_at_ns > 0) {
@@ -343,7 +351,10 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
     // Apply accumulated batch counter adjustments and fire callbacks.
     applyBatchMods(self, b, &batch_mods, batch_mod_count, op.now_ns);
 
-    return .{ .affected = affected };
+    return .{
+        .affected = affected,
+        .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
+    };
 }
 
 /// Record a batch modification. Coalesces multiple changes to the same batch.

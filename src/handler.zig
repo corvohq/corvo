@@ -46,6 +46,8 @@ pub const OpHandler = struct {
     fail_result_count: u16 = 0,
     bulk_results: [max_bulk_results]BulkResult = undefined,
     bulk_result_count: u16 = 0,
+    cancel_signals: [max_cancel_signals]CancelSignal = undefined,
+    cancel_signal_count: u16 = 0,
 
     // Promote/reclaim notification: queues that had jobs promoted to pending.
     promote_queue_bufs: [max_promote_queues][64]u8 = undefined,
@@ -87,6 +89,7 @@ pub const OpHandler = struct {
     const max_side_effects = 32;
     const max_fail_results = 256;
     pub const max_bulk_results = 4096;
+    const max_cancel_signals = 256;
     const max_promote_queues = 32;
 
     pub const FailResult = struct {
@@ -109,6 +112,20 @@ pub const OpHandler = struct {
         }
         pub fn backtraceSlice(self: *const FailResult) []const u8 {
             return self.backtrace[0..self.backtrace_len];
+        }
+    };
+
+    pub const CancelSignal = struct {
+        job_id: [64]u8 = undefined,
+        job_id_len: u8 = 0,
+        worker_id: [128]u8 = undefined,
+        worker_id_len: u8 = 0,
+
+        pub fn jobId(self: *const CancelSignal) []const u8 {
+            return self.job_id[0..self.job_id_len];
+        }
+        pub fn workerId(self: *const CancelSignal) []const u8 {
+            return self.worker_id[0..self.worker_id_len];
         }
     };
 
@@ -372,6 +389,7 @@ pub const OpHandler = struct {
         self.side_effect_count = 0;
         self.fail_result_count = 0;
         self.bulk_result_count = 0;
+        self.cancel_signal_count = 0;
         self.promote_queue_count = 0;
     }
 
@@ -438,6 +456,19 @@ pub const OpHandler = struct {
         r.new_queue_len = ql;
         self.bulk_results[self.bulk_result_count] = r;
         self.bulk_result_count += 1;
+    }
+
+    pub fn recordCancelSignal(self: *OpHandler, job_id: []const u8, worker_id: []const u8) void {
+        if (self.cancel_signal_count >= max_cancel_signals) return;
+        var sig = CancelSignal{};
+        const il: u8 = @intCast(@min(job_id.len, sig.job_id.len));
+        @memcpy(sig.job_id[0..il], job_id[0..il]);
+        sig.job_id_len = il;
+        const wl: u8 = @intCast(@min(worker_id.len, sig.worker_id.len));
+        @memcpy(sig.worker_id[0..wl], worker_id[0..wl]);
+        sig.worker_id_len = wl;
+        self.cancel_signals[self.cancel_signal_count] = sig;
+        self.cancel_signal_count += 1;
     }
 
     /// Main apply dispatch — the core state machine.

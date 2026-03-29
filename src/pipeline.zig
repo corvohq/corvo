@@ -429,6 +429,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 const batch_ack_seq = self.last_recorded_seq;
 
                 self.encodeResponses();
+                self.pushCancelSignals();
                 self.fulfillSubscriptions();
                 self.compactRecvBufs();
 
@@ -454,6 +455,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 }
             } else {
                 self.encodeResponses();
+                self.pushCancelSignals();
                 self.fulfillSubscriptions();
                 self.flushSends();
                 self.compactRecvBufs();
@@ -870,8 +872,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
                 rpc.MSG_BULK_ACTION => {
                     var reader = BufReader{ .data = frame.payload };
-                    const parsed = rpc.bulk.parseBulkAction(&reader, &self.bulk_ids_buf) catch
+                    var parsed = rpc.bulk.parseBulkAction(&reader, &self.bulk_ids_buf) catch
                         return .{ .err = "parse error" };
+                    // Override client now_ns with server clock (deterministic core).
+                    parsed.now_ns = self.nowNs();
                     const op_data = ops_mod.OpData{ .bulk_action = parsed };
                     const result = self.handler.apply(batch, .bulk_action, &op_data);
                     self.emitMirrorOp(.bulk_action, &op_data, &result);
@@ -1400,6 +1404,49 @@ pub fn Pipeline(comptime IoBackend: type) type {
             @memcpy(self.notified_queue_bufs[idx][0..qlen], queue[0..qlen]);
             self.notified_queue_lens[idx] = qlen;
             self.notified_queue_count += 1;
+        }
+
+        // ====================================================================
+        // Cancel signals — push to workers whose active jobs were cancelled
+        // ====================================================================
+
+        fn pushCancelSignals(self: *Self) void {
+            if (self.handler.cancel_signal_count == 0) return;
+
+            for (self.handler.cancel_signals[0..self.handler.cancel_signal_count]) |*sig| {
+                const worker_id = sig.workerId();
+
+                // Find the subscribed connection with this worker_id.
+                for (self.waiting_conns[0..self.waiting_conn_count]) |conn_id| {
+                    const c = self.io.conn(conn_id);
+                    if (c.phase == .free) continue;
+                    if (c.worker_id_len != worker_id.len) continue;
+                    if (!std.mem.eql(u8, c.worker_id_buf[0..c.worker_id_len], worker_id)) continue;
+
+                    // Push MSG_CANCEL_SIGNAL frame into this connection's send_buf.
+                    const write_start = c.send_len;
+                    const space = c.send_buf.len - write_start;
+                    const needed = rpc.FRAME_HEADER_SIZE + 2 + 1 + sig.job_id_len;
+                    assert.check(space >= needed, "pushCancelSignals: send_buf overflow for conn {d}", .{conn_id});
+
+                    var writer = BufWriter{ .buf = c.send_buf[write_start..] };
+                    writer.pos = rpc.FRAME_HEADER_SIZE;
+                    writer.writeU16(1); // count
+                    writer.writePrefixed(sig.jobId());
+
+                    const payload_len: u32 = @intCast(writer.pos - rpc.FRAME_HEADER_SIZE);
+                    rpc.writeFrameHeader(
+                        c.send_buf[write_start..][0..rpc.FRAME_HEADER_SIZE],
+                        rpc.MSG_CANCEL_SIGNAL,
+                        0, // no req_id for server push
+                        payload_len,
+                    );
+
+                    c.send_len += @intCast(writer.pos);
+                    self.trackSendConn(conn_id);
+                    break;
+                }
+            }
         }
 
         // ====================================================================
