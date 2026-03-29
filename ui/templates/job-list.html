@@ -6,12 +6,4 @@
   </div>
 </div>
 {{> job_table}}
-{{#has_pages}}
-<div class="flex items-center justify-between mt-4">
-  <span class="text-sm text-zinc-500 dark:text-zinc-400">Page {{page_display}} of {{total_pages}}</span>
-  <div class="flex gap-2">
-    {{#has_prev}}<a href="{{prev_url}}" class="border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md px-3 py-1.5 text-sm font-medium text-zinc-700 dark:text-zinc-300">&larr; Previous</a>{{/has_prev}}
-    {{#has_next}}<a href="{{next_url}}" class="border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md px-3 py-1.5 text-sm font-medium text-zinc-700 dark:text-zinc-300">Next &rarr;</a>{{/has_next}}
-  </div>
-</div>
-{{/has_pages}}
+{{> pagination}}

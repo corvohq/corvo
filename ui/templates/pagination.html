@@ -1,0 +1,16 @@
+{{#has_pages}}
+<div class="flex items-center justify-between mt-4">
+  <span class="text-sm text-zinc-500 dark:text-zinc-400">Page {{page_display}} of {{total_pages}}</span>
+  <div class="flex items-center gap-1">
+    {{#has_prev}}<a href="{{prev_url}}" class="px-2 py-1 text-sm rounded-md text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800">&larr;</a>{{/has_prev}}
+    {{#pages}}
+    {{#is_ellipsis}}<span class="px-2 py-1 text-zinc-400 dark:text-zinc-500">…</span>{{/is_ellipsis}}
+    {{^is_ellipsis}}
+    {{#is_current}}<span class="px-3 py-1 text-sm font-medium rounded-md bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900">{{label}}</span>{{/is_current}}
+    {{^is_current}}<a href="{{url}}" class="px-3 py-1 text-sm rounded-md text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800">{{label}}</a>{{/is_current}}
+    {{/is_ellipsis}}
+    {{/pages}}
+    {{#has_next}}<a href="{{next_url}}" class="px-2 py-1 text-sm rounded-md text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800">&rarr;</a>{{/has_next}}
+  </div>
+</div>
+{{/has_pages}}

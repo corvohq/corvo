@@ -32,6 +32,7 @@ const job_list_tmpl = zigstache.Template.parse(ui_embed.job_list_html) catch unr
 const job_table_tmpl = zigstache.Template.parse(ui_embed.job_table_html) catch unreachable;
 const job_detail_tmpl = zigstache.Template.parse(ui_embed.job_detail_html) catch unreachable;
 const workers_tmpl = zigstache.Template.parse(ui_embed.workers_html) catch unreachable;
+const pagination_tmpl = zigstache.Template.parse(ui_embed.pagination_html) catch unreachable;
 
 // ============================================================================
 // Dispatch
@@ -175,9 +176,8 @@ fn queueDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, queue_name: []c
     // Job views.
     var job_buf: [max_table_rows]sqlite_read.JobRow = undefined;
     var job_views: [max_table_rows]JobView = undefined;
-    var action_buf: [max_table_rows * 2]JobAction = undefined;
     const count: usize = if (reader) |rdr| rdr.queryJobsByQueueState(queue_name, state_filter, max_table_rows, offset, &job_buf) catch 0 else 0;
-    const jobs = getJobViews(job_buf[0..count], &job_views, &action_buf, .queue_detail);
+    const jobs = getJobViews(job_buf[0..count], &job_views, .queue_detail);
 
     var bulk_buf: [2]BulkAction = undefined;
     const bulk_actions = getBulkActions(.queue_detail, &bulk_buf);
@@ -185,18 +185,19 @@ fn queueDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, queue_name: []c
     // Pagination.
     const total: u32 = if (qs) |q| queueStateCount(q, state_filter) else 0;
     const total_pages = if (total > 0) (total + max_table_rows - 1) / max_table_rows else 1;
+    var pag_base_buf: [256]u8 = undefined;
+    var pag_base_s = std.io.fixedBufferStream(&pag_base_buf);
+    pag_base_s.writer().print("/ui/queues/{s}?", .{queue_name}) catch {};
+    if (state_filter) |sf| pag_base_s.writer().print("state={s}&", .{sf}) catch {};
     var prev_url_buf: [256]u8 = undefined;
     var next_url_buf: [256]u8 = undefined;
     var prev_s = std.io.fixedBufferStream(&prev_url_buf);
     var next_s = std.io.fixedBufferStream(&next_url_buf);
-    prev_s.writer().print("/ui/queues/{s}?", .{queue_name}) catch {};
-    next_s.writer().print("/ui/queues/{s}?", .{queue_name}) catch {};
-    if (state_filter) |sf| {
-        prev_s.writer().print("state={s}&", .{sf}) catch {};
-        next_s.writer().print("state={s}&", .{sf}) catch {};
-    }
-    prev_s.writer().print("page={d}", .{page -| 1}) catch {};
-    next_s.writer().print("page={d}", .{page + 1}) catch {};
+    prev_s.writer().print("{s}page={d}", .{ pag_base_s.getWritten(), page -| 1 }) catch {};
+    next_s.writer().print("{s}page={d}", .{ pag_base_s.getWritten(), page + 1 }) catch {};
+    var page_links: [10]PageLink = undefined;
+    var page_url_bufs: [10][256]u8 = undefined;
+    const pg: []const PageLink = buildPageLinks(pag_base_s.getWritten(), page, total_pages, &page_links, &page_url_bufs);
 
     const tabs: []const FilterTabView = &filter_tabs;
     var content_buf: [page_buf_size]u8 = undefined;
@@ -221,7 +222,8 @@ fn queueDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, queue_name: []c
         .prev_url = prev_s.getWritten(),
         .has_next = page + 1 < total_pages,
         .next_url = next_s.getWritten(),
-    }, .{ .job_table = &job_table_tmpl }) catch
+        .pages = pg,
+    }, .{ .job_table = &job_table_tmpl, .pagination = &pagination_tmpl }) catch
         return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Queue Detail", content);
 }
@@ -255,26 +257,26 @@ fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, 
     // Job views.
     var job_buf: [max_table_rows]sqlite_read.JobRow = undefined;
     var job_views: [max_table_rows]JobView = undefined;
-    var action_buf: [max_table_rows * 2]JobAction = undefined;
     const count = rdr.queryJobsByQueueState(queue_filter, state, max_table_rows, offset, &job_buf) catch 0;
-    const jobs = getJobViews(job_buf[0..count], &job_views, &action_buf, actions);
+    const jobs = getJobViews(job_buf[0..count], &job_views, actions);
 
     var bulk_buf: [2]BulkAction = undefined;
     const bulk_actions = getBulkActions(actions, &bulk_buf);
 
-    // Pagination URLs.
+    // Pagination.
+    var pag_base_buf: [256]u8 = undefined;
+    var pag_base_s = std.io.fixedBufferStream(&pag_base_buf);
+    pag_base_s.writer().print("{s}?", .{base_path}) catch {};
+    if (queue_filter) |qf| pag_base_s.writer().print("queue={s}&", .{qf}) catch {};
     var prev_url_buf: [256]u8 = undefined;
     var next_url_buf: [256]u8 = undefined;
     var prev_s = std.io.fixedBufferStream(&prev_url_buf);
     var next_s = std.io.fixedBufferStream(&next_url_buf);
-    prev_s.writer().print("{s}?", .{base_path}) catch {};
-    next_s.writer().print("{s}?", .{base_path}) catch {};
-    if (queue_filter) |qf| {
-        prev_s.writer().print("queue={s}&", .{qf}) catch {};
-        next_s.writer().print("queue={s}&", .{qf}) catch {};
-    }
-    prev_s.writer().print("page={d}", .{page -| 1}) catch {};
-    next_s.writer().print("page={d}", .{page + 1}) catch {};
+    prev_s.writer().print("{s}page={d}", .{ pag_base_s.getWritten(), page -| 1 }) catch {};
+    next_s.writer().print("{s}page={d}", .{ pag_base_s.getWritten(), page + 1 }) catch {};
+    var page_links: [10]PageLink = undefined;
+    var page_url_bufs: [10][256]u8 = undefined;
+    const pages = buildPageLinks(pag_base_s.getWritten(), page, total_pages, &page_links, &page_url_bufs);
 
     var content_buf: [page_buf_size]u8 = undefined;
     const content = job_list_tmpl.renderWithPartials(&content_buf, .{
@@ -291,7 +293,8 @@ fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, 
         .prev_url = prev_s.getWritten(),
         .has_next = page + 1 < total_pages,
         .next_url = next_s.getWritten(),
-    }, .{ .job_table = &job_table_tmpl }) catch
+        .pages = pages,
+    }, .{ .job_table = &job_table_tmpl, .pagination = &pagination_tmpl }) catch
         return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, title, content);
 }
@@ -508,13 +511,6 @@ const FailureView = struct {
     created_at: []const u8,
 };
 
-const JobAction = struct {
-    job_id: []const u8,
-    action: []const u8,
-    label: []const u8,
-    class: []const u8,
-};
-
 const BulkAction = struct {
     action: []const u8,
     label: []const u8,
@@ -531,7 +527,19 @@ const JobView = struct {
     max_retries: i32,
     created_at: []const u8,
     has_cb: bool,
-    actions: []const JobAction,
+    has_retry: bool,
+    has_delete: bool,
+    has_cancel: bool,
+    has_approve: bool,
+    has_reject: bool,
+    has_run: bool,
+};
+
+const PageLink = struct {
+    label: u32,
+    url: []const u8,
+    is_current: bool,
+    is_ellipsis: bool,
 };
 
 const PropView = struct {
@@ -597,46 +605,12 @@ fn getQueueViews(reader: ?*sqlite_read.Reader, queue_buf: *[64]sqlite_read.Queue
 fn getJobViews(
     jobs: []const sqlite_read.JobRow,
     views: *[max_table_rows]JobView,
-    action_buf: *[max_table_rows * 2]JobAction,
     actions: RowActions,
 ) []const JobView {
     const has_cb = actions != .none;
-    var action_idx: usize = 0;
-
     for (jobs, 0..) |*j, i| {
-        const action_start = action_idx;
-        const id = j.idSlice();
-
-        switch (actions) {
-            .dead => {
-                action_buf[action_idx] = .{ .job_id = id, .action = "retry", .label = "Retry", .class = "text-indigo-600 dark:text-indigo-400 hover:text-indigo-800" };
-                action_idx += 1;
-                action_buf[action_idx] = .{ .job_id = id, .action = "delete", .label = "Delete", .class = "text-red-600 dark:text-red-400 hover:text-red-800" };
-                action_idx += 1;
-            },
-            .held => {
-                action_buf[action_idx] = .{ .job_id = id, .action = "approve", .label = "Approve", .class = "text-emerald-600 dark:text-emerald-400 hover:text-emerald-800" };
-                action_idx += 1;
-                action_buf[action_idx] = .{ .job_id = id, .action = "reject", .label = "Reject", .class = "text-red-600 dark:text-red-400 hover:text-red-800" };
-                action_idx += 1;
-            },
-            .scheduled => {
-                action_buf[action_idx] = .{ .job_id = id, .action = "run", .label = "Run Now", .class = "text-indigo-600 dark:text-indigo-400 hover:text-indigo-800" };
-                action_idx += 1;
-                action_buf[action_idx] = .{ .job_id = id, .action = "delete", .label = "Delete", .class = "text-red-600 dark:text-red-400 hover:text-red-800" };
-                action_idx += 1;
-            },
-            .queue_detail => {
-                action_buf[action_idx] = .{ .job_id = id, .action = "cancel", .label = "Cancel", .class = "text-amber-600 dark:text-amber-400 hover:text-amber-800" };
-                action_idx += 1;
-                action_buf[action_idx] = .{ .job_id = id, .action = "delete", .label = "Delete", .class = "text-red-600 dark:text-red-400 hover:text-red-800" };
-                action_idx += 1;
-            },
-            .none => {},
-        }
-
         views[i] = .{
-            .id = id,
+            .id = j.idSlice(),
             .queue = j.queueSlice(),
             .state = j.stateSlice(),
             .state_class = stateBadgeClassDark(j.stateSlice()),
@@ -645,7 +619,12 @@ fn getJobViews(
             .max_retries = j.max_retries,
             .created_at = j.createdAtSlice(),
             .has_cb = has_cb,
-            .actions = action_buf[action_start..action_idx],
+            .has_retry = actions == .dead,
+            .has_delete = actions == .dead or actions == .scheduled or actions == .queue_detail,
+            .has_cancel = actions == .queue_detail,
+            .has_approve = actions == .held,
+            .has_reject = actions == .held,
+            .has_run = actions == .scheduled,
         };
     }
     return views[0..jobs.len];
@@ -675,6 +654,41 @@ fn getBulkActions(actions: RowActions, buf: *[2]BulkAction) []const BulkAction {
         },
         .none => buf[0..0],
     };
+}
+
+fn buildPageLinks(base_url: []const u8, page: u32, total_pages: u32, links: *[10]PageLink, url_bufs: *[10][256]u8) []const PageLink {
+    var count: usize = 0;
+    var url_idx: usize = 0;
+
+    const addPage = struct {
+        fn f(ls: *[10]PageLink, c: *usize, bufs: *[10][256]u8, idx: *usize, base: []const u8, p: u32, current: u32) void {
+            var s = std.io.fixedBufferStream(&bufs[idx.*]);
+            s.writer().print("{s}page={d}", .{ base, p }) catch {};
+            ls[c.*] = .{ .label = p + 1, .url = s.getWritten(), .is_current = p == current, .is_ellipsis = false };
+            c.* += 1;
+            idx.* += 1;
+        }
+    }.f;
+
+    const addEllipsis = struct {
+        fn f(ls: *[10]PageLink, c: *usize) void {
+            ls[c.*] = .{ .label = 0, .url = "", .is_current = false, .is_ellipsis = true };
+            c.* += 1;
+        }
+    }.f;
+
+    if (total_pages <= 7) {
+        for (0..total_pages) |i| addPage(links, &count, url_bufs, &url_idx, base_url, @intCast(i), page);
+    } else {
+        addPage(links, &count, url_bufs, &url_idx, base_url, 0, page);
+        const win_start = if (page > 2) page - 1 else @as(u32, 1);
+        const win_end = @min(page + 2, total_pages - 1);
+        if (win_start > 1) addEllipsis(links, &count);
+        for (win_start..win_end) |i| addPage(links, &count, url_bufs, &url_idx, base_url, @intCast(i), page);
+        if (win_end < total_pages - 1) addEllipsis(links, &count);
+        addPage(links, &count, url_bufs, &url_idx, base_url, total_pages - 1, page);
+    }
+    return links[0..count];
 }
 
 fn buildBarViews(queues: []const sqlite_read.QueueStats, bars: *[64]BarView) []const BarView {
