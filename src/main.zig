@@ -75,11 +75,9 @@ fn parsePeers(spec: []const u8, ids_out: *[max_peers][]const u8, addrs_out: *[ma
         const port_str = host_port[colon_pos + 1 ..];
         const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPeerSpec;
 
-        // Cluster transport bind port = server port + 1000 (convention).
-        const cluster_port = port + 1000;
-
+        // Peer spec port is the cluster transport port directly.
         ids_out[count] = id;
-        addrs_out[count] = try std.net.Address.parseIp(host, cluster_port);
+        addrs_out[count] = try std.net.Address.parseIp(host, port);
         count += 1;
     }
 
