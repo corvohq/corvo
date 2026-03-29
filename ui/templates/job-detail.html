@@ -43,15 +43,14 @@
       </div>
     </div>
   </div>
-{{#has_payload}}
   <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm">
     <div class="px-6 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between">
       <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Payload</h3>
-      <button onclick="corvoPayloadCopy(this)" class="text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 font-medium">Copy</button>
+      {{#has_payload}}<button onclick="corvoPayloadCopy(this)" class="text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 font-medium">Copy</button>{{/has_payload}}
     </div>
-    <pre id="job-payload" class="p-6 text-xs font-mono overflow-x-auto text-zinc-800 dark:text-zinc-200 bg-zinc-50 dark:bg-zinc-950 rounded-b-xl">{{payload}}</pre>
+    {{#has_payload}}<pre id="job-payload" class="p-6 text-xs font-mono overflow-x-auto text-zinc-800 dark:text-zinc-200 bg-zinc-50 dark:bg-zinc-950 rounded-b-xl">{{payload}}</pre>{{/has_payload}}
+    {{^has_payload}}<p class="px-6 py-8 text-sm text-zinc-500 dark:text-zinc-400 text-center">No payload</p>{{/has_payload}}
   </div>
-{{/has_payload}}
 {{#has_errors}}
   <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm">
     <div class="px-6 py-4 border-b border-zinc-200 dark:border-zinc-800">
