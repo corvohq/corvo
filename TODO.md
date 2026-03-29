@@ -15,20 +15,16 @@
 - [x] Purge: limit-based trigger — `purge_threshold` config (default 10k); handler tracks `dead_since_purge`, pipeline triggers early purge when exceeded
 - [x] Explicit `--cluster-port` flag — overrides default (server port + 1000); peer spec port is now the cluster transport port directly
 
-## Persistent Fetch Subscriptions (credits)
+## Persistent Fetch Subscriptions (prefetch)
 
-- [x] **Server**: Keep subscription alive after fulfillment — decrement credits by jobs pushed instead of clearing. If credits remain, keep connection in waiting list. Only remove when credits reach 0.
-  - Change in `pipeline.zig` `fulfillSubscriptions()`: `c.credits -= result.affected; if (c.credits == 0) { clear + remove }`.
-  - Eliminates subscribe-per-batch round-trip. One subscribe per connection lifetime.
-  - Client sends credits via fetch frame, server pushes until credits exhausted.
-  - Client acks don't need to replenish credits — client re-subscribes with new credits when ready for more.
-- [ ] **Zig SDK** (`~/dev/corvohq/zig-sdk`): Update `subscribe()` + `readPushedJobs()` to send high credits once, read multiple pushes without re-subscribing.
-- [ ] **Go SDK** (`~/dev/corvohq/go-sdk`): Same pattern — subscribe with high credits, persistent connection.
+- [x] **Server**: Permanent subscriptions with prefetch flow control. Worker subscribes once with prefetch=N, server pushes up to N jobs, acks replenish prefetch. Partition round-robin for fair distribution. 37k lifecycle/sec 4+4, 73k 1+1.
+- [x] **Bench tool**: Message loop handles interleaved FETCH_RESP/ACK_RESP, subscribe once with prefetch=batch_size.
+- [ ] **Zig SDK** (`~/dev/corvohq/zig-sdk`): Subscribe once with prefetch, message loop for push/ack interleaving.
+- [ ] **Go SDK** (`~/dev/corvohq/go-sdk`): Same.
 - [ ] **Python SDK** (`~/dev/corvohq/python-sdk`): Same.
 - [ ] **TypeScript SDK** (`~/dev/corvohq/typescript-sdk`): Same.
 - [ ] **Rust SDK** (`~/dev/corvohq/rust-sdk`): Same.
 - [ ] **Haskell SDK** (`~/dev/corvohq/haskell-sdk`): Same.
-- [x] **Bench tool**: Update `rpcLifecycleWorker` to subscribe once with high credits, remove re-subscribe loop.
 
 ## bench (saturation benchmark)
 
