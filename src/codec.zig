@@ -340,18 +340,25 @@ pub fn decodeJob(data: []const u8) types.Job {
 // Queue Config Codec
 // ============================================================================
 //
-// Fixed fields (16 bytes):
+// Fixed fields (50 bytes):
 //   [0]     version (u8)
 //   [1]     flags (u8): bit0=paused, bit1=fairness
 //   [2..5]  max_concurrency (u32 LE)
 //   [6..9]  rate_limit (u32 LE)
 //   [10..13] rate_window_ms (u32 LE)
 //   [14..21] created_at_ns (u64 LE)
+//   [22..25] pending_count (u32 LE)
+//   [26..29] active_count (u32 LE)
+//   [30..33] retrying_count (u32 LE)
+//   [34..37] completed_count (u32 LE)
+//   [38..41] dead_count (u32 LE)
+//   [42..45] scheduled_count (u32 LE)
+//   [46..49] held_count (u32 LE)
 //
 // Variable fields:
-//   name
+//   name, namespace
 
-const queue_fixed_size: usize = 22;
+const queue_fixed_size: usize = 50;
 pub const max_queue_encoded_size: usize = 512;
 
 pub fn encodeQueue(buf: []u8, q: *const types.Queue) []const u8 {
@@ -369,6 +376,15 @@ pub fn encodeQueue(buf: []u8, q: *const types.Queue) []const u8 {
     pos = writeU32LE(buf, pos, q.rate_limit);
     pos = writeU32LE(buf, pos, q.rate_window_ms);
     pos = writeU64LE(buf, pos, q.created_at_ns);
+
+    // Per-state counters
+    pos = writeU32LE(buf, pos, q.pending_count);
+    pos = writeU32LE(buf, pos, q.active_count);
+    pos = writeU32LE(buf, pos, q.retrying_count);
+    pos = writeU32LE(buf, pos, q.completed_count);
+    pos = writeU32LE(buf, pos, q.dead_count);
+    pos = writeU32LE(buf, pos, q.scheduled_count);
+    pos = writeU32LE(buf, pos, q.held_count);
 
     pos = writeStr(buf, pos, q.name);
     pos = writeStr(buf, pos, q.namespace);
@@ -406,6 +422,29 @@ pub fn decodeQueue(data: []const u8) types.Queue {
     const created = readU64LE(data, pos);
     pos = created.next;
     q.created_at_ns = created.val;
+
+    // Per-state counters
+    const pc = readU32LE(data, pos);
+    pos = pc.next;
+    q.pending_count = pc.val;
+    const ac = readU32LE(data, pos);
+    pos = ac.next;
+    q.active_count = ac.val;
+    const rc = readU32LE(data, pos);
+    pos = rc.next;
+    q.retrying_count = rc.val;
+    const cc = readU32LE(data, pos);
+    pos = cc.next;
+    q.completed_count = cc.val;
+    const dc = readU32LE(data, pos);
+    pos = dc.next;
+    q.dead_count = dc.val;
+    const sc = readU32LE(data, pos);
+    pos = sc.next;
+    q.scheduled_count = sc.val;
+    const hc = readU32LE(data, pos);
+    pos = hc.next;
+    q.held_count = hc.val;
 
     const name = readStr(data, pos);
     pos = name.next;
@@ -823,6 +862,13 @@ test "queue encode/decode roundtrip" {
         .rate_window_ms = 5000,
         .fairness = true,
         .created_at_ns = 1710000000000000000,
+        .pending_count = 42,
+        .active_count = 7,
+        .retrying_count = 3,
+        .completed_count = 1000,
+        .dead_count = 5,
+        .scheduled_count = 12,
+        .held_count = 2,
     };
 
     var buf: [max_queue_encoded_size]u8 = undefined;
@@ -837,6 +883,13 @@ test "queue encode/decode roundtrip" {
     try testing.expectEqual(@as(u32, 100), decoded.rate_limit);
     try testing.expectEqual(@as(u32, 5000), decoded.rate_window_ms);
     try testing.expectEqual(@as(u64, 1710000000000000000), decoded.created_at_ns);
+    try testing.expectEqual(@as(u32, 42), decoded.pending_count);
+    try testing.expectEqual(@as(u32, 7), decoded.active_count);
+    try testing.expectEqual(@as(u32, 3), decoded.retrying_count);
+    try testing.expectEqual(@as(u32, 1000), decoded.completed_count);
+    try testing.expectEqual(@as(u32, 5), decoded.dead_count);
+    try testing.expectEqual(@as(u32, 12), decoded.scheduled_count);
+    try testing.expectEqual(@as(u32, 2), decoded.held_count);
 }
 
 test "worker encode/decode roundtrip" {

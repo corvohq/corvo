@@ -22,13 +22,8 @@ pub const tcp_transport = @import("tcp_transport.zig");
 pub const pipeline = @import("pipeline.zig");
 pub const pending_index = @import("pending_index.zig");
 
-// SQLite mirror modules — exported for downstream use but tests
-// run via separate `zig build test-sqlite` target to avoid
-// interaction with talon's memory-mapped I/O.
-pub const sqlite = @import("sqlite.zig");
-pub const schema = @import("schema.zig");
-pub const mirror = @import("mirror.zig");
-pub const sqlite_read = @import("sqlite_read.zig");
+// KV read layer — reads directly from Talon KV store.
+pub const kv_read = @import("kv_read.zig");
 pub const http_read = @import("http_read.zig");
 
 // IO backend (io_uring / kqueue / sim)
@@ -51,7 +46,7 @@ pub const cluster_sim = @import("cluster_sim.zig");
 
 test {
     const testing = @import("std").testing;
-    // Pull in non-sqlite module tests.
+    // Pull in module tests.
     testing.refAllDecls(@import("assert.zig"));
     testing.refAllDecls(@import("types.zig"));
     testing.refAllDecls(@import("ops.zig"));
@@ -70,5 +65,5 @@ test {
     testing.refAllDecls(@import("cluster_sim.zig"));
     testing.refAllDecls(@import("io.zig"));
     testing.refAllDecls(@import("config.zig"));
-    // sqlite, schema, mirror, sqlite_read — tested via `zig build test-sqlite`
+    testing.refAllDecls(@import("kv_read.zig"));
 }

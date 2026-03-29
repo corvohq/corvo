@@ -10,7 +10,6 @@
 //!   --bind <addr>             Listen address (default: 0.0.0.0)
 //!   --port <port>             Listen port (default: 9878)
 //!   --data-dir <dir>          Data directory (default: /tmp/corvo-data)
-//!   --no-mirror               Disable SQLite mirror
 //!   --node-id <id>            Node ID for cluster mode (enables cluster)
 //!   --peers <spec>            Comma-separated peer list: id@host:port,...
 //!   --sync-repl               Enable sync replication
@@ -31,8 +30,7 @@ const rpc = corvo.rpc;
 const handler_mod = corvo.handler;
 const oplog_mod = corvo.oplog;
 const notify_mod = corvo.notify;
-const mirror_mod = corvo.mirror;
-const sqlite_read = corvo.sqlite_read;
+const kv_read = corvo.kv_read;
 const http_read = corvo.http_read;
 const pipeline_mod = corvo.pipeline;
 const cluster_mod = corvo.cluster;
@@ -100,7 +98,6 @@ fn printHelp() void {
         \\  --bind <addr>             Listen address (default: 0.0.0.0)
         \\  --port <port>             Listen port (default: 9878)
         \\  --data-dir <dir>          Data directory (default: /tmp/corvo-data)
-        \\  --no-mirror               Disable SQLite mirror
         \\  --max-payload-size <n>    Max payload bytes (default: 65536, max: 262144)
         \\  --max-conns <n>           Max connections (default: 4096)
         \\  --max-queues <n>          Max queues (default: 100)
@@ -210,7 +207,7 @@ pub fn main() !void {
                 return;
             };
         } else if (std.mem.eql(u8, arg, "--no-mirror")) {
-            config.mirror = false;
+            // Kept for backward compat — no-op, mirror removed.
         } else if (std.mem.eql(u8, arg, "--node-id")) {
             config.node_id = args.next() orelse {
                 std.debug.print("--node-id requires an argument\n", .{});
@@ -307,25 +304,8 @@ pub fn main() !void {
     var notify = notify_mod.QueueNotifier.init(allocator);
     defer notify.deinit();
 
-    // --- Mirror + SQLite reader (optional) ---
-    var mirror: ?mirror_mod.Mirror = null;
-    var reader: ?sqlite_read.Reader = null;
-
-    if (config.mirror) {
-        var mirror_path_buf: [256]u8 = undefined;
-        const mirror_path_slice = std.fmt.bufPrint(&mirror_path_buf, "{s}/mirror.db", .{config.data_dir}) catch unreachable;
-        var mirror_path_z: [257]u8 = undefined;
-        @memcpy(mirror_path_z[0..mirror_path_slice.len], mirror_path_slice);
-        mirror_path_z[mirror_path_slice.len] = 0;
-
-        mirror = mirror_mod.Mirror.init(allocator, mirror_path_z[0..mirror_path_slice.len :0]) catch |err| {
-            std.debug.print("corvo: failed to init mirror: {}\n", .{err});
-            return;
-        };
-        mirror.?.kv_stores = &stores;
-        reader = sqlite_read.Reader.init(&mirror.?.db);
-    }
-    defer if (mirror) |*m| m.deinit();
+    // --- KV reader (reads directly from Talon KV store) ---
+    var kv_reader = kv_read.Reader.init(&stores[0]);
 
     // --- Cluster setup (optional) ---
     var cluster_node: ?cluster_mod.ClusterNode = null;
@@ -390,8 +370,7 @@ pub fn main() !void {
         &stores,
         &oplog,
         &notify,
-        if (reader) |*r| r else null,
-        if (mirror) |*m| m else null,
+        &kv_reader,
         .{
             .clock_fn = &realClock,
             .max_payload_size = config.max_payload_size,

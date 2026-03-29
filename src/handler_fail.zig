@@ -148,6 +148,9 @@ pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops
         var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
         b.set(keys.jobKey(&jk_buf, fail_job.job_id), codec.encodeJob(&job_enc_buf, &job));
 
+        // Update read indexes: active → retrying or dead
+        self.transitionReadIndexes(b, &job, .active, job.state);
+
         self.verifyJobIndexes(b, &job, "fail");
         affected += 1;
     }

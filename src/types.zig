@@ -165,6 +165,41 @@ pub const Queue = struct {
     fairness: bool = false,
     created_at_ns: u64 = 0,
     namespace: []const u8 = "",
+
+    // Per-state job counters (maintained by handlers on state transitions).
+    pending_count: u32 = 0,
+    active_count: u32 = 0,
+    retrying_count: u32 = 0,
+    completed_count: u32 = 0,
+    dead_count: u32 = 0,
+    scheduled_count: u32 = 0,
+    held_count: u32 = 0,
+
+    pub fn incrState(self: *Queue, state: JobState) void {
+        self.counterPtr(state).* +|= 1;
+    }
+
+    pub fn decrState(self: *Queue, state: JobState) void {
+        self.counterPtr(state).* -|= 1;
+    }
+
+    fn counterPtr(self: *Queue, state: JobState) *u32 {
+        return switch (state) {
+            .pending => &self.pending_count,
+            .active => &self.active_count,
+            .retrying => &self.retrying_count,
+            .completed => &self.completed_count,
+            .dead => &self.dead_count,
+            .scheduled => &self.scheduled_count,
+            .held => &self.held_count,
+            .cancelled => &self.dead_count, // cancelled counted as dead
+        };
+    }
+
+    pub fn totalJobs(self: *const Queue) u32 {
+        return self.pending_count +| self.active_count +| self.retrying_count +|
+            self.completed_count +| self.dead_count +| self.scheduled_count +| self.held_count;
+    }
 };
 
 // ============================================================================

@@ -27,8 +27,7 @@ pub fn build(b: *std.Build) void {
     corvo_mod.addImport("talon", talon_mod);
     corvo_mod.addImport("zigstache", zigstache_mod);
     corvo_mod.addAnonymousImport("ui_embed", .{ .root_source_file = b.path("ui_embed.zig") });
-    corvo_mod.link_libc = true;
-    corvo_mod.linkSystemLibrary("sqlite3", .{});
+    corvo_mod.link_libc = true; // required by talon (memory-mapped I/O)
 
     // --- Static library ---
     const lib = b.addLibrary(.{
@@ -47,28 +46,12 @@ pub fn build(b: *std.Build) void {
     test_mod.addImport("zigstache", zigstache_mod);
     test_mod.addAnonymousImport("ui_embed", .{ .root_source_file = b.path("ui_embed.zig") });
     test_mod.link_libc = true;
-    test_mod.linkSystemLibrary("sqlite3", .{});
     const tests = b.addTest(.{
         .root_module = test_mod,
     });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
-
-    // --- SQLite mirror tests (separate binary to avoid talon interaction) ---
-    const sqlite_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/sqlite_test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    sqlite_test_mod.link_libc = true;
-    sqlite_test_mod.linkSystemLibrary("sqlite3", .{});
-    const sqlite_tests = b.addTest(.{
-        .root_module = sqlite_test_mod,
-    });
-    const run_sqlite_tests = b.addRunArtifact(sqlite_tests);
-    const sqlite_test_step = b.step("test-sqlite", "Run SQLite mirror tests");
-    sqlite_test_step.dependOn(&run_sqlite_tests.step);
 
     // --- Simulator tests ---
     const sim_mod = b.createModule(.{

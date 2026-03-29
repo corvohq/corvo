@@ -7,7 +7,7 @@
 const std = @import("std");
 const zigstache = @import("zigstache");
 const http = @import("http.zig");
-const sqlite_read = @import("sqlite_read.zig");
+const kv_read = @import("kv_read.zig");
 const ui_embed = @import("ui_embed");
 
 /// Max HTML body size. Pages render into a buffer of this size.
@@ -45,7 +45,7 @@ const pagination_tmpl = zigstache.Template.parse(ui_embed.pagination_html) catch
 // ============================================================================
 
 /// Route a UI page request. Returns bytes written to send_buf.
-pub fn dispatch(path: []const u8, query: []const u8, send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
+pub fn dispatch(path: []const u8, query: []const u8, send_buf: []u8, reader: ?*kv_read.Reader) u32 {
     // Full page routes.
     if (eql(path, "/") or eql(path, "")) return dashboard(send_buf, reader);
     if (eql(path, "/queues")) return queuesPage(send_buf, reader);
@@ -82,11 +82,11 @@ fn renderPage(send_buf: []u8, title: []const u8, content: []const u8) u32 {
 // Full Pages
 // ============================================================================
 
-fn dashboard(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    var queue_buf: [64]sqlite_read.QueueStats = undefined;
+fn dashboard(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
+    var queue_buf: [64]kv_read.QueueStats = undefined;
     var queue_views: [64]QueueView = undefined;
     var bar_buf: [64]BarView = undefined;
-    var job_buf: [10]sqlite_read.JobRow = undefined;
+    var job_buf: [10]kv_read.JobRow = undefined;
     var failure_views: [10]FailureView = undefined;
 
     const has_data = reader != null;
@@ -100,7 +100,7 @@ fn dashboard(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
         total_active += q.active;
         total_dead += q.dead;
     }
-    const worker_count: i32 = if (reader) |rdr| rdr.countWorkers() catch 0 else 0;
+    const worker_count: i32 = if (reader) |rdr| rdr.countWorkers() else 0;
     const bars = if (queues.len > 0) buildBarViews(queue_buf[0..queues.len], &bar_buf) else bar_buf[0..0];
     const failures = if (reader) |rdr| getFailureViews(rdr, &job_buf, &failure_views) else failure_views[0..0];
 
@@ -129,8 +129,8 @@ fn dashboard(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
     return renderPage(send_buf, "Dashboard", content);
 }
 
-fn queuesPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    var queue_buf: [64]sqlite_read.QueueStats = undefined;
+fn queuesPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
+    var queue_buf: [64]kv_read.QueueStats = undefined;
     var views: [64]QueueView = undefined;
     const queues = getQueueViews(reader, &queue_buf, &views);
 
@@ -142,16 +142,16 @@ fn queuesPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
     return renderPage(send_buf, "Queues", content);
 }
 
-fn queueDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, queue_name: []const u8, query: []const u8) u32 {
+fn queueDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, queue_name: []const u8, query: []const u8) u32 {
     const state_filter = getQueryParam(query, "state");
     const page = parsePageParam(query);
     const offset: u32 = page * max_table_rows;
 
     // Find this queue's stats.
-    var queue_stats_buf: [64]sqlite_read.QueueStats = undefined;
-    var qs: ?*const sqlite_read.QueueStats = null;
+    var queue_stats_buf: [64]kv_read.QueueStats = undefined;
+    var qs: ?*const kv_read.QueueStats = null;
     if (reader) |rdr| {
-        const q_count = rdr.getQueueStats(&queue_stats_buf) catch 0;
+        const q_count = rdr.getQueueStats(&queue_stats_buf);
         for (0..q_count) |i| {
             if (eql(queue_stats_buf[i].nameSlice(), queue_name)) {
                 qs = &queue_stats_buf[i];
@@ -180,9 +180,9 @@ fn queueDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, queue_name: []c
     }
 
     // Job views.
-    var job_buf: [max_table_rows]sqlite_read.JobRow = undefined;
+    var job_buf: [max_table_rows]kv_read.JobRow = undefined;
     var job_views: [max_table_rows]JobView = undefined;
-    const count: usize = if (reader) |rdr| rdr.queryJobsByQueueState(queue_name, state_filter, max_table_rows, offset, &job_buf) catch 0 else 0;
+    const count: usize = if (reader) |rdr| rdr.queryJobsByQueueState(queue_name, state_filter, max_table_rows, offset, &job_buf) else 0;
     const jobs = getJobViews(job_buf[0..count], &job_views, .queue_detail);
 
     var bulk_buf: [2]BulkAction = undefined;
@@ -232,19 +232,19 @@ fn queueDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, queue_name: []c
     return renderPage(send_buf, "Queue Detail", content);
 }
 
-fn deadLetterPage(send_buf: []u8, reader: ?*sqlite_read.Reader, query: []const u8) u32 {
+fn deadLetterPage(send_buf: []u8, reader: ?*kv_read.Reader, query: []const u8) u32 {
     return jobListPage(send_buf, reader, "Dead Letter", "dead", .dead, "/ui/dead-letter", query);
 }
 
-fn heldJobsPage(send_buf: []u8, reader: ?*sqlite_read.Reader, query: []const u8) u32 {
+fn heldJobsPage(send_buf: []u8, reader: ?*kv_read.Reader, query: []const u8) u32 {
     return jobListPage(send_buf, reader, "Held Jobs", "held", .held, "/ui/held", query);
 }
 
-fn scheduledJobsPage(send_buf: []u8, reader: ?*sqlite_read.Reader, query: []const u8) u32 {
+fn scheduledJobsPage(send_buf: []u8, reader: ?*kv_read.Reader, query: []const u8) u32 {
     return jobListPage(send_buf, reader, "Scheduled Jobs", "scheduled", .scheduled, "/ui/scheduled", query);
 }
 
-fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, state: []const u8, actions: RowActions, base_path: []const u8, query: []const u8) u32 {
+fn jobListPage(send_buf: []u8, reader: ?*kv_read.Reader, title: []const u8, state: []const u8, actions: RowActions, base_path: []const u8, query: []const u8) u32 {
     const rdr = reader orelse return renderPage(send_buf, title, "<p class=\"text-zinc-500 dark:text-zinc-400\">No data available</p>");
 
     const page = parsePageParam(query);
@@ -253,15 +253,15 @@ fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, 
 
     // Total count for pagination.
     const total: u32 = @intCast(@max(if (queue_filter) |qf|
-        rdr.countJobsByQueueState(qf, state) catch @as(i32, 0)
+        rdr.countJobsByQueueState(qf, state)
     else
-        rdr.countJobsByState(state) catch @as(i32, 0), 0));
+        rdr.countJobsByState(state), 0));
     const total_pages = if (total > 0) (total + max_table_rows - 1) / max_table_rows else 1;
 
     // Job views.
-    var job_buf: [max_table_rows]sqlite_read.JobRow = undefined;
+    var job_buf: [max_table_rows]kv_read.JobRow = undefined;
     var job_views: [max_table_rows]JobView = undefined;
-    const count = rdr.queryJobsByQueueState(queue_filter, state, max_table_rows, offset, &job_buf) catch 0;
+    const count = rdr.queryJobsByQueueState(queue_filter, state, max_table_rows, offset, &job_buf);
     const jobs = getJobViews(job_buf[0..count], &job_views, actions);
 
     var bulk_buf: [2]BulkAction = undefined;
@@ -301,9 +301,9 @@ fn jobListPage(send_buf: []u8, reader: ?*sqlite_read.Reader, title: []const u8, 
     return renderPage(send_buf, title, content);
 }
 
-fn jobDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, job_id: []const u8) u32 {
+fn jobDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, job_id: []const u8) u32 {
     const rdr = reader orelse return renderPage(send_buf, "Job Detail", "<p class=\"text-zinc-500 dark:text-zinc-400\">No data available</p>");
-    const j = (rdr.getJob(job_id) catch null) orelse return renderPage(send_buf, "Job Detail", "<p class=\"text-red-500 dark:text-red-400\">Job not found</p>");
+    const j = rdr.getJob(job_id) orelse return renderPage(send_buf, "Job Detail", "<p class=\"text-red-500 dark:text-red-400\">Job not found</p>");
 
     // Properties.
     var props: [5]PropView = undefined;
@@ -352,11 +352,11 @@ fn jobDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, job_id: []const u
 
     // Payload.
     var raw_payload: [4096]u8 = undefined;
-    const payload = rdr.getJobPayload(job_id, &raw_payload) catch null;
+    const payload = rdr.getJobPayload(job_id, &raw_payload);
 
     // Errors.
-    var err_rows: [16]sqlite_read.JobError = undefined;
-    const err_count = rdr.getJobErrors(job_id, &err_rows) catch 0;
+    var err_rows: [16]kv_read.JobError = undefined;
+    const err_count = rdr.getJobErrors(job_id, &err_rows);
     var error_views: [16]ErrorView = undefined;
     for (0..err_count) |i| {
         const err = &err_rows[i];
@@ -387,7 +387,7 @@ fn jobDetailPage(send_buf: []u8, reader: ?*sqlite_read.Reader, job_id: []const u
     return renderPage(send_buf, "Job Detail", content);
 }
 
-fn workersPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
+fn workersPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
     const WorkerView = struct {
         id: []const u8,
         hostname: []const u8,
@@ -396,8 +396,8 @@ fn workersPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
         started_at: []const u8,
     };
 
-    var worker_buf: [64]sqlite_read.WorkerRow = undefined;
-    const count: usize = if (reader) |rdr| rdr.getWorkers(&worker_buf) catch 0 else 0;
+    var worker_buf: [64]kv_read.WorkerRow = undefined;
+    const count: usize = if (reader) |rdr| rdr.getWorkers(&worker_buf) else 0;
 
     var views: [64]WorkerView = undefined;
     for (0..count) |i| {
@@ -419,7 +419,7 @@ fn workersPage(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
     return renderPage(send_buf, "Workers", content);
 }
 
-fn clusterPage(send_buf: []u8, _: ?*sqlite_read.Reader) u32 {
+fn clusterPage(send_buf: []u8, _: ?*kv_read.Reader) u32 {
     return renderPage(send_buf, "Cluster", ui_embed.cluster_html);
 }
 
@@ -427,11 +427,11 @@ fn clusterPage(send_buf: []u8, _: ?*sqlite_read.Reader) u32 {
 // HTMX Partials
 // ============================================================================
 
-fn dashboardStatsPartial(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    var queue_buf: [64]sqlite_read.QueueStats = undefined;
+fn dashboardStatsPartial(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
+    var queue_buf: [64]kv_read.QueueStats = undefined;
     var queue_views: [64]QueueView = undefined;
     var bar_buf: [64]BarView = undefined;
-    var job_buf: [10]sqlite_read.JobRow = undefined;
+    var job_buf: [10]kv_read.JobRow = undefined;
     var failure_views: [10]FailureView = undefined;
 
     const has_data = reader != null;
@@ -445,7 +445,7 @@ fn dashboardStatsPartial(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
         total_active += q.active;
         total_dead += q.dead;
     }
-    const worker_count: i32 = if (reader) |rdr| rdr.countWorkers() catch 0 else 0;
+    const worker_count: i32 = if (reader) |rdr| rdr.countWorkers() else 0;
     const bars = if (queues.len > 0) buildBarViews(queue_buf[0..queues.len], &bar_buf) else bar_buf[0..0];
     const failures = if (reader) |rdr| getFailureViews(rdr, &job_buf, &failure_views) else failure_views[0..0];
 
@@ -470,8 +470,8 @@ fn dashboardStatsPartial(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
     return http.writeResponseHtml(send_buf, 200, result);
 }
 
-fn queuesTablePartial(send_buf: []u8, reader: ?*sqlite_read.Reader) u32 {
-    var queue_buf: [64]sqlite_read.QueueStats = undefined;
+fn queuesTablePartial(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
+    var queue_buf: [64]kv_read.QueueStats = undefined;
     var views: [64]QueueView = undefined;
     const queues = getQueueViews(reader, &queue_buf, &views);
 
@@ -577,9 +577,9 @@ const QueueView = struct {
     paused: bool,
 };
 
-fn getQueueViews(reader: ?*sqlite_read.Reader, queue_buf: *[64]sqlite_read.QueueStats, views: *[64]QueueView) []const QueueView {
+fn getQueueViews(reader: ?*kv_read.Reader, queue_buf: *[64]kv_read.QueueStats, views: *[64]QueueView) []const QueueView {
     const rdr = reader orelse return views[0..0];
-    const count = rdr.getQueueStats(queue_buf) catch return views[0..0];
+    const count = rdr.getQueueStats(queue_buf);
     for (0..count) |i| {
         const q = &queue_buf[i];
         views[i] = .{
@@ -598,7 +598,7 @@ fn getQueueViews(reader: ?*sqlite_read.Reader, queue_buf: *[64]sqlite_read.Queue
 }
 
 fn getJobViews(
-    jobs: []const sqlite_read.JobRow,
+    jobs: []const kv_read.JobRow,
     views: *[max_table_rows]JobView,
     actions: RowActions,
 ) []const JobView {
@@ -698,7 +698,7 @@ fn buildPageLinks(base_url: []const u8, page: u32, total_pages: u32, links: *[10
     return links[0..count];
 }
 
-fn buildBarViews(queues: []const sqlite_read.QueueStats, bars: *[64]BarView) []const BarView {
+fn buildBarViews(queues: []const kv_read.QueueStats, bars: *[64]BarView) []const BarView {
     const chart_h: u32 = 160;
     const bar_gap: u32 = 4;
     const n: u32 = @intCast(queues.len);
@@ -731,8 +731,8 @@ fn buildBarViews(queues: []const sqlite_read.QueueStats, bars: *[64]BarView) []c
     return bars[0..n];
 }
 
-fn getFailureViews(reader: *sqlite_read.Reader, job_buf: *[10]sqlite_read.JobRow, views: *[10]FailureView) []const FailureView {
-    const count = reader.queryJobsByQueueState(null, "dead", 10, 0, job_buf) catch return views[0..0];
+fn getFailureViews(reader: *kv_read.Reader, job_buf: *[10]kv_read.JobRow, views: *[10]FailureView) []const FailureView {
+    const count = reader.queryJobsByQueueState(null, "dead", 10, 0, job_buf);
     for (0..count) |i| {
         const j = &job_buf[i];
         views[i] = .{
@@ -764,7 +764,7 @@ fn stateBadgeClassDark(state: []const u8) []const u8 {
     return "inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-400";
 }
 
-fn filterCount(q: *const sqlite_read.QueueStats, state: ?[]const u8) i32 {
+fn filterCount(q: *const kv_read.QueueStats, state: ?[]const u8) i32 {
     if (state) |s| {
         if (eql(s, "pending")) return q.pending;
         if (eql(s, "active")) return q.active;
@@ -778,7 +778,7 @@ fn filterCount(q: *const sqlite_read.QueueStats, state: ?[]const u8) i32 {
     return q.pending + q.active + q.retrying + q.dead + q.completed + q.scheduled + q.held;
 }
 
-fn queueStateCount(q: *const sqlite_read.QueueStats, state: ?[]const u8) u32 {
+fn queueStateCount(q: *const kv_read.QueueStats, state: ?[]const u8) u32 {
     return @intCast(@max(filterCount(q, state), 0));
 }
 

@@ -75,6 +75,7 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
                     var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
                     b.set(keys.jobKey(&jk_buf, job_id), codec.encodeJob(&job_enc_buf, &job));
+                    self.transitionReadIndexes(b, &job, .scheduled, .pending);
                     self.verifyJobIndexes(b, &job, "promote-scheduled");
                     self.recordBulkResult(job_id, .update_state, "pending", "", now_ns);
                     affected += 1;
@@ -125,6 +126,7 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
                     var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
                     b.set(keys.jobKey(&jk_buf, job_id), codec.encodeJob(&job_enc_buf, &job));
+                    self.transitionReadIndexes(b, &job, .retrying, .pending);
                     self.verifyJobIndexes(b, &job, "promote-retrying");
                     self.recordBulkResult(job_id, .update_state, "pending", "", now_ns);
                     affected += 1;
@@ -242,6 +244,7 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
                     var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
                     b.set(keys.jobKey(&jk_buf, job_id), codec.encodeJob(&job_enc_buf, &job));
+                    self.transitionReadIndexes(b, &job, .active, .dead);
                     self.verifyJobIndexes(b, &job, "reclaim-dead");
                     self.recordBulkResult(job_id, .update_state, "dead", "", now_ns);
                 } else {
@@ -257,6 +260,7 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
                     var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
                     b.set(keys.jobKey(&jk_buf, job_id), codec.encodeJob(&job_enc_buf, &job));
+                    self.transitionReadIndexes(b, &job, .active, .pending);
                     self.verifyJobIndexes(b, &job, "reclaim-pending");
                     self.recordBulkResult(job_id, .update_state, "pending", "", now_ns);
                 }
@@ -347,6 +351,7 @@ fn applyExpire(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
                 var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
                 b.set(keys.jobKey(&jk_buf, job_id), codec.encodeJob(&job_enc_buf, &job));
+                self.transitionReadIndexes(b, &job, .pending, .dead);
                 self.verifyJobIndexes(b, &job, "expire");
                 var dk_buf: keys.KeyBuf = undefined;
                 b.set(keys.deadKey(&dk_buf, now_ns, job_id), "");
@@ -400,6 +405,14 @@ fn applyPurge(self: *OpHandler, b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult 
                         if (!iter.next()) break;
                         continue;
                     }
+                }
+
+                // Delete read indexes + tag indexes + decrement counter
+                if (job_bytes != null) {
+                    const job = codec.decodeJob(job_bytes.?);
+                    OpHandler.deleteReadIndexes(b, &job);
+                    OpHandler.deleteTagIndexes(b, &job);
+                    self.decrQueueCounter(b, job.queue, job.state);
                 }
 
                 b.delete(keys.jobKey(&jk_buf, job_id));

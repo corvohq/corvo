@@ -1,4 +1,4 @@
-//! HTTP read handlers — query SQLite mirror, build JSON, write HTTP response.
+//! HTTP read handlers — query KV store, build JSON, write HTTP response.
 //!
 //! Pure functions: take send_buf + reader, return response length.
 //! No IO, no pipeline, no state. Pipeline calls these and queues the send.
@@ -6,7 +6,7 @@
 const std = @import("std");
 const http = @import("http.zig");
 const json = @import("json_writer.zig");
-const sqlite_read = @import("sqlite_read.zig");
+const kv_read = @import("kv_read.zig");
 const http_ui = @import("http_ui.zig");
 
 /// Cluster info for /cluster/status. Set by main.zig after election.
@@ -32,7 +32,7 @@ pub fn dispatch(
     param: []const u8,
     body: []const u8,
     send_buf: []u8,
-    reader: ?*sqlite_read.Reader,
+    reader: ?*kv_read.Reader,
 ) u32 {
     // Strip query string for route matching.
     const clean = if (std.mem.indexOfScalar(u8, path, '?')) |qi| path[0..qi] else path;
@@ -94,33 +94,13 @@ pub fn dispatch(
 // Metrics (special — text/plain, not JSON)
 // ============================================================================
 
-pub fn metrics(send_buf: []u8, mirror_stats: ?MirrorStats, reader: ?*sqlite_read.Reader) u32 {
+pub fn metrics(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
     var body_buf: [32768]u8 = undefined;
     var pos: usize = 0;
 
-    if (mirror_stats) |ms| {
-        const lag = ms.queued -| ms.committed;
-        pos += (std.fmt.bufPrint(
-            body_buf[pos..],
-            "# HELP corvo_mirror_queued_total Total operations queued to mirror\n" ++
-                "# TYPE corvo_mirror_queued_total counter\n" ++
-                "corvo_mirror_queued_total {d}\n" ++
-                "# HELP corvo_mirror_committed_total Total operations committed to SQLite\n" ++
-                "# TYPE corvo_mirror_committed_total counter\n" ++
-                "corvo_mirror_committed_total {d}\n" ++
-                "# HELP corvo_mirror_dropped_total Operations dropped due to full queue\n" ++
-                "# TYPE corvo_mirror_dropped_total counter\n" ++
-                "corvo_mirror_dropped_total {d}\n" ++
-                "# HELP corvo_mirror_lag Operations pending in mirror queue\n" ++
-                "# TYPE corvo_mirror_lag gauge\n" ++
-                "corvo_mirror_lag {d}\n",
-            .{ ms.queued, ms.committed, ms.dropped, lag },
-        ) catch &[0]u8{}).len;
-    }
-
     if (reader) |rdr| {
-        var stats_buf: [64]sqlite_read.QueueStats = undefined;
-        const qcount = rdr.getQueueStats(&stats_buf) catch 0;
+        var stats_buf: [64]kv_read.QueueStats = undefined;
+        const qcount = rdr.getQueueStats(&stats_buf);
         if (qcount > 0) {
             pos += (std.fmt.bufPrint(
                 body_buf[pos..],
@@ -149,7 +129,7 @@ pub fn metrics(send_buf: []u8, mirror_stats: ?MirrorStats, reader: ?*sqlite_read
             }
         }
 
-        const wcount = rdr.countWorkers() catch 0;
+        const wcount = rdr.countWorkers();
         pos += (std.fmt.bufPrint(
             body_buf[pos..],
             "# HELP corvo_workers_registered Number of registered workers\n" ++
@@ -195,19 +175,14 @@ fn clusterStatus(send_buf: []u8) u32 {
     return http.writeResponse(send_buf, 200, w.getWritten());
 }
 
-pub const MirrorStats = struct {
-    queued: u64,
-    committed: u64,
-    dropped: u64,
-};
 
 // ============================================================================
 // Individual read handlers
 // ============================================================================
 
-fn queues(send_buf: []u8, reader: *sqlite_read.Reader) u32 {
-    var queue_buf: [64]sqlite_read.QueueStats = undefined;
-    const count = reader.getQueueStats(&queue_buf) catch return writeError(send_buf, 500, "query_failed");
+fn queues(send_buf: []u8, reader: *kv_read.Reader) u32 {
+    var queue_buf: [64]kv_read.QueueStats = undefined;
+    const count = reader.getQueueStats(&queue_buf);
 
     var body_buf: [32768]u8 = undefined;
     var jw = json.JsonWriter.init(&body_buf);
@@ -231,9 +206,9 @@ fn queues(send_buf: []u8, reader: *sqlite_read.Reader) u32 {
     return http.writeResponse(send_buf, 200, jw.getWritten());
 }
 
-fn workers(send_buf: []u8, reader: *sqlite_read.Reader) u32 {
-    var worker_buf: [64]sqlite_read.WorkerRow = undefined;
-    const count = reader.getWorkers(&worker_buf) catch return writeError(send_buf, 500, "query_failed");
+fn workers(send_buf: []u8, reader: *kv_read.Reader) u32 {
+    var worker_buf: [64]kv_read.WorkerRow = undefined;
+    const count = reader.getWorkers(&worker_buf);
 
     var body_buf: [16384]u8 = undefined;
     var jw = json.JsonWriter.init(&body_buf);
@@ -252,9 +227,9 @@ fn workers(send_buf: []u8, reader: *sqlite_read.Reader) u32 {
     return http.writeResponse(send_buf, 200, jw.getWritten());
 }
 
-fn crons(send_buf: []u8, reader: *sqlite_read.Reader) u32 {
-    var cron_buf: [64]sqlite_read.CronRow = undefined;
-    const count = reader.listCrons(&cron_buf) catch return writeError(send_buf, 500, "query_failed");
+fn crons(send_buf: []u8, reader: *kv_read.Reader) u32 {
+    var cron_buf: [64]kv_read.CronRow = undefined;
+    const count = reader.listCrons(&cron_buf);
 
     var body_buf: [16384]u8 = undefined;
     var jw = json.JsonWriter.init(&body_buf);
@@ -273,8 +248,8 @@ fn crons(send_buf: []u8, reader: *sqlite_read.Reader) u32 {
     return http.writeResponse(send_buf, 200, jw.getWritten());
 }
 
-fn cron(send_buf: []u8, reader: *sqlite_read.Reader, cron_id: []const u8) u32 {
-    const cr = (reader.getCron(cron_id) catch return writeError(send_buf, 500, "query_failed")) orelse
+fn cron(send_buf: []u8, reader: *kv_read.Reader, cron_id: []const u8) u32 {
+    const cr = reader.getCron(cron_id) orelse
         return writeError(send_buf, 404, "schedule not found");
 
     var body_buf: [4096]u8 = undefined;
@@ -289,8 +264,8 @@ fn cron(send_buf: []u8, reader: *sqlite_read.Reader, cron_id: []const u8) u32 {
     return http.writeResponse(send_buf, 200, jw.getWritten());
 }
 
-fn job(send_buf: []u8, reader: *sqlite_read.Reader, job_id: []const u8) u32 {
-    const j = (reader.getJob(job_id) catch return writeError(send_buf, 500, "query_failed")) orelse
+fn job(send_buf: []u8, reader: *kv_read.Reader, job_id: []const u8) u32 {
+    const j = reader.getJob(job_id) orelse
         return writeError(send_buf, 404, "job not found");
 
     var body_buf: [32768]u8 = undefined;
@@ -326,7 +301,7 @@ fn job(send_buf: []u8, reader: *sqlite_read.Reader, job_id: []const u8) u32 {
 
     // Payload from separate table.
     var payload_buf: [65536]u8 = undefined;
-    if (reader.getJobPayload(job_id, &payload_buf) catch null) |payload| {
+    if (reader.getJobPayload(job_id, &payload_buf)) |payload| {
         jw.fieldRaw("payload", payload);
     }
 
@@ -338,8 +313,8 @@ fn job(send_buf: []u8, reader: *sqlite_read.Reader, job_id: []const u8) u32 {
     if (j.lease_expires_at_len > 0) jw.fieldStr("lease_expires_at", j.leaseExpiresAtSlice());
     if (j.expire_at_len > 0) jw.fieldStr("expire_at", j.expireAtSlice());
 
-    var err_buf: [32]sqlite_read.JobError = undefined;
-    const err_count = reader.getJobErrors(job_id, &err_buf) catch 0;
+    var err_buf: [32]kv_read.JobError = undefined;
+    const err_count = reader.getJobErrors(job_id, &err_buf);
     if (err_count > 0) {
         jw.beginArrayField("errors");
         for (0..err_count) |i| {
@@ -357,15 +332,13 @@ fn job(send_buf: []u8, reader: *sqlite_read.Reader, job_id: []const u8) u32 {
     return http.writeResponse(send_buf, 200, jw.getWritten());
 }
 
-fn search(send_buf: []u8, reader: *sqlite_read.Reader, path: []const u8) u32 {
+fn search(send_buf: []u8, reader: *kv_read.Reader, path: []const u8) u32 {
     const query_str = http.extractQueryParam(path, "q") orelse
         return writeError(send_buf, 400, "q parameter is required");
     if (query_str.len == 0) return writeError(send_buf, 400, "q parameter is required");
 
-    var result_buf: [100]sqlite_read.JobRow = undefined;
-    const count = reader.searchJobs(query_str, &result_buf) catch blk: {
-        break :blk reader.searchJobsLike(query_str, &result_buf) catch 0;
-    };
+    var result_buf: [100]kv_read.JobRow = undefined;
+    const count = reader.searchJobs(query_str, &result_buf);
 
     var body_buf: [32768]u8 = undefined;
     var jw = json.JsonWriter.init(&body_buf);
@@ -378,7 +351,7 @@ fn search(send_buf: []u8, reader: *sqlite_read.Reader, path: []const u8) u32 {
     return http.writeResponse(send_buf, 200, jw.getWritten());
 }
 
-fn jobSearch(send_buf: []u8, reader: *sqlite_read.Reader, path: []const u8) u32 {
+fn jobSearch(send_buf: []u8, reader: *kv_read.Reader, path: []const u8) u32 {
     const query_str = http.extractQueryParam(path, "q");
 
     var body_buf: [32768]u8 = undefined;
@@ -387,14 +360,12 @@ fn jobSearch(send_buf: []u8, reader: *sqlite_read.Reader, path: []const u8) u32 
     jw.beginArrayField("jobs");
 
     if (query_str) |q| {
-        var result_buf: [100]sqlite_read.JobRow = undefined;
-        const count = reader.searchJobs(q, &result_buf) catch blk: {
-            break :blk reader.searchJobsLike(q, &result_buf) catch 0;
-        };
+        var result_buf: [100]kv_read.JobRow = undefined;
+        const count = reader.searchJobs(q, &result_buf);
         for (0..count) |i| writeJobRowSummary(&jw, &result_buf[i]);
     } else {
-        var job_buf: [100]sqlite_read.JobRow = undefined;
-        const count = reader.getJobs(&job_buf) catch 0;
+        var job_buf: [100]kv_read.JobRow = undefined;
+        const count = reader.getJobs(&job_buf);
         for (0..count) |i| writeJobRowSummary(&jw, &job_buf[i]);
     }
 
@@ -403,7 +374,7 @@ fn jobSearch(send_buf: []u8, reader: *sqlite_read.Reader, path: []const u8) u32 
     return http.writeResponse(send_buf, 200, jw.getWritten());
 }
 
-fn jobSearchPost(send_buf: []u8, reader: *sqlite_read.Reader, body_input: []const u8) u32 {
+fn jobSearchPost(send_buf: []u8, reader: *kv_read.Reader, body_input: []const u8) u32 {
     var body_buf: [32768]u8 = undefined;
     var jw = json.JsonWriter.init(&body_buf);
     jw.beginObject();
@@ -417,16 +388,14 @@ fn jobSearchPost(send_buf: []u8, reader: *sqlite_read.Reader, body_input: []cons
     const limit_val = extractJSONInt(body_input, "limit");
     const limit: u32 = if (limit_val) |l| @intCast(@min(@max(l, 1), 500)) else 100;
 
-    var job_buf: [100]sqlite_read.JobRow = undefined;
+    var job_buf: [100]kv_read.JobRow = undefined;
     const actual_limit = @min(limit, @as(u32, @intCast(job_buf.len)));
     var count: u32 = 0;
 
     if (text_filter) |q| {
-        count = reader.searchJobs(q, job_buf[0..actual_limit]) catch blk: {
-            break :blk reader.searchJobsLike(q, job_buf[0..actual_limit]) catch 0;
-        };
+        count = reader.searchJobs(q, job_buf[0..actual_limit]);
     } else {
-        count = reader.queryJobsByQueueState(queue_filter, state_filter, actual_limit, 0, &job_buf) catch 0;
+        count = reader.queryJobsByQueueState(queue_filter, state_filter, actual_limit, 0, &job_buf);
     }
 
     for (0..count) |i| writeJobRowSummary(&jw, &job_buf[i]);
@@ -438,7 +407,7 @@ fn jobSearchPost(send_buf: []u8, reader: *sqlite_read.Reader, body_input: []cons
     return http.writeResponse(send_buf, 200, jw.getWritten());
 }
 
-fn bulkGetJobs(send_buf: []u8, reader: *sqlite_read.Reader, body: []const u8) u32 {
+fn bulkGetJobs(send_buf: []u8, reader: *kv_read.Reader, body: []const u8) u32 {
     var id_buf: [100][]const u8 = undefined;
     const id_count = extractJSONStringArray(body, "job_ids", &id_buf);
     if (id_count == 0) return writeError(send_buf, 400, "job_ids required");
@@ -449,7 +418,7 @@ fn bulkGetJobs(send_buf: []u8, reader: *sqlite_read.Reader, body: []const u8) u3
     jw.beginArrayField("jobs");
 
     for (0..@min(id_count, 100)) |i| {
-        const j = (reader.getJob(id_buf[i]) catch continue) orelse continue;
+        const j = reader.getJob(id_buf[i]) orelse continue;
         jw.beginObject();
         jw.fieldStr("id", j.idSlice());
         jw.fieldStr("queue", j.queueSlice());
@@ -465,9 +434,9 @@ fn bulkGetJobs(send_buf: []u8, reader: *sqlite_read.Reader, body: []const u8) u3
     return http.writeResponse(send_buf, 200, jw.getWritten());
 }
 
-fn budgets(send_buf: []u8, reader: *sqlite_read.Reader) u32 {
-    var budget_buf: [64]sqlite_read.BudgetRow = undefined;
-    const count = reader.listBudgets(&budget_buf) catch return writeError(send_buf, 500, "query_failed");
+fn budgets(send_buf: []u8, reader: *kv_read.Reader) u32 {
+    var budget_buf: [64]kv_read.BudgetRow = undefined;
+    const count = reader.listBudgets(&budget_buf);
 
     var body_buf: [16384]u8 = undefined;
     var jw = json.JsonWriter.init(&body_buf);
@@ -487,9 +456,9 @@ fn budgets(send_buf: []u8, reader: *sqlite_read.Reader) u32 {
     return http.writeResponse(send_buf, 200, jw.getWritten());
 }
 
-fn apiKeys(send_buf: []u8, reader: *sqlite_read.Reader) u32 {
-    var key_buf: [100]sqlite_read.ApiKeyRow = undefined;
-    const count = reader.listApiKeys(&key_buf) catch return writeError(send_buf, 500, "query_failed");
+fn apiKeys(send_buf: []u8, reader: *kv_read.Reader) u32 {
+    var key_buf: [100]kv_read.ApiKeyRow = undefined;
+    const count = reader.listApiKeys(&key_buf);
 
     var body_buf: [16384]u8 = undefined;
     var jw = json.JsonWriter.init(&body_buf);
@@ -509,9 +478,9 @@ fn apiKeys(send_buf: []u8, reader: *sqlite_read.Reader) u32 {
     return http.writeResponse(send_buf, 200, jw.getWritten());
 }
 
-fn approvalPolicies(send_buf: []u8, reader: *sqlite_read.Reader) u32 {
-    var policy_buf: [64]sqlite_read.ApprovalPolicyRow = undefined;
-    const count = reader.listApprovalPolicies(&policy_buf) catch return writeError(send_buf, 500, "query_failed");
+fn approvalPolicies(send_buf: []u8, reader: *kv_read.Reader) u32 {
+    var policy_buf: [64]kv_read.ApprovalPolicyRow = undefined;
+    const count = reader.listApprovalPolicies(&policy_buf);
 
     var body_buf: [16384]u8 = undefined;
     var jw = json.JsonWriter.init(&body_buf);
@@ -548,7 +517,7 @@ fn debugRuntime(send_buf: []u8) u32 {
 // Helpers
 // ============================================================================
 
-fn writeJobRowSummary(jw: *json.JsonWriter, j: *const sqlite_read.JobRow) void {
+fn writeJobRowSummary(jw: *json.JsonWriter, j: *const kv_read.JobRow) void {
     jw.beginObject();
     jw.fieldStr("id", j.idSlice());
     jw.fieldStr("queue", j.queueSlice());
