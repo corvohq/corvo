@@ -14,14 +14,12 @@ const io_mod = @import("io.zig");
 const rpc = @import("rpc.zig");
 const http = @import("http.zig");
 const http_read = @import("http_read.zig");
-const sqlite_read = @import("sqlite_read.zig");
+const kv_read = @import("kv_read.zig");
 const ops_mod = @import("ops.zig");
 const kv = @import("kv.zig");
 const handler_mod = @import("handler.zig");
 const oplog_mod = @import("oplog.zig");
 const notify_mod = @import("notify.zig");
-const mirror_mod = @import("mirror.zig");
-const mirror_events = @import("mirror_events.zig");
 const assert = @import("assert.zig");
 const keys = @import("keys.zig");
 const codec = @import("codec.zig");
@@ -59,8 +57,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
         stores: []kv.Store,
         oplog: *oplog_mod.Log,
         notify: *QueueNotifier,
-        reader: ?*sqlite_read.Reader,
-        mirror: ?*mirror_mod.Mirror,
+        reader: ?*kv_read.Reader,
         config: Config,
         allocator: std.mem.Allocator,
         mut_list: std.ArrayList(kv.Mutation) = .{},
@@ -209,8 +206,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             stores: []kv.Store,
             oplog: *oplog_mod.Log,
             notify: *QueueNotifier,
-            reader: ?*sqlite_read.Reader,
-            mirror: ?*mirror_mod.Mirror,
+            reader: ?*kv_read.Reader,
             config: Config,
         ) Self {
             return .{
@@ -220,7 +216,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 .oplog = oplog,
                 .notify = notify,
                 .reader = reader,
-                .mirror = mirror,
                 .config = config,
                 .allocator = allocator,
             };
@@ -235,12 +230,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
             stores: []kv.Store,
             oplog: *oplog_mod.Log,
             notify: *QueueNotifier,
-            reader: ?*sqlite_read.Reader,
-            mirror: ?*mirror_mod.Mirror,
+            reader: ?*kv_read.Reader,
             config: Config,
         ) *Self {
             const self = allocator.create(Self) catch unreachable;
-            self.* = init(allocator, io_backend, handler, stores, oplog, notify, reader, mirror, config);
+            self.* = init(allocator, io_backend, handler, stores, oplog, notify, reader, config);
             return self;
         }
 
@@ -466,9 +460,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 self.requeueRecvs(recv_conns[0..recv_conn_count]);
             }
 
-            // No periodic mirror flush — buffer accumulates until HTTP read
-            // triggers flushAll(). On overflow, next read does full KV→SQLite rebuild.
-
             self.io.submit();
             self.ticks_total += 1;
         }
@@ -564,9 +555,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
             switch (route) {
                 .read => {
-                    // Flush mirror so HTTP reads see latest state.
-                    if (self.mirror) |m| m.flushAll();
-
                     // Handle inline — write response directly, bypass batch.
                     const clean = if (std.mem.indexOfScalar(u8, req.path, '?')) |qi| req.path[0..qi] else req.path;
                     const api = if (std.mem.startsWith(u8, clean, "/api/v1/")) clean["/api/v1".len..] else clean;
@@ -698,9 +686,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 self.recordOplog();
             }
 
-            if (self.mirror) |m| {
-                mirror_events.mirrorEffects(m, self.handler);
-            }
         }
 
         fn recordRecvCompaction(self: *Self, conn_id: u16, consumed: u32) void {
@@ -744,11 +729,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
             if (record_mutations and self.mut_list.items.len > 0) {
                 self.recordOplog();
-            }
-
-            // Post-commit: drain handler effect buffers into mirror.
-            if (self.mirror) |m| {
-                mirror_events.mirrorEffects(m, self.handler);
             }
 
             // Post-commit: notify queue waiters
@@ -1546,22 +1526,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
         // Helpers
         // ====================================================================
 
-        /// Emit a mirror event for a single op. Called inline during decode
-        /// while OpData is still live on the stack. mirrorFromOp copies all
-        /// fields into fixed-size MirrorOp payloads, so no dangling pointers.
-        fn emitMirrorOp(self: *Self, op_type: ops_mod.OpType, op_data: *const ops_mod.OpData, result: *const ops_mod.OpResult) void {
-            if (self.mirror) |m| {
-                // Drain handler effects BEFORE the primary op's mirror event.
-                // This ensures side-effect enqueues (chain jobs, batch callbacks,
-                // requeued jobs) are inserted into the mirror before any subsequent
-                // operation (e.g., fetch) tries to update them.
-                if (self.handler.side_effect_count > 0 or self.handler.bulk_result_count > 0 or self.handler.fail_result_count > 0) {
-                    mirror_events.mirrorEffects(m, self.handler);
-                    self.handler.resetEffects();
-                }
-                mirror_events.mirrorFromOp(m, op_type, op_data, result);
-            }
-        }
+        /// No-op — mirror removed. Kept to avoid touching every callsite.
+        fn emitMirrorOp(_: *Self, _: ops_mod.OpType, _: *const ops_mod.OpData, _: *const ops_mod.OpResult) void {}
 
         fn nowNs(self: *const Self) u64 {
             const ts = self.config.clock_fn();

@@ -683,6 +683,15 @@ pub const Reader = struct {
         return enabled;
     }
 
+    pub fn getApiKeyByHash(self: *Reader, key_hash: []const u8) ?ApiKeyRow {
+        var batch = self.store.newBatch();
+        defer batch.close();
+
+        var key_buf: keys.KeyBuf = undefined;
+        _ = batch.get(keys.entSettingKey(&key_buf, keys.prefix_ent_apikey, key_hash)) orelse return null;
+        return ApiKeyRow{};
+    }
+
     // ====================================================================
     // Approval Policies
     // ====================================================================

@@ -12,7 +12,7 @@ const ops_mod = @import("ops.zig");
 const types = @import("types.zig");
 const rpc = @import("rpc.zig");
 const http_read = @import("http_read.zig");
-const sqlite_read = @import("sqlite_read.zig");
+const kv_read = @import("kv_read.zig");
 const json = @import("json_writer.zig");
 const kv = @import("kv.zig");
 const keys = @import("keys.zig");
@@ -557,10 +557,10 @@ pub fn hashApiKey(key: []const u8, out: *[64]u8) []const u8 {
 pub fn checkAuth(
     api_key: ?[]const u8,
     method: Method,
-    reader: ?*sqlite_read.Reader,
+    reader: ?*kv_read.Reader,
 ) AuthResult {
-    const rdr = reader orelse return .ok; // no mirror = no auth checking
-    const key_count = rdr.countEnabledApiKeys() catch return .ok;
+    const rdr = reader orelse return .ok;
+    const key_count = rdr.countEnabledApiKeys();
     if (key_count == 0) return .ok; // no keys configured = auth disabled
 
     const raw_key = api_key orelse return .unauthorized;
@@ -569,9 +569,7 @@ pub fn checkAuth(
     var hash_buf: [64]u8 = undefined;
     const key_hash = hashApiKey(raw_key, &hash_buf);
 
-    const row = rdr.getApiKeyByHash(key_hash) catch return .unauthorized;
-    if (row == null) return .unauthorized;
-    const r = row.?;
+    const r = rdr.getApiKeyByHash(key_hash) orelse return .unauthorized;
     if (!r.enabled) return .unauthorized;
 
     // Role-based access: readonly can only GET, worker can't manage.
