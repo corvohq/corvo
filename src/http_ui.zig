@@ -12,14 +12,21 @@ const ui_embed = @import("ui_embed");
 
 /// Max HTML body size. Pages render into a buffer of this size.
 /// Mustache templates with dark mode classes + inline SVG icons need headroom.
-const page_buf_size = 57344;
+/// send_buf is 64KB (IO layer — do not change). Layout ~8KB + HTTP headers ~200B.
+/// page_buf must fit within send_buf after layout wrapping.
+const send_buf_size = 65536;
+const layout_overhead = 8400;
+const page_buf_size = send_buf_size - layout_overhead;
+const render_buf_size = send_buf_size - 200;
 
-/// Layout-expanded page buffer. Must fit layout template + page content + HTTP headers
-/// within send_buf (~66KB). Layout is ~4KB, headers ~200B.
-const render_buf_size = 65000;
+/// Max table rows per page. Each row with SVG icons is ~1.5KB.
+/// 20 rows × 1.5KB = 30KB, leaving room for headers/filters/pagination.
+const max_table_rows = 20;
 
-/// Max table rows per page. Keeps HTML under page_buf_size.
-const max_table_rows = 25;
+comptime {
+    std.debug.assert(page_buf_size + layout_overhead <= send_buf_size);
+    std.debug.assert(render_buf_size < send_buf_size);
+}
 
 /// Comptime-parsed Mustache templates.
 const layout_tmpl = zigstache.Template.parse(ui_embed.layout_html) catch unreachable;
