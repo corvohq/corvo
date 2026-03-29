@@ -20,6 +20,7 @@ pub const ClusterInfo = struct {
 };
 
 pub var g_cluster_info: ?*const ClusterInfo = null;
+pub var g_admin_password: []const u8 = "";
 const ui_embed = @import("ui_embed");
 
 
@@ -48,6 +49,11 @@ pub fn dispatch(
     // UI routes — static assets and server-rendered pages.
     if (std.mem.eql(u8, clean, "/ui") or std.mem.startsWith(u8, clean, "/ui/")) {
         const ui_path = if (clean.len > 3) clean[3..] else "/";
+
+        // Logout: clear session cookie, redirect to login.
+        if (std.mem.eql(u8, ui_path, "/logout"))
+            return http.writeLogoutRedirect(send_buf);
+
         // Try static asset first.
         if (ui_embed.lookup(ui_path)) |file|
             return http.writeResponseStatic(send_buf, file.data, file.content_type, file.gzipped);
@@ -66,7 +72,9 @@ pub fn dispatch(
     if (std.mem.eql(u8, api, "/cluster/status"))
         return clusterStatus(send_buf);
     if (std.mem.eql(u8, api, "/auth/status"))
-        return http.writeResponse(send_buf, 200, "{\"admin_password_set\":false}");
+        return authStatus(send_buf);
+    if (std.mem.eql(u8, api, "/auth/login") and method == .POST)
+        return handleLogin(send_buf, body);
 
     const rdr = reader orelse return writeError(send_buf, 503, "no_mirror");
 
@@ -89,6 +97,88 @@ pub fn dispatch(
     if (std.mem.eql(u8, api, "/metrics/throughput"))
         return throughputMetrics(send_buf, server_metrics);
     return writeError(send_buf, 404, "not found");
+}
+
+// ============================================================================
+// Admin Auth — login handler
+// ============================================================================
+
+fn authStatus(send_buf: []u8) u32 {
+    var body_buf: [128]u8 = undefined;
+    var w = json.JsonWriter.init(&body_buf);
+    w.beginObject();
+    w.fieldBool("admin_password_set", g_admin_password.len > 0);
+    w.endObject();
+    return http.writeResponse(send_buf, 200, w.getWritten());
+}
+
+fn handleLogin(send_buf: []u8, body: []const u8) u32 {
+    if (g_admin_password.len == 0)
+        return http.writeResponse(send_buf, 400, "{\"error\":\"no admin password configured\"}");
+
+    // Parse form body: password=value (URL-encoded form data).
+    const password = extractFormValue(body, "password") orelse
+        return http.writeRedirect(send_buf, "/ui/login?error=1");
+
+    // Percent-decode the password (browsers encode form values).
+    var decoded_buf: [256]u8 = undefined;
+    const decoded = percentDecode(password, &decoded_buf);
+
+    if (!std.mem.eql(u8, decoded, g_admin_password))
+        return http.writeRedirect(send_buf, "/ui/login?error=1");
+
+    // Valid — set session cookie and redirect to dashboard.
+    var token_buf: [64]u8 = undefined;
+    const token = http.sessionHash(g_admin_password, &token_buf);
+    return http.writeLoginRedirect(send_buf, token);
+}
+
+fn extractFormValue(body: []const u8, key: []const u8) ?[]const u8 {
+    var rest = body;
+    while (rest.len > 0) {
+        const amp = std.mem.indexOfScalar(u8, rest, '&') orelse rest.len;
+        const pair = rest[0..amp];
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse {
+            rest = if (amp < rest.len) rest[amp + 1 ..] else "";
+            continue;
+        };
+        if (std.mem.eql(u8, pair[0..eq], key))
+            return pair[eq + 1 ..];
+        rest = if (amp < rest.len) rest[amp + 1 ..] else "";
+    }
+    return null;
+}
+
+fn percentDecode(input: []const u8, buf: *[256]u8) []const u8 {
+    var out: usize = 0;
+    var i: usize = 0;
+    while (i < input.len and out < buf.len) {
+        if (input[i] == '%' and i + 2 < input.len) {
+            const hi = hexDigit(input[i + 1]);
+            const lo = hexDigit(input[i + 2]);
+            if (hi != null and lo != null) {
+                buf[out] = (@as(u8, hi.?) << 4) | lo.?;
+                out += 1;
+                i += 3;
+                continue;
+            }
+        }
+        if (input[i] == '+') {
+            buf[out] = ' ';
+        } else {
+            buf[out] = input[i];
+        }
+        out += 1;
+        i += 1;
+    }
+    return buf[0..out];
+}
+
+fn hexDigit(c: u8) ?u4 {
+    if (c >= '0' and c <= '9') return @intCast(c - '0');
+    if (c >= 'a' and c <= 'f') return @intCast(c - 'a' + 10);
+    if (c >= 'A' and c <= 'F') return @intCast(c - 'A' + 10);
+    return null;
 }
 
 // ============================================================================

@@ -17,6 +17,7 @@
 //!   --max-conns <n>           Max concurrent connections (default: 4096)
 //!   --max-queues <n>          Max number of queues (default: 100)
 //!   --max-tags-per-queue <n>  Max fairness tags per queue (default: 1000)
+//!   --admin-password <pw>     Admin password (locks UI + API, enables session auth)
 //!   --help                    Show this help
 
 const std = @import("std");
@@ -105,6 +106,7 @@ fn printHelp() void {
         \\  --node-id <id>            Node ID (enables cluster mode)
         \\  --peers <spec>            Peers: id@host:port,id@host:port,...
         \\  --sync-repl               Enable sync replication
+        \\  --admin-password <pw>     Admin password (locks UI + API)
         \\  --help                    Show this help
         \\
         \\Config file format:
@@ -256,6 +258,11 @@ pub fn main() !void {
                 std.debug.print("invalid max-tags-per-queue: {s}\n", .{val});
                 return;
             };
+        } else if (std.mem.eql(u8, arg, "--admin-password")) {
+            config.admin_password = args.next() orelse {
+                std.debug.print("--admin-password requires an argument\n", .{});
+                return;
+            };
         }
     }
 
@@ -385,6 +392,7 @@ pub fn main() !void {
             .repl_hook = repl_hook,
             .sync_replication = config.sync_replication,
             .coalesce_window_ns = if (config.sync_replication) 200_000 else 0,
+            .admin_password = config.admin_password,
         },
     );
     defer pipeline.destroyHeap();
@@ -425,6 +433,10 @@ pub fn main() !void {
         };
         http_read.g_cluster_info = &cluster_info;
     }
+
+    // --- Admin auth ---
+    http_read.g_admin_password = config.admin_password;
+    corvo.http_ui.g_auth_enabled = config.admin_password.len > 0;
 
     std.debug.print("corvo: listening on {s}:{d} (rpc+http)\n", .{ config.bind, config.port });
 

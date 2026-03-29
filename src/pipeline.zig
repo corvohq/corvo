@@ -172,6 +172,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             /// the batch is full or this window elapses. Zero disables coalescing.
             /// Only applies when sync_replication is true.
             coalesce_window_ns: u64 = 0, // set by main.zig for production
+            admin_password: []const u8 = "",
         };
 
         // ====================================================================
@@ -535,17 +536,36 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 return;
             }
 
-            // Auth check (skipped for healthz and auth/status).
+            // Auth check.
             const clean_path = if (std.mem.indexOfScalar(u8, req.path, '?')) |qi| req.path[0..qi] else req.path;
+            const is_ui_route = std.mem.eql(u8, clean_path, "/ui") or std.mem.startsWith(u8, clean_path, "/ui/");
+            const is_ui_static = is_ui_route and
+                (std.mem.endsWith(u8, clean_path, ".js") or
+                std.mem.endsWith(u8, clean_path, ".css") or
+                std.mem.endsWith(u8, clean_path, ".svg"));
+            const admin_pw_set = self.config.admin_password.len > 0;
+
             const skip_auth = std.mem.eql(u8, clean_path, "/healthz") or
                 std.mem.eql(u8, clean_path, "/api/v1/auth/status") or
+                std.mem.eql(u8, clean_path, "/api/v1/auth/login") or
                 std.mem.eql(u8, clean_path, "/metrics") or
-                std.mem.eql(u8, clean_path, "/ui") or
-                std.mem.startsWith(u8, clean_path, "/ui/");
+                is_ui_static or
+                (is_ui_route and !admin_pw_set) or
+                (is_ui_route and std.mem.eql(u8, clean_path, "/ui/login")) or
+                (is_ui_route and std.mem.eql(u8, clean_path, "/ui/logout"));
             if (!skip_auth) {
-                const auth_result = http.checkAuth(req.api_key, req.method, self.reader);
+                const auth_result = http.checkAuth(
+                    req.api_key,
+                    req.session_cookie,
+                    self.config.admin_password,
+                    req.method,
+                    self.reader,
+                );
                 if (auth_result != .ok) {
-                    const resp_len = http.writeAuthError(c.send_buf, auth_result);
+                    const resp_len = if (is_ui_route)
+                        http.writeRedirect(c.send_buf, "/ui/login")
+                    else
+                        http.writeAuthError(c.send_buf, auth_result);
                     if (resp_len > 0) {
                         c.send_len = resp_len;
                         self.io.queueSend(conn_id, resp_len);

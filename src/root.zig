@@ -25,6 +25,7 @@ pub const pending_index = @import("pending_index.zig");
 // KV read layer — reads directly from Talon KV store.
 pub const kv_read = @import("kv_read.zig");
 pub const http_read = @import("http_read.zig");
+pub const http_ui = @import("http_ui.zig");
 
 // IO backend (io_uring / kqueue / sim)
 pub const io = @import("io.zig");

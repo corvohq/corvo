@@ -72,6 +72,9 @@
       </button>
       <button hx-get="/ui/partials/enqueue-form" hx-target="#modal" hx-swap="innerHTML"
         class="bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:bg-zinc-800 dark:hover:bg-zinc-200 rounded-md px-3 py-1.5 md:px-4 md:py-2 text-xs md:text-sm font-medium">Enqueue</button>
+      {{#show_logout}}<a href="/ui/logout" class="p-2 rounded-md text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800" title="Logout">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
+      </a>{{/show_logout}}
     </div>
   </div>
   <div id="modal"></div>

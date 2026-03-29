@@ -25,6 +25,7 @@ pub const job_detail_html = @embedFile("ui/templates/job-detail.html");
 pub const workers_html = @embedFile("ui/templates/workers.html");
 pub const pagination_html = @embedFile("ui/templates/pagination.html");
 pub const cluster_html = @embedFile("ui/templates/cluster.html");
+pub const login_html = @embedFile("ui/templates/login.html");
 
 /// Largest embedded asset size. send_buf must fit this + HTTP headers (~200B).
 pub const max_asset_size: usize = htmx_js_gz.len;

@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login - Corvo</title>
+  <link rel="icon" href="/ui/favicon.svg">
+  <link rel="stylesheet" href="/ui/tailwind.css">
+  <script>if(localStorage.getItem('theme')==='dark'||(localStorage.getItem('theme')===null&&matchMedia('(prefers-color-scheme:dark)').matches))document.documentElement.classList.add('dark')</script>
+</head>
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 min-h-screen flex items-center justify-center">
+  <div class="w-full max-w-sm px-4">
+    <div class="text-center mb-8">
+      <img src="/ui/logo-full.svg" alt="Corvo" class="h-8 mx-auto mb-2">
+    </div>
+    <form method="POST" action="/api/v1/auth/login" class="bg-white dark:bg-zinc-900 rounded-lg shadow-sm p-6 border border-zinc-200 dark:border-zinc-800">
+      {{#has_error}}<div class="mb-4 text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 rounded-md px-3 py-2">Invalid password.</div>{{/has_error}}
+      <label class="block text-sm font-medium mb-2" for="password">Admin Password</label>
+      <input type="password" name="password" id="password" required autofocus
+        class="w-full rounded-md border border-zinc-300 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-zinc-500 dark:focus:ring-zinc-400">
+      <button type="submit"
+        class="mt-4 w-full bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:bg-zinc-800 dark:hover:bg-zinc-200 rounded-md px-4 py-2 text-sm font-medium transition-colors">Sign In</button>
+    </form>
+  </div>
+</body>
+</html>

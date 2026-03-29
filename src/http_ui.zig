@@ -10,6 +10,9 @@ const http = @import("http.zig");
 const kv_read = @import("kv_read.zig");
 const ui_embed = @import("ui_embed");
 
+/// Whether admin password auth is enabled (set by main.zig).
+pub var g_auth_enabled: bool = false;
+
 /// Max HTML body size. Pages render into a buffer of this size.
 /// Mustache templates with dark mode classes + inline SVG icons need headroom.
 /// send_buf is 64KB (IO layer — do not change). Layout ~8KB + HTTP headers ~200B.
@@ -39,6 +42,7 @@ const job_table_tmpl = zigstache.Template.parse(ui_embed.job_table_html) catch u
 const job_detail_tmpl = zigstache.Template.parse(ui_embed.job_detail_html) catch unreachable;
 const workers_tmpl = zigstache.Template.parse(ui_embed.workers_html) catch unreachable;
 const pagination_tmpl = zigstache.Template.parse(ui_embed.pagination_html) catch unreachable;
+const login_tmpl = zigstache.Template.parse(ui_embed.login_html) catch unreachable;
 
 // ============================================================================
 // Dispatch
@@ -46,6 +50,9 @@ const pagination_tmpl = zigstache.Template.parse(ui_embed.pagination_html) catch
 
 /// Route a UI page request. Returns bytes written to send_buf.
 pub fn dispatch(path: []const u8, query: []const u8, send_buf: []u8, reader: ?*kv_read.Reader) u32 {
+    // Login page (standalone, no layout).
+    if (eql(path, "/login")) return loginPage(send_buf, query);
+
     // Full page routes.
     if (eql(path, "/") or eql(path, "")) return dashboard(send_buf, reader);
     if (eql(path, "/queues")) return queuesPage(send_buf, reader);
@@ -72,9 +79,25 @@ pub fn dispatch(path: []const u8, query: []const u8, send_buf: []u8, reader: ?*k
 /// Splice title and content into the layout template, then write the HTTP response.
 fn renderPage(send_buf: []u8, title: []const u8, content: []const u8) u32 {
     var buf: [render_buf_size]u8 = undefined;
-    const rendered = layout_tmpl.render(&buf, .{ .title = title, .content = content }) catch |err| switch (err) {
+    const rendered = layout_tmpl.render(&buf, .{
+        .title = title,
+        .content = content,
+        .show_logout = g_auth_enabled,
+    }) catch |err| switch (err) {
         error.BufferOverflow => return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>"),
     };
+    return http.writeResponseHtml(send_buf, 200, rendered);
+}
+
+// ============================================================================
+// Login Page (standalone — no layout wrapper)
+// ============================================================================
+
+fn loginPage(send_buf: []u8, query: []const u8) u32 {
+    const has_error = getQueryParam(query, "error") != null;
+    var buf: [render_buf_size]u8 = undefined;
+    const rendered = login_tmpl.render(&buf, .{ .has_error = has_error }) catch
+        return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return http.writeResponseHtml(send_buf, 200, rendered);
 }
 

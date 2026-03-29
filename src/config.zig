@@ -22,6 +22,9 @@ pub const ServerConfig = struct {
     mirror: bool = true,
     max_conns: u16 = 4096,
 
+    // Auth
+    admin_password: []const u8 = "",
+
     // Cluster identity (node-local)
     node_id: []const u8 = "",
     peers: []const u8 = "",
@@ -174,6 +177,8 @@ pub const ServerConfig = struct {
             self.peers = val;
         } else if (eql(key, "cluster-port")) {
             self.cluster_port = parseInt(u16, val) orelse return error.InvalidValue;
+        } else if (eql(key, "admin-password")) {
+            self.admin_password = val;
         } else {
             return error.UnknownKey;
         }

@@ -38,6 +38,7 @@ pub const HttpRequest = struct {
     body: []const u8,
     total_len: u32,
     api_key: ?[]const u8 = null,
+    session_cookie: ?[]const u8 = null,
 };
 
 // ============================================================================
@@ -75,12 +76,16 @@ pub fn parseRequest(data: []const u8) ?HttpRequest {
     // Extract API key from X-API-Key or Authorization: Bearer headers.
     const api_key = extractApiKey(header_section);
 
+    // Extract session cookie for admin password auth.
+    const session_cookie = extractSessionCookie(header_section);
+
     return .{
         .method = method,
         .path = path,
         .body = body,
         .total_len = total_len,
         .api_key = api_key,
+        .session_cookie = session_cookie,
     };
 }
 
@@ -144,6 +149,32 @@ fn extractApiKey(headers: []const u8) ?[]const u8 {
             if (val.len > 7 and eqlIgnoreCase(val[0..7], "bearer ")) {
                 const key = std.mem.trimLeft(u8, val[7..], " \t");
                 if (key.len > 0) return key;
+            }
+        }
+    }
+    return null;
+}
+
+fn extractSessionCookie(headers: []const u8) ?[]const u8 {
+    const cookie_prefix = "corvo_session=";
+    var start: usize = 0;
+    while (start < headers.len) {
+        const end = std.mem.indexOf(u8, headers[start..], "\r\n") orelse headers.len - start;
+        const line = headers[start..][0..end];
+        start += end + 2;
+
+        // Cookie: name=value; name2=value2
+        if (line.len > 8 and (line[0] == 'C' or line[0] == 'c') and eqlIgnoreCase(line[0..8], "cookie: ")) {
+            var cookies = line[8..];
+            while (cookies.len > 0) {
+                cookies = std.mem.trimLeft(u8, cookies, " ");
+                if (std.mem.startsWith(u8, cookies, cookie_prefix)) {
+                    const val = cookies[cookie_prefix.len..];
+                    const val_end = std.mem.indexOfScalar(u8, val, ';') orelse val.len;
+                    if (val_end > 0) return val[0..val_end];
+                }
+                const semi = std.mem.indexOfScalar(u8, cookies, ';') orelse break;
+                cookies = cookies[semi + 1 ..];
             }
         }
     }
@@ -332,6 +363,8 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
                 return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, "", "approval_policy");
             if (std.mem.eql(u8, api, "/auth/keys"))
                 return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, "", "api_key");
+            if (std.mem.eql(u8, api, "/auth/login"))
+                return .read;
 
             if (std.mem.eql(u8, api, "/jobs/bulk-get"))
                 return .read;
@@ -552,16 +585,34 @@ pub fn hashApiKey(key: []const u8, out: *[64]u8) []const u8 {
     return out[0..64];
 }
 
-/// Check auth for an HTTP request. Returns ok if no auth is configured,
-/// unauthorized if auth is required but missing/invalid, forbidden if role insufficient.
+/// Check auth for an HTTP request.
+///
+/// Auth layers (checked in order):
+///   1. Admin password — Bearer token matches admin_password, or valid session cookie.
+///   2. API keys — hashed key lookup in KV store, role-based access.
+///
+/// Returns ok if no auth is configured (no admin password, no API keys).
 pub fn checkAuth(
     api_key: ?[]const u8,
+    session_cookie: ?[]const u8,
+    admin_password: []const u8,
     method: Method,
     reader: ?*kv_read.Reader,
 ) AuthResult {
-    const rdr = reader orelse return .ok;
+    // Layer 1: admin password (Bearer token or session cookie).
+    if (admin_password.len > 0) {
+        if (api_key) |key| {
+            if (std.mem.eql(u8, key, admin_password)) return .ok;
+        }
+        if (session_cookie) |cookie| {
+            if (validateSessionCookie(cookie, admin_password)) return .ok;
+        }
+    }
+
+    // Layer 2: API key lookup.
+    const rdr = reader orelse return if (admin_password.len > 0) .unauthorized else .ok;
     const key_count = rdr.countEnabledApiKeys();
-    if (key_count == 0) return .ok; // no keys configured = auth disabled
+    if (key_count == 0) return if (admin_password.len > 0) .unauthorized else .ok;
 
     const raw_key = api_key orelse return .unauthorized;
     if (raw_key.len == 0) return .unauthorized;
@@ -584,8 +635,76 @@ pub fn writeAuthError(send_buf: []u8, auth_result: AuthResult) u32 {
     return switch (auth_result) {
         .unauthorized => writeResponse(send_buf, 401, "{\"error\":\"unauthorized\"}"),
         .forbidden => writeResponse(send_buf, 403, "{\"error\":\"forbidden\"}"),
-        .ok => 0,
+        .ok => unreachable,
     };
+}
+
+// ============================================================================
+// Session Auth — stateless session tokens for admin password
+// ============================================================================
+
+/// Compute session token: hex(SHA256("corvo-session:" + admin_password)).
+pub fn sessionHash(admin_password: []const u8, out: *[64]u8) []const u8 {
+    assert.check(admin_password.len > 0, "sessionHash called with empty password", .{});
+    const prefix = "corvo-session:";
+    var input_buf: [256]u8 = undefined;
+    assert.check(prefix.len + admin_password.len <= input_buf.len, "admin password too long", .{});
+    @memcpy(input_buf[0..prefix.len], prefix);
+    @memcpy(input_buf[prefix.len..][0..admin_password.len], admin_password);
+
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(input_buf[0 .. prefix.len + admin_password.len], &hash, .{});
+    const hex_chars = "0123456789abcdef";
+    for (hash, 0..) |byte, i| {
+        out[i * 2] = hex_chars[byte >> 4];
+        out[i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+    return out[0..64];
+}
+
+fn validateSessionCookie(cookie: []const u8, admin_password: []const u8) bool {
+    if (cookie.len != 64) return false;
+    var expected: [64]u8 = undefined;
+    const token = sessionHash(admin_password, &expected);
+    return std.mem.eql(u8, cookie, token);
+}
+
+/// Write 303 redirect with Set-Cookie (session token).
+pub fn writeLoginRedirect(send_buf: []u8, token: []const u8) u32 {
+    var stream = std.io.fixedBufferStream(send_buf);
+    const w = stream.writer();
+    w.writeAll("HTTP/1.1 303 See Other\r\n") catch return 0;
+    w.writeAll("Location: /ui\r\n") catch return 0;
+    w.print("Set-Cookie: corvo_session={s}; HttpOnly; SameSite=Strict; Path=/\r\n", .{token}) catch return 0;
+    w.writeAll("Content-Length: 0\r\n") catch return 0;
+    w.writeAll("Connection: keep-alive\r\n") catch return 0;
+    w.writeAll("\r\n") catch return 0;
+    return @intCast(stream.pos);
+}
+
+/// Write 303 redirect (no cookie).
+pub fn writeRedirect(send_buf: []u8, location: []const u8) u32 {
+    var stream = std.io.fixedBufferStream(send_buf);
+    const w = stream.writer();
+    w.writeAll("HTTP/1.1 303 See Other\r\n") catch return 0;
+    w.print("Location: {s}\r\n", .{location}) catch return 0;
+    w.writeAll("Content-Length: 0\r\n") catch return 0;
+    w.writeAll("Connection: keep-alive\r\n") catch return 0;
+    w.writeAll("\r\n") catch return 0;
+    return @intCast(stream.pos);
+}
+
+/// Write 303 redirect to /ui/login with cookie cleared.
+pub fn writeLogoutRedirect(send_buf: []u8) u32 {
+    var stream = std.io.fixedBufferStream(send_buf);
+    const w = stream.writer();
+    w.writeAll("HTTP/1.1 303 See Other\r\n") catch return 0;
+    w.writeAll("Location: /ui/login\r\n") catch return 0;
+    w.writeAll("Set-Cookie: corvo_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0\r\n") catch return 0;
+    w.writeAll("Content-Length: 0\r\n") catch return 0;
+    w.writeAll("Connection: keep-alive\r\n") catch return 0;
+    w.writeAll("\r\n") catch return 0;
+    return @intCast(stream.pos);
 }
 
 // ============================================================================
