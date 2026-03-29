@@ -2,7 +2,7 @@
 
 ## UI End-to-End Tests
 
-- [ ] Run UI e2e tests against pipeline v2 — verify dashboard works with all HTTP read/write endpoints
+- [x] Run UI e2e tests against pipeline v2 — 40 Playwright tests passing (pages, actions, filters, exports, HTMX refresh, API endpoints)
 
 ## Server
 

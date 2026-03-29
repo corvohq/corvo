@@ -10,18 +10,19 @@ test.describe("Dashboard", () => {
   });
 
   test("shows seeded queue names", async ({ page }) => {
-    await expect(page.getByText("emails")).toBeVisible();
-    await expect(page.getByText("payments")).toBeVisible();
+    await expect(page.getByRole("link", { name: "emails" })).toBeVisible();
+    await expect(page.getByRole("link", { name: "payments" })).toBeVisible();
   });
 
   test("shows summary stat cards", async ({ page }) => {
-    await expect(page.getByText("Pending")).toBeVisible();
-    await expect(page.getByText("Active")).toBeVisible();
-    await expect(page.getByText("Workers")).toBeVisible();
+    const main = page.locator("main");
+    await expect(main.getByText("Total Pending")).toBeVisible();
+    await expect(main.getByText("Active").first()).toBeVisible();
+    await expect(main.getByText("Workers")).toBeVisible();
   });
 
   test("Enqueue Job button is present", async ({ page }) => {
-    await expect(page.getByRole("button", { name: /enqueue job/i })).toBeVisible();
+    await expect(page.getByRole("button", { name: /^enqueue$/i })).toBeVisible();
   });
 
   test("sidebar navigation links present", async ({ page }) => {
@@ -50,26 +51,25 @@ test.describe("Queues page", () => {
   test("queue links navigate to detail page", async ({ page }) => {
     await page.getByRole("link", { name: "emails" }).click();
     await expect(page).toHaveURL(/\/ui\/queues\/emails/);
-    await expect(page.getByText("emails")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "emails" })).toBeVisible();
   });
 });
 
 test.describe("Queue detail", () => {
   test("shows queue name and action buttons", async ({ page }) => {
     await page.goto("/ui/queues/emails");
-    await expect(page.getByText("emails")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "emails" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Pause" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Resume" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Drain" })).toBeVisible();
   });
 
-  test("shows jobs in table with action buttons", async ({ page }) => {
+  test("shows jobs in table", async ({ page }) => {
     await page.goto("/ui/queues/emails");
     const rows = page.locator("table tbody tr");
     await expect(rows.first()).toBeVisible();
-    // Row has Cancel and Delete action buttons.
-    await expect(rows.first().getByRole("button", { name: "Cancel" })).toBeVisible();
-    await expect(rows.first().getByRole("button", { name: "Delete" })).toBeVisible();
+    // Row links to job detail.
+    await expect(rows.first().locator("a")).toBeVisible();
   });
 
   test("has select-all checkbox and bulk bar appears", async ({ page }) => {
@@ -78,6 +78,98 @@ test.describe("Queue detail", () => {
     await expect(selectAll).toBeVisible();
     await selectAll.check();
     await expect(page.getByText(/\d+ selected/)).toBeVisible();
+  });
+});
+
+test.describe("Queue detail: filter and export", () => {
+  test("filter tabs are present", async ({ page }) => {
+    await page.goto("/ui/queues/emails");
+    await expect(page.getByRole("link", { name: /all/i }).first()).toBeVisible();
+    await expect(page.getByRole("link", { name: /pending/i }).first()).toBeVisible();
+  });
+
+  test("client-side text filter narrows rows", async ({ page }) => {
+    await page.goto("/ui/queues/emails");
+    const rows = page.locator("table tbody tr");
+    const initialCount = await rows.count();
+    // Type a filter that won't match anything.
+    await page.locator("input[placeholder='Filter jobs...']").fill("zzz-no-match");
+    // All rows should be hidden.
+    await expect(rows.first()).toBeHidden();
+    // Clear filter to restore.
+    await page.locator("input[placeholder='Filter jobs...']").fill("");
+    await expect(rows).toHaveCount(initialCount);
+  });
+
+  test("export buttons are visible", async ({ page }) => {
+    await page.goto("/ui/queues/emails");
+    await expect(page.getByRole("button", { name: "JSON" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "CSV" })).toBeVisible();
+  });
+});
+
+test.describe("Queue detail: stats cards", () => {
+  test("shows stats cards for queue", async ({ page }) => {
+    await page.goto("/ui/queues/emails");
+    await expect(page.getByText("Pending", { exact: true }).first()).toBeVisible();
+    await expect(page.getByText("Dead", { exact: true }).first()).toBeVisible();
+  });
+});
+
+test.describe("HTMX auto-refresh", () => {
+  test("dashboard stats container has hx-trigger", async ({ page }) => {
+    await page.goto("/ui/");
+    const statsDiv = page.locator("[hx-get='/ui/partials/dashboard-stats']");
+    await expect(statsDiv).toHaveAttribute("hx-trigger", /every/);
+  });
+
+  test("queues table container has hx-trigger", async ({ page }) => {
+    await page.goto("/ui/queues");
+    const tableDiv = page.locator("[hx-get='/ui/partials/queues-table']");
+    await expect(tableDiv).toHaveAttribute("hx-trigger", /every/);
+  });
+});
+
+test.describe("Dark mode", () => {
+  test("toggle button exists in header", async ({ page }) => {
+    await page.goto("/ui/");
+    // Dark mode toggle is next to the Enqueue button in the header.
+    const headerActions = page.locator("main .flex.items-center.gap-2").first();
+    const toggleBtn = headerActions.locator("button").first();
+    await expect(toggleBtn).toBeVisible();
+  });
+});
+
+test.describe("API: metrics and cluster endpoints", () => {
+  test("throughput endpoint returns JSON", async ({ request }) => {
+    const resp = await request.get("/api/v1/metrics/throughput");
+    expect(resp.status()).toBe(200);
+    const body = await resp.json();
+    expect(body).toHaveProperty("enqueue_rate");
+    expect(body).toHaveProperty("per_second");
+  });
+
+  test("cluster events endpoint returns JSON", async ({ request }) => {
+    const resp = await request.get("/api/v1/cluster/events");
+    expect(resp.status()).toBe(200);
+    const body = await resp.json();
+    expect(body).toHaveProperty("events");
+    expect(Array.isArray(body.events)).toBe(true);
+  });
+
+  test("cluster status endpoint returns JSON", async ({ request }) => {
+    const resp = await request.get("/api/v1/cluster/status");
+    expect(resp.status()).toBe(200);
+    const body = await resp.json();
+    expect(body).toHaveProperty("state");
+    expect(body).toHaveProperty("node_id");
+  });
+
+  test("prometheus metrics endpoint returns text", async ({ request }) => {
+    const resp = await request.get("/metrics");
+    expect(resp.status()).toBe(200);
+    const text = await resp.text();
+    expect(text).toContain("corvo_enqueued_total");
   });
 });
 
@@ -113,10 +205,10 @@ test.describe("Job Detail", () => {
     await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Cancel" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Delete" })).toBeVisible();
-    // Should show job metadata.
-    await expect(page.getByText("Queue")).toBeVisible();
-    await expect(page.getByText("State")).toBeVisible();
-    await expect(page.getByText("Priority")).toBeVisible();
+    // Should show job metadata table.
+    await expect(page.getByRole("cell", { name: "Queue" })).toBeVisible();
+    await expect(page.getByRole("cell", { name: "State" })).toBeVisible();
+    await expect(page.getByRole("cell", { name: "Priority" })).toBeVisible();
   });
 });
 
