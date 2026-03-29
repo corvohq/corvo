@@ -10,6 +10,7 @@ const codec = @import("codec.zig");
 const kv = @import("kv.zig");
 const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
+const metrics_mod = handler.metrics_mod;
 
 // Chain step sentinel values (since chain_step is u16, we use high values for cleanup handlers).
 const chain_step_exit: u16 = 0xFFFF;
@@ -54,9 +55,9 @@ pub fn applyAck(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.AckOp) ops.O
 
         if (next_state == .completed) {
             job.completed_at_ns = op.now_ns;
+            self.metrics.recordComplete(job.queue, job.created_at_ns, job.started_at_ns, op.now_ns);
             var dk_buf: keys.KeyBuf = undefined;
             b.set(keys.deadKey(&dk_buf, op.now_ns, job.id), "");
-            self.dead_since_purge += 1;
 
             if (job.expire_after_ms > 0 and job.expire_at_ns > 0) {
                 var xk_buf: keys.KeyBuf = undefined;

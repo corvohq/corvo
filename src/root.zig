@@ -38,6 +38,9 @@ pub const cluster = @import("cluster.zig");
 // Server configuration
 pub const server_config = @import("config.zig");
 
+// Performance metrics
+pub const metrics = @import("metrics.zig");
+
 // CLI client
 pub const cli = @import("cli.zig");
 

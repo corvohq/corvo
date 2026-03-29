@@ -557,6 +557,18 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 .read => {
                     // Handle inline — write response directly, bypass batch.
                     const clean = if (std.mem.indexOfScalar(u8, req.path, '?')) |qi| req.path[0..qi] else req.path;
+
+                    // /metrics is special: needs handler metrics + reader.
+                    if (std.mem.eql(u8, clean, "/metrics")) {
+                        const resp_len = http_read.metrics(c.send_buf, self.reader, &self.handler.metrics);
+                        if (resp_len > 0) {
+                            c.send_len = resp_len;
+                            self.io.queueSend(conn_id, resp_len);
+                        }
+                        self.recordRecvCompaction(conn_id, req.total_len);
+                        return;
+                    }
+
                     const api = if (std.mem.startsWith(u8, clean, "/api/v1/")) clean["/api/v1".len..] else clean;
                     const param = extractPathParam(api);
                     const resp_len = http_read.dispatch(

@@ -10,6 +10,7 @@ const codec = @import("codec.zig");
 const kv = @import("kv.zig");
 const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
+const metrics_mod = handler.metrics_mod;
 
 pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueOp) ops.OpResult {
     if (op.jobs.len == 0) {
@@ -169,6 +170,7 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
         self.incrQueueCounter(b, job.queue, job.state);
 
         self.verifyJobIndexes(b, &job, "enqueue");
+        self.metrics.recordEnqueue(job.queue, 1);
         affected += 1;
     }
 

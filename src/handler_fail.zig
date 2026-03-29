@@ -10,6 +10,7 @@ const codec = @import("codec.zig");
 const kv = @import("kv.zig");
 const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
+const metrics_mod = handler.metrics_mod;
 
 // Chain step sentinel values (matching handler_ack.zig).
 const chain_step_failure: u16 = 0xFFFE;
@@ -101,13 +102,13 @@ pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops
             job.state = .dead;
             job.completed_at_ns = op.now_ns;
             job.failed_at_ns = op.now_ns;
+            self.metrics.recordFail(job.queue);
             job.worker_id = null;
             job.hostname = null;
             job.lease_expires_at_ns = 0;
 
             var dk_buf: keys.KeyBuf = undefined;
             b.set(keys.deadKey(&dk_buf, op.now_ns, fail_job.job_id), "");
-            self.dead_since_purge += 1;
 
             // Release unique lock if we own it
             var uk_buf: keys.KeyBuf = undefined;

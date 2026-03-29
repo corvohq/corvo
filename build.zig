@@ -85,6 +85,23 @@ pub fn build(b: *std.Build) void {
     const bench_rpc_step = b.step("bench-rpc", "Run RPC benchmarks");
     bench_rpc_step.dependOn(&run_bench_rpc.step);
 
+    // --- Saturation Benchmark executable ---
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_mod.addImport("corvo", corvo_mod);
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = bench_mod,
+    });
+    b.installArtifact(bench_exe);
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |a| run_bench.addArgs(a);
+    const bench_step = b.step("bench", "Run saturation benchmarks");
+    bench_step.dependOn(&run_bench.step);
+
     // --- Corvo server executable ---
     const main_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

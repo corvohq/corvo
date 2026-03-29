@@ -8,6 +8,7 @@ const http = @import("http.zig");
 const json = @import("json_writer.zig");
 const kv_read = @import("kv_read.zig");
 const http_ui = @import("http_ui.zig");
+const metrics_mod = @import("metrics.zig");
 
 /// Cluster info for /cluster/status. Set by main.zig after election.
 pub const ClusterInfo = struct {
@@ -94,10 +95,16 @@ pub fn dispatch(
 // Metrics (special — text/plain, not JSON)
 // ============================================================================
 
-pub fn metrics(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
-    var body_buf: [32768]u8 = undefined;
+pub fn metrics(send_buf: []u8, reader: ?*kv_read.Reader, server_metrics: ?*const metrics_mod.ServerMetrics) u32 {
+    var body_buf: [65536]u8 = undefined;
     var pos: usize = 0;
 
+    // Server-side performance metrics (latency histograms + throughput counters).
+    if (server_metrics) |sm| {
+        pos += sm.writePrometheus(body_buf[pos..]);
+    }
+
+    // KV-based queue state gauges.
     if (reader) |rdr| {
         var stats_buf: [64]kv_read.QueueStats = undefined;
         const qcount = rdr.getQueueStats(&stats_buf);

@@ -12,6 +12,7 @@ const keys = @import("keys.zig");
 const codec = @import("codec.zig");
 const kv = @import("kv.zig");
 const pending_index_mod = @import("pending_index.zig");
+pub const metrics_mod = @import("metrics.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -58,6 +59,9 @@ pub const OpHandler = struct {
     /// is written (ack/fail/reclaim/expire/bulk). Pipeline uses this to
     /// trigger purge early when count exceeds purge_threshold.
     dead_since_purge: u32 = 0,
+
+    /// Performance metrics (latency histograms + throughput counters).
+    metrics: metrics_mod.ServerMetrics = .{},
 
     /// Maximum rate window across all queues/global/namespace rate limits.
     /// Used by maintenance to compute correct cleanup cutoff.
