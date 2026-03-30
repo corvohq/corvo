@@ -55,12 +55,16 @@
 
 ## Server
 
-- [ ] Admin password auth — `--admin-password` flag, UI login form + session cookie, HTTP Bearer auth. Bootstrap key: locks system, then create scoped API keys. Layers: no auth (dev) → admin password (simple) → API keys (enterprise/roles).
+- [x] Admin password auth — `--admin-password` flag, UI login form + session cookie, HTTP Bearer auth. Bootstrap key: locks system, then create scoped API keys. Layers: no auth (dev) → admin password (simple) → API keys (enterprise/roles).
 
 ## V1 Release
 
 - [ ] SDK publishing — git init + publish for all SDK repos
 - [ ] Dockerfile + CI/release workflows verified end-to-end
+
+## Enterprise (`../corvo-enterprise`)
+
+- [ ] Rewrite for current architecture — main.zig uses old stack (Engine, Mirror, Store, Scheduler, separate HTTP+RPC ports). Needs: Pipeline, io.zig (single port), KV reads (no SQLite). schema_ent.zig SQLite DDL → KV key prefixes. routes.zig dispatch pattern is fine, handlers are stubs. license.zig is fine.
 
 ## TigerStyle Audit (last)
 
