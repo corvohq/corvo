@@ -653,6 +653,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                             self.config.admin_password,
                             self.reader,
                             w.msg_type,
+                            w.sub_action,
                         );
                         if (write_auth != .ok) {
                             const resp_len = http.writeAuthError(c.send_buf, write_auth);

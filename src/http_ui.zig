@@ -51,6 +51,7 @@ const job_detail_tmpl = zigstache.Template.parse(ui_embed.job_detail_html) catch
 const workers_tmpl = zigstache.Template.parse(ui_embed.workers_html) catch unreachable;
 const pagination_tmpl = zigstache.Template.parse(ui_embed.pagination_html) catch unreachable;
 const login_tmpl = zigstache.Template.parse(ui_embed.login_html) catch unreachable;
+const api_keys_tmpl = zigstache.Template.parse(ui_embed.api_keys_html) catch unreachable;
 
 // ============================================================================
 // Dispatch
@@ -71,6 +72,7 @@ pub fn dispatch(path: []const u8, query: []const u8, send_buf: []u8, reader: ?*k
     if (std.mem.startsWith(u8, path, "/jobs/")) return jobDetailPage(send_buf, reader, path["/jobs/".len..]);
     if (eql(path, "/workers")) return workersPage(send_buf, reader);
     if (eql(path, "/cluster")) return clusterPage(send_buf, reader);
+    if (eql(path, "/api-keys")) return apiKeysPage(send_buf, reader);
 
     // HTMX partial routes (fragments, no layout).
     if (eql(path, "/partials/dashboard-stats")) return dashboardStatsPartial(send_buf, reader);
@@ -500,6 +502,41 @@ fn workersPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
 
 fn clusterPage(send_buf: []u8, _: ?*kv_read.Reader) u32 {
     return renderPage(send_buf, "Cluster", ui_embed.cluster_html);
+}
+
+fn apiKeysPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
+    var key_buf: [100]kv_read.ApiKeyRow = undefined;
+    const count: usize = if (reader) |rdr| rdr.listApiKeys(&key_buf) else 0;
+
+    const ApiKeyView = struct {
+        name: []const u8,
+        key_hash: []const u8,
+        key_hash_short: []const u8,
+        role: []const u8,
+        enabled: bool,
+        created_at: []const u8,
+    };
+
+    var views: [100]ApiKeyView = undefined;
+    for (0..count) |i| {
+        const row = &key_buf[i];
+        const kh = row.keyHashSlice();
+        views[i] = .{
+            .name = row.nameSlice(),
+            .key_hash = kh,
+            .key_hash_short = if (kh.len > 12) kh[0..12] else kh,
+            .role = row.roleSlice(),
+            .enabled = row.enabled,
+            .created_at = row.createdAtSlice(),
+        };
+    }
+
+    var content_buf: [page_buf_size]u8 = undefined;
+    const content = api_keys_tmpl.render(&content_buf, .{
+        .has_keys = count > 0,
+        .keys = views[0..count],
+    }) catch return renderPage(send_buf, "API Keys", "<p>Page too large</p>");
+    return renderPage(send_buf, "API Keys", content);
 }
 
 // ============================================================================

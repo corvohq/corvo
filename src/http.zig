@@ -614,10 +614,13 @@ pub fn checkAuth(
         }
     }
 
+    // No admin password → no auth enforcement. API keys require admin password as bootstrap.
+    if (admin_password.len == 0) return .{ .ok = .admin };
+
     // Layer 2: API key lookup.
-    const rdr = reader orelse return if (admin_password.len > 0) .unauthorized else .{ .ok = .admin };
+    const rdr = reader orelse return .unauthorized;
     const key_count = rdr.countEnabledApiKeys();
-    if (key_count == 0) return if (admin_password.len > 0) .unauthorized else .{ .ok = .admin };
+    if (key_count == 0) return .unauthorized;
 
     const raw_key = api_key orelse return .unauthorized;
     if (raw_key.len == 0) return .unauthorized;
@@ -646,6 +649,7 @@ pub fn writeAuthError(send_buf: []u8, auth_result: AuthResult) u32 {
 
 /// Check identity + role authorization for a write operation.
 /// Combines checkAuth identity lookup with role-based write enforcement.
+/// API key management requires admin_password to be set (bootstrap requirement).
 /// Returns .ok with role if authorized, or .unauthorized/.forbidden.
 pub fn authorizeWrite(
     api_key: ?[]const u8,
@@ -653,7 +657,14 @@ pub fn authorizeWrite(
     admin_password: []const u8,
     reader: ?*kv_read.Reader,
     msg_type: u8,
+    sub_action: []const u8,
 ) AuthResult {
+    // API key creation requires admin password as bootstrap.
+    // Delete is allowed without password (escape hatch for stuck state).
+    if (msg_type == rpc.MSG_MODIFY_ENT_SETTING and admin_password.len == 0 and
+        std.mem.eql(u8, sub_action, "api_key"))
+        return .forbidden;
+
     const auth = checkAuth(api_key, session_cookie, admin_password, reader);
     switch (auth) {
         .ok => |role| {

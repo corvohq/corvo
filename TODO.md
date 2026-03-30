@@ -57,14 +57,33 @@
 
 - [x] Admin password auth — `--admin-password` flag, UI login form + session cookie, HTTP Bearer auth. Bootstrap key: locks system, then create scoped API keys. Layers: no auth (dev) → admin password (simple) → API keys (enterprise/roles).
 
+## Server
+
+- [ ] `--max-jobs` flag — explicit resource limit on total job count. Handler rejects enqueue when `total_jobs >= max_jobs` (boundary error, not assert). Same pattern as max_queues/max_namespaces. Enables Corvo Cloud tiered plans.
+
 ## V1 Release
 
 - [ ] SDK publishing — git init + publish for all SDK repos
 - [ ] Dockerfile + CI/release workflows verified end-to-end
 
-## Enterprise (`../corvo-enterprise`)
+## Scoped API Keys
 
-- [ ] Rewrite for current architecture — main.zig uses old stack (Engine, Mirror, Store, Scheduler, separate HTTP+RPC ports). Needs: Pipeline, io.zig (single port), KV reads (no SQLite). schema_ent.zig SQLite DDL → KV key prefixes. routes.zig dispatch pattern is fine, handlers are stubs. license.zig is fine.
+- [x] API key generation — random key, SHA256 hash as KV key, JSON value with name/role/enabled/key_hash/created_at_ns
+- [x] Role enforcement — admin (full), producer (enqueue/batch), worker (fetch/ack/fail/heartbeat). authorizeWrite in http.zig.
+- [x] KV read stubs fixed — apiKeyFromValue parses JSON, getApiKeyByHash returns populated ApiKeyRow
+- [x] API keys UI — moved to core, JS fetch for create/delete, one-time key display, role descriptions
+- [x] Admin password required for key creation, delete allowed without (escape hatch)
+
+## Webhooks
+
+- [ ] Webhook registration — POST /api/v1/webhooks, KV-backed, URL + events (job.completed, job.failed, job.dead)
+- [ ] Webhook dispatch — fire-and-forget HTTP POST on job state transitions, retry with backoff
+
+## Audit Log
+
+- [ ] Audit entries — KV-backed log of admin actions (key create/delete, queue config, bulk actions)
+- [ ] GET /api/v1/audit — paginated read endpoint
+- [ ] UI page — audit log viewer
 
 ## TigerStyle Audit (last)
 
