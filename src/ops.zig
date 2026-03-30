@@ -27,7 +27,7 @@ pub const OpType = enum(u8) {
     maintenance = 10,
     batch_create = 11,
     batch_seal = 12,
-    modify_ent_setting = 13,
+    modify_setting = 13,
     multi = 14,
     cron_create = 15,
     cron_update = 16,
@@ -197,7 +197,6 @@ pub const QueueAction = enum(u8) {
     fairness = 5,
     clear = 6,
     delete = 7,
-    namespace = 8,
 
     pub fn toString(self: QueueAction) []const u8 {
         return switch (self) {
@@ -208,7 +207,6 @@ pub const QueueAction = enum(u8) {
             .fairness => "fairness",
             .clear => "clear",
             .delete => "delete",
-            .namespace => "namespace",
         };
     }
 };
@@ -220,7 +218,6 @@ pub const QueueOp = struct {
     rate_limit: u32 = 0,
     rate_window_ms: u32 = 0,
     fairness: bool = false,
-    namespace: []const u8 = "",
 };
 
 pub const ClearQueueOp = struct {
@@ -356,29 +353,21 @@ pub const GlobalConfigOp = struct {
 };
 
 // ============================================================================
-// Enterprise
+// Settings
 // ============================================================================
 
-pub const EntSetting = enum(u8) {
-    ns = 1,
-    role = 2,
+pub const Setting = enum(u8) {
     api_key = 3,
     webhook = 4,
-    sso = 5,
     audit_entry = 6,
-    approval_policy = 7,
-    ns_rate_limit = 8,
     api_key_used = 9,
 };
 
-pub const ModifyEntSettingOp = struct {
-    setting: EntSetting = .ns,
+pub const ModifySettingOp = struct {
+    setting: Setting = .api_key,
     id: []const u8 = "",
     scope: []const u8 = "",
     data: ?[]const u8 = null, // null = delete, otherwise = upsert
-    // Typed fields for ns_rate_limit (avoids JSON parsing in handler).
-    rate_limit: u32 = 0,
-    rate_window_ms: u32 = 0,
 };
 
 // ============================================================================
@@ -403,7 +392,7 @@ pub const OpData = union(OpType) {
     maintenance: MaintenanceOp,
     batch_create: CreateBatchOp,
     batch_seal: SealBatchOp,
-    modify_ent_setting: ModifyEntSettingOp,
+    modify_setting: ModifySettingOp,
     multi: void, // nested multi not supported
     cron_create: CreateCronOp,
     cron_update: UpdateCronOp,
@@ -461,7 +450,7 @@ test "OpType exhaustive" {
     _ = switch (op) {
         .enqueue, .fetch, .ack, .fail, .heartbeat, .bulk_action => true,
         .queue_config, .clear_queue, .delete_queue, .maintenance => true,
-        .batch_create, .batch_seal, .modify_ent_setting, .multi => true,
+        .batch_create, .batch_seal, .modify_setting, .multi => true,
         .cron_create, .cron_update, .cron_delete, .cron_trigger => true,
         .set_budget, .delete_budget, .global_config => true,
     };

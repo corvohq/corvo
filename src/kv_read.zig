@@ -288,46 +288,6 @@ pub const ApiKeyRow = struct {
     }
 };
 
-pub const ApprovalPolicyRow = struct {
-    id: [128]u8 = undefined,
-    id_len: u8 = 0,
-    name: [128]u8 = undefined,
-    name_len: u8 = 0,
-    mode: [32]u8 = undefined,
-    mode_len: u8 = 0,
-    enabled: bool = true,
-    queue: [128]u8 = undefined,
-    queue_len: u8 = 0,
-    tag_key: [128]u8 = undefined,
-    tag_key_len: u8 = 0,
-    tag_value: [128]u8 = undefined,
-    tag_value_len: u8 = 0,
-    created_at: [32]u8 = undefined,
-    created_at_len: u8 = 0,
-
-    pub fn idSlice(self: *const ApprovalPolicyRow) []const u8 {
-        return self.id[0..self.id_len];
-    }
-    pub fn nameSlice(self: *const ApprovalPolicyRow) []const u8 {
-        return self.name[0..self.name_len];
-    }
-    pub fn modeSlice(self: *const ApprovalPolicyRow) []const u8 {
-        return self.mode[0..self.mode_len];
-    }
-    pub fn queueSlice(self: *const ApprovalPolicyRow) []const u8 {
-        return self.queue[0..self.queue_len];
-    }
-    pub fn tagKeySlice(self: *const ApprovalPolicyRow) []const u8 {
-        return self.tag_key[0..self.tag_key_len];
-    }
-    pub fn tagValueSlice(self: *const ApprovalPolicyRow) []const u8 {
-        return self.tag_value[0..self.tag_value_len];
-    }
-    pub fn createdAtSlice(self: *const ApprovalPolicyRow) []const u8 {
-        return self.created_at[0..self.created_at_len];
-    }
-};
-
 pub const QueryResult = struct {
     count: u32 = 0,
     has_more: bool = false,
@@ -670,7 +630,7 @@ pub const Reader = struct {
     // ====================================================================
 
     pub fn listApiKeys(self: *Reader, results: []ApiKeyRow) u32 {
-        return self.scanEntPrefix(keys.prefix_ent_apikey, ApiKeyRow, results, apiKeyFromValue);
+        return self.scanPrefix(keys.prefix_apikey, ApiKeyRow, results, apiKeyFromValue);
     }
 
     pub fn countEnabledApiKeys(self: *Reader) i32 {
@@ -688,16 +648,8 @@ pub const Reader = struct {
         defer batch.close();
 
         var key_buf: keys.KeyBuf = undefined;
-        const val = batch.get(keys.entSettingKey(&key_buf, keys.prefix_ent_apikey, key_hash)) orelse return null;
+        const val = batch.get(keys.settingKey(&key_buf, keys.prefix_apikey, key_hash)) orelse return null;
         return apiKeyFromValue(val);
-    }
-
-    // ====================================================================
-    // Approval Policies
-    // ====================================================================
-
-    pub fn listApprovalPolicies(self: *Reader, results: []ApprovalPolicyRow) u32 {
-        return self.scanEntPrefix(keys.prefix_ent_approval_policy, ApprovalPolicyRow, results, approvalPolicyFromValue);
     }
 
     // ====================================================================
@@ -855,7 +807,7 @@ pub const Reader = struct {
         return count;
     }
 
-    fn scanEntPrefix(
+    fn scanPrefix(
         self: *Reader,
         prefix: []const u8,
         comptime T: type,
@@ -1006,11 +958,6 @@ fn jsonBool(body: []const u8, key: []const u8) ?bool {
     if (val_start + 4 <= body.len and std.mem.eql(u8, body[val_start..][0..4], "true")) return true;
     if (val_start + 5 <= body.len and std.mem.eql(u8, body[val_start..][0..5], "false")) return false;
     return null;
-}
-
-fn approvalPolicyFromValue(val: []const u8) ApprovalPolicyRow {
-    _ = val;
-    return ApprovalPolicyRow{};
 }
 
 fn stateStringToByte(state: []const u8) ?u8 {

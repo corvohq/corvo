@@ -92,7 +92,6 @@ pub fn dispatch(
     if (std.mem.startsWith(u8, api, "/cron-jobs/") and param.len > 0) return cron(send_buf, rdr, param);
     if (std.mem.eql(u8, api, "/budgets")) return budgets(send_buf, rdr);
     if (std.mem.eql(u8, api, "/api-keys")) return apiKeys(send_buf, rdr);
-    if (std.mem.eql(u8, api, "/approval-policies")) return approvalPolicies(send_buf, rdr);
     if (std.mem.eql(u8, api, "/cluster/events"))
         return clusterEvents(send_buf);
     if (std.mem.eql(u8, api, "/metrics/throughput"))
@@ -691,30 +690,6 @@ fn apiKeys(send_buf: []u8, reader: *kv_read.Reader) u32 {
         jw.fieldBool("enabled", row.enabled);
         jw.fieldStr("created_at", row.createdAtSlice());
         if (row.expires_at_len > 0) jw.fieldStr("expires_at", row.expiresAtSlice());
-        jw.endObject();
-    }
-    jw.endArray();
-    return http.writeResponse(send_buf, 200, jw.getWritten());
-}
-
-fn approvalPolicies(send_buf: []u8, reader: *kv_read.Reader) u32 {
-    var policy_buf: [64]kv_read.ApprovalPolicyRow = undefined;
-    const count = reader.listApprovalPolicies(&policy_buf);
-
-    var body_buf: [16384]u8 = undefined;
-    var jw = json.JsonWriter.init(&body_buf);
-    jw.beginArray();
-    for (0..count) |i| {
-        const row = &policy_buf[i];
-        jw.beginObject();
-        jw.fieldStr("id", row.idSlice());
-        jw.fieldStr("name", row.nameSlice());
-        jw.fieldStr("mode", row.modeSlice());
-        jw.fieldBool("enabled", row.enabled);
-        jw.fieldStr("queue", row.queueSlice());
-        jw.fieldStr("tag_key", row.tagKeySlice());
-        jw.fieldStr("tag_value", row.tagValueSlice());
-        jw.fieldStr("created_at", row.createdAtSlice());
         jw.endObject();
     }
     jw.endArray();

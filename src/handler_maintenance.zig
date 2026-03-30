@@ -500,15 +500,11 @@ fn applyCleanRateLimit(b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult {
     // Clean global rate limit entries (gl| prefix).
     cleanRateLimitPrefix(b, keys.prefix_global_rate_limit, cutoff_ns);
 
-    // Clean namespace rate limit entries (nl| prefix).
-    cleanRateLimitPrefix(b, keys.prefix_ns_rate_limit, cutoff_ns);
-
     return .{};
 }
 
-/// Generic rate limit prefix cleaner for gl| and nl| keys.
+/// Generic rate limit prefix cleaner for gl| keys.
 /// gl| keys: prefix{fetched_ns:8BE}{random:8BE} — timestamp immediately after prefix.
-/// nl| keys: prefix{namespace}\x00{fetched_ns:8BE}{random:8BE} — timestamp after separator.
 fn cleanRateLimitPrefix(b: *kv.WriteBatch, prefix: []const u8, cutoff_ns: u64) void {
     var p_buf: keys.KeyBuf = undefined;
     var pe_buf: keys.KeyBuf = undefined;

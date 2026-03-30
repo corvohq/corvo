@@ -58,32 +58,6 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             if (self.getActiveCount(queue.name) >= @as(i32, @intCast(queue.max_concurrency))) continue;
         }
 
-        // Check namespace rate limit
-        const has_ns_rl = queue.namespace.len > 0 and blk: {
-            if (self.ns_rate_limits.get(queue.namespace)) |ns_rl| {
-                if (ns_rl.rate_limit > 0 and ns_rl.rate_window_ms > 0) {
-                    const ns_window_ns = @as(u64, ns_rl.rate_window_ms) * 1_000_000;
-                    const ns_window_start = if (op.now_ns > ns_window_ns) op.now_ns - ns_window_ns else 0;
-                    var ns_lower_buf: keys.KeyBuf = undefined;
-                    var ns_upper_buf: keys.KeyBuf = undefined;
-                    var ns_prefix_buf: keys.KeyBuf = undefined;
-                    var ns_iter = b.newIter(
-                        keys.nsRateLimitWindowStart(&ns_lower_buf, queue.namespace, ns_window_start),
-                        keys.prefixEnd(&ns_upper_buf, keys.nsRateLimitPrefix(&ns_prefix_buf, queue.namespace)),
-                    );
-                    defer ns_iter.close();
-                    var ns_count: u32 = 0;
-                    if (ns_iter.first()) {
-                        ns_count += 1;
-                        while (ns_iter.next()) ns_count += 1;
-                    }
-                    if (ns_count >= ns_rl.rate_limit) continue;
-                    break :blk true;
-                }
-            }
-            break :blk false;
-        };
-
         // Check per-queue rate limit
         if (queue.rate_limit > 0 and queue.rate_window_ms > 0) {
             const window_ns = @as(u64, queue.rate_window_ms) * 1_000_000;
@@ -110,7 +84,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
         // Separate from the normal pop loop to avoid any overhead on non-fairness queues.
         if (queue.fairness) {
             var fairness_budget: u32 = @max((@min(op.count, ops.OpResult.max_inline_fetch) - result.affected) * 2, 64);
-            fetchWithFairness(self, b, &result, queue_name, &fairness_budget, max_fetch, lease_expires_ns, lease_duration_ms, op, has_rl, has_global_rl, has_ns_rl, queue.namespace);
+            fetchWithFairness(self, b, &result, queue_name, &fairness_budget, max_fetch, lease_expires_ns, lease_duration_ms, op, has_rl, has_global_rl);
             continue; // next queue
         }
 
@@ -174,11 +148,6 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
                 var gl_rlk_buf: keys.KeyBuf = undefined;
                 b.set(keys.globalRateLimitKey(&gl_rlk_buf, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected)) +% 0x80000000), "");
             }
-            if (has_ns_rl) {
-                var ns_rlk_buf: keys.KeyBuf = undefined;
-                b.set(keys.nsRateLimitKey(&ns_rlk_buf, queue.namespace, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected)) +% 0x40000000), "");
-            }
-
             self.transitionReadIndexes(b, &job, .pending, .active);
             self.verifyJobIndexes(b, &job, "fetch");
 
@@ -247,8 +216,6 @@ fn fetchWithFairness(
     op: *const ops.FetchOp,
     has_rl: bool,
     has_global_rl: bool,
-    has_ns_rl: bool,
-    namespace: []const u8,
 ) void {
     const max_candidates: u32 = 16;
 
@@ -360,11 +327,6 @@ fn fetchWithFairness(
             var gl_rlk_buf: keys.KeyBuf = undefined;
             b.set(keys.globalRateLimitKey(&gl_rlk_buf, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected)) +% 0x80000000), "");
         }
-        if (has_ns_rl) {
-            var ns_rlk_buf: keys.KeyBuf = undefined;
-            b.set(keys.nsRateLimitKey(&ns_rlk_buf, namespace, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected)) +% 0x40000000), "");
-        }
-
         self.transitionReadIndexes(b, &job, .pending, .active);
         self.verifyJobIndexes(b, &job, "fetch-fairness");
 

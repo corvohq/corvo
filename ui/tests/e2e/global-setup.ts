@@ -1,5 +1,6 @@
 import { spawn, execSync } from "child_process";
-import { rm } from "fs/promises";
+import { createHash } from "crypto";
+import { rm, writeFile } from "fs/promises";
 import * as path from "path";
 import * as net from "net";
 import { fileURLToPath } from "url";
@@ -9,6 +10,7 @@ const CORVO_BIN = path.resolve(__dirname, "../../../zig-out/bin/corvo");
 const DATA_DIR = "/tmp/corvo-e2e-data";
 const SERVER_PORT = 18080;
 const SERVER_URL = `http://localhost:${SERVER_PORT}`;
+const ADMIN_PASSWORD = "test123";
 
 function waitForPort(port: number, timeout = 15_000): Promise<void> {
   const deadline = Date.now() + timeout;
@@ -36,7 +38,7 @@ async function seedData() {
   const enqueue = (queue: string, payload: object) =>
     fetch(`${SERVER_URL}/api/v1/enqueue`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${ADMIN_PASSWORD}` },
       body: JSON.stringify({ queue, payload }),
     });
 
@@ -66,6 +68,7 @@ export default async function globalSetup() {
     "--data-dir", DATA_DIR,
     "--port", String(SERVER_PORT),
     "--max-conns", "64",
+    "--admin-password", ADMIN_PASSWORD,
   ], { detached: false, stdio: "ignore" });
 
   server.on("error", (err) => {
@@ -83,4 +86,25 @@ export default async function globalSetup() {
   console.log("[e2e] Seeding demo data...");
   await seedData();
   console.log("[e2e] Seed complete");
+
+  // Compute session cookie so browser tests can make write requests.
+  const sessionToken = createHash("sha256")
+    .update(`corvo-session:${ADMIN_PASSWORD}`)
+    .digest("hex");
+  const storageState = {
+    cookies: [{
+      name: "corvo_session",
+      value: sessionToken,
+      domain: "localhost",
+      path: "/",
+      httpOnly: true,
+      sameSite: "Strict" as const,
+      secure: false,
+      expires: -1,
+    }],
+    origins: [],
+  };
+  const statePath = path.resolve(__dirname, "../../storage-state.json");
+  await writeFile(statePath, JSON.stringify(storageState));
+  console.log("[e2e] Saved session cookie to storage-state.json");
 }

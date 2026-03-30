@@ -356,7 +356,7 @@ pub fn decodeJob(data: []const u8) types.Job {
 //   [46..49] held_count (u32 LE)
 //
 // Variable fields:
-//   name, namespace
+//   name
 
 const queue_fixed_size: usize = 50;
 pub const max_queue_encoded_size: usize = 512;
@@ -387,7 +387,6 @@ pub fn encodeQueue(buf: []u8, q: *const types.Queue) []const u8 {
     pos = writeU32LE(buf, pos, q.held_count);
 
     pos = writeStr(buf, pos, q.name);
-    pos = writeStr(buf, pos, q.namespace);
 
     return buf[0..pos];
 }
@@ -449,12 +448,6 @@ pub fn decodeQueue(data: []const u8) types.Queue {
     const name = readStr(data, pos);
     pos = name.next;
     q.name = name.val;
-
-    // Namespace: backward-compatible — only read if data remains.
-    if (pos < data.len) {
-        const ns = readStr(data, pos);
-        q.namespace = ns.val;
-    }
 
     return q;
 }

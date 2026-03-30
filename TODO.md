@@ -55,7 +55,9 @@
 
 ## Server
 
-- [x] Admin password auth — `--admin-password` flag, UI login form + session cookie, HTTP Bearer auth. Bootstrap key: locks system, then create scoped API keys. Layers: no auth (dev) → admin password (simple) → API keys (enterprise/roles).
+- [x] Admin password auth — `--admin-password` flag, UI login form + session cookie, HTTP Bearer auth. Bootstrap key: locks system, then create scoped API keys. Layers: no auth (dev) → admin password (simple) → API keys (roles).
+- [x] Enterprise naming removed — `EntSetting` → `Setting`, `handler_ent.zig` → `handler_settings.zig`, `MSG_MODIFY_ENT_SETTING` → `MSG_MODIFY_SETTING`, `prefix_ent_*` → `prefix_*`. Dead features stripped: namespaces, roles, SSO, approval policies.
+- [x] API keys e2e tests — 9 Playwright tests: page rendering, form toggle, CRUD (create shows one-time key, table row, delete). Auth infrastructure: server runs with `--admin-password`, session cookie storageState, Bearer auth on all fetch calls.
 
 ## Server
 
@@ -71,8 +73,9 @@
 - [x] API key generation — random key, SHA256 hash as KV key, JSON value with name/role/enabled/key_hash/created_at_ns
 - [x] Role enforcement — admin (full), producer (enqueue/batch), worker (fetch/ack/fail/heartbeat). authorizeWrite in http.zig.
 - [x] KV read stubs fixed — apiKeyFromValue parses JSON, getApiKeyByHash returns populated ApiKeyRow
-- [x] API keys UI — moved to core, JS fetch for create/delete, one-time key display, role descriptions
+- [x] API keys UI — JS fetch for create/delete, one-time key display, role descriptions
 - [x] Admin password required for key creation, delete allowed without (escape hatch)
+- [x] API keys e2e tests — 9 Playwright tests covering page, form, CRUD lifecycle
 
 ## Webhooks
 
@@ -81,8 +84,10 @@
 
 ## Audit Log
 
-- [ ] Audit entries — KV-backed log of admin actions (key create/delete, queue config, bulk actions)
-- [ ] GET /api/v1/audit — paginated read endpoint
+Management operations only — cancel, delete, pause, promote, requeue, queue create/modify, rate limit changes, key create/delete. Not enqueue/fetch/ack. Logged with API key name or "admin". Console enriches with user identity.
+
+- [ ] Audit entries in KV (`audit|{ts}_{seq}`) — key, operation, target (queue/job), count, timestamp
+- [ ] GET /api/v1/audit-logs — paginated read endpoint with time range filter
 - [ ] UI page — audit log viewer
 
 ## TigerStyle Audit (last)

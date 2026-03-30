@@ -1,6 +1,7 @@
 import { test, expect, Page } from "@playwright/test";
 
 const BASE = "http://localhost:18080";
+const AUTH = { Authorization: "Bearer test123" };
 
 async function expectToast(page: Page, type: "success" | "error" = "success") {
   const toast = page.locator("#toast div").first();
@@ -21,7 +22,7 @@ async function enqueueJob(
   if (opts?.payload !== undefined) body.payload = opts.payload;
   const resp = await fetch(`${BASE}/api/v1/enqueue`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...AUTH },
     body: JSON.stringify(body),
   });
   const data = await resp.json();
@@ -29,7 +30,7 @@ async function enqueueJob(
 }
 
 async function cancelJob(jobId: string) {
-  await fetch(`${BASE}/api/v1/jobs/${jobId}/cancel`, { method: "POST" });
+  await fetch(`${BASE}/api/v1/jobs/${jobId}/cancel`, { method: "POST", headers: AUTH });
 }
 
 // ─── State change verification ─────────────────────────────────────────────
@@ -83,7 +84,7 @@ test.describe("State change: delete removes job", () => {
     await page.getByRole("button", { name: "Delete" }).click();
     await page.waitForLoadState("load");
     // Verify job no longer exists via API.
-    const resp = await fetch(`${BASE}/api/v1/jobs/${jobId}`);
+    const resp = await fetch(`${BASE}/api/v1/jobs/${jobId}`, { headers: AUTH });
     expect(resp.status).toBe(404);
   });
 });
@@ -120,8 +121,8 @@ test.describe("Bulk: Cancel All changes job states", () => {
     // corvoBulkAction triggers fetch then location.reload().
     await page.waitForLoadState("load");
     // Verify via API — single job GET returns flat JSON.
-    const r1 = await (await fetch(`${BASE}/api/v1/jobs/${id1}`)).json();
-    const r2 = await (await fetch(`${BASE}/api/v1/jobs/${id2}`)).json();
+    const r1 = await (await fetch(`${BASE}/api/v1/jobs/${id1}`, { headers: AUTH })).json();
+    const r2 = await (await fetch(`${BASE}/api/v1/jobs/${id2}`, { headers: AUTH })).json();
     expect(r1.state).toBe("cancelled");
     expect(r2.state).toBe("cancelled");
   });
@@ -140,8 +141,8 @@ test.describe("Bulk: Delete All removes jobs", () => {
 
     await page.waitForLoadState("load");
     // Deleted jobs return 404.
-    const r1 = await fetch(`${BASE}/api/v1/jobs/${id1}`);
-    const r2 = await fetch(`${BASE}/api/v1/jobs/${id2}`);
+    const r1 = await fetch(`${BASE}/api/v1/jobs/${id1}`, { headers: AUTH });
+    const r2 = await fetch(`${BASE}/api/v1/jobs/${id2}`, { headers: AUTH });
     expect(r1.status).toBe(404);
     expect(r2.status).toBe(404);
   });
@@ -179,12 +180,12 @@ test.describe("Requeued job shows parent link", () => {
     await cancelJob(parentId);
 
     // Requeue via API.
-    await fetch(`${BASE}/api/v1/jobs/${parentId}/requeue`, { method: "POST" });
+    await fetch(`${BASE}/api/v1/jobs/${parentId}/requeue`, { method: "POST", headers: AUTH });
 
     // Find the new pending job in this queue.
     const listResp = await fetch(`${BASE}/api/v1/jobs`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...AUTH },
       body: JSON.stringify({ queue: "test.cover.parent", state: ["pending"] }),
     });
     const listData = await listResp.json();
@@ -242,10 +243,10 @@ test.describe("Dark mode toggle", () => {
 test.describe("API edge cases", () => {
   test("requeue on pending job is a no-op (state stays pending)", async () => {
     const jobId = await enqueueJob("test.cover.edge.requeue");
-    const resp = await fetch(`${BASE}/api/v1/jobs/${jobId}/requeue`, { method: "POST" });
+    const resp = await fetch(`${BASE}/api/v1/jobs/${jobId}/requeue`, { method: "POST", headers: AUTH });
     expect(resp.status).toBe(200);
     // State should still be pending — requeue only works on terminal states.
-    const job = await (await fetch(`${BASE}/api/v1/jobs/${jobId}`)).json();
+    const job = await (await fetch(`${BASE}/api/v1/jobs/${jobId}`, { headers: AUTH })).json();
     expect(job.state).toBe("pending");
   });
 
@@ -253,15 +254,16 @@ test.describe("API edge cases", () => {
     const jobId = await enqueueJob("test.cover.edge.cancel");
     await cancelJob(jobId);
     // Cancel again — should be no-op since already terminal.
-    const resp = await fetch(`${BASE}/api/v1/jobs/${jobId}/cancel`, { method: "POST" });
+    const resp = await fetch(`${BASE}/api/v1/jobs/${jobId}/cancel`, { method: "POST", headers: AUTH });
     expect(resp.status).toBe(200);
-    const job = await (await fetch(`${BASE}/api/v1/jobs/${jobId}`)).json();
+    const job = await (await fetch(`${BASE}/api/v1/jobs/${jobId}`, { headers: AUTH })).json();
     expect(job.state).toBe("cancelled");
   });
 
   test("delete on nonexistent job returns 200 (affected: 0)", async () => {
     const resp = await fetch(`${BASE}/api/v1/jobs/nonexistent-fake-id/delete`, {
       method: "POST",
+      headers: AUTH,
     });
     expect(resp.status).toBe(200);
     const body = await resp.json();

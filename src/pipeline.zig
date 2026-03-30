@@ -1042,7 +1042,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     self.http_scratch.jobs[0].job_id = id;
                     frame.path_param = id;
                 },
-                rpc.MSG_BATCH_CREATE, rpc.MSG_CRON_CREATE, rpc.MSG_SET_BUDGET, rpc.MSG_MODIFY_ENT_SETTING => {
+                rpc.MSG_BATCH_CREATE, rpc.MSG_CRON_CREATE, rpc.MSG_SET_BUDGET, rpc.MSG_MODIFY_SETTING => {
                     self.http_id_counter += 1;
                     const id = http.generateId(&self.http_scratch.id_buf2, now_ns, self.http_id_counter);
                     self.http_scratch.id2_len = @intCast(id.len);
@@ -1068,7 +1068,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             );
 
             // API key create: copy raw key to per-frame buffer for response encoding.
-            if (frame.msg_type == rpc.MSG_MODIFY_ENT_SETTING and
+            if (frame.msg_type == rpc.MSG_MODIFY_SETTING and
                 std.mem.eql(u8, frame.sub_action, "api_key") and decoded.count > 0)
             {
                 @memcpy(self.http_id_bufs[frame_idx][0..64], self.http_scratch.api_key_raw[0..64]);
@@ -1106,7 +1106,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 rpc.MSG_CRON_TRIGGER => .cron_trigger,
                 rpc.MSG_SET_BUDGET => .set_budget,
                 rpc.MSG_DELETE_BUDGET => .delete_budget,
-                rpc.MSG_MODIFY_ENT_SETTING => .modify_ent_setting,
+                rpc.MSG_MODIFY_SETTING => .modify_setting,
                 rpc.MSG_GLOBAL_CONFIG => .global_config,
                 else => return .{ .err = "unsupported http write" },
             };
@@ -1242,7 +1242,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 rpc.MSG_CRON_TRIGGER,
                 rpc.MSG_SET_BUDGET,
                 rpc.MSG_DELETE_BUDGET,
-                rpc.MSG_MODIFY_ENT_SETTING,
+                rpc.MSG_MODIFY_SETTING,
                 rpc.MSG_GLOBAL_CONFIG,
                 => rpc.management.encodeGenericResp(writer, result),
                 else => {

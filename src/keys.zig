@@ -40,8 +40,6 @@ pub const prefix_queue_append = "qa|"; // qa|{queue}\x00{created_ns:8BE}{job_id}
 pub const prefix_queue_cursor = "qac|"; // qac|{queue}
 pub const prefix_global_rate_limit = "gl|"; // gl|{fetched_ns:8BE}{random:8BE}
 pub const key_global_config = "g|rl"; // singleton: [rate:u32LE][window_ms:u32LE]
-pub const prefix_ns_rate_limit = "nl|"; // nl|{namespace}\x00{fetched_ns:8BE}{random:8BE}
-
 // Read indexes (for HTTP/UI reads — written by handlers on state transitions)
 pub const prefix_job_time = "jt|"; // jt|{inv_created_ns:8BE}{job_id}
 pub const prefix_job_queue = "jq|"; // jq|{queue}\x00{inv_created_ns:8BE}{job_id}
@@ -49,15 +47,10 @@ pub const prefix_job_state = "js|"; // js|{state:1}{inv_created_ns:8BE}{job_id}
 pub const prefix_job_queue_state = "jqs|"; // jqs|{queue}\x00{state:1}{inv_created_ns:8BE}{job_id}
 pub const prefix_tag_queue = "tq|"; // tq|{queue}\x00{tag_key}\x00{tag_value}\x00{job_id}
 
-// Enterprise prefixes
-pub const prefix_ent_ns = "ent_ns|";
-pub const prefix_ent_role = "ent_role|";
-pub const prefix_ent_apikey = "ent_apikey|";
-pub const prefix_ent_webhook = "ent_wh|";
-pub const prefix_ent_sso = "ent_sso|";
-pub const prefix_ent_audit = "ent_audit|";
-pub const prefix_ent_approval_policy = "ent_ap|";
-pub const prefix_ent_ns_rate_limit = "ent_nsrl|";
+// Setting prefixes
+pub const prefix_apikey = "apikey|";
+pub const prefix_webhook = "wh|";
+pub const prefix_audit = "audit|";
 
 const sep: u8 = 0x00;
 
@@ -327,37 +320,6 @@ pub fn globalConfigKey(buf: *KeyBuf) []const u8 {
     const k = key_global_config;
     @memcpy(buf[0..k.len], k);
     return buf[0..k.len];
-}
-
-// ============================================================================
-// Namespace rate limit keys
-// ============================================================================
-
-/// nl|{namespace}\x00{fetched_ns:8BE}{random:8BE}
-pub fn nsRateLimitKey(buf: *KeyBuf, namespace: []const u8, fetched_ns: u64, random: u64) []const u8 {
-    var pos = copyPrefix(buf, prefix_ns_rate_limit);
-    pos = copyStr(buf, pos, namespace);
-    pos = putU8(buf, pos, sep);
-    pos = putU64BE(buf, pos, fetched_ns);
-    pos = putU64BE(buf, pos, random);
-    return buf[0..pos];
-}
-
-/// nl|{namespace}\x00
-pub fn nsRateLimitPrefix(buf: *KeyBuf, namespace: []const u8) []const u8 {
-    var pos = copyPrefix(buf, prefix_ns_rate_limit);
-    pos = copyStr(buf, pos, namespace);
-    pos = putU8(buf, pos, sep);
-    return buf[0..pos];
-}
-
-/// nl|{namespace}\x00{windowStartNs:8BE}
-pub fn nsRateLimitWindowStart(buf: *KeyBuf, namespace: []const u8, window_start_ns: u64) []const u8 {
-    var pos = copyPrefix(buf, prefix_ns_rate_limit);
-    pos = copyStr(buf, pos, namespace);
-    pos = putU8(buf, pos, sep);
-    pos = putU64BE(buf, pos, window_start_ns);
-    return buf[0..pos];
 }
 
 /// b|{batch_id}
@@ -634,15 +596,15 @@ pub fn prefixEnd(buf: *KeyBuf, prefix: []const u8) ?[]const u8 {
     return null; // prefix is all 0xFF
 }
 
-/// Enterprise setting key: {prefix}{id}
-pub fn entSettingKey(buf: *KeyBuf, prefix: []const u8, id: []const u8) []const u8 {
+/// Setting key: {prefix}{id}
+pub fn settingKey(buf: *KeyBuf, prefix: []const u8, id: []const u8) []const u8 {
     var pos = copyPrefix(buf, prefix);
     pos = copyStr(buf, pos, id);
     return buf[0..pos];
 }
 
-/// Enterprise scoped setting key: {prefix}{scope}\x00{id}
-pub fn entSettingScopeKey(buf: *KeyBuf, prefix: []const u8, scope: []const u8, id: []const u8) []const u8 {
+/// Scoped setting key: {prefix}{scope}\x00{id}
+pub fn settingScopeKey(buf: *KeyBuf, prefix: []const u8, scope: []const u8, id: []const u8) []const u8 {
     var pos = copyPrefix(buf, prefix);
     pos = copyStr(buf, pos, scope);
     pos = putU8(buf, pos, sep);

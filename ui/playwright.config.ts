@@ -2,7 +2,7 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  testMatch: ["**/ui.spec.ts", "**/actions.spec.ts", "**/state-and-bulk.spec.ts"],
+  testMatch: ["**/ui.spec.ts", "**/actions.spec.ts", "**/state-and-bulk.spec.ts", "**/api-keys.spec.ts"],
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
@@ -12,6 +12,10 @@ export default defineConfig({
     baseURL: "http://localhost:18080",
     trace: "on-first-retry",
     screenshot: "only-on-failure",
+    storageState: "./storage-state.json",
+    extraHTTPHeaders: {
+      Authorization: "Bearer test123",
+    },
   },
   projects: [
     {

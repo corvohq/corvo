@@ -1,6 +1,7 @@
 import { test, expect, Page } from "@playwright/test";
 
 const BASE = "http://localhost:18080";
+const AUTH = { Authorization: "Bearer test123" };
 
 async function expectToast(page: Page, type: "success" | "error" = "success") {
   const toast = page.locator("#toast div").first();
@@ -17,7 +18,7 @@ async function enqueueJob(queue: string, opts?: { scheduled_at?: string }): Prom
   if (opts?.scheduled_at) body.scheduled_at = opts.scheduled_at;
   const resp = await fetch(`${BASE}/api/v1/enqueue`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...AUTH },
     body: JSON.stringify(body),
   });
   const data = await resp.json();
@@ -26,7 +27,7 @@ async function enqueueJob(queue: string, opts?: { scheduled_at?: string }): Prom
 
 // Cancel a job via API to move it to cancelled (terminal) state.
 async function cancelJob(jobId: string) {
-  await fetch(`${BASE}/api/v1/jobs/${jobId}/cancel`, { method: "POST" });
+  await fetch(`${BASE}/api/v1/jobs/${jobId}/cancel`, { method: "POST", headers: AUTH });
 }
 
 // ─── Enqueue Job dialog ─────────────────────────────────────────────────────

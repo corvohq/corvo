@@ -359,10 +359,8 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
                 return writeRoute(rpc.MSG_SET_BUDGET, "", "");
             if (std.mem.eql(u8, api, "/throttle"))
                 return writeRoute(rpc.MSG_GLOBAL_CONFIG, "", "set");
-            if (std.mem.eql(u8, api, "/approval-policies"))
-                return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, "", "approval_policy");
             if (std.mem.eql(u8, api, "/auth/keys"))
-                return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, "", "api_key");
+                return writeRoute(rpc.MSG_MODIFY_SETTING, "", "api_key");
             if (std.mem.eql(u8, api, "/auth/login"))
                 return .read;
 
@@ -408,14 +406,6 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
                 if (queue.len > 0) return writeRoute(rpc.MSG_ENQUEUE_BATCH, queue, "webhook");
             }
 
-            // POST /namespaces/{ns}/throttle
-            if (std.mem.startsWith(u8, api, "/namespaces/")) {
-                const rest = api["/namespaces/".len..];
-                if (std.mem.endsWith(u8, rest, "/throttle")) {
-                    const ns = rest[0 .. rest.len - "/throttle".len];
-                    if (ns.len > 0) return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, ns, "ns_rate_limit");
-                }
-            }
         },
 
         .PUT => {
@@ -471,25 +461,9 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
             if (std.mem.eql(u8, api, "/throttle"))
                 return writeRoute(rpc.MSG_GLOBAL_CONFIG, "", "remove");
 
-            // DELETE /namespaces/{ns}/throttle
-            if (std.mem.startsWith(u8, api, "/namespaces/")) {
-                const rest = api["/namespaces/".len..];
-                if (std.mem.endsWith(u8, rest, "/throttle")) {
-                    const ns = rest[0 .. rest.len - "/throttle".len];
-                    if (ns.len > 0) return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, ns, "ns_rate_limit_delete");
-                }
-            }
-
-            // DELETE /approval-policies/{id}
-            if (std.mem.startsWith(u8, api, "/approval-policies/")) {
-                const id = api["/approval-policies/".len..];
-                if (id.len > 0)
-                    return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, id, "approval_policy_delete");
-            }
-
             // DELETE /auth/keys
             if (std.mem.eql(u8, api, "/auth/keys"))
-                return writeRoute(rpc.MSG_MODIFY_ENT_SETTING, "", "api_key_delete");
+                return writeRoute(rpc.MSG_MODIFY_SETTING, "", "api_key_delete");
         },
 
         .GET => return .read,
@@ -531,10 +505,9 @@ fn classifyQueueAction(method: Method, rest: []const u8) RouteAction {
 
     if (method == .DELETE) {
         if (action.len == 0) return writeRoute(rpc.MSG_DELETE_QUEUE, name, "");
-        // DELETE /queues/{name}/throttle or /fairness or /namespace → remove setting
+        // DELETE /queues/{name}/throttle or /fairness → remove setting
         if (std.mem.eql(u8, action, "throttle")) return writeRoute(rpc.MSG_QUEUE_CONFIG, name, "throttle_remove");
         if (std.mem.eql(u8, action, "fairness")) return writeRoute(rpc.MSG_QUEUE_CONFIG, name, "fairness_remove");
-        if (std.mem.eql(u8, action, "namespace")) return writeRoute(rpc.MSG_QUEUE_CONFIG, name, "namespace_remove");
         return .not_found;
     }
 
@@ -542,7 +515,7 @@ fn classifyQueueAction(method: Method, rest: []const u8) RouteAction {
     if (action.len == 0) return .not_found;
     if (std.mem.eql(u8, action, "clear")) return writeRoute(rpc.MSG_CLEAR_QUEUE, name, "");
 
-    const valid = [_][]const u8{ "pause", "resume", "concurrency", "throttle", "fairness", "drain", "namespace" };
+    const valid = [_][]const u8{ "pause", "resume", "concurrency", "throttle", "fairness", "drain" };
     for (valid) |v| {
         if (std.mem.eql(u8, action, v))
             return writeRoute(rpc.MSG_QUEUE_CONFIG, name, action);
@@ -661,7 +634,7 @@ pub fn authorizeWrite(
 ) AuthResult {
     // API key creation requires admin password as bootstrap.
     // Delete is allowed without password (escape hatch for stuck state).
-    if (msg_type == rpc.MSG_MODIFY_ENT_SETTING and admin_password.len == 0 and
+    if (msg_type == rpc.MSG_MODIFY_SETTING and admin_password.len == 0 and
         std.mem.eql(u8, sub_action, "api_key"))
         return .forbidden;
 
@@ -813,7 +786,7 @@ pub fn decodeWrite(
         } }, .count = 1 },
         rpc.MSG_SET_BUDGET => return decodeSetBudget(body, now_ns, scratch),
         rpc.MSG_DELETE_BUDGET => return .{ .op_data = .{ .delete_budget = .{ .scope = param, .target = sub_action } }, .count = 1 },
-        rpc.MSG_MODIFY_ENT_SETTING => return decodeEntSetting(body, param, sub_action, scratch, now_ns),
+        rpc.MSG_MODIFY_SETTING => return decodeSetting(body, param, sub_action, scratch, now_ns),
         rpc.MSG_GLOBAL_CONFIG => return decodeGlobalConfig(body, sub_action),
         else => return .{ .op_data = .{ .enqueue = .{} }, .count = 0 },
     }
@@ -832,8 +805,6 @@ pub const DecodeScratch = struct {
     // Secondary ID buf for generated cron_id, batch_id, budget_id, trigger job_id
     id_buf2: [64]u8 = undefined,
     id2_len: u8 = 0,
-    // Buffer for binary-encoded namespace rate limit config.
-    ns_rl_buf: [8]u8 = undefined,
     // API key generation scratch buffers.
     api_key_raw: [64]u8 = undefined, // hex-encoded random key (32 bytes → 64 hex chars)
     api_key_json: [384]u8 = undefined, // JSON value for KV storage
@@ -1335,12 +1306,6 @@ fn decodeQueueConfig(body: []const u8, queue: []const u8, sub_action: []const u8
     } else if (std.mem.eql(u8, sub_action, "fairness_remove")) {
         op.action = .fairness;
         op.fairness = false;
-    } else if (std.mem.eql(u8, sub_action, "namespace")) {
-        op.action = .namespace;
-        op.namespace = extractJSONString(body, "namespace") orelse "";
-    } else if (std.mem.eql(u8, sub_action, "namespace_remove")) {
-        op.action = .namespace;
-        op.namespace = "";
     } else {
         return .{ .op_data = .{ .queue_config = .{} }, .count = 0 };
     }
@@ -1432,26 +1397,13 @@ fn decodeSetBudget(body: []const u8, now_ns: u64, scratch: *DecodeScratch) Decod
     return .{ .op_data = .{ .set_budget = op }, .count = 1 };
 }
 
-fn decodeEntSetting(body: []const u8, param: []const u8, sub_action: []const u8, scratch: *DecodeScratch, now_ns: u64) DecodeResult {
-    if (std.mem.eql(u8, sub_action, "approval_policy")) {
-        return .{ .op_data = .{ .modify_ent_setting = .{
-            .setting = .approval_policy,
-            .id = scratch.id_buf2[0..scratch.id2_len],
-            .data = if (body.len > 0) body else null,
-        } }, .count = 1 };
-    }
-    if (std.mem.eql(u8, sub_action, "approval_policy_delete")) {
-        return .{ .op_data = .{ .modify_ent_setting = .{
-            .setting = .approval_policy,
-            .id = param,
-            .data = null,
-        } }, .count = 1 };
-    }
+fn decodeSetting(body: []const u8, param: []const u8, sub_action: []const u8, scratch: *DecodeScratch, now_ns: u64) DecodeResult {
+    _ = param;
     if (std.mem.eql(u8, sub_action, "api_key")) {
         // Generate random API key (32 random bytes → 64 hex chars).
         var random_bytes: [32]u8 = undefined;
         std.posix.getrandom(&random_bytes) catch
-            return .{ .op_data = .{ .modify_ent_setting = .{} }, .count = 0 };
+            return .{ .op_data = .{ .modify_setting = .{} }, .count = 0 };
         const hex_chars = "0123456789abcdef";
         for (random_bytes, 0..) |byte, i| {
             scratch.api_key_raw[i * 2] = hex_chars[byte >> 4];
@@ -1468,10 +1420,10 @@ fn decodeEntSetting(body: []const u8, param: []const u8, sub_action: []const u8,
         const json_val = std.fmt.bufPrint(&scratch.api_key_json,
             "{{\"name\":\"{s}\",\"role\":\"{s}\",\"enabled\":true,\"key_hash\":\"{s}\",\"created_at_ns\":{d}}}",
             .{ name, role, scratch.id_buf2[0..64], now_ns },
-        ) catch return .{ .op_data = .{ .modify_ent_setting = .{} }, .count = 0 };
+        ) catch return .{ .op_data = .{ .modify_setting = .{} }, .count = 0 };
         scratch.api_key_json_len = @intCast(json_val.len);
 
-        return .{ .op_data = .{ .modify_ent_setting = .{
+        return .{ .op_data = .{ .modify_setting = .{
             .setting = .api_key,
             .id = scratch.id_buf2[0..64],
             .data = scratch.api_key_json[0..scratch.api_key_json_len],
@@ -1480,40 +1432,13 @@ fn decodeEntSetting(body: []const u8, param: []const u8, sub_action: []const u8,
     if (std.mem.eql(u8, sub_action, "api_key_delete")) {
         // key_hash from body
         const key_hash = extractJSONString(body, "key_hash") orelse "";
-        return .{ .op_data = .{ .modify_ent_setting = .{
+        return .{ .op_data = .{ .modify_setting = .{
             .setting = .api_key,
             .id = key_hash,
             .data = null,
         } }, .count = 1 };
     }
-    if (std.mem.eql(u8, sub_action, "ns_rate_limit")) {
-        const rate: u32 = if (extractJSONInt(body, "rate")) |r|
-            @intCast(std.math.clamp(r, 0, std.math.maxInt(i32)))
-        else
-            0;
-        const window: u32 = if (extractJSONInt(body, "window_ms")) |w|
-            @intCast(std.math.clamp(w, 0, std.math.maxInt(i32)))
-        else
-            1000;
-        // Encode binary data into scratch buffer for KV persistence.
-        std.mem.writeInt(u32, scratch.ns_rl_buf[0..4], rate, .little);
-        std.mem.writeInt(u32, scratch.ns_rl_buf[4..8], window, .little);
-        return .{ .op_data = .{ .modify_ent_setting = .{
-            .setting = .ns_rate_limit,
-            .id = param,
-            .data = &scratch.ns_rl_buf,
-            .rate_limit = rate,
-            .rate_window_ms = window,
-        } }, .count = 1 };
-    }
-    if (std.mem.eql(u8, sub_action, "ns_rate_limit_delete")) {
-        return .{ .op_data = .{ .modify_ent_setting = .{
-            .setting = .ns_rate_limit,
-            .id = param,
-            .data = null,
-        } }, .count = 1 };
-    }
-    return .{ .op_data = .{ .modify_ent_setting = .{} }, .count = 0 };
+    return .{ .op_data = .{ .modify_setting = .{} }, .count = 0 };
 }
 
 fn decodeGlobalConfig(body: []const u8, sub_action: []const u8) DecodeResult {
@@ -1664,7 +1589,7 @@ pub fn encodeWriteResponse(
         },
         rpc.MSG_CRON_UPDATE, rpc.MSG_CRON_DELETE, rpc.MSG_CRON_TRIGGER => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
         rpc.MSG_SET_BUDGET, rpc.MSG_DELETE_BUDGET => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
-        rpc.MSG_MODIFY_ENT_SETTING => {
+        rpc.MSG_MODIFY_SETTING => {
             if (std.mem.eql(u8, sub_action, "api_key") and path_param.len == 64) {
                 // API key create — return the raw key (one-time display).
                 var body_buf: [256]u8 = undefined;
