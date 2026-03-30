@@ -2,7 +2,18 @@
 
 ## UI End-to-End Tests
 
-- [x] Run UI e2e tests against pipeline v2 — 40 Playwright tests passing (pages, actions, filters, exports, HTMX refresh, API endpoints)
+- [x] Run UI e2e tests against pipeline v2 — 47 Playwright tests passing (pages, actions, filters, exports, HTMX refresh, API endpoints)
+- [x] State-conditional button tests — pending/cancelled/scheduled show correct buttons
+- [x] Job action route tests — DELETE/CANCEL/REQUEUE/PROMOTE return 200
+- [x] Confirm dialog tests — Cancel/Delete handle browser confirm
+- [x] Timestamp formatting test — time elements render relative, not raw ISO
+- [ ] State change verification — pause flips badge to "Paused", cancel changes state to "cancelled", promote changes to "pending", delete removes job
+- [ ] Error toast content — verify error message from server appears in toast
+- [ ] Bulk action end-to-end — click Cancel All / Delete All, verify jobs change state
+- [ ] Job detail with payload — enqueue with payload, verify payload section renders with Copy button
+- [ ] Requeued job shows parent link — requeue a cancelled job, verify "Requeued From" link on new job
+- [ ] Dark mode toggle — click toggle, verify `dark` class on `<html>`
+- [ ] API edge cases — requeue on pending returns no-op, delete on active fails, cancel on completed is no-op
 
 ## Server
 

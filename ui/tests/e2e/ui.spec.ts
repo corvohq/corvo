@@ -201,10 +201,10 @@ test.describe("Job Detail", () => {
     const jobLink = page.locator("table tbody tr a").first();
     await jobLink.click();
     await expect(page).toHaveURL(/\/ui\/jobs\//);
-    // Should show job detail with action buttons.
-    await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
+    // Pending job should show Cancel + Delete (not Requeue).
     await expect(page.getByRole("button", { name: "Cancel" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Delete" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Requeue" })).not.toBeVisible();
     // Should show job metadata table.
     await expect(page.getByRole("cell", { name: "Queue" })).toBeVisible();
     await expect(page.getByRole("cell", { name: "State" })).toBeVisible();

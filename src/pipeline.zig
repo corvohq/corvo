@@ -744,7 +744,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 const op_data = ops_mod.OpData{ .maintenance = .{ .action = iv.action, .now_ns = now_ns, .cutoff_ns = cutoff } };
                 const result = self.handler.apply(&batch, .maintenance, &op_data);
                 const elapsed_us: u64 = @intCast(@max(0, self.config.clock_fn() - t0));
-                if (elapsed_us > 1000 or result.affected > 0)
+                if (result.affected > 0)
                     std.debug.print("corvo: maintenance {s} — {d} affected, {d}us\n", .{
                         iv.action.toString(), result.affected, elapsed_us,
                     });
