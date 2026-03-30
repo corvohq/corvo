@@ -19,7 +19,8 @@
 
 - [x] Mirror rebuild on overflow — when ring buffer drops ops, `needs_rebuild` flag triggers full KV→SQLite rebuild on next `flushAll()`. Scans all entity prefixes (j|, jp|, qc|, w|, sc|, b|, bg|) and restores complete mirror state. Metrics endpoint exposes rebuild count.
 - [x] Rate limiting — sliding window per-queue (existing) + global (`POST /api/v1/throttle`) + enterprise namespace (`POST /api/v1/namespaces/{ns}/throttle`), queue namespace assignment (`POST /api/v1/queues/{name}/namespace`), cleanup cutoff fix
-- [x] **KV-only reads — eliminate SQLite mirror** — `kv_read.zig` reads directly from Talon KV via prefix scans. New read indexes (jt|, jq|, js|, jqs|, ti|). Queue stats via counters in qc| codec. SQLite dependency removed entirely. Tag search replaces FTS5.
+- [x] **KV-only reads — eliminate SQLite mirror** — `kv_read.zig` reads directly from Talon KV via prefix scans. New read indexes (jt|, jq|, js|, jqs|, tq|). Queue stats via counters in qc| codec. SQLite dependency removed entirely. Tag search replaces FTS5.
+- [x] **Tag search** — `tq|{queue}\x00{tag_key}\x00{tag_value}\x00{job_id}` index, queue-first for locality. `searchByTag()` with queue+state filtering. HTTP endpoint `GET /api/v1/jobs/search-by-tag`. UI tag search on queue detail page. Payload search kept as API-only (`searchPayload`). Dead wrappers removed.
 - [x] Throughput metrics (`/metrics/throughput`) — rolling 60-second window, per-second ops/sec for enqueued/completed/failed
 - [x] Cluster events (`/cluster/events`) — ring buffer of last 64 state transitions (leader elected, stepped down, follower started, snapshots)
 - [x] Cluster Prometheus metrics — `corvo_cluster_state`, `corvo_cluster_epoch`, `corvo_cluster_lease_valid`, `corvo_cluster_peers_total` on `/metrics`

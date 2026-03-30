@@ -719,6 +719,7 @@ pub const OpHandler = struct {
     }
 
     /// Write tag index entries for a job. Parses JSON object tags.
+    /// Index key: tq|{tag_key}\x00{tag_value}\x00{queue}\x00{job_id}
     pub fn writeTagIndexes(b: *kv.WriteBatch, job: *const types.Job) void {
         const tag_str = job.tags orelse return;
         if (tag_str.len < 2) return;
@@ -737,14 +738,16 @@ pub const OpHandler = struct {
             const v_end = std.mem.indexOfScalarPos(u8, tag_str, v_start + 1, '"') orelse break;
             const tag_value = tag_str[v_start + 1 .. v_end];
 
-            var ti_buf: keys.KeyBuf = undefined;
-            b.set(keys.tagIndexKey(&ti_buf, tag_key, tag_value, job.id), "");
+            var tq_buf: keys.KeyBuf = undefined;
+            b.set(keys.tagQueueKey(&tq_buf, job.queue, tag_key, tag_value, job.id), "");
 
             pos = v_end + 1;
         }
     }
 
     /// Delete tag index entries for a job (mirror of writeTagIndexes).
+    /// Uses job.queue for the queue segment — caller must ensure queue is correct
+    /// (i.e. call BEFORE changing job.queue during moves).
     pub fn deleteTagIndexes(b: *kv.WriteBatch, job: *const types.Job) void {
         const tag_str = job.tags orelse return;
         if (tag_str.len < 2) return;
@@ -760,8 +763,8 @@ pub const OpHandler = struct {
             const v_end = std.mem.indexOfScalarPos(u8, tag_str, v_start + 1, '"') orelse break;
             const tag_value = tag_str[v_start + 1 .. v_end];
 
-            var ti_buf: keys.KeyBuf = undefined;
-            b.delete(keys.tagIndexKey(&ti_buf, tag_key, tag_value, job.id));
+            var tq_buf: keys.KeyBuf = undefined;
+            b.delete(keys.tagQueueKey(&tq_buf, job.queue, tag_key, tag_value, job.id));
 
             pos = v_end + 1;
         }

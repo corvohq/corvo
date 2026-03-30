@@ -47,7 +47,7 @@ pub const prefix_job_time = "jt|"; // jt|{inv_created_ns:8BE}{job_id}
 pub const prefix_job_queue = "jq|"; // jq|{queue}\x00{inv_created_ns:8BE}{job_id}
 pub const prefix_job_state = "js|"; // js|{state:1}{inv_created_ns:8BE}{job_id}
 pub const prefix_job_queue_state = "jqs|"; // jqs|{queue}\x00{state:1}{inv_created_ns:8BE}{job_id}
-pub const prefix_tag_index = "ti|"; // ti|{tag_key}\x00{tag_value}\x00{job_id}
+pub const prefix_tag_queue = "tq|"; // tq|{queue}\x00{tag_key}\x00{tag_value}\x00{job_id}
 
 // Enterprise prefixes
 pub const prefix_ent_ns = "ent_ns|";
@@ -558,9 +558,11 @@ pub fn jobQueueStateQueuePrefix(buf: *KeyBuf, queue: []const u8) []const u8 {
     return buf[0..pos];
 }
 
-/// ti|{tag_key}\x00{tag_value}\x00{job_id}
-pub fn tagIndexKey(buf: *KeyBuf, tag_key: []const u8, tag_value: []const u8, job_id: []const u8) []const u8 {
-    var pos = copyPrefix(buf, prefix_tag_index);
+/// tq|{queue}\x00{tag_key}\x00{tag_value}\x00{job_id}
+pub fn tagQueueKey(buf: *KeyBuf, queue: []const u8, tag_key: []const u8, tag_value: []const u8, job_id: []const u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_tag_queue);
+    pos = copyStr(buf, pos, queue);
+    pos = putU8(buf, pos, sep);
     pos = copyStr(buf, pos, tag_key);
     pos = putU8(buf, pos, sep);
     pos = copyStr(buf, pos, tag_value);
@@ -569,20 +571,14 @@ pub fn tagIndexKey(buf: *KeyBuf, tag_key: []const u8, tag_value: []const u8, job
     return buf[0..pos];
 }
 
-/// ti|{tag_key}\x00{tag_value}\x00
-pub fn tagIndexPrefix(buf: *KeyBuf, tag_key: []const u8, tag_value: []const u8) []const u8 {
-    var pos = copyPrefix(buf, prefix_tag_index);
+/// tq|{queue}\x00{tag_key}\x00{tag_value}\x00
+pub fn tagQueuePrefix(buf: *KeyBuf, queue: []const u8, tag_key: []const u8, tag_value: []const u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_tag_queue);
+    pos = copyStr(buf, pos, queue);
+    pos = putU8(buf, pos, sep);
     pos = copyStr(buf, pos, tag_key);
     pos = putU8(buf, pos, sep);
     pos = copyStr(buf, pos, tag_value);
-    pos = putU8(buf, pos, sep);
-    return buf[0..pos];
-}
-
-/// ti|{tag_key}\x00
-pub fn tagIndexKeyPrefix(buf: *KeyBuf, tag_key: []const u8) []const u8 {
-    var pos = copyPrefix(buf, prefix_tag_index);
-    pos = copyStr(buf, pos, tag_key);
     pos = putU8(buf, pos, sep);
     return buf[0..pos];
 }
@@ -611,14 +607,16 @@ pub fn jobIdFromQueueStateKey(k: []const u8) ?[]const u8 {
     return k[sep_pos + 1 + 1 + 8 ..]; // skip sep + state + 8-byte inv_ts
 }
 
-/// Extract job ID from a ti| key: ti|{tag_key}\x00{tag_value}\x00{job_id}
-pub fn jobIdFromTagKey(k: []const u8) ?[]const u8 {
-    const start = prefix_tag_index.len;
-    // Find first sep (after tag_key)
+/// Extract job ID from a tq| key: tq|{queue}\x00{tag_key}\x00{tag_value}\x00{job_id}
+pub fn jobIdFromTagQueueKey(k: []const u8) ?[]const u8 {
+    const start = prefix_tag_queue.len;
+    // Find first sep (after queue)
     const sep1 = std.mem.indexOfScalarPos(u8, k, start, sep) orelse return null;
-    // Find second sep (after tag_value)
+    // Find second sep (after tag_key)
     const sep2 = std.mem.indexOfScalarPos(u8, k, sep1 + 1, sep) orelse return null;
-    return k[sep2 + 1 ..];
+    // Find third sep (after tag_value)
+    const sep3 = std.mem.indexOfScalarPos(u8, k, sep2 + 1, sep) orelse return null;
+    return k[sep3 + 1 ..];
 }
 
 /// Compute the key just past all keys with the given prefix.
@@ -810,10 +808,10 @@ test "jobQueueStateKey extract job ID" {
     try std.testing.expectEqualStrings("job-42", id);
 }
 
-test "tagIndexKey extract job ID" {
+test "tagQueueKey extract job ID" {
     var buf: KeyBuf = undefined;
-    const k = tagIndexKey(&buf, "customer_id", "acme", "job-99");
-    try std.testing.expect(std.mem.startsWith(u8, k, prefix_tag_index));
-    const id = jobIdFromTagKey(k).?;
+    const k = tagQueueKey(&buf, "payments", "customer_id", "acme", "job-99");
+    try std.testing.expect(std.mem.startsWith(u8, k, prefix_tag_queue));
+    const id = jobIdFromTagQueueKey(k).?;
     try std.testing.expectEqualStrings("job-99", id);
 }

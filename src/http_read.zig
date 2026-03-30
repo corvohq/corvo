@@ -79,6 +79,7 @@ pub fn dispatch(
     const rdr = reader orelse return writeError(send_buf, 503, "no_mirror");
 
     if (std.mem.eql(u8, api, "/jobs/bulk-get") and method == .POST) return bulkGetJobs(send_buf, rdr, body);
+    if (std.mem.eql(u8, api, "/jobs/search-by-tag")) return searchByTag(send_buf, rdr, path);
     if (std.mem.eql(u8, api, "/jobs") or std.mem.eql(u8, api, "/jobs/search")) {
         if (method == .POST) return jobSearchPost(send_buf, rdr, body);
         return jobSearch(send_buf, rdr, path);
@@ -526,7 +527,7 @@ fn search(send_buf: []u8, reader: *kv_read.Reader, path: []const u8) u32 {
     if (query_str.len == 0) return writeError(send_buf, 400, "q parameter is required");
 
     var result_buf: [100]kv_read.JobRow = undefined;
-    const count = reader.searchJobs(query_str, &result_buf);
+    const count = reader.searchPayload(query_str, &result_buf);
 
     var body_buf: [32768]u8 = undefined;
     var jw = json.JsonWriter.init(&body_buf);
@@ -535,6 +536,36 @@ fn search(send_buf: []u8, reader: *kv_read.Reader, path: []const u8) u32 {
     jw.beginArrayField("results");
     for (0..count) |i| writeJobRowSummary(&jw, &result_buf[i]);
     jw.endArray();
+    jw.endObject();
+    return http.writeResponse(send_buf, 200, jw.getWritten());
+}
+
+fn searchByTag(send_buf: []u8, reader: *kv_read.Reader, path: []const u8) u32 {
+    const tag_key = http.extractQueryParam(path, "tag_key") orelse
+        return writeError(send_buf, 400, "tag_key parameter is required");
+    const tag_value = http.extractQueryParam(path, "tag_value") orelse
+        return writeError(send_buf, 400, "tag_value parameter is required");
+    const queue = http.extractQueryParam(path, "queue") orelse
+        return writeError(send_buf, 400, "queue parameter is required");
+    const state = http.extractQueryParam(path, "state");
+    if (tag_key.len == 0) return writeError(send_buf, 400, "tag_key parameter is required");
+    if (tag_value.len == 0) return writeError(send_buf, 400, "tag_value parameter is required");
+    if (queue.len == 0) return writeError(send_buf, 400, "queue parameter is required");
+
+    var result_buf: [100]kv_read.JobRow = undefined;
+    const count = reader.searchByTag(tag_key, tag_value, queue, state, &result_buf);
+
+    var body_buf: [32768]u8 = undefined;
+    var jw = json.JsonWriter.init(&body_buf);
+    jw.beginObject();
+    jw.fieldStr("tag_key", tag_key);
+    jw.fieldStr("tag_value", tag_value);
+    jw.fieldStr("queue", queue);
+    if (state) |s| jw.fieldStr("state", s);
+    jw.beginArrayField("jobs");
+    for (0..count) |i| writeJobRowSummary(&jw, &result_buf[i]);
+    jw.endArray();
+    jw.fieldInt("total", count);
     jw.endObject();
     return http.writeResponse(send_buf, 200, jw.getWritten());
 }
@@ -549,7 +580,7 @@ fn jobSearch(send_buf: []u8, reader: *kv_read.Reader, path: []const u8) u32 {
 
     if (query_str) |q| {
         var result_buf: [100]kv_read.JobRow = undefined;
-        const count = reader.searchJobs(q, &result_buf);
+        const count = reader.searchPayload(q, &result_buf);
         for (0..count) |i| writeJobRowSummary(&jw, &result_buf[i]);
     } else {
         var job_buf: [100]kv_read.JobRow = undefined;
@@ -581,7 +612,7 @@ fn jobSearchPost(send_buf: []u8, reader: *kv_read.Reader, body_input: []const u8
     var count: u32 = 0;
 
     if (text_filter) |q| {
-        count = reader.searchJobs(q, job_buf[0..actual_limit]);
+        count = reader.searchPayload(q, job_buf[0..actual_limit]);
     } else {
         count = reader.queryJobsByQueueState(queue_filter, state_filter, actual_limit, 0, &job_buf);
     }

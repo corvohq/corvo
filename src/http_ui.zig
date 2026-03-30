@@ -167,6 +167,9 @@ fn queuesPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
 
 fn queueDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, queue_name: []const u8, query: []const u8) u32 {
     const state_filter = getQueryParam(query, "state");
+    const tag_key = getQueryParam(query, "tag_key");
+    const tag_value = getQueryParam(query, "tag_value");
+    const has_tag_search = tag_key != null and tag_value != null and tag_key.?.len > 0 and tag_value.?.len > 0;
     const page = parsePageParam(query);
     const offset: u32 = page * max_table_rows;
 
@@ -184,15 +187,19 @@ fn queueDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, queue_name: []const
     }
     const paused = if (qs) |q| q.paused else false;
 
-    // Filter tabs.
+    // Filter tabs — preserve tag params in URLs.
     const filter_states = [_]?[]const u8{ null, "pending", "active", "retrying", "dead", "completed", "scheduled", "held" };
     const filter_labels = [_][]const u8{ "All", "Pending", "Active", "Retrying", "Dead", "Completed", "Scheduled", "Held" };
-    var tab_url_bufs: [8][128]u8 = undefined;
+    var tab_url_bufs: [8][256]u8 = undefined;
     var filter_tabs: [8]FilterTabView = undefined;
     for (filter_states, filter_labels, 0..) |fs, fl, i| {
         var s = std.io.fixedBufferStream(&tab_url_bufs[i]);
         s.writer().print("/ui/queues/{s}", .{queue_name}) catch {};
         if (fs) |state| s.writer().print("?state={s}", .{state}) catch {};
+        if (has_tag_search) {
+            const sep: []const u8 = if (fs != null) "&" else "?";
+            s.writer().print("{s}tag_key={s}&tag_value={s}", .{ sep, tag_key.?, tag_value.? }) catch {};
+        }
         const is_active = if (fs) |st| (if (state_filter) |cf| eql(st, cf) else false) else state_filter == null;
         filter_tabs[i] = .{
             .href = s.getWritten(),
@@ -202,22 +209,38 @@ fn queueDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, queue_name: []const
         };
     }
 
-    // Job views.
+    // Job views — use tag search or standard query.
     var job_buf: [max_table_rows]kv_read.JobRow = undefined;
     var job_views: [max_table_rows]JobView = undefined;
-    const count: usize = if (reader) |rdr| rdr.queryJobsByQueueState(queue_name, state_filter, max_table_rows, offset, &job_buf) else 0;
+    var count: usize = 0;
+    if (has_tag_search) {
+        if (reader) |rdr| {
+            count = rdr.searchByTag(tag_key.?, tag_value.?, queue_name, state_filter, &job_buf);
+        }
+    } else {
+        if (reader) |rdr| {
+            count = rdr.queryJobsByQueueState(queue_name, state_filter, max_table_rows, offset, &job_buf);
+        }
+    }
     const jobs = getJobViews(job_buf[0..count], &job_views, .queue_detail);
 
     var bulk_buf: [2]BulkAction = undefined;
     const bulk_actions = getBulkActions(.queue_detail, &bulk_buf);
 
+    // Clear tag URL — preserves state filter only.
+    var clear_tag_buf: [256]u8 = undefined;
+    var clear_tag_s = std.io.fixedBufferStream(&clear_tag_buf);
+    clear_tag_s.writer().print("/ui/queues/{s}", .{queue_name}) catch {};
+    if (state_filter) |sf| clear_tag_s.writer().print("?state={s}", .{sf}) catch {};
+
     // Pagination.
-    const total: u32 = if (qs) |q| queueStateCount(q, state_filter) else 0;
+    const total: u32 = if (has_tag_search) @intCast(count) else if (qs) |q| queueStateCount(q, state_filter) else 0;
     const total_pages = if (total > 0) (total + max_table_rows - 1) / max_table_rows else 1;
     var pag_base_buf: [256]u8 = undefined;
     var pag_base_s = std.io.fixedBufferStream(&pag_base_buf);
     pag_base_s.writer().print("/ui/queues/{s}?", .{queue_name}) catch {};
     if (state_filter) |sf| pag_base_s.writer().print("state={s}&", .{sf}) catch {};
+    if (has_tag_search) pag_base_s.writer().print("tag_key={s}&tag_value={s}&", .{ tag_key.?, tag_value.? }) catch {};
     var nav_bufs: [4][256]u8 = undefined;
     var page_links: [10]PageLink = undefined;
     var page_url_bufs: [10][256]u8 = undefined;
@@ -236,6 +259,10 @@ fn queueDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, queue_name: []const
         .dead = if (qs) |q| q.dead else @as(i32, 0),
         .completed = if (qs) |q| q.completed else @as(i32, 0),
         .filter_tabs = tabs,
+        .tag_key = if (tag_key) |tk| tk else "",
+        .tag_value = if (tag_value) |tv| tv else "",
+        .has_tag_search = has_tag_search,
+        .clear_tag_url = clear_tag_s.getWritten(),
         .has_bulk = true,
         .bulk_actions = bulk_actions,
         .has_jobs = count > 0,

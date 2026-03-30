@@ -41,6 +41,13 @@
     </div>
     <input type="text" placeholder="Filter jobs..." class="rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-1.5 text-sm text-zinc-900 dark:text-zinc-100 focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-100 sm:ml-auto w-full sm:w-48" oninput="corvoFilterRows(this.value)">
   </div>
+  <form method="get" class="flex flex-wrap items-center gap-2">
+    {{#export_state}}<input type="hidden" name="state" value="{{export_state}}">{{/export_state}}
+    <input type="text" name="tag_key" placeholder="Tag key" value="{{tag_key}}" class="rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-1.5 text-sm text-zinc-900 dark:text-zinc-100 focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-100 w-40">
+    <input type="text" name="tag_value" placeholder="Tag value" value="{{tag_value}}" class="rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-1.5 text-sm text-zinc-900 dark:text-zinc-100 focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-100 w-40">
+    <button type="submit" class="rounded-md bg-zinc-900 dark:bg-zinc-100 px-3 py-1.5 text-sm font-medium text-white dark:text-zinc-900 hover:bg-zinc-700 dark:hover:bg-zinc-300">Search Tags</button>
+    {{#has_tag_search}}<a href="{{clear_tag_url}}" class="rounded-md border border-zinc-300 dark:border-zinc-700 px-3 py-1.5 text-sm font-medium text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800">Clear</a>{{/has_tag_search}}
+  </form>
   {{> job_table}}
   {{> pagination}}
 </div>

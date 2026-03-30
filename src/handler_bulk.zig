@@ -252,7 +252,10 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                         }
                     }
                 }
+                // Delete tag indexes with old queue, then update queue, then rewrite
+                OpHandler.deleteTagIndexes(b, &job);
                 job.queue = move_to;
+                OpHandler.writeTagIndexes(b, &job);
                 self.recordBulkResult(job_id, .move, "pending", move_to, op.now_ns);
             },
 

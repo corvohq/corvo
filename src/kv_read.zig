@@ -704,32 +704,42 @@ pub const Reader = struct {
     // Search
     // ====================================================================
 
-    /// Search jobs by tag key+value. Scans ti|{key}\x00{value}\x00 prefix.
-    pub fn searchByTag(self: *Reader, tag_key: []const u8, tag_value: []const u8, results: []JobRow) u32 {
+    /// Search jobs by tag key+value within a queue. Scans tq|{key}\x00{value}\x00{queue}\x00 prefix.
+    /// Optionally filters by state. Returns up to results.len matching jobs.
+    pub fn searchByTag(self: *Reader, tag_key: []const u8, tag_value: []const u8, queue: []const u8, state: ?[]const u8, results: []JobRow) u32 {
+        const max_scan = 10_000;
+        const state_byte: ?u8 = if (state) |s| stateStringToByte(s) else null;
         var batch = self.store.newBatch();
         defer batch.close();
 
         var prefix_buf: keys.KeyBuf = undefined;
         var upper_buf: keys.KeyBuf = undefined;
-        const prefix = keys.tagIndexPrefix(&prefix_buf, tag_key, tag_value);
+        const prefix = keys.tagQueuePrefix(&prefix_buf, queue, tag_key, tag_value);
         const upper = keys.prefixEnd(&upper_buf, prefix) orelse return 0;
 
         var iter = batch.newIter(prefix, upper);
         defer iter.close();
 
         var count: u32 = 0;
+        var scanned: u32 = 0;
         if (!iter.first()) return 0;
         while (true) {
-            if (count >= results.len) break;
+            if (count >= results.len or scanned >= max_scan) break;
+            scanned += 1;
             const k = iter.key();
-            const job_id = keys.jobIdFromTagKey(k) orelse {
+            const job_id = keys.jobIdFromTagQueueKey(k) orelse {
                 if (!iter.next()) break;
                 continue;
             };
-            // Look up the actual job
             var job_key_buf: keys.KeyBuf = undefined;
             if (batch.get(keys.jobKey(&job_key_buf, job_id))) |job_val| {
                 const job = codec.decodeJob(job_val);
+                if (state_byte) |sb| {
+                    if (@intFromEnum(job.state) != sb) {
+                        if (!iter.next()) break;
+                        continue;
+                    }
+                }
                 results[count] = jobToRow(&job);
                 count += 1;
             }
@@ -777,16 +787,6 @@ pub const Reader = struct {
         return count;
     }
 
-    /// FTS5 search — delegates to payload search (no FTS in KV).
-    /// Kept for API compatibility with http_read.zig callers.
-    pub fn searchJobs(self: *Reader, query: []const u8, results: []JobRow) u32 {
-        return self.searchPayload(query, results);
-    }
-
-    /// LIKE search fallback — same as searchPayload.
-    pub fn searchJobsLike(self: *Reader, query: []const u8, results: []JobRow) u32 {
-        return self.searchPayload(query, results);
-    }
 
     // ====================================================================
     // Internal helpers
