@@ -39,6 +39,10 @@ pub const cluster = @import("cluster.zig");
 // Server configuration
 pub const server_config = @import("config.zig");
 
+// Re-exported dependencies (for enterprise binary to use the same module instances)
+pub const zigstache = @import("zigstache");
+pub const talon = @import("talon");
+
 // Performance metrics
 pub const metrics = @import("metrics.zig");
 

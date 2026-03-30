@@ -13,13 +13,21 @@ const ui_embed = @import("ui_embed");
 /// Whether admin password auth is enabled (set by main.zig).
 pub var g_auth_enabled: bool = false;
 
+/// Whether enterprise mode is active (set by enterprise main.zig).
+/// Controls sidebar nav visibility for enterprise links.
+pub var g_enterprise: bool = false;
+
+/// Enterprise UI dispatch hook — set by enterprise binary at startup.
+/// Called for UI paths not matched by core. Returns response length, or null for 404.
+pub var ent_ui_dispatch: ?*const fn ([]const u8, []const u8, []u8, ?*kv_read.Reader) ?u32 = null;
+
 /// Max HTML body size. Pages render into a buffer of this size.
 /// Mustache templates with dark mode classes + inline SVG icons need headroom.
 /// send_buf is 64KB (IO layer — do not change). Layout ~8KB + HTTP headers ~200B.
 /// page_buf must fit within send_buf after layout wrapping.
 const send_buf_size = 65536;
 const layout_overhead = 8400;
-const page_buf_size = send_buf_size - layout_overhead;
+pub const page_buf_size = send_buf_size - layout_overhead;
 const render_buf_size = send_buf_size - 200;
 
 /// Max table rows per page.
@@ -69,6 +77,10 @@ pub fn dispatch(path: []const u8, query: []const u8, send_buf: []u8, reader: ?*k
     if (eql(path, "/partials/queues-table")) return queuesTablePartial(send_buf, reader);
     if (eql(path, "/partials/enqueue-form")) return enqueueFormPartial(send_buf);
 
+    if (ent_ui_dispatch) |ent_dispatch| {
+        if (ent_dispatch(path, query, send_buf, reader)) |n| return n;
+    }
+
     return http.writeResponseHtml(send_buf, 404, "<h1>Not Found</h1>");
 }
 
@@ -77,12 +89,13 @@ pub fn dispatch(path: []const u8, query: []const u8, send_buf: []u8, reader: ?*k
 // ============================================================================
 
 /// Splice title and content into the layout template, then write the HTTP response.
-fn renderPage(send_buf: []u8, title: []const u8, content: []const u8) u32 {
+pub fn renderPage(send_buf: []u8, title: []const u8, content: []const u8) u32 {
     var buf: [render_buf_size]u8 = undefined;
     const rendered = layout_tmpl.render(&buf, .{
         .title = title,
         .content = content,
         .show_logout = g_auth_enabled,
+        .enterprise = g_enterprise,
     }) catch |err| switch (err) {
         error.BufferOverflow => return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>"),
     };
