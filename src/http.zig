@@ -567,8 +567,14 @@ fn classifyCronPostAction(rest: []const u8) RouteAction {
 // Auth — API key validation
 // ============================================================================
 
-pub const AuthResult = enum {
-    ok,
+pub const AuthRole = enum(u8) {
+    admin = 0,
+    worker = 1,
+    producer = 2,
+};
+
+pub const AuthResult = union(enum) {
+    ok: AuthRole,
     unauthorized,
     forbidden,
 };
@@ -596,23 +602,22 @@ pub fn checkAuth(
     api_key: ?[]const u8,
     session_cookie: ?[]const u8,
     admin_password: []const u8,
-    method: Method,
     reader: ?*kv_read.Reader,
 ) AuthResult {
-    // Layer 1: admin password (Bearer token or session cookie).
+    // Layer 1: admin password (Bearer token or session cookie) → admin role.
     if (admin_password.len > 0) {
         if (api_key) |key| {
-            if (std.mem.eql(u8, key, admin_password)) return .ok;
+            if (std.mem.eql(u8, key, admin_password)) return .{ .ok = .admin };
         }
         if (session_cookie) |cookie| {
-            if (validateSessionCookie(cookie, admin_password)) return .ok;
+            if (validateSessionCookie(cookie, admin_password)) return .{ .ok = .admin };
         }
     }
 
     // Layer 2: API key lookup.
-    const rdr = reader orelse return if (admin_password.len > 0) .unauthorized else .ok;
+    const rdr = reader orelse return if (admin_password.len > 0) .unauthorized else .{ .ok = .admin };
     const key_count = rdr.countEnabledApiKeys();
-    if (key_count == 0) return if (admin_password.len > 0) .unauthorized else .ok;
+    if (key_count == 0) return if (admin_password.len > 0) .unauthorized else .{ .ok = .admin };
 
     const raw_key = api_key orelse return .unauthorized;
     if (raw_key.len == 0) return .unauthorized;
@@ -623,11 +628,11 @@ pub fn checkAuth(
     const r = rdr.getApiKeyByHash(key_hash) orelse return .unauthorized;
     if (!r.enabled) return .unauthorized;
 
-    // Role-based access: readonly can only GET, worker can't manage.
     const role = r.roleSlice();
-    if (std.mem.eql(u8, role, "readonly") and method != .GET) return .forbidden;
-
-    return .ok;
+    if (std.mem.eql(u8, role, "admin")) return .{ .ok = .admin };
+    if (std.mem.eql(u8, role, "worker")) return .{ .ok = .worker };
+    if (std.mem.eql(u8, role, "producer")) return .{ .ok = .producer };
+    return .unauthorized;
 }
 
 /// Write a 401 or 403 response.
@@ -637,6 +642,40 @@ pub fn writeAuthError(send_buf: []u8, auth_result: AuthResult) u32 {
         .forbidden => writeResponse(send_buf, 403, "{\"error\":\"forbidden\"}"),
         .ok => unreachable,
     };
+}
+
+/// Check identity + role authorization for a write operation.
+/// Combines checkAuth identity lookup with role-based write enforcement.
+/// Returns .ok with role if authorized, or .unauthorized/.forbidden.
+pub fn authorizeWrite(
+    api_key: ?[]const u8,
+    session_cookie: ?[]const u8,
+    admin_password: []const u8,
+    reader: ?*kv_read.Reader,
+    msg_type: u8,
+) AuthResult {
+    const auth = checkAuth(api_key, session_cookie, admin_password, reader);
+    switch (auth) {
+        .ok => |role| {
+            if (roleAllowsWrite(role, msg_type)) return auth;
+            return .forbidden;
+        },
+        .unauthorized, .forbidden => return auth,
+    }
+}
+
+fn roleAllowsWrite(role: AuthRole, msg_type: u8) bool {
+    switch (role) {
+        .admin => return true,
+        .producer => return switch (msg_type) {
+            rpc.MSG_ENQUEUE_BATCH, rpc.MSG_BATCH_CREATE, rpc.MSG_BATCH_SEAL => true,
+            else => false,
+        },
+        .worker => return switch (msg_type) {
+            rpc.MSG_FETCH_BATCH, rpc.MSG_ACK_BATCH, rpc.MSG_FAIL_BATCH, rpc.MSG_HEARTBEAT => true,
+            else => false,
+        },
+    }
 }
 
 // ============================================================================
@@ -763,7 +802,7 @@ pub fn decodeWrite(
         } }, .count = 1 },
         rpc.MSG_SET_BUDGET => return decodeSetBudget(body, now_ns, scratch),
         rpc.MSG_DELETE_BUDGET => return .{ .op_data = .{ .delete_budget = .{ .scope = param, .target = sub_action } }, .count = 1 },
-        rpc.MSG_MODIFY_ENT_SETTING => return decodeEntSetting(body, param, sub_action, scratch),
+        rpc.MSG_MODIFY_ENT_SETTING => return decodeEntSetting(body, param, sub_action, scratch, now_ns),
         rpc.MSG_GLOBAL_CONFIG => return decodeGlobalConfig(body, sub_action),
         else => return .{ .op_data = .{ .enqueue = .{} }, .count = 0 },
     }
@@ -784,6 +823,10 @@ pub const DecodeScratch = struct {
     id2_len: u8 = 0,
     // Buffer for binary-encoded namespace rate limit config.
     ns_rl_buf: [8]u8 = undefined,
+    // API key generation scratch buffers.
+    api_key_raw: [64]u8 = undefined, // hex-encoded random key (32 bytes → 64 hex chars)
+    api_key_json: [384]u8 = undefined, // JSON value for KV storage
+    api_key_json_len: u16 = 0,
 };
 
 fn decodeEnqueue(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
@@ -1378,7 +1421,7 @@ fn decodeSetBudget(body: []const u8, now_ns: u64, scratch: *DecodeScratch) Decod
     return .{ .op_data = .{ .set_budget = op }, .count = 1 };
 }
 
-fn decodeEntSetting(body: []const u8, param: []const u8, sub_action: []const u8, scratch: *DecodeScratch) DecodeResult {
+fn decodeEntSetting(body: []const u8, param: []const u8, sub_action: []const u8, scratch: *DecodeScratch, now_ns: u64) DecodeResult {
     if (std.mem.eql(u8, sub_action, "approval_policy")) {
         return .{ .op_data = .{ .modify_ent_setting = .{
             .setting = .approval_policy,
@@ -1394,10 +1437,33 @@ fn decodeEntSetting(body: []const u8, param: []const u8, sub_action: []const u8,
         } }, .count = 1 };
     }
     if (std.mem.eql(u8, sub_action, "api_key")) {
+        // Generate random API key (32 random bytes → 64 hex chars).
+        var random_bytes: [32]u8 = undefined;
+        std.posix.getrandom(&random_bytes) catch
+            return .{ .op_data = .{ .modify_ent_setting = .{} }, .count = 0 };
+        const hex_chars = "0123456789abcdef";
+        for (random_bytes, 0..) |byte, i| {
+            scratch.api_key_raw[i * 2] = hex_chars[byte >> 4];
+            scratch.api_key_raw[i * 2 + 1] = hex_chars[byte & 0x0f];
+        }
+
+        // Hash the raw key → key_hash (used as KV key suffix).
+        _ = hashApiKey(&scratch.api_key_raw, &scratch.id_buf2);
+        scratch.id2_len = 64;
+
+        // Build JSON value for KV storage.
+        const name = extractJSONString(body, "name") orelse "unnamed";
+        const role = extractJSONString(body, "role") orelse "admin";
+        const json_val = std.fmt.bufPrint(&scratch.api_key_json,
+            "{{\"name\":\"{s}\",\"role\":\"{s}\",\"enabled\":true,\"key_hash\":\"{s}\",\"created_at_ns\":{d}}}",
+            .{ name, role, scratch.id_buf2[0..64], now_ns },
+        ) catch return .{ .op_data = .{ .modify_ent_setting = .{} }, .count = 0 };
+        scratch.api_key_json_len = @intCast(json_val.len);
+
         return .{ .op_data = .{ .modify_ent_setting = .{
             .setting = .api_key,
-            .id = scratch.id_buf2[0..scratch.id2_len],
-            .data = if (body.len > 0) body else null,
+            .id = scratch.id_buf2[0..64],
+            .data = scratch.api_key_json[0..scratch.api_key_json_len],
         } }, .count = 1 };
     }
     if (std.mem.eql(u8, sub_action, "api_key_delete")) {
@@ -1587,7 +1653,22 @@ pub fn encodeWriteResponse(
         },
         rpc.MSG_CRON_UPDATE, rpc.MSG_CRON_DELETE, rpc.MSG_CRON_TRIGGER => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
         rpc.MSG_SET_BUDGET, rpc.MSG_DELETE_BUDGET => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
-        rpc.MSG_MODIFY_ENT_SETTING => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
+        rpc.MSG_MODIFY_ENT_SETTING => {
+            if (std.mem.eql(u8, sub_action, "api_key") and path_param.len == 64) {
+                // API key create — return the raw key (one-time display).
+                var body_buf: [256]u8 = undefined;
+                var jw = json.JsonWriter.init(&body_buf);
+                jw.beginObject();
+                jw.fieldStr("key", path_param);
+                // Hash the raw key to get key_hash for the response.
+                var hash_buf: [64]u8 = undefined;
+                const kh = hashApiKey(path_param, &hash_buf);
+                jw.fieldStr("key_hash", kh);
+                jw.endObject();
+                return writeResponse(send_buf, 201, jw.getWritten());
+            }
+            return writeResponse(send_buf, 200, "{\"status\":\"ok\"}");
+        },
         else => return writeResponse(send_buf, 200, "{\"status\":\"ok\"}"),
     }
 }

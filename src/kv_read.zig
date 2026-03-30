@@ -688,8 +688,8 @@ pub const Reader = struct {
         defer batch.close();
 
         var key_buf: keys.KeyBuf = undefined;
-        _ = batch.get(keys.entSettingKey(&key_buf, keys.prefix_ent_apikey, key_hash)) orelse return null;
-        return ApiKeyRow{};
+        const val = batch.get(keys.entSettingKey(&key_buf, keys.prefix_ent_apikey, key_hash)) orelse return null;
+        return apiKeyFromValue(val);
     }
 
     // ====================================================================
@@ -957,9 +957,55 @@ fn cronToRow(c: *const types.Cron) CronRow {
 }
 
 fn apiKeyFromValue(val: []const u8) ApiKeyRow {
-    // Enterprise API key values are JSON: {"name":"...","role":"...","enabled":true,...}
-    _ = val;
-    return ApiKeyRow{};
+    // Enterprise API key values are JSON: {"name":"...","role":"...","enabled":true,"key_hash":"...","created_at_ns":...}
+    var row = ApiKeyRow{};
+    if (jsonStr(val, "key_hash")) |v| copyField(&row.key_hash, &row.key_hash_len, v);
+    if (jsonStr(val, "name")) |v| copyField(&row.name, &row.name_len, v);
+    if (jsonStr(val, "role")) |v| copyField(&row.role, &row.role_len, v);
+    if (jsonStr(val, "created_at_ns")) |_| {} else if (jsonStr(val, "created_at")) |v| copyField(&row.created_at, &row.created_at_len, v);
+    // Parse created_at_ns integer for formatting.
+    if (jsonInt(val, "created_at_ns")) |ns| formatNs(&row.created_at, &row.created_at_len, ns);
+    // Parse enabled boolean (defaults to true).
+    if (jsonBool(val, "enabled")) |e| row.enabled = e;
+    return row;
+}
+
+/// Minimal JSON string extractor: finds "key":"value" and returns value.
+fn jsonStr(body: []const u8, key: []const u8) ?[]const u8 {
+    var search_buf: [128]u8 = undefined;
+    const search_key = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;
+    const start = std.mem.indexOf(u8, body, search_key) orelse return null;
+    const val_start = start + search_key.len;
+    if (val_start >= body.len) return null;
+    const end = std.mem.indexOfScalar(u8, body[val_start..], '"') orelse return null;
+    return body[val_start..][0..end];
+}
+
+/// Minimal JSON integer extractor: finds "key":12345 and returns value.
+fn jsonInt(body: []const u8, key: []const u8) ?u64 {
+    var search_buf: [128]u8 = undefined;
+    const search_key = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
+    const start = std.mem.indexOf(u8, body, search_key) orelse return null;
+    var val_start = start + search_key.len;
+    while (val_start < body.len and body[val_start] == ' ') val_start += 1;
+    if (val_start >= body.len) return null;
+    if (body[val_start] == '"') return null; // it's a string, not int
+    var end = val_start;
+    while (end < body.len and body[end] >= '0' and body[end] <= '9') end += 1;
+    if (end == val_start) return null;
+    return std.fmt.parseInt(u64, body[val_start..end], 10) catch null;
+}
+
+/// Minimal JSON boolean extractor: finds "key":true or "key":false.
+fn jsonBool(body: []const u8, key: []const u8) ?bool {
+    var search_buf: [128]u8 = undefined;
+    const search_key = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
+    const start = std.mem.indexOf(u8, body, search_key) orelse return null;
+    var val_start = start + search_key.len;
+    while (val_start < body.len and body[val_start] == ' ') val_start += 1;
+    if (val_start + 4 <= body.len and std.mem.eql(u8, body[val_start..][0..4], "true")) return true;
+    if (val_start + 5 <= body.len and std.mem.eql(u8, body[val_start..][0..5], "false")) return false;
+    return null;
 }
 
 fn approvalPolicyFromValue(val: []const u8) ApprovalPolicyRow {

@@ -587,12 +587,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 (is_ui_route and !admin_pw_set) or
                 (is_ui_route and std.mem.eql(u8, clean_path, "/ui/login")) or
                 (is_ui_route and std.mem.eql(u8, clean_path, "/ui/logout"));
-            if (!skip_auth) {
+            // Auth: identity check for reads/UI/404. Writes use authorizeWrite (identity + role).
+            if (!skip_auth and route != .write) {
                 const auth_result = http.checkAuth(
                     req.api_key,
                     req.session_cookie,
                     self.config.admin_password,
-                    req.method,
                     self.reader,
                 );
                 if (auth_result != .ok) {
@@ -644,6 +644,24 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 },
                 .write => |w| {
                     if (self.frame_count >= max_frames) return; // back-pressure
+
+                    // Identity + role authorization for write operations.
+                    if (!skip_auth) {
+                        const write_auth = http.authorizeWrite(
+                            req.api_key,
+                            req.session_cookie,
+                            self.config.admin_password,
+                            self.reader,
+                            w.msg_type,
+                        );
+                        if (write_auth != .ok) {
+                            const resp_len = http.writeAuthError(c.send_buf, write_auth);
+                            c.send_len = resp_len;
+                            self.io.queueSend(conn_id, resp_len);
+                            self.recordRecvCompaction(conn_id, req.total_len);
+                            return;
+                        }
+                    }
 
                     // Payload size validation — return 413 instead of asserting.
                     if (req.body.len > self.config.max_payload_size) {
@@ -1047,6 +1065,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 &self.http_scratch,
                 frame.http_path,
             );
+
+            // API key create: copy raw key to per-frame buffer for response encoding.
+            if (frame.msg_type == rpc.MSG_MODIFY_ENT_SETTING and
+                std.mem.eql(u8, frame.sub_action, "api_key") and decoded.count > 0)
+            {
+                @memcpy(self.http_id_bufs[frame_idx][0..64], self.http_scratch.api_key_raw[0..64]);
+                frame.path_param = self.http_id_bufs[frame_idx][0..64];
+            }
 
             // Batch enqueue: generate remaining IDs (first was pre-generated above).
             if (frame.msg_type == rpc.MSG_ENQUEUE_BATCH and decoded.count > 1) {
