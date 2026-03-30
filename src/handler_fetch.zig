@@ -208,6 +208,22 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
         };
         if (op.hostname.len > 0) w.hostname = op.hostname;
 
+        // Format queue names as comma-separated list.
+        var q_buf: [512]u8 = undefined;
+        var q_len: usize = 0;
+        for (op.queues, 0..) |qname, i| {
+            if (i > 0) {
+                if (q_len < q_buf.len) {
+                    q_buf[q_len] = ',';
+                    q_len += 1;
+                }
+            }
+            const copy_len = @min(qname.len, q_buf.len - q_len);
+            @memcpy(q_buf[q_len..][0..copy_len], qname[0..copy_len]);
+            q_len += copy_len;
+        }
+        if (q_len > 0) w.queues = q_buf[0..q_len];
+
         var wk_buf: keys.KeyBuf = undefined;
         var w_enc_buf: [codec.max_worker_encoded_size]u8 = undefined;
         b.set(keys.workerKey(&wk_buf, op.worker_id), codec.encodeWorker(&w_enc_buf, &w));

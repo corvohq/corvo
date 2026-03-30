@@ -514,7 +514,7 @@ fn classifyJobPostAction(rest: []const u8) RouteAction {
     if (id.len == 0 or action.len == 0) return .not_found;
 
     // Validate known actions
-    const valid = [_][]const u8{ "requeue", "cancel", "hold", "approve", "reject", "move" };
+    const valid = [_][]const u8{ "requeue", "cancel", "delete", "hold", "approve", "reject", "move", "promote" };
     for (valid) |v| {
         if (std.mem.eql(u8, action, v))
             return writeRoute(rpc.MSG_BULK_ACTION, id, action);
@@ -1248,6 +1248,7 @@ fn parseBulkAction(s: []const u8) ?ops_mod.BulkAction {
     if (std.mem.eql(u8, s, "hold")) return .hold;
     if (std.mem.eql(u8, s, "approve")) return .approve;
     if (std.mem.eql(u8, s, "reject")) return .reject;
+    if (std.mem.eql(u8, s, "promote")) return .promote;
     return null;
 }
 

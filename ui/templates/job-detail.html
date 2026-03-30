@@ -5,9 +5,12 @@
       <span class="{{state_class}}">{{state}}</span>
     </div>
     <div class="flex gap-2">
-      <button hx-post="/api/v1/jobs/{{job_id}}/retry" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-indigo-500 hover:bg-indigo-600">Retry</button>
-      <button hx-post="/api/v1/jobs/{{job_id}}/cancel" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-amber-500 hover:bg-amber-600">Cancel</button>
-      <button hx-post="/api/v1/jobs/{{job_id}}/delete" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-red-500 hover:bg-red-600">Delete</button>
+      {{#can_requeue}}<button hx-post="/api/v1/jobs/{{job_id}}/requeue" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-indigo-500 hover:bg-indigo-600">Requeue</button>{{/can_requeue}}
+      {{#can_promote}}<button hx-post="/api/v1/jobs/{{job_id}}/promote" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-indigo-500 hover:bg-indigo-600">Run Now</button>{{/can_promote}}
+      {{#can_cancel}}<button hx-post="/api/v1/jobs/{{job_id}}/cancel" hx-swap="none" hx-confirm="Cancel this job?" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-amber-500 hover:bg-amber-600">Cancel</button>{{/can_cancel}}
+      {{#can_approve}}<button hx-post="/api/v1/jobs/{{job_id}}/approve" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-emerald-500 hover:bg-emerald-600">Approve</button>{{/can_approve}}
+      {{#can_approve}}<button hx-post="/api/v1/jobs/{{job_id}}/reject" hx-swap="none" hx-confirm="Reject this job?" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-zinc-500 hover:bg-zinc-600">Reject</button>{{/can_approve}}
+      {{#can_delete}}<button hx-post="/api/v1/jobs/{{job_id}}/delete" hx-swap="none" hx-confirm="Delete this job? This cannot be undone." class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-red-500 hover:bg-red-600">Delete</button>{{/can_delete}}
     </div>
   </div>
   <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -23,6 +26,12 @@
             <td class="px-6 py-3 text-zinc-900 dark:text-zinc-100">{{value}}</td>
           </tr>
           {{/properties}}
+          {{#has_parent}}
+          <tr>
+            <td class="px-6 py-3 text-zinc-500 dark:text-zinc-400 font-medium w-40">Requeued From</td>
+            <td class="px-6 py-3"><a href="/ui/jobs/{{parent_id}}" class="text-indigo-600 dark:text-indigo-400 hover:underline font-mono text-xs">{{parent_id}}</a></td>
+          </tr>
+          {{/has_parent}}
         </tbody>
       </table>
     </div>

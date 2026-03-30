@@ -379,7 +379,7 @@ pub const OpHandler = struct {
         }
 
         self.recomputeMaxRateWindow();
-        _ = .{ pending_count, active_count, total_count };
+        std.debug.print("corvo: state ready — {d} jobs ({d} pending, {d} active)\n", .{ total_count, pending_count, active_count });
     }
 
     // ========================================================================

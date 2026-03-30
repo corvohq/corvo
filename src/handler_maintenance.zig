@@ -383,10 +383,6 @@ fn applyPurge(self: *OpHandler, b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult 
 
         if (iter.first()) {
             while (true) {
-                // Cap per-tick purge to avoid bulk_results overflow.
-                // Remaining dead keys are cleaned on the next purge interval.
-                if (self.bulk_result_count >= OpHandler.max_bulk_results - 1) break;
-
                 const key = iter.key();
                 const prefix_len = keys.prefix_dead.len;
                 const completed_at = keys.getU64BE(key[prefix_len .. prefix_len + 8]);
@@ -428,7 +424,6 @@ fn applyPurge(self: *OpHandler, b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult 
                 }
 
                 b.delete(key); // d| key
-                self.recordBulkResult(job_id, .delete, "", "", 0);
                 affected += 1;
 
                 if (!iter.next()) break;

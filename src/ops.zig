@@ -159,6 +159,7 @@ pub const BulkAction = enum(u8) {
     hold = 7,
     approve = 8,
     reject = 9,
+    promote = 10,
 
     pub fn toString(self: BulkAction) []const u8 {
         return switch (self) {
@@ -170,6 +171,7 @@ pub const BulkAction = enum(u8) {
             .hold => "hold",
             .approve => "approve",
             .reject => "reject",
+            .promote => "promote",
         };
     }
 };

@@ -109,6 +109,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
         last_rate_limit_ns: u64 = 0,
         last_expire_ns: u64 = 0,
         last_purge_ns: u64 = 0,
+        last_workers_ns: u64 = 0,
 
         // Sync replication — pipelined prepares.
         // Up to max_prepare_slots batches can be in-flight. Each slot holds
@@ -164,6 +165,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
             rate_limit_interval_ns: u64 = 0,
             expire_interval_ns: u64 = 0,
             purge_interval_ns: u64 = 0,
+            purge_retention_ns: u64 = 14 * 24 * 3_600_000_000_000,
+            workers_interval_ns: u64 = 0,
+            worker_timeout_ns: u64 = 60_000_000_000,
             repl_hook: ?ReplHook = null,
             sync_replication: bool = false,
             /// Adaptive batch coalescing window for sync replication (nanoseconds).
@@ -245,6 +249,36 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 if (m.value.len > 0 and m.op != .delete) self.allocator.free(@constCast(m.value));
             }
             self.mut_list.deinit(self.allocator);
+        }
+
+        /// Seed maintenance timestamps and clean stale workers before accepting
+        /// connections. Purge runs on its normal interval — it can be slow with
+        /// large backlogs and doesn't affect correctness.
+        pub fn warmup(self: *Self) void {
+            const now_ns = self.nowNs();
+
+            // Seed all timestamps so normal intervals start from now.
+            self.last_promote_ns = now_ns;
+            self.last_reclaim_ns = now_ns;
+            self.last_unique_ns = now_ns;
+            self.last_rate_limit_ns = now_ns;
+            self.last_expire_ns = now_ns;
+            self.last_purge_ns = now_ns;
+            self.last_workers_ns = now_ns;
+
+            // Clean stale workers so the UI doesn't show ghosts.
+            self.handler.resetEffects();
+            var batch = self.stores[0].newBatch();
+            defer batch.close();
+
+            const t0 = self.config.clock_fn();
+            const cutoff = now_ns -| self.config.worker_timeout_ns;
+            const op = ops_mod.OpData{ .maintenance = .{ .action = .workers, .now_ns = now_ns, .cutoff_ns = cutoff } };
+            const result = self.handler.apply(&batch, .maintenance, &op);
+            const elapsed_us: u64 = @intCast(@max(0, self.config.clock_fn() - t0));
+            std.debug.print("corvo: warmup — cleaned {d} stale workers ({d}us)\n", .{ result.affected, elapsed_us });
+
+            batch.commit();
         }
 
         pub fn destroyHeap(self: *Self) void {
@@ -664,13 +698,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
         fn runMaintenance(self: *Self) void {
             const now_ns = self.nowNs();
 
-            const intervals = [6]struct { ns: u64, last: *u64, action: ops_mod.MaintenanceAction }{
+            const intervals = [7]struct { ns: u64, last: *u64, action: ops_mod.MaintenanceAction }{
                 .{ .ns = self.config.promote_interval_ns, .last = &self.last_promote_ns, .action = .promote },
                 .{ .ns = self.config.reclaim_interval_ns, .last = &self.last_reclaim_ns, .action = .reclaim },
                 .{ .ns = self.config.unique_interval_ns, .last = &self.last_unique_ns, .action = .unique },
                 .{ .ns = self.config.rate_limit_interval_ns, .last = &self.last_rate_limit_ns, .action = .rate_limit },
                 .{ .ns = self.config.expire_interval_ns, .last = &self.last_expire_ns, .action = .expire },
                 .{ .ns = self.config.purge_interval_ns, .last = &self.last_purge_ns, .action = .purge },
+                .{ .ns = self.config.workers_interval_ns, .last = &self.last_workers_ns, .action = .workers },
             };
 
             var any_due = false;
@@ -699,10 +734,20 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
                 const cutoff = if (iv.action == .rate_limit and self.handler.max_rate_window_ns > 0)
                     now_ns -| self.handler.max_rate_window_ns
+                else if (iv.action == .workers)
+                    now_ns -| self.config.worker_timeout_ns
+                else if (iv.action == .purge)
+                    now_ns -| self.config.purge_retention_ns
                 else
                     now_ns;
+                const t0 = self.config.clock_fn();
                 const op_data = ops_mod.OpData{ .maintenance = .{ .action = iv.action, .now_ns = now_ns, .cutoff_ns = cutoff } };
                 const result = self.handler.apply(&batch, .maintenance, &op_data);
+                const elapsed_us: u64 = @intCast(@max(0, self.config.clock_fn() - t0));
+                if (elapsed_us > 1000 or result.affected > 0)
+                    std.debug.print("corvo: maintenance {s} — {d} affected, {d}us\n", .{
+                        iv.action.toString(), result.affected, elapsed_us,
+                    });
                 self.emitMirrorOp(.maintenance, &op_data, &result);
 
                 if (result.notify_queues) |queues| {

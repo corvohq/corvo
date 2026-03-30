@@ -282,6 +282,7 @@ pub fn main() !void {
     std.fs.cwd().makePath(config.data_dir) catch {};
 
     // --- Open Talon DB ---
+    std.debug.print("corvo: opening data store ({s}/kv)...\n", .{config.data_dir});
     var kv_path_buf: [256]u8 = undefined;
     const kv_path = std.fmt.bufPrint(&kv_path_buf, "{s}/kv", .{config.data_dir}) catch unreachable;
     const db = try talon.DB.open(allocator, kv_path, .{});
@@ -291,6 +292,7 @@ pub fn main() !void {
     var stores = [1]kv.Store{kvstore};
 
     // --- OpHandler ---
+    std.debug.print("corvo: rebuilding state...\n", .{});
     var handler = handler_mod.OpHandler.init(allocator);
     handler.max_queues = config.max_queues;
     handler.max_tags_per_queue = config.max_tags_per_queue;
@@ -389,6 +391,9 @@ pub fn main() !void {
             .rate_limit_interval_ns = config.rate_limit_interval_ns,
             .expire_interval_ns = config.expire_interval_ns,
             .purge_interval_ns = config.purge_interval_ns,
+            .purge_retention_ns = config.purge_retention_ns,
+            .workers_interval_ns = config.workers_interval_ns,
+            .worker_timeout_ns = config.worker_timeout_ns,
             .repl_hook = repl_hook,
             .sync_replication = config.sync_replication,
             .coalesce_window_ns = if (config.sync_replication) 200_000 else 0,
@@ -396,6 +401,10 @@ pub fn main() !void {
         },
     );
     defer pipeline.destroyHeap();
+
+    // Run initial maintenance before accepting connections.
+    std.debug.print("corvo: running startup maintenance...\n", .{});
+    pipeline.warmup();
 
     // Wire cluster ack notification to pipeline's atomic + oplog for retry.
     if (cluster_mode) {

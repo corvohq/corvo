@@ -45,7 +45,10 @@ pub const ServerConfig = struct {
     rate_limit_interval_ns: u64 = 30_000_000_000,
     expire_interval_ns: u64 = 10_000_000_000,
     purge_interval_ns: u64 = 3_600_000_000_000,
+    purge_retention_ns: u64 = 14 * 24 * 3_600_000_000_000, // 14 days — terminal jobs older than this are purged
     purge_threshold: u32 = 10_000, // 0 = disabled; purge early when terminal job count exceeds this
+    workers_interval_ns: u64 = 30_000_000_000, // 30s — clean up stale workers
+    worker_timeout_ns: u64 = 60_000_000_000, // 60s — workers with no heartbeat for this long are removed
 
     sync_replication: bool = false,
 
@@ -169,6 +172,8 @@ pub const ServerConfig = struct {
             self.purge_interval_ns = parseInt(u64, val) orelse return error.InvalidValue;
         } else if (eql(key, "purge-threshold")) {
             self.purge_threshold = parseInt(u32, val) orelse return error.InvalidValue;
+        } else if (eql(key, "purge-retention")) {
+            self.purge_retention_ns = (parseInt(u64, val) orelse return error.InvalidValue) * 3_600_000_000_000;
         } else if (eql(key, "sync-replication")) {
             self.sync_replication = parseBool(val) orelse return error.InvalidValue;
         } else if (eql(key, "node-id")) {

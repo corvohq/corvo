@@ -306,6 +306,22 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 self.recordBulkResult(job_id, .update_state, "pending", "", op.now_ns);
             },
 
+            .promote => {
+                if (job.state != .scheduled) continue;
+                var sk_buf: keys.KeyBuf = undefined;
+                b.delete(OpHandler.jobScheduledKey(&sk_buf, &job));
+                job.state = .pending;
+                job.scheduled_at_ns = 0;
+                self.pending.push(job.queue, job.priority, job.created_at_ns, job_id);
+                if (job.expire_after_ms > 0) {
+                    job.expire_at_ns = op.now_ns + @as(u64, job.expire_after_ms) * 1_000_000;
+                    var xk_buf: keys.KeyBuf = undefined;
+                    b.set(keys.expireKey(&xk_buf, job.expire_at_ns, job_id), "");
+                }
+                self.recordPromoteQueue(job.queue);
+                self.recordBulkResult(job_id, .update_state, "pending", "", op.now_ns);
+            },
+
             .reject => {
                 if (job.state != .held) continue;
                 // Delete unique lock

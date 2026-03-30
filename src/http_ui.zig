@@ -345,9 +345,10 @@ fn jobDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, job_id: []const u8) u
     props[3] = .{ .label = "Attempt", .value = att_s.getWritten() };
     prop_count = 4;
     if (j.worker_id_len > 0) {
-        props[4] = .{ .label = "Worker", .value = j.workerIdSlice() };
-        prop_count = 5;
+        props[prop_count] = .{ .label = "Worker", .value = j.workerIdSlice() };
+        prop_count += 1;
     }
+    const parent_id = if (j.parent_id_len > 0) j.parentIdSlice() else "";
 
     // Timeline.
     var timeline: [5]TimelineView = undefined;
@@ -395,17 +396,32 @@ fn jobDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, job_id: []const u8) u
     const tl: []const TimelineView = timeline[0..tl_count];
     const errors: []const ErrorView = error_views[0..err_count];
 
+    const state_str = j.stateSlice();
+    const is_terminal = std.mem.eql(u8, state_str, "completed") or
+        std.mem.eql(u8, state_str, "dead") or
+        std.mem.eql(u8, state_str, "cancelled");
+    const is_active = std.mem.eql(u8, state_str, "active");
+    const is_held = std.mem.eql(u8, state_str, "held");
+    const is_scheduled = std.mem.eql(u8, state_str, "scheduled");
+
     var content_buf: [page_buf_size]u8 = undefined;
     const content = job_detail_tmpl.render(&content_buf, .{
         .job_id = j.idSlice(),
-        .state = j.stateSlice(),
-        .state_class = stateBadgeClassDark(j.stateSlice()),
+        .state = state_str,
+        .state_class = stateBadgeClassDark(state_str),
         .properties = properties,
         .timeline = tl,
         .has_payload = payload != null,
         .payload = if (payload) |p| p else "",
         .has_errors = err_count > 0,
         .errors = errors,
+        .can_requeue = is_terminal,
+        .can_promote = is_scheduled,
+        .can_cancel = !is_terminal and !is_held,
+        .can_delete = !is_active,
+        .can_approve = is_held,
+        .has_parent = parent_id.len > 0,
+        .parent_id = parent_id,
     }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Job Detail", content);
 }
