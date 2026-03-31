@@ -43,6 +43,9 @@ pub const server_config = @import("config.zig");
 pub const zigstache = @import("zigstache");
 pub const talon = @import("talon");
 
+// Webhook dispatch
+pub const webhook = @import("webhook.zig");
+
 // Performance metrics
 pub const metrics = @import("metrics.zig");
 
@@ -74,4 +77,5 @@ test {
     testing.refAllDecls(@import("io.zig"));
     testing.refAllDecls(@import("config.zig"));
     testing.refAllDecls(@import("kv_read.zig"));
+    testing.refAllDecls(@import("webhook.zig"));
 }

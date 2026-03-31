@@ -49,6 +49,14 @@ pub const OpHandler = struct {
     cancel_signals: [max_cancel_signals]CancelSignal = undefined,
     cancel_signal_count: u16 = 0,
 
+    // Webhook events — accumulated during apply, drained by pipeline after commit.
+    webhook_events: [max_webhook_events]WebhookEvent = undefined,
+    webhook_event_count: u16 = 0,
+
+    // Webhook config cache — bounded, loaded from KV on warmup, updated on create/delete.
+    webhook_cache: [max_webhooks]WebhookCached = undefined,
+    webhook_cache_count: u8 = 0,
+
     // Promote/reclaim notification: queues that had jobs promoted to pending.
     promote_queue_bufs: [max_promote_queues][64]u8 = undefined,
     promote_queue_lens: [max_promote_queues]u8 = [_]u8{0} ** max_promote_queues,
@@ -81,6 +89,8 @@ pub const OpHandler = struct {
     const max_fail_results = 256;
     pub const max_bulk_results = 4096;
     const max_cancel_signals = 256;
+    const max_webhook_events = 256;
+    pub const max_webhooks = 64;
     const max_promote_queues = 32;
 
     pub const FailResult = struct {
@@ -140,6 +150,69 @@ pub const OpHandler = struct {
         }
         pub fn queueSlice(self: *const BulkResult) []const u8 {
             return self.new_queue[0..self.new_queue_len];
+        }
+    };
+
+    pub const WebhookEvent = struct {
+        pub const EventType = enum(u8) { completed = 1, failed = 2, dead = 3 };
+
+        job_id: [128]u8 = undefined,
+        job_id_len: u8 = 0,
+        queue: [64]u8 = undefined,
+        queue_len: u8 = 0,
+        webhook_url: [512]u8 = undefined,
+        webhook_url_len: u16 = 0,
+        webhook_id: [64]u8 = undefined,
+        webhook_id_len: u8 = 0,
+        event: EventType = .completed,
+        now_ns: u64 = 0,
+
+        pub fn jobId(self: *const WebhookEvent) []const u8 {
+            return self.job_id[0..self.job_id_len];
+        }
+        pub fn queueSlice(self: *const WebhookEvent) []const u8 {
+            return self.queue[0..self.queue_len];
+        }
+        pub fn urlSlice(self: *const WebhookEvent) []const u8 {
+            return self.webhook_url[0..self.webhook_url_len];
+        }
+        pub fn webhookIdSlice(self: *const WebhookEvent) []const u8 {
+            return self.webhook_id[0..self.webhook_id_len];
+        }
+        pub fn eventName(self: *const WebhookEvent) []const u8 {
+            return switch (self.event) {
+                .completed => "job.completed",
+                .failed => "job.failed",
+                .dead => "job.dead",
+            };
+        }
+    };
+
+    pub const WebhookCached = struct {
+        id: [64]u8 = undefined,
+        id_len: u8 = 0,
+        url: [512]u8 = undefined,
+        url_len: u16 = 0,
+        queue_filter: [64]u8 = undefined,
+        queue_filter_len: u8 = 0,
+        on_completed: bool = false,
+        on_failed: bool = false,
+        on_dead: bool = false,
+        enabled: bool = true,
+
+        pub fn idSlice(self: *const WebhookCached) []const u8 {
+            return self.id[0..self.id_len];
+        }
+        pub fn urlSlice(self: *const WebhookCached) []const u8 {
+            return self.url[0..self.url_len];
+        }
+        pub fn queueFilterSlice(self: *const WebhookCached) []const u8 {
+            return self.queue_filter[0..self.queue_filter_len];
+        }
+        pub fn matchesQueue(self: *const WebhookCached, queue: []const u8) bool {
+            const filter = self.queueFilterSlice();
+            if (filter.len == 0 or std.mem.eql(u8, filter, "*")) return true;
+            return std.mem.eql(u8, filter, queue);
         }
     };
 
@@ -339,6 +412,7 @@ pub const OpHandler = struct {
         self.fail_result_count = 0;
         self.bulk_result_count = 0;
         self.cancel_signal_count = 0;
+        self.webhook_event_count = 0;
         self.promote_queue_count = 0;
     }
 
@@ -418,6 +492,109 @@ pub const OpHandler = struct {
         sig.worker_id_len = wl;
         self.cancel_signals[self.cancel_signal_count] = sig;
         self.cancel_signal_count += 1;
+    }
+
+    pub fn recordWebhookEvent(
+        self: *OpHandler,
+        job_id: []const u8,
+        queue: []const u8,
+        event: WebhookEvent.EventType,
+        webhook_id: []const u8,
+        webhook_url: []const u8,
+        now_ns: u64,
+    ) void {
+        if (self.webhook_event_count >= max_webhook_events) return;
+        var ev = WebhookEvent{};
+        const jl: u8 = @intCast(@min(job_id.len, ev.job_id.len));
+        @memcpy(ev.job_id[0..jl], job_id[0..jl]);
+        ev.job_id_len = jl;
+        const ql: u8 = @intCast(@min(queue.len, ev.queue.len));
+        @memcpy(ev.queue[0..ql], queue[0..ql]);
+        ev.queue_len = ql;
+        const ul: u16 = @intCast(@min(webhook_url.len, ev.webhook_url.len));
+        @memcpy(ev.webhook_url[0..ul], webhook_url[0..ul]);
+        ev.webhook_url_len = ul;
+        const wl: u8 = @intCast(@min(webhook_id.len, ev.webhook_id.len));
+        @memcpy(ev.webhook_id[0..wl], webhook_id[0..wl]);
+        ev.webhook_id_len = wl;
+        ev.event = event;
+        ev.now_ns = now_ns;
+        self.webhook_events[self.webhook_event_count] = ev;
+        self.webhook_event_count += 1;
+    }
+
+    /// Check webhook cache and record events for matching webhooks.
+    /// Writes whd| delivery records to the batch (atomic with state transition)
+    /// and records events in the effect buffer (for pipeline awareness).
+    pub fn checkWebhooks(self: *OpHandler, job_id: []const u8, queue: []const u8, event: WebhookEvent.EventType, now_ns: u64) void {
+        for (self.webhook_cache[0..self.webhook_cache_count]) |*wh| {
+            if (!wh.enabled) continue;
+            if (!wh.matchesQueue(queue)) continue;
+            const matches = switch (event) {
+                .completed => wh.on_completed,
+                .failed => wh.on_failed,
+                .dead => wh.on_dead,
+            };
+            if (!matches) continue;
+            self.recordWebhookEvent(job_id, queue, event, wh.idSlice(), wh.urlSlice(), now_ns);
+        }
+    }
+
+    /// Load webhook cache from KV. Called on warmup.
+    pub fn loadWebhookCache(self: *OpHandler, b: *kv.WriteBatch) void {
+        self.webhook_cache_count = 0;
+        var lower_buf: keys.KeyBuf = undefined;
+        var upper_buf: keys.KeyBuf = undefined;
+        @memcpy(lower_buf[0..keys.prefix_webhook.len], keys.prefix_webhook);
+        const upper = keys.prefixEnd(&upper_buf, lower_buf[0..keys.prefix_webhook.len]) orelse return;
+
+        var iter = b.newIter(lower_buf[0..keys.prefix_webhook.len], upper);
+        defer iter.close();
+
+        if (!iter.first()) return;
+        while (true) {
+            if (self.webhook_cache_count >= max_webhooks) break;
+            self.webhook_cache[self.webhook_cache_count] = webhookValueToCached(iter.value());
+            self.webhook_cache_count += 1;
+            if (!iter.next()) break;
+        }
+    }
+
+    /// Add or update a webhook in the cache.
+    pub fn addWebhookToCache(self: *OpHandler, val: []const u8) void {
+        const entry = webhookValueToCached(val);
+        const new_id = entry.idSlice();
+        // Update existing entry if same ID.
+        for (self.webhook_cache[0..self.webhook_cache_count]) |*wh| {
+            if (std.mem.eql(u8, wh.idSlice(), new_id)) {
+                wh.* = entry;
+                return;
+            }
+        }
+        if (self.webhook_cache_count >= max_webhooks) return;
+        self.webhook_cache[self.webhook_cache_count] = entry;
+        self.webhook_cache_count += 1;
+    }
+
+    /// Remove a webhook from the cache by ID.
+    pub fn removeWebhookFromCache(self: *OpHandler, webhook_id: []const u8) void {
+        var i: u8 = 0;
+        while (i < self.webhook_cache_count) {
+            if (std.mem.eql(u8, self.webhook_cache[i].idSlice(), webhook_id)) {
+                // Swap with last and shrink.
+                self.webhook_cache_count -= 1;
+                if (i < self.webhook_cache_count) {
+                    self.webhook_cache[i] = self.webhook_cache[self.webhook_cache_count];
+                }
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    /// Public JSON string extractor for cross-module use (pipeline webhook dispatch).
+    pub fn jsonStrPub(body: []const u8, key: []const u8) ?[]const u8 {
+        return jsonStr(body, key);
     }
 
     /// Main apply dispatch — the core state machine.
@@ -953,6 +1130,58 @@ pub fn getJobIDFromTimeSortedKey(prefix_len: usize, key: []const u8) []const u8 
     const id_offset = prefix_len + 8; // ns(8)
     assert.check(key.len > id_offset, "invalid time-sorted key length", .{});
     return key[id_offset..];
+}
+
+/// Parse webhook JSON value into a WebhookCached entry.
+fn webhookValueToCached(val: []const u8) OpHandler.WebhookCached {
+    var entry = OpHandler.WebhookCached{};
+
+    // Parse fields using same JSON extractors as kv_read.
+    if (jsonStr(val, "id")) |v| {
+        const l: u8 = @intCast(@min(v.len, entry.id.len));
+        @memcpy(entry.id[0..l], v[0..l]);
+        entry.id_len = l;
+    }
+    if (jsonStr(val, "url")) |v| {
+        const l: u16 = @intCast(@min(v.len, entry.url.len));
+        @memcpy(entry.url[0..l], v[0..l]);
+        entry.url_len = l;
+    }
+    if (jsonStr(val, "queue")) |v| {
+        const l: u8 = @intCast(@min(v.len, entry.queue_filter.len));
+        @memcpy(entry.queue_filter[0..l], v[0..l]);
+        entry.queue_filter_len = l;
+    }
+    if (jsonStr(val, "events")) |events_str| {
+        // Comma-separated: "job.completed,job.failed,job.dead"
+        entry.on_completed = std.mem.indexOf(u8, events_str, "job.completed") != null;
+        entry.on_failed = std.mem.indexOf(u8, events_str, "job.failed") != null;
+        entry.on_dead = std.mem.indexOf(u8, events_str, "job.dead") != null;
+    }
+    if (jsonBool(val, "enabled")) |e| entry.enabled = e;
+    return entry;
+}
+
+/// Minimal JSON string extractor (duplicated from kv_read for module independence).
+fn jsonStr(body: []const u8, key: []const u8) ?[]const u8 {
+    var search_buf: [128]u8 = undefined;
+    const search_key = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;
+    const start = std.mem.indexOf(u8, body, search_key) orelse return null;
+    const val_start = start + search_key.len;
+    if (val_start >= body.len) return null;
+    const end = std.mem.indexOfScalar(u8, body[val_start..], '"') orelse return null;
+    return body[val_start..][0..end];
+}
+
+fn jsonBool(body: []const u8, key: []const u8) ?bool {
+    var search_buf: [128]u8 = undefined;
+    const search_key = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
+    const start = std.mem.indexOf(u8, body, search_key) orelse return null;
+    var val_start = start + search_key.len;
+    while (val_start < body.len and body[val_start] == ' ') val_start += 1;
+    if (val_start + 4 <= body.len and std.mem.eql(u8, body[val_start..][0..4], "true")) return true;
+    if (val_start + 5 <= body.len and std.mem.eql(u8, body[val_start..][0..5], "false")) return false;
+    return null;
 }
 
 test "calculateBackoffNs" {

@@ -393,6 +393,7 @@ pub fn main() !void {
             .purge_interval_ns = config.purge_interval_ns,
             .purge_retention_ns = config.purge_retention_ns,
             .workers_interval_ns = config.workers_interval_ns,
+            .webhook_interval_ns = config.workers_interval_ns, // same as workers (1s default)
             .worker_timeout_ns = config.worker_timeout_ns,
             .repl_hook = repl_hook,
             .sync_replication = config.sync_replication,

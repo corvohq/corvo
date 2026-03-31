@@ -45,6 +45,7 @@ const workers_tmpl = zigstache.Template.parse(ui_embed.workers_html) catch unrea
 const pagination_tmpl = zigstache.Template.parse(ui_embed.pagination_html) catch unreachable;
 const login_tmpl = zigstache.Template.parse(ui_embed.login_html) catch unreachable;
 const api_keys_tmpl = zigstache.Template.parse(ui_embed.api_keys_html) catch unreachable;
+const webhooks_tmpl = zigstache.Template.parse(ui_embed.webhooks_html) catch unreachable;
 
 // ============================================================================
 // Dispatch
@@ -66,6 +67,7 @@ pub fn dispatch(path: []const u8, query: []const u8, send_buf: []u8, reader: ?*k
     if (eql(path, "/workers")) return workersPage(send_buf, reader);
     if (eql(path, "/cluster")) return clusterPage(send_buf, reader);
     if (eql(path, "/api-keys")) return apiKeysPage(send_buf, reader);
+    if (eql(path, "/webhooks")) return webhooksPage(send_buf, reader);
 
     // HTMX partial routes (fragments, no layout).
     if (eql(path, "/partials/dashboard-stats")) return dashboardStatsPartial(send_buf, reader);
@@ -525,6 +527,62 @@ fn apiKeysPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
         .keys = views[0..count],
     }) catch return renderPage(send_buf, "API Keys", "<p>Page too large</p>");
     return renderPage(send_buf, "API Keys", content);
+}
+
+fn webhooksPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
+    var wh_buf: [64]kv_read.WebhookRow = undefined;
+    const count: usize = if (reader) |rdr| rdr.listWebhooks(&wh_buf) else 0;
+
+    const WebhookView = struct {
+        id: []const u8,
+        url: []const u8,
+        queue: []const u8,
+        events: []const u8,
+        event_list: []const []const u8,
+        created_at: []const u8,
+    };
+
+    var views: [64]WebhookView = undefined;
+    // Pre-split event strings into arrays for mustache iteration.
+    var event_slices: [64][3][]const u8 = undefined;
+    var event_counts: [64]usize = undefined;
+    for (0..count) |i| {
+        const row = &wh_buf[i];
+        const ev = row.eventsSlice();
+        var ec: usize = 0;
+        // Split comma-separated events.
+        var start: usize = 0;
+        for (ev, 0..) |c, j| {
+            if (c == ',') {
+                if (ec < 3) {
+                    event_slices[i][ec] = ev[start..j];
+                    ec += 1;
+                }
+                start = j + 1;
+            }
+        }
+        if (start < ev.len and ec < 3) {
+            event_slices[i][ec] = ev[start..];
+            ec += 1;
+        }
+        event_counts[i] = ec;
+
+        views[i] = .{
+            .id = row.idSlice(),
+            .url = row.urlSlice(),
+            .queue = row.queueFilterSlice(),
+            .events = ev,
+            .event_list = event_slices[i][0..ec],
+            .created_at = row.createdAtSlice(),
+        };
+    }
+
+    var content_buf: [page_buf_size]u8 = undefined;
+    const content = webhooks_tmpl.render(&content_buf, .{
+        .has_webhooks = count > 0,
+        .webhooks = views[0..count],
+    }) catch return renderPage(send_buf, "Webhooks", "<p>Page too large</p>");
+    return renderPage(send_buf, "Webhooks", content);
 }
 
 // ============================================================================

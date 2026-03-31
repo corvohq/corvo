@@ -257,6 +257,20 @@ pub const KqueueBackend = struct {
         self.closeConn(conn_id);
     }
 
+    /// Allocate an outbound connection slot. Stub — kqueue outbound not yet implemented.
+    pub fn initOutboundConn(self: *KqueueBackend, fd: std.posix.fd_t) ?u16 {
+        _ = self;
+        _ = fd;
+        return null;
+    }
+
+    /// Queue a connect on an outbound connection. Stub — kqueue outbound not yet implemented.
+    pub fn queueConnect(self: *KqueueBackend, conn_id: u16, addr: *const std.net.Address) void {
+        _ = self;
+        _ = conn_id;
+        _ = addr;
+    }
+
     pub fn submit(self: *KqueueBackend) void {
         if (comptime !is_macos) return;
 

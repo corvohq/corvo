@@ -288,6 +288,36 @@ pub const ApiKeyRow = struct {
     }
 };
 
+pub const WebhookRow = struct {
+    id: [64]u8 = undefined,
+    id_len: u8 = 0,
+    url: [512]u8 = undefined,
+    url_len: u16 = 0,
+    queue_filter: [64]u8 = undefined,
+    queue_filter_len: u8 = 0,
+    events: [128]u8 = undefined,
+    events_len: u8 = 0,
+    enabled: bool = true,
+    created_at: [32]u8 = undefined,
+    created_at_len: u8 = 0,
+
+    pub fn idSlice(self: *const WebhookRow) []const u8 {
+        return self.id[0..self.id_len];
+    }
+    pub fn urlSlice(self: *const WebhookRow) []const u8 {
+        return self.url[0..self.url_len];
+    }
+    pub fn queueFilterSlice(self: *const WebhookRow) []const u8 {
+        return self.queue_filter[0..self.queue_filter_len];
+    }
+    pub fn eventsSlice(self: *const WebhookRow) []const u8 {
+        return self.events[0..self.events_len];
+    }
+    pub fn createdAtSlice(self: *const WebhookRow) []const u8 {
+        return self.created_at[0..self.created_at_len];
+    }
+};
+
 pub const QueryResult = struct {
     count: u32 = 0,
     has_more: bool = false,
@@ -653,6 +683,23 @@ pub const Reader = struct {
     }
 
     // ====================================================================
+    // Webhooks
+    // ====================================================================
+
+    pub fn listWebhooks(self: *Reader, results: []WebhookRow) u32 {
+        return self.scanPrefix(keys.prefix_webhook, WebhookRow, results, webhookFromValue);
+    }
+
+    pub fn getWebhookById(self: *Reader, webhook_id: []const u8) ?WebhookRow {
+        var batch = self.store.newBatch();
+        defer batch.close();
+
+        var key_buf: keys.KeyBuf = undefined;
+        const val = batch.get(keys.settingKey(&key_buf, keys.prefix_webhook, webhook_id)) orelse return null;
+        return webhookFromValue(val);
+    }
+
+    // ====================================================================
     // Search
     // ====================================================================
 
@@ -909,15 +956,25 @@ fn cronToRow(c: *const types.Cron) CronRow {
 }
 
 fn apiKeyFromValue(val: []const u8) ApiKeyRow {
-    // Enterprise API key values are JSON: {"name":"...","role":"...","enabled":true,"key_hash":"...","created_at_ns":...}
+    // API key values are JSON: {"name":"...","role":"...","enabled":true,"key_hash":"...","created_at_ns":...}
     var row = ApiKeyRow{};
     if (jsonStr(val, "key_hash")) |v| copyField(&row.key_hash, &row.key_hash_len, v);
     if (jsonStr(val, "name")) |v| copyField(&row.name, &row.name_len, v);
     if (jsonStr(val, "role")) |v| copyField(&row.role, &row.role_len, v);
     if (jsonStr(val, "created_at_ns")) |_| {} else if (jsonStr(val, "created_at")) |v| copyField(&row.created_at, &row.created_at_len, v);
-    // Parse created_at_ns integer for formatting.
     if (jsonInt(val, "created_at_ns")) |ns| formatNs(&row.created_at, &row.created_at_len, ns);
-    // Parse enabled boolean (defaults to true).
+    if (jsonBool(val, "enabled")) |e| row.enabled = e;
+    return row;
+}
+
+fn webhookFromValue(val: []const u8) WebhookRow {
+    // Webhook values are JSON: {"id":"...","url":"...","queue":"*","events":"job.completed,job.failed,job.dead","enabled":true,"created_at_ns":...}
+    var row = WebhookRow{};
+    if (jsonStr(val, "id")) |v| copyField(&row.id, &row.id_len, v);
+    if (jsonStr(val, "url")) |v| copyField16(&row.url, &row.url_len, v);
+    if (jsonStr(val, "queue")) |v| copyField(&row.queue_filter, &row.queue_filter_len, v);
+    if (jsonStr(val, "events")) |v| copyField(&row.events, &row.events_len, v);
+    if (jsonInt(val, "created_at_ns")) |ns| formatNs(&row.created_at, &row.created_at_len, ns);
     if (jsonBool(val, "enabled")) |e| row.enabled = e;
     return row;
 }

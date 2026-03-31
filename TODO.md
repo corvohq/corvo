@@ -79,8 +79,10 @@
 
 ## Webhooks
 
-- [ ] Webhook registration — POST /api/v1/webhooks, KV-backed, URL + events (job.completed, job.failed, job.dead)
-- [ ] Webhook dispatch — fire-and-forget HTTP POST on job state transitions, retry with backoff
+- [x] Webhook registration — POST /api/v1/webhooks, KV-backed, URL + events (job.completed, job.failed, job.dead)
+- [x] Webhook dispatch — fire-and-forget HTTP POST on job state transitions via io_uring outbound TCP connect
+- [x] Webhooks UI page — zigstache template, CRUD, nav link
+- [x] Webhooks e2e tests — Playwright (page rendering, CRUD, API)
 
 ## Audit Log
 

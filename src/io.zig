@@ -14,7 +14,7 @@ pub const Completion = struct {
     conn_id: u16,
     event: Event,
 
-    pub const Event = enum { recv, send_done, accept, closed };
+    pub const Event = enum { recv, send_done, accept, closed, connected };
 };
 
 /// Platform-specific IO backend, selected at comptime.
@@ -59,8 +59,8 @@ pub const ConnState = struct {
     waiting: bool = false,
     last_req_id: u32 = 0,
 
-    pub const Phase = enum { free, recv_pending, ready, send_pending };
-    pub const Protocol = enum { unknown, rpc, http };
+    pub const Phase = enum { free, recv_pending, ready, send_pending, connect_pending };
+    pub const Protocol = enum { unknown, rpc, http, webhook };
 
     pub fn reset(self: *ConnState) void {
         self.fd = -1;

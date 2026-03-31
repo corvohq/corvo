@@ -9,7 +9,6 @@ const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
 
 pub fn applyModifySetting(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.ModifySettingOp) ops.OpResult {
-    _ = self;
     const prefix = settingPrefix(op.setting);
 
     // api_key_used is mirror-only metadata; skip KV write.
@@ -27,6 +26,15 @@ pub fn applyModifySetting(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Mo
         b.set(key, data);
     } else {
         b.delete(key);
+    }
+
+    // Update webhook cache on create/delete.
+    if (op.setting == .webhook) {
+        if (op.data) |data| {
+            self.addWebhookToCache(data);
+        } else {
+            self.removeWebhookFromCache(op.id);
+        }
     }
 
     return .{};

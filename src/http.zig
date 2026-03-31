@@ -361,6 +361,8 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
                 return writeRoute(rpc.MSG_GLOBAL_CONFIG, "", "set");
             if (std.mem.eql(u8, api, "/auth/keys"))
                 return writeRoute(rpc.MSG_MODIFY_SETTING, "", "api_key");
+            if (std.mem.eql(u8, api, "/webhooks"))
+                return writeRoute(rpc.MSG_MODIFY_SETTING, "", "webhook_create");
             if (std.mem.eql(u8, api, "/auth/login"))
                 return .read;
 
@@ -464,6 +466,9 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
             // DELETE /auth/keys
             if (std.mem.eql(u8, api, "/auth/keys"))
                 return writeRoute(rpc.MSG_MODIFY_SETTING, "", "api_key_delete");
+            // DELETE /webhooks
+            if (std.mem.eql(u8, api, "/webhooks"))
+                return writeRoute(rpc.MSG_MODIFY_SETTING, "", "webhook_delete");
         },
 
         .GET => return .read,
@@ -809,6 +814,9 @@ pub const DecodeScratch = struct {
     api_key_raw: [64]u8 = undefined, // hex-encoded random key (32 bytes → 64 hex chars)
     api_key_json: [384]u8 = undefined, // JSON value for KV storage
     api_key_json_len: u16 = 0,
+    // Webhook scratch buffers.
+    webhook_json: [1024]u8 = undefined,
+    webhook_json_len: u16 = 0,
 };
 
 fn decodeEnqueue(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeResult {
@@ -1438,6 +1446,66 @@ fn decodeSetting(body: []const u8, param: []const u8, sub_action: []const u8, sc
             .data = null,
         } }, .count = 1 };
     }
+    if (std.mem.eql(u8, sub_action, "webhook_create")) {
+        const url = extractJSONString(body, "url") orelse "";
+        if (url.len == 0) return .{ .op_data = .{ .modify_setting = .{} }, .count = 0 };
+
+        // Generate webhook ID from random bytes.
+        var random_bytes: [16]u8 = undefined;
+        std.posix.getrandom(&random_bytes) catch
+            return .{ .op_data = .{ .modify_setting = .{} }, .count = 0 };
+        const hex_chars = "0123456789abcdef";
+        for (random_bytes, 0..) |byte, i| {
+            scratch.id_buf2[i * 2] = hex_chars[byte >> 4];
+            scratch.id_buf2[i * 2 + 1] = hex_chars[byte & 0x0f];
+        }
+        scratch.id2_len = 32;
+
+        // Build comma-separated events string from JSON array.
+        // Input: {"events":["job.completed","job.failed"]}
+        // Output: "job.completed,job.failed"
+        var events_buf: [128]u8 = undefined;
+        var events_len: usize = 0;
+        const event_names = [_][]const u8{ "job.completed", "job.failed", "job.dead" };
+        for (event_names) |ev_name| {
+            if (std.mem.indexOf(u8, body, ev_name) != null) {
+                if (events_len > 0) {
+                    events_buf[events_len] = ',';
+                    events_len += 1;
+                }
+                @memcpy(events_buf[events_len..][0..ev_name.len], ev_name);
+                events_len += ev_name.len;
+            }
+        }
+        if (events_len == 0) {
+            // Default to all events.
+            const all = "job.completed,job.failed,job.dead";
+            @memcpy(events_buf[0..all.len], all);
+            events_len = all.len;
+        }
+
+        const queue_filter = extractJSONString(body, "queue") orelse "*";
+
+        const json_val = std.fmt.bufPrint(&scratch.webhook_json,
+            "{{\"id\":\"{s}\",\"url\":\"{s}\",\"queue\":\"{s}\",\"events\":\"{s}\",\"enabled\":true,\"created_at_ns\":{d}}}",
+            .{ scratch.id_buf2[0..32], url, queue_filter, events_buf[0..events_len], now_ns },
+        ) catch return .{ .op_data = .{ .modify_setting = .{} }, .count = 0 };
+        scratch.webhook_json_len = @intCast(json_val.len);
+
+        return .{ .op_data = .{ .modify_setting = .{
+            .setting = .webhook,
+            .id = scratch.id_buf2[0..32],
+            .data = scratch.webhook_json[0..scratch.webhook_json_len],
+        } }, .count = 1 };
+    }
+    if (std.mem.eql(u8, sub_action, "webhook_delete")) {
+        const webhook_id = extractJSONString(body, "id") orelse "";
+        return .{ .op_data = .{ .modify_setting = .{
+            .setting = .webhook,
+            .id = webhook_id,
+            .data = null,
+        } }, .count = 1 };
+    }
     return .{ .op_data = .{ .modify_setting = .{} }, .count = 0 };
 }
 
@@ -1600,6 +1668,14 @@ pub fn encodeWriteResponse(
                 var hash_buf: [64]u8 = undefined;
                 const kh = hashApiKey(path_param, &hash_buf);
                 jw.fieldStr("key_hash", kh);
+                jw.endObject();
+                return writeResponse(send_buf, 201, jw.getWritten());
+            }
+            if (std.mem.eql(u8, sub_action, "webhook_create") and path_param.len == 32) {
+                var body_buf: [256]u8 = undefined;
+                var jw = json.JsonWriter.init(&body_buf);
+                jw.beginObject();
+                jw.fieldStr("id", path_param);
                 jw.endObject();
                 return writeResponse(send_buf, 201, jw.getWritten());
             }

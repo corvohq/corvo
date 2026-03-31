@@ -24,6 +24,7 @@ const OP_ACCEPT: u8 = 1;
 const OP_RECV: u8 = 2;
 const OP_SEND: u8 = 3;
 const OP_CLOSE: u8 = 4;
+const OP_CONNECT: u8 = 5;
 
 fn encodeUserData(op: u8, conn_id: u16) u64 {
     return (@as(u64, op) << 16) | @as(u64, conn_id);
@@ -246,6 +247,21 @@ pub const UringBackend = struct {
                         }
                     }
                 },
+                OP_CONNECT => {
+                    if (conn_id >= self.max_conns) continue;
+                    const c = &self.conns[conn_id];
+                    if (c.phase == .free) continue;
+
+                    if (cqe.res < 0) {
+                        out[out_count] = .{ .conn_id = conn_id, .event = .closed };
+                        out_count += 1;
+                        self.closeConn(conn_id);
+                    } else {
+                        c.phase = .ready;
+                        out[out_count] = .{ .conn_id = conn_id, .event = .connected };
+                        out_count += 1;
+                    }
+                },
                 OP_CLOSE => {},
                 else => {
                     assert.fail("drain: unknown op {d} in CQE user_data", .{op});
@@ -294,6 +310,40 @@ pub const UringBackend = struct {
     pub fn queueClose(self: *UringBackend, conn_id: u16) void {
         assert.check(conn_id < self.max_conns, "queueClose: conn_id {d} >= max {d}", .{ conn_id, self.max_conns });
         self.closeConn(conn_id);
+    }
+
+    /// Allocate an outbound connection slot for a pre-created socket fd.
+    /// Returns the conn_id, or null if no free slots.
+    pub fn initOutboundConn(self: *UringBackend, fd: posix.fd_t) ?u16 {
+        const slot = self.allocConn() orelse return null;
+        const c = &self.conns[slot];
+        c.fd = fd;
+        c.phase = .connect_pending;
+        c.protocol = .webhook;
+        c.recv_pos = 0;
+        c.send_pos = 0;
+        c.send_len = 0;
+        self.setTcpNodelay(fd);
+        return slot;
+    }
+
+    /// Queue a connect on an outbound connection. The address must remain
+    /// valid until the CQE arrives (stack-allocated is fine — io_uring copies it).
+    pub fn queueConnect(self: *UringBackend, conn_id: u16, addr: *const std.net.Address) void {
+        assert.check(conn_id < self.max_conns, "queueConnect: conn_id {d} >= max {d}", .{ conn_id, self.max_conns });
+        const c = &self.conns[conn_id];
+        assert.check(c.phase == .connect_pending, "queueConnect: conn {d} not in connect_pending phase", .{conn_id});
+        assert.check(c.fd >= 0, "queueConnect: conn {d} has invalid fd", .{conn_id});
+
+        _ = self.ring.connect(
+            encodeUserData(OP_CONNECT, conn_id),
+            c.fd,
+            &addr.any,
+            addr.getOsSockLen(),
+        ) catch {
+            self.closeConn(conn_id);
+            return;
+        };
     }
 
     /// Flush all queued operations to kernel.

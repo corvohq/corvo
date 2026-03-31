@@ -153,6 +153,20 @@ pub const SimBackend = struct {
         _ = self;
     }
 
+    /// Allocate an outbound connection slot. No-op for sim (returns null).
+    pub fn initOutboundConn(self: *SimBackend, fd: std.posix.fd_t) ?u16 {
+        _ = self;
+        _ = fd;
+        return null;
+    }
+
+    /// Queue a connect on an outbound connection. No-op for sim.
+    pub fn queueConnect(self: *SimBackend, conn_id: u16, addr: *const std.net.Address) void {
+        _ = self;
+        _ = conn_id;
+        _ = addr;
+    }
+
     /// Close a connection and free its slot.
     pub fn queueClose(self: *SimBackend, conn_id: u16) void {
         assert.check(conn_id < self.max_conns, "SimBackend.queueClose: conn_id out of range", .{});

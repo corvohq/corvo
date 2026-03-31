@@ -1,0 +1,106 @@
+<div class="space-y-6">
+  <div class="flex items-center justify-between">
+    <p class="text-sm text-zinc-500 dark:text-zinc-400">HTTP POST notifications on job state transitions. HTTP URLs only (no TLS).</p>
+    <button onclick="document.getElementById('create-webhook-form').classList.toggle('hidden')"
+      class="bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:bg-zinc-800 dark:hover:bg-zinc-200 rounded-md px-4 py-2 text-sm font-medium">Add Webhook</button>
+  </div>
+
+  <form id="create-webhook-form" class="hidden rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6 space-y-4"
+    onsubmit="return corvoCreateWebhook(this)">
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div>
+        <label class="block text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1">URL</label>
+        <input name="url" required class="w-full rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 px-3 py-2 text-sm text-zinc-900 dark:text-zinc-100" placeholder="http://localhost:9999/webhook">
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1">Queue Filter</label>
+        <input name="queue" value="*" class="w-full rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 px-3 py-2 text-sm text-zinc-900 dark:text-zinc-100" placeholder="* (all queues)">
+      </div>
+    </div>
+    <div>
+      <label class="block text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-2">Events</label>
+      <div class="flex gap-4">
+        <label class="flex items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
+          <input type="checkbox" name="event_completed" checked class="rounded border-zinc-300 dark:border-zinc-600"> job.completed
+        </label>
+        <label class="flex items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
+          <input type="checkbox" name="event_failed" checked class="rounded border-zinc-300 dark:border-zinc-600"> job.failed
+        </label>
+        <label class="flex items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
+          <input type="checkbox" name="event_dead" checked class="rounded border-zinc-300 dark:border-zinc-600"> job.dead
+        </label>
+      </div>
+    </div>
+    <div>
+      <button type="submit" class="bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:bg-zinc-800 dark:hover:bg-zinc-200 rounded-md px-4 py-2 text-sm font-medium">Create</button>
+    </div>
+  </form>
+
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm overflow-x-auto">
+  <table class="w-full text-sm">
+  <thead>
+  <tr class="border-b border-zinc-200 dark:border-zinc-800">
+    <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">URL</th>
+    <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Events</th>
+    <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Queue</th>
+    <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Created</th>
+    <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Actions</th>
+  </tr>
+  </thead>
+  <tbody class="divide-y divide-zinc-100 dark:divide-zinc-800">
+  {{#webhooks}}
+  <tr class="hover:bg-zinc-50 dark:hover:bg-zinc-800">
+    <td class="px-6 py-3 text-zinc-700 dark:text-zinc-300 font-mono text-xs break-all max-w-xs">{{url}}</td>
+    <td class="px-6 py-3">
+      <div class="flex flex-wrap gap-1">{{#event_list}}<span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-400">{{.}}</span>{{/event_list}}</div>
+    </td>
+    <td class="px-6 py-3 text-zinc-500 dark:text-zinc-400 font-mono text-xs">{{queue}}</td>
+    <td class="px-6 py-3 text-zinc-500 dark:text-zinc-400"><time data-ts="{{created_at}}">{{created_at}}</time></td>
+    <td class="px-6 py-3 text-right">
+      <button onclick="corvoDeleteWebhook('{{id}}')"
+        class="text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 text-xs font-medium">Delete</button>
+    </td>
+  </tr>
+  {{/webhooks}}
+  {{^webhooks}}
+  <tr><td colspan="5" class="px-6 py-8 text-center text-zinc-500 dark:text-zinc-400">No webhooks configured</td></tr>
+  {{/webhooks}}
+  </tbody>
+  </table>
+  </div>
+</div>
+<script>
+function corvoCreateWebhook(form){
+  var d=new FormData(form);
+  var events=[];
+  if(d.get('event_completed'))events.push('job.completed');
+  if(d.get('event_failed'))events.push('job.failed');
+  if(d.get('event_dead'))events.push('job.dead');
+  fetch('/api/v1/webhooks',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({url:d.get('url'),queue:d.get('queue')||'*',events:events})})
+  .then(function(r){
+    if(!r.ok)return r.text().then(function(t){
+      var msg='Failed to create webhook ('+r.status+')';
+      try{var j=JSON.parse(t);if(j.error)msg=j.error}catch(ex){}
+      corvoToast('error',msg);
+    });
+    sessionStorage.setItem('corvo_toast','Webhook created');
+    location.reload();
+  });
+  return false;
+}
+function corvoDeleteWebhook(id){
+  if(!confirm('Delete this webhook?'))return;
+  fetch('/api/v1/webhooks',{method:'DELETE',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:id})})
+  .then(function(r){
+    if(!r.ok)return r.text().then(function(t){
+      var msg='Failed to delete webhook ('+r.status+')';
+      try{var j=JSON.parse(t);if(j.error)msg=j.error}catch(ex){}
+      corvoToast('error',msg);
+    });
+    sessionStorage.setItem('corvo_toast','Webhook deleted');
+    location.reload();
+  });
+}
+</script>

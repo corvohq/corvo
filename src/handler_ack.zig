@@ -59,6 +59,9 @@ pub fn applyAck(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.AckOp) ops.O
             var dk_buf: keys.KeyBuf = undefined;
             b.set(keys.deadKey(&dk_buf, op.now_ns, job.id), "");
 
+            // Record webhook events for matching webhooks.
+            self.checkWebhooks(job.id, job.queue, .completed, op.now_ns);
+
             if (job.expire_after_ms > 0 and job.expire_at_ns > 0) {
                 var xk_buf: keys.KeyBuf = undefined;
                 b.delete(keys.expireKey(&xk_buf, job.expire_at_ns, job.id));

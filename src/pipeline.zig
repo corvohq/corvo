@@ -10,6 +10,7 @@
 //!   io.submit()
 
 const std = @import("std");
+const posix = std.posix;
 const io_mod = @import("io.zig");
 const rpc = @import("rpc.zig");
 const http = @import("http.zig");
@@ -24,6 +25,7 @@ const assert = @import("assert.zig");
 const keys = @import("keys.zig");
 const codec = @import("codec.zig");
 const types = @import("types.zig");
+const webhook_mod = @import("webhook.zig");
 
 const OpHandler = handler_mod.OpHandler;
 const QueueNotifier = notify_mod.QueueNotifier;
@@ -110,6 +112,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
         last_expire_ns: u64 = 0,
         last_purge_ns: u64 = 0,
         last_workers_ns: u64 = 0,
+        last_webhook_ns: u64 = 0,
 
         // Sync replication — pipelined prepares.
         // Up to max_prepare_slots batches can be in-flight. Each slot holds
@@ -167,6 +170,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             purge_interval_ns: u64 = 0,
             purge_retention_ns: u64 = 14 * 24 * 3_600_000_000_000,
             workers_interval_ns: u64 = 0,
+            webhook_interval_ns: u64 = 0,
             worker_timeout_ns: u64 = 60_000_000_000,
             repl_hook: ?ReplHook = null,
             sync_replication: bool = false,
@@ -265,11 +269,16 @@ pub fn Pipeline(comptime IoBackend: type) type {
             self.last_expire_ns = now_ns;
             self.last_purge_ns = now_ns;
             self.last_workers_ns = now_ns;
+            self.last_webhook_ns = now_ns;
 
             // Clean stale workers so the UI doesn't show ghosts.
             self.handler.resetEffects();
             var batch = self.stores[0].newBatch();
             defer batch.close();
+
+            // Load webhook cache from KV.
+            self.handler.loadWebhookCache(&batch);
+            std.debug.print("corvo: warmup — loaded {d} webhooks\n", .{self.handler.webhook_cache_count});
 
             const t0 = self.config.clock_fn();
             const cutoff = now_ns -| self.config.worker_timeout_ns;
@@ -331,9 +340,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         .recv => self.deferRecvConn(completion.conn_id),
                         .accept => {},
                         .closed => self.onConnClosed(completion.conn_id),
+                        .connected => self.handleWebhookConnected(completion.conn_id),
                         .send_done => {
                             const sc = self.io.conn(completion.conn_id);
-                            if (sc.recv_pos > 0) {
+                            if (sc.protocol == .webhook) {
+                                self.io.queueRecv(completion.conn_id);
+                            } else if (sc.recv_pos > 0) {
                                 self.deferRecvConn(completion.conn_id);
                             } else {
                                 self.io.queueRecv(completion.conn_id);
@@ -395,9 +407,13 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     },
                     .accept => {},
                     .closed => self.onConnClosed(completion.conn_id),
+                    .connected => self.handleWebhookConnected(completion.conn_id),
                     .send_done => {
                         const c = self.io.conn(completion.conn_id);
-                        if (c.recv_pos > 0) {
+                        if (c.protocol == .webhook) {
+                            // Webhook send done → wait for HTTP response.
+                            self.io.queueRecv(completion.conn_id);
+                        } else if (c.recv_pos > 0) {
                             var dup = false;
                             for (recv_conns[0..recv_conn_count]) |existing| {
                                 if (existing == completion.conn_id) { dup = true; break; }
@@ -465,6 +481,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
                 self.encodeResponses();
                 self.pushCancelSignals();
+                self.writeWebhookDispatchRecords();
                 self.fulfillSubscriptions();
                 self.compactRecvBufs();
 
@@ -491,6 +508,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             } else {
                 self.encodeResponses();
                 self.pushCancelSignals();
+                self.writeWebhookDispatchRecords();
                 self.fulfillSubscriptions();
                 self.flushSends();
                 self.compactRecvBufs();
@@ -518,6 +536,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             switch (c.protocol) {
                 .rpc => self.extractRpcFrames(conn_id, c),
                 .http => self.extractHttpFrames(conn_id, c),
+                .webhook => self.handleWebhookResponse(conn_id, c),
                 .unknown => unreachable,
             }
         }
@@ -785,6 +804,126 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 self.recordOplog();
             }
 
+            // Webhook dispatch — separate from the main maintenance batch.
+            // Scans whd| for pending deliveries and initiates outbound HTTP.
+            if (self.config.webhook_interval_ns > 0 and
+                now_ns - self.last_webhook_ns >= self.config.webhook_interval_ns)
+            {
+                self.dispatchWebhooks(now_ns);
+                self.last_webhook_ns = now_ns;
+            }
+        }
+
+        /// Scan whd| prefix for pending webhook deliveries and initiate outbound HTTP.
+        /// Bounded: max 8 deliveries per tick to avoid starving the event loop.
+        fn dispatchWebhooks(self: *Self, now_ns: u64) void {
+            var wb = self.stores[0].newBatch();
+            defer wb.close();
+
+            var lower_buf: keys.KeyBuf = undefined;
+            var upper_buf: keys.KeyBuf = undefined;
+            @memcpy(lower_buf[0..keys.prefix_webhook_dispatch.len], keys.prefix_webhook_dispatch);
+            const upper = keys.prefixEnd(&upper_buf, lower_buf[0..keys.prefix_webhook_dispatch.len]) orelse return;
+
+            var iter = wb.newIter(lower_buf[0..keys.prefix_webhook_dispatch.len], upper);
+            defer iter.close();
+
+            if (!iter.first()) return;
+
+            const max_per_tick: u32 = 8;
+            var dispatched: u32 = 0;
+            var keys_to_delete: [8]keys.KeyBuf = undefined;
+            var delete_lens: [8]usize = undefined;
+            var delete_count: u32 = 0;
+
+            while (dispatched < max_per_tick) {
+                const key_slice = iter.key();
+                const val = iter.value();
+
+                // Parse scheduled_ns from key: whd|{scheduled_ns:8BE}{job_id}
+                if (key_slice.len <= keys.prefix_webhook_dispatch.len + 8) {
+                    if (!iter.next()) break;
+                    continue;
+                }
+                const ns_bytes = key_slice[keys.prefix_webhook_dispatch.len..][0..8];
+                const scheduled_ns = std.mem.readInt(u64, ns_bytes, .big);
+                if (scheduled_ns > now_ns) break; // All remaining are in the future.
+
+                // Parse webhook delivery JSON.
+                const url_str = handler_mod.OpHandler.jsonStrPub(val, "url") orelse {
+                    if (!iter.next()) break;
+                    continue;
+                };
+                const job_id = handler_mod.OpHandler.jsonStrPub(val, "job_id") orelse "";
+                const queue = handler_mod.OpHandler.jsonStrPub(val, "queue") orelse "";
+                const event = handler_mod.OpHandler.jsonStrPub(val, "event") orelse "";
+
+                // Parse URL and resolve address.
+                const parsed = webhook_mod.parseUrl(url_str) orelse {
+                    // Invalid URL — delete the record.
+                    if (delete_count < 8) {
+                        @memcpy(keys_to_delete[delete_count][0..key_slice.len], key_slice);
+                        delete_lens[delete_count] = key_slice.len;
+                        delete_count += 1;
+                    }
+                    if (!iter.next()) break;
+                    continue;
+                };
+
+                const addr = webhook_mod.resolveHost(parsed.host, parsed.port) orelse {
+                    if (!iter.next()) break;
+                    continue;
+                };
+
+                // Create non-blocking socket.
+                const fd = posix.socket(
+                    posix.AF.INET,
+                    posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
+                    0,
+                ) catch {
+                    if (!iter.next()) break;
+                    continue;
+                };
+
+                // Allocate outbound connection slot.
+                const conn_id = self.io.initOutboundConn(fd) orelse {
+                    posix.close(fd);
+                    break; // No free slots — stop dispatching.
+                };
+
+                // Build HTTP POST request into send_buf.
+                const c = self.io.conn(conn_id);
+                var payload_buf: [1024]u8 = undefined;
+                const payload = webhook_mod.buildEventPayload(&payload_buf, event, job_id, queue, now_ns) orelse "";
+                const req = webhook_mod.buildHttpPost(c.send_buf, parsed.host, parsed.path, payload) orelse {
+                    self.io.queueClose(conn_id);
+                    if (!iter.next()) break;
+                    continue;
+                };
+                c.send_len = @intCast(req.len);
+
+                // Queue the connect SQE.
+                self.io.queueConnect(conn_id, &addr);
+
+                // Delete the delivery record (fire-and-forget for now).
+                if (delete_count < 8) {
+                    @memcpy(keys_to_delete[delete_count][0..key_slice.len], key_slice);
+                    delete_lens[delete_count] = key_slice.len;
+                    delete_count += 1;
+                }
+
+                dispatched += 1;
+                if (!iter.next()) break;
+            }
+
+            // Delete processed delivery records.
+            if (delete_count > 0) {
+                iter.close();
+                for (0..delete_count) |i| {
+                    wb.delete(keys_to_delete[i][0..delete_lens[i]]);
+                }
+                wb.commit();
+            }
         }
 
         fn recordRecvCompaction(self: *Self, conn_id: u16, consumed: u32) void {
@@ -1073,6 +1212,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
             {
                 @memcpy(self.http_id_bufs[frame_idx][0..64], self.http_scratch.api_key_raw[0..64]);
                 frame.path_param = self.http_id_bufs[frame_idx][0..64];
+            }
+
+            // Webhook create: copy webhook ID to per-frame buffer for response encoding.
+            if (frame.msg_type == rpc.MSG_MODIFY_SETTING and
+                std.mem.eql(u8, frame.sub_action, "webhook_create") and decoded.count > 0)
+            {
+                @memcpy(self.http_id_bufs[frame_idx][0..32], self.http_scratch.id_buf2[0..32]);
+                frame.path_param = self.http_id_bufs[frame_idx][0..32];
             }
 
             // Batch enqueue: generate remaining IDs (first was pre-generated above).
@@ -1544,6 +1691,64 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     break;
                 }
             }
+        }
+
+        /// Handle webhook HTTP response. Parses status code, closes conn.
+        /// Deletes the whd| delivery record on success (2xx), reschedules on failure.
+        fn handleWebhookResponse(self: *Self, conn_id: u16, c: *ConnState) void {
+            const data = c.recv_buf[0..c.recv_pos];
+
+            // Parse HTTP status from "HTTP/1.1 200 OK\r\n..."
+            const success = if (data.len >= 12 and std.mem.startsWith(u8, data, "HTTP/"))
+                data[9] == '2' // 2xx status
+            else
+                false;
+
+            if (success) {
+                std.debug.print("corvo: webhook delivered (conn {d})\n", .{conn_id});
+            } else {
+                std.debug.print("corvo: webhook delivery failed (conn {d})\n", .{conn_id});
+            }
+
+            self.io.queueClose(conn_id);
+        }
+
+        /// Handle a webhook outbound connection completing.
+        /// Triggers the HTTP POST send (data already in send_buf).
+        fn handleWebhookConnected(self: *Self, conn_id: u16) void {
+            const c = self.io.conn(conn_id);
+            if (c.phase == .free) return;
+            if (c.send_len == 0) {
+                self.io.queueClose(conn_id);
+                return;
+            }
+            self.io.queueSend(conn_id, c.send_len);
+        }
+
+        /// Write webhook dispatch records to KV for pending delivery.
+        /// Called after executeBatch commit. Uses a separate batch so dispatch
+        /// records are durable but don't block the main apply path.
+        fn writeWebhookDispatchRecords(self: *Self) void {
+            if (self.handler.webhook_event_count == 0) return;
+
+            var batch = self.stores[0].newBatch();
+            defer batch.close();
+
+            for (self.handler.webhook_events[0..self.handler.webhook_event_count]) |*ev| {
+                // Build delivery record JSON.
+                var val_buf: [1024]u8 = undefined;
+                const val = std.fmt.bufPrint(&val_buf,
+                    "{{\"webhook_id\":\"{s}\",\"url\":\"{s}\",\"job_id\":\"{s}\",\"queue\":\"{s}\",\"event\":\"{s}\",\"attempt\":0,\"max_attempts\":5,\"created_at_ns\":{d}}}",
+                    .{ ev.webhookIdSlice(), ev.urlSlice(), ev.jobId(), ev.queueSlice(), ev.eventName(), ev.now_ns },
+                ) catch continue;
+
+                // Key: whd|{now_ns:8BE}{job_id} — due immediately for first attempt.
+                var key_buf: keys.KeyBuf = undefined;
+                const key = keys.webhookDispatchKey(&key_buf, ev.now_ns, ev.jobId());
+                batch.set(key, val);
+            }
+
+            batch.commit();
         }
 
         // ====================================================================

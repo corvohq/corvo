@@ -50,6 +50,7 @@ pub const prefix_tag_queue = "tq|"; // tq|{queue}\x00{tag_key}\x00{tag_value}\x0
 // Setting prefixes
 pub const prefix_apikey = "apikey|";
 pub const prefix_webhook = "wh|";
+pub const prefix_webhook_dispatch = "whd|"; // whd|{scheduled_ns:8BE}{webhook_id_hash:8}
 pub const prefix_audit = "audit|";
 
 const sep: u8 = 0x00;
@@ -432,6 +433,16 @@ pub fn expireKey(buf: *KeyBuf, expire_at_ns: u64, job_id: []const u8) []const u8
 pub fn deadKey(buf: *KeyBuf, terminal_at_ns: u64, job_id: []const u8) []const u8 {
     var pos = copyPrefix(buf, prefix_dead);
     pos = putU64BE(buf, pos, terminal_at_ns);
+    pos = copyStr(buf, pos, job_id);
+    return buf[0..pos];
+}
+
+/// whd|{scheduled_ns:8BE}{job_id} — webhook delivery record.
+/// scheduled_ns = when to attempt delivery (now for first attempt, future for retries).
+/// Lexicographic order means forward scan yields oldest-first (due soonest).
+pub fn webhookDispatchKey(buf: *KeyBuf, scheduled_ns: u64, job_id: []const u8) []const u8 {
+    var pos = copyPrefix(buf, prefix_webhook_dispatch);
+    pos = putU64BE(buf, pos, scheduled_ns);
     pos = copyStr(buf, pos, job_id);
     return buf[0..pos];
 }

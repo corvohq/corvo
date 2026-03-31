@@ -97,6 +97,8 @@ pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops
 
             var rk_buf: keys.KeyBuf = undefined;
             b.set(OpHandler.jobRetryingKey(&rk_buf, &job), "");
+
+            self.checkWebhooks(fail_job.job_id, job.queue, .failed, op.now_ns);
         } else {
             // Dead
             job.state = .dead;
@@ -109,6 +111,8 @@ pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops
 
             var dk_buf: keys.KeyBuf = undefined;
             b.set(keys.deadKey(&dk_buf, op.now_ns, fail_job.job_id), "");
+
+            self.checkWebhooks(fail_job.job_id, job.queue, .dead, op.now_ns);
 
             // Release unique lock if we own it
             var uk_buf: keys.KeyBuf = undefined;
