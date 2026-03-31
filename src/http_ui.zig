@@ -19,7 +19,7 @@ pub var g_auth_enabled: bool = false;
 /// send_buf is 64KB (IO layer — do not change). Layout ~8KB + HTTP headers ~200B.
 /// page_buf must fit within send_buf after layout wrapping.
 const send_buf_size = 65536;
-const layout_overhead = 8400;
+const layout_overhead = 17000;
 pub const page_buf_size = send_buf_size - layout_overhead;
 const render_buf_size = send_buf_size - 200;
 
@@ -46,6 +46,7 @@ const pagination_tmpl = zigstache.Template.parse(ui_embed.pagination_html) catch
 const login_tmpl = zigstache.Template.parse(ui_embed.login_html) catch unreachable;
 const api_keys_tmpl = zigstache.Template.parse(ui_embed.api_keys_html) catch unreachable;
 const webhooks_tmpl = zigstache.Template.parse(ui_embed.webhooks_html) catch unreachable;
+const audit_logs_tmpl = zigstache.Template.parse(ui_embed.audit_logs_html) catch unreachable;
 
 // ============================================================================
 // Dispatch
@@ -68,6 +69,7 @@ pub fn dispatch(path: []const u8, query: []const u8, send_buf: []u8, reader: ?*k
     if (eql(path, "/cluster")) return clusterPage(send_buf, reader);
     if (eql(path, "/api-keys")) return apiKeysPage(send_buf, reader);
     if (eql(path, "/webhooks")) return webhooksPage(send_buf, reader);
+    if (eql(path, "/audit-logs")) return auditLogsPage(send_buf, reader);
 
     // HTMX partial routes (fragments, no layout).
     if (eql(path, "/partials/dashboard-stats")) return dashboardStatsPartial(send_buf, reader);
@@ -110,50 +112,11 @@ fn loginPage(send_buf: []u8, query: []const u8) u32 {
 // Full Pages
 // ============================================================================
 
-fn dashboard(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
-    var queue_buf: [64]kv_read.QueueStats = undefined;
-    var queue_views: [64]QueueView = undefined;
-    var bar_buf: [64]BarView = undefined;
-    var job_buf: [10]kv_read.JobRow = undefined;
-    var failure_views: [10]FailureView = undefined;
-
-    const has_data = reader != null;
-    const queues = getQueueViews(reader, &queue_buf, &queue_views);
-
-    var total_pending: i64 = 0;
-    var total_active: i64 = 0;
-    var total_dead: i64 = 0;
-    for (queue_buf[0..queues.len]) |q| {
-        total_pending += q.pending;
-        total_active += q.active;
-        total_dead += q.dead;
-    }
-    const worker_count: i32 = if (reader) |rdr| rdr.countWorkers() else 0;
-    const bars = if (queues.len > 0) buildBarViews(queue_buf[0..queues.len], &bar_buf) else bar_buf[0..0];
-    const failures = if (reader) |rdr| getFailureViews(rdr, &job_buf, &failure_views) else failure_views[0..0];
-
-    const data = .{
-        .has_data = has_data,
-        .total_pending = total_pending,
-        .total_active = total_active,
-        .total_dead = total_dead,
-        .queue_count = @as(i64, @intCast(queues.len)),
-        .worker_count = worker_count,
-        .has_bars = queues.len > 0,
-        .chart_w = @as(u32, 600),
-        .chart_total_h = @as(u32, 190),
-        .bars = bars,
-        .has_failures = failures.len > 0,
-        .failures = failures,
-        .has_queues = queues.len > 0,
-        .queues = queues,
-    };
-
+fn dashboard(send_buf: []u8, _: ?*kv_read.Reader) u32 {
+    // Dashboard is a thin shell — HTMX loads stats+queues via /ui/partials/dashboard-stats on load.
     var content_buf: [page_buf_size]u8 = undefined;
-    const content = dashboard_tmpl.renderWithPartials(&content_buf, data, .{
-        .stats = &dashboard_stats_tmpl,
-        .queues_table = &queues_table_tmpl,
-    }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
+    const content = dashboard_tmpl.render(&content_buf, .{}) catch
+        return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Dashboard", content);
 }
 
@@ -585,14 +548,48 @@ fn webhooksPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
     return renderPage(send_buf, "Webhooks", content);
 }
 
+fn auditLogsPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
+    var entries_buf: [200]kv_read.AuditEntryRow = undefined;
+    const count: usize = if (reader) |rdr| rdr.listAuditEntries(&entries_buf) else 0;
+
+    const AuditView = struct {
+        op: []const u8,
+        target: []const u8,
+        count: []const u8,
+        actor: []const u8,
+        created_at: []const u8,
+    };
+
+    var views: [200]AuditView = undefined;
+    var count_bufs: [200][16]u8 = undefined;
+    for (0..count) |i| {
+        const row = &entries_buf[i];
+        const count_str = std.fmt.bufPrint(&count_bufs[i], "{d}", .{row.count}) catch "0";
+        views[i] = .{
+            .op = row.opSlice(),
+            .target = row.targetSlice(),
+            .count = count_str,
+            .actor = row.actorSlice(),
+            .created_at = row.createdAtSlice(),
+        };
+    }
+
+    var content_buf: [page_buf_size]u8 = undefined;
+    const content = audit_logs_tmpl.render(&content_buf, .{
+        .has_entries = count > 0,
+        .entries = views[0..count],
+    }) catch return renderPage(send_buf, "Audit Log", "<p>Page too large</p>");
+    return renderPage(send_buf, "Audit Log", content);
+}
+
 // ============================================================================
 // HTMX Partials
 // ============================================================================
 
 fn dashboardStatsPartial(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
-    var queue_buf: [64]kv_read.QueueStats = undefined;
-    var queue_views: [64]QueueView = undefined;
-    var bar_buf: [64]BarView = undefined;
+    var queue_buf: [max_table_rows]kv_read.QueueStats = undefined;
+    var queue_views: [max_table_rows]QueueView = undefined;
+    var bar_buf: [max_table_rows]BarView = undefined;
     var job_buf: [10]kv_read.JobRow = undefined;
     var failure_views: [10]FailureView = undefined;
 
@@ -739,9 +736,9 @@ const QueueView = struct {
     paused: bool,
 };
 
-fn getQueueViews(reader: ?*kv_read.Reader, queue_buf: *[64]kv_read.QueueStats, views: *[64]QueueView) []const QueueView {
+fn getQueueViews(reader: ?*kv_read.Reader, queue_buf: []kv_read.QueueStats, views: []QueueView) []const QueueView {
     const rdr = reader orelse return views[0..0];
-    const count = rdr.getQueueStats(queue_buf);
+    const count = rdr.getQueueStats(queue_buf[0..@min(queue_buf.len, 64)]);
     for (0..count) |i| {
         const q = &queue_buf[i];
         views[i] = .{
@@ -860,7 +857,7 @@ fn buildPageLinks(base_url: []const u8, page: u32, total_pages: u32, links: *[10
     return links[0..count];
 }
 
-fn buildBarViews(queues: []const kv_read.QueueStats, bars: *[64]BarView) []const BarView {
+fn buildBarViews(queues: []const kv_read.QueueStats, bars: []BarView) []const BarView {
     const chart_h: u32 = 160;
     const bar_gap: u32 = 4;
     const n: u32 = @intCast(queues.len);

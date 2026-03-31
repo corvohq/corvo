@@ -197,6 +197,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
             path_param: []const u8 = "",
             sub_action: []const u8 = "",
             http_path: []const u8 = "", // full path including query string (for webhook query params)
+            actor: [128]u8 = undefined,
+            actor_len: u8 = 0,
+
+            fn actorSlice(self: *const FrameDesc) []const u8 {
+                return self.actor[0..self.actor_len];
+            }
         };
 
         const RecvCompaction = struct {
@@ -665,6 +671,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     if (self.frame_count >= max_frames) return; // back-pressure
 
                     // Identity + role authorization for write operations.
+                    var auth_actor: [128]u8 = undefined;
+                    var auth_actor_len: u8 = 0;
                     if (!skip_auth) {
                         const write_auth = http.authorizeWrite(
                             req.api_key,
@@ -674,12 +682,18 @@ pub fn Pipeline(comptime IoBackend: type) type {
                             w.msg_type,
                             w.sub_action,
                         );
-                        if (write_auth != .ok) {
-                            const resp_len = http.writeAuthError(c.send_buf, write_auth);
-                            c.send_len = resp_len;
-                            self.io.queueSend(conn_id, resp_len);
-                            self.recordRecvCompaction(conn_id, req.total_len);
-                            return;
+                        switch (write_auth) {
+                            .ok => |info| {
+                                @memcpy(auth_actor[0..info.actor_len], info.actorSlice());
+                                auth_actor_len = info.actor_len;
+                            },
+                            .unauthorized, .forbidden => {
+                                const resp_len = http.writeAuthError(c.send_buf, write_auth);
+                                c.send_len = resp_len;
+                                self.io.queueSend(conn_id, resp_len);
+                                self.recordRecvCompaction(conn_id, req.total_len);
+                                return;
+                            },
                         }
                     }
 
@@ -692,7 +706,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         return;
                     }
 
-                    self.frames[self.frame_count] = .{
+                    var frame = FrameDesc{
                         .conn_id = conn_id,
                         .req_id = 0,
                         .msg_type = w.msg_type,
@@ -701,7 +715,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         .path_param = w.param,
                         .sub_action = w.sub_action,
                         .http_path = req.path,
+                        .actor_len = auth_actor_len,
                     };
+                    @memcpy(frame.actor[0..auth_actor_len], auth_actor[0..auth_actor_len]);
+                    self.frames[self.frame_count] = frame;
                     self.frame_count += 1;
                     self.recordRecvCompaction(conn_id, req.total_len);
                 },
@@ -1260,6 +1277,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
             var result = self.handler.apply(batch, op_type, &decoded.op_data);
             self.emitMirrorOp(op_type, &decoded.op_data, &result);
+
+            // Audit: write entry in same batch for management ops.
+            if (frame.actor_len > 0) {
+                self.handler.writeAuditEntry(batch, op_type, &decoded.op_data, &result, frame.actorSlice(), now_ns);
+            }
 
             // Batch enqueue: copy job_ids into result.fetched for response encoding.
             if (frame.msg_type == rpc.MSG_ENQUEUE_BATCH and decoded.count > 1) {

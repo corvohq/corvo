@@ -469,6 +469,9 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
             // DELETE /webhooks
             if (std.mem.eql(u8, api, "/webhooks"))
                 return writeRoute(rpc.MSG_MODIFY_SETTING, "", "webhook_delete");
+            // DELETE /audit-logs — clear all audit entries
+            if (std.mem.eql(u8, api, "/audit-logs"))
+                return writeRoute(rpc.MSG_MODIFY_SETTING, "", "audit_clear");
         },
 
         .GET => return .read,
@@ -551,8 +554,34 @@ pub const AuthRole = enum(u8) {
     producer = 2,
 };
 
+pub const AuthInfo = struct {
+    role: AuthRole,
+    actor: [128]u8 = undefined,
+    actor_len: u8 = 0,
+
+    pub fn actorSlice(self: *const AuthInfo) []const u8 {
+        return self.actor[0..self.actor_len];
+    }
+
+    fn initAdmin() AuthInfo {
+        var info = AuthInfo{ .role = .admin };
+        const name = "admin";
+        @memcpy(info.actor[0..name.len], name);
+        info.actor_len = name.len;
+        return info;
+    }
+
+    fn initKey(role: AuthRole, name: []const u8) AuthInfo {
+        var info = AuthInfo{ .role = role };
+        const len: u8 = @intCast(@min(name.len, info.actor.len));
+        @memcpy(info.actor[0..len], name[0..len]);
+        info.actor_len = len;
+        return info;
+    }
+};
+
 pub const AuthResult = union(enum) {
-    ok: AuthRole,
+    ok: AuthInfo,
     unauthorized,
     forbidden,
 };
@@ -585,15 +614,15 @@ pub fn checkAuth(
     // Layer 1: admin password (Bearer token or session cookie) → admin role.
     if (admin_password.len > 0) {
         if (api_key) |key| {
-            if (std.mem.eql(u8, key, admin_password)) return .{ .ok = .admin };
+            if (std.mem.eql(u8, key, admin_password)) return .{ .ok = AuthInfo.initAdmin() };
         }
         if (session_cookie) |cookie| {
-            if (validateSessionCookie(cookie, admin_password)) return .{ .ok = .admin };
+            if (validateSessionCookie(cookie, admin_password)) return .{ .ok = AuthInfo.initAdmin() };
         }
     }
 
     // No admin password → no auth enforcement. API keys require admin password as bootstrap.
-    if (admin_password.len == 0) return .{ .ok = .admin };
+    if (admin_password.len == 0) return .{ .ok = AuthInfo.initAdmin() };
 
     // Layer 2: API key lookup.
     const rdr = reader orelse return .unauthorized;
@@ -609,10 +638,11 @@ pub fn checkAuth(
     const r = rdr.getApiKeyByHash(key_hash) orelse return .unauthorized;
     if (!r.enabled) return .unauthorized;
 
-    const role = r.roleSlice();
-    if (std.mem.eql(u8, role, "admin")) return .{ .ok = .admin };
-    if (std.mem.eql(u8, role, "worker")) return .{ .ok = .worker };
-    if (std.mem.eql(u8, role, "producer")) return .{ .ok = .producer };
+    const key_name = r.nameSlice();
+    const role_str = r.roleSlice();
+    if (std.mem.eql(u8, role_str, "admin")) return .{ .ok = AuthInfo.initKey(.admin, key_name) };
+    if (std.mem.eql(u8, role_str, "worker")) return .{ .ok = AuthInfo.initKey(.worker, key_name) };
+    if (std.mem.eql(u8, role_str, "producer")) return .{ .ok = AuthInfo.initKey(.producer, key_name) };
     return .unauthorized;
 }
 
@@ -645,8 +675,8 @@ pub fn authorizeWrite(
 
     const auth = checkAuth(api_key, session_cookie, admin_password, reader);
     switch (auth) {
-        .ok => |role| {
-            if (roleAllowsWrite(role, msg_type)) return auth;
+        .ok => |info| {
+            if (roleAllowsWrite(info.role, msg_type)) return auth;
             return .forbidden;
         },
         .unauthorized, .forbidden => return auth,
@@ -1503,6 +1533,13 @@ fn decodeSetting(body: []const u8, param: []const u8, sub_action: []const u8, sc
         return .{ .op_data = .{ .modify_setting = .{
             .setting = .webhook,
             .id = webhook_id,
+            .data = null,
+        } }, .count = 1 };
+    }
+    if (std.mem.eql(u8, sub_action, "audit_clear")) {
+        return .{ .op_data = .{ .modify_setting = .{
+            .setting = .audit_entry,
+            .id = "",
             .data = null,
         } }, .count = 1 };
     }

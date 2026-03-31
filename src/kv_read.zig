@@ -318,6 +318,32 @@ pub const WebhookRow = struct {
     }
 };
 
+pub const AuditEntryRow = struct {
+    op: [64]u8 = undefined,
+    op_len: u8 = 0,
+    target: [256]u8 = undefined,
+    target_len: u16 = 0,
+    actor: [128]u8 = undefined,
+    actor_len: u8 = 0,
+    count: u32 = 0,
+    ts: u64 = 0,
+    created_at: [32]u8 = undefined,
+    created_at_len: u8 = 0,
+
+    pub fn opSlice(self: *const AuditEntryRow) []const u8 {
+        return self.op[0..self.op_len];
+    }
+    pub fn targetSlice(self: *const AuditEntryRow) []const u8 {
+        return self.target[0..self.target_len];
+    }
+    pub fn actorSlice(self: *const AuditEntryRow) []const u8 {
+        return self.actor[0..self.actor_len];
+    }
+    pub fn createdAtSlice(self: *const AuditEntryRow) []const u8 {
+        return self.created_at[0..self.created_at_len];
+    }
+};
+
 pub const QueryResult = struct {
     count: u32 = 0,
     has_more: bool = false,
@@ -700,6 +726,51 @@ pub const Reader = struct {
     }
 
     // ====================================================================
+    // Audit Log
+    // ====================================================================
+
+    /// List audit entries, newest first. Returns up to results.len entries.
+    pub fn listAuditEntries(self: *Reader, results: []AuditEntryRow) u32 {
+        const count = self.scanPrefix(keys.prefix_audit, AuditEntryRow, results, auditEntryFromValue);
+        // Reverse for newest-first (forward scan gives oldest-first).
+        if (count > 1) {
+            var lo: u32 = 0;
+            var hi: u32 = count - 1;
+            while (lo < hi) {
+                const tmp = results[lo];
+                results[lo] = results[hi];
+                results[hi] = tmp;
+                lo += 1;
+                hi -= 1;
+            }
+        }
+        return count;
+    }
+
+    /// Count total audit entries.
+    pub fn countAuditEntries(self: *Reader) u32 {
+        var batch = self.store.newBatch();
+        defer batch.close();
+
+        var lower_buf: keys.KeyBuf = undefined;
+        var upper_buf: keys.KeyBuf = undefined;
+        const prefix = keys.prefix_audit;
+        @memcpy(lower_buf[0..prefix.len], prefix);
+        const upper = keys.prefixEnd(&upper_buf, lower_buf[0..prefix.len]) orelse return 0;
+
+        var iter = batch.newIter(lower_buf[0..prefix.len], upper);
+        defer iter.close();
+
+        var count: u32 = 0;
+        if (!iter.first()) return 0;
+        while (true) {
+            count += 1;
+            if (!iter.next()) break;
+        }
+        return count;
+    }
+
+    // ====================================================================
     // Search
     // ====================================================================
 
@@ -976,6 +1047,20 @@ fn webhookFromValue(val: []const u8) WebhookRow {
     if (jsonStr(val, "events")) |v| copyField(&row.events, &row.events_len, v);
     if (jsonInt(val, "created_at_ns")) |ns| formatNs(&row.created_at, &row.created_at_len, ns);
     if (jsonBool(val, "enabled")) |e| row.enabled = e;
+    return row;
+}
+
+fn auditEntryFromValue(val: []const u8) AuditEntryRow {
+    // Audit values are JSON: {"op":"cancel","target":"queue:default","count":5,"actor":"admin","ts":1234567890}
+    var row = AuditEntryRow{};
+    if (jsonStr(val, "op")) |v| copyField(&row.op, &row.op_len, v);
+    if (jsonStr(val, "target")) |v| copyField16(&row.target, &row.target_len, v);
+    if (jsonStr(val, "actor")) |v| copyField(&row.actor, &row.actor_len, v);
+    if (jsonInt(val, "count")) |c| row.count = @intCast(c);
+    if (jsonInt(val, "ts")) |ts| {
+        row.ts = ts;
+        formatNs(&row.created_at, &row.created_at_len, ts);
+    }
     return row;
 }
 

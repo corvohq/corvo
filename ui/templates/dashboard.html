@@ -1,3 +1,2 @@
-<div id="dashboard-stats" hx-get="/ui/partials/dashboard-stats" hx-trigger="every 5s, corvo:refresh from:body" hx-swap="innerHTML">
-{{> stats}}
+<div id="dashboard-stats" hx-get="/ui/partials/dashboard-stats" hx-trigger="load, every 5s, corvo:refresh from:body" hx-swap="innerHTML">
 </div>

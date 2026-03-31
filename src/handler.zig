@@ -1016,6 +1016,7 @@ pub const OpHandler = struct {
 
     // Settings
     pub const applyModifySetting = @import("handler_settings.zig").applyModifySetting;
+    pub const writeAuditEntry = @import("handler_settings.zig").writeAuditEntry;
 
     // Global config
     pub fn applyGlobalConfig(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.GlobalConfigOp) ops.OpResult {

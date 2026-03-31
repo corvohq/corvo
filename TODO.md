@@ -88,9 +88,9 @@
 
 Management operations only — cancel, delete, pause, promote, requeue, queue create/modify, rate limit changes, key create/delete. Not enqueue/fetch/ack. Logged with API key name or "admin". Console enriches with user identity.
 
-- [ ] Audit entries in KV (`audit|{ts}_{seq}`) — key, operation, target (queue/job), count, timestamp
-- [ ] GET /api/v1/audit-logs — paginated read endpoint with time range filter
-- [ ] UI page — audit log viewer
+- [x] Audit entries in KV (`audit|{ts_ns}`) — same-batch write, operation, target (queue/job), count, actor, timestamp
+- [x] GET /api/v1/audit-logs — read endpoint (newest first). DELETE /api/v1/audit-logs — clear all.
+- [x] UI page — audit log viewer with Clear All button. 10 Playwright e2e tests.
 
 ## TigerStyle Audit (last)
 

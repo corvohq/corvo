@@ -93,6 +93,7 @@ pub fn dispatch(
     if (std.mem.eql(u8, api, "/budgets")) return budgets(send_buf, rdr);
     if (std.mem.eql(u8, api, "/api-keys")) return apiKeys(send_buf, rdr);
     if (std.mem.eql(u8, api, "/webhooks")) return webhooksApi(send_buf, rdr);
+    if (std.mem.eql(u8, api, "/audit-logs")) return auditLogs(send_buf, rdr);
     if (std.mem.eql(u8, api, "/cluster/events"))
         return clusterEvents(send_buf);
     if (std.mem.eql(u8, api, "/metrics/throughput"))
@@ -712,6 +713,28 @@ fn webhooksApi(send_buf: []u8, reader: *kv_read.Reader) u32 {
         jw.fieldStr("queue", row.queueFilterSlice());
         jw.fieldStr("events", row.eventsSlice());
         jw.fieldBool("enabled", row.enabled);
+        jw.fieldStr("created_at", row.createdAtSlice());
+        jw.endObject();
+    }
+    jw.endArray();
+    return http.writeResponse(send_buf, 200, jw.getWritten());
+}
+
+fn auditLogs(send_buf: []u8, reader: *kv_read.Reader) u32 {
+    var entries: [200]kv_read.AuditEntryRow = undefined;
+    const count = reader.listAuditEntries(&entries);
+
+    var body_buf: [32768]u8 = undefined;
+    var jw = json.JsonWriter.init(&body_buf);
+    jw.beginArray();
+    for (0..count) |i| {
+        const row = &entries[i];
+        jw.beginObject();
+        jw.fieldStr("op", row.opSlice());
+        jw.fieldStr("target", row.targetSlice());
+        jw.fieldInt("count", row.count);
+        jw.fieldStr("actor", row.actorSlice());
+        jw.fieldInt("ts", row.ts);
         jw.fieldStr("created_at", row.createdAtSlice());
         jw.endObject();
     }

@@ -10,13 +10,15 @@ test.describe("Dashboard", () => {
   });
 
   test("shows seeded queue names", async ({ page }) => {
-    await expect(page.getByRole("link", { name: "emails" })).toBeVisible();
+    // Dashboard loads stats via HTMX on load — wait for content.
+    await expect(page.getByRole("link", { name: "emails" })).toBeVisible({ timeout: 10_000 });
     await expect(page.getByRole("link", { name: "payments" })).toBeVisible();
   });
 
   test("shows summary stat cards", async ({ page }) => {
     const main = page.locator("main");
-    await expect(main.getByText("Total Pending")).toBeVisible();
+    // Dashboard loads stats via HTMX on load — wait for content.
+    await expect(main.getByText("Total Pending")).toBeVisible({ timeout: 10_000 });
     await expect(main.getByText("Active").first()).toBeVisible();
     await expect(main.getByText("Workers")).toBeVisible();
   });
