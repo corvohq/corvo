@@ -17,6 +17,10 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
         return .{ .err = "no jobs provided" };
     }
 
+    if (self.max_jobs > 0 and self.total_jobs + @as(u32, @intCast(op.jobs.len)) > self.max_jobs) {
+        return .{ .err = "max jobs exceeded" };
+    }
+
     var affected: u32 = 0;
 
     // Track last queue to skip redundant queueNameKey writes and
@@ -175,6 +179,7 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
         affected += 1;
     }
 
+    self.total_jobs += affected;
     return .{ .affected = affected };
 }
 

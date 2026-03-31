@@ -109,15 +109,47 @@ pub fn applyAck(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.AckOp) ops.O
         self.decrActiveCount(job.queue);
         if (job.group) |g| self.decrFairnessActive(job.queue, g);
 
-        // Write updated job
         job.state = next_state;
-        var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
-        b.set(keys.jobKey(&jk_buf, ack.job_id), codec.encodeJob(&job_enc_buf, &job));
 
-        // Update read indexes: active → next_state
-        self.transitionReadIndexes(b, &job, .active, next_state);
+        if (next_state == .completed and !self.persist_completed) {
+            // Auto-delete: remove job entirely — no storage cost.
+            b.delete(keys.jobKey(&jk_buf, ack.job_id));
+            var jpk_buf: keys.KeyBuf = undefined;
+            b.delete(keys.jobPayloadKey(&jpk_buf, ack.job_id));
+            // Delete active-state read indexes
+            var old_js_buf: keys.KeyBuf = undefined;
+            var old_jqs_buf: keys.KeyBuf = undefined;
+            b.delete(keys.jobStateKey(&old_js_buf, @intFromEnum(types.JobState.active), job.created_at_ns, job.id));
+            b.delete(keys.jobQueueStateKey(&old_jqs_buf, job.queue, @intFromEnum(types.JobState.active), job.created_at_ns, job.id));
+            // Delete time + queue read indexes
+            var jt_buf: keys.KeyBuf = undefined;
+            var jq_buf: keys.KeyBuf = undefined;
+            b.delete(keys.jobTimeKey(&jt_buf, job.created_at_ns, job.id));
+            b.delete(keys.jobQueueKey(&jq_buf, job.queue, job.created_at_ns, job.id));
+            OpHandler.deleteTagIndexes(b, &job);
+            // Decrement active counter (no completed counter to worry about)
+            self.decrQueueCounter(b, job.queue, .active);
+            // Delete d| key (written above in completion block)
+            var dk_del_buf: keys.KeyBuf = undefined;
+            b.delete(keys.deadKey(&dk_del_buf, op.now_ns, job.id));
+            // Delete error keys
+            var jep_buf: keys.KeyBuf = undefined;
+            var jee_buf: keys.KeyBuf = undefined;
+            const err_prefix = keys.jobErrorPrefix(&jep_buf, job.id);
+            if (keys.prefixEnd(&jee_buf, err_prefix)) |err_end| {
+                b.deleteRange(err_prefix, err_end);
+            }
+            self.total_jobs -|= 1;
+        } else {
+            // Write updated job
+            var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
+            b.set(keys.jobKey(&jk_buf, ack.job_id), codec.encodeJob(&job_enc_buf, &job));
 
-        self.verifyJobIndexes(b, &job, "ack");
+            // Update read indexes: active → next_state
+            self.transitionReadIndexes(b, &job, .active, next_state);
+
+            self.verifyJobIndexes(b, &job, "ack");
+        }
         affected += 1;
     }
 

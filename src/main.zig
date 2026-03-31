@@ -16,6 +16,7 @@
 //!   --max-payload-size <n>    Max payload size in bytes (default: 65536)
 //!   --max-conns <n>           Max concurrent connections (default: 4096)
 //!   --max-queues <n>          Max number of queues (default: 100)
+//!   --max-jobs <n>            Max total jobs (default: 0 = unlimited)
 //!   --max-tags-per-queue <n>  Max fairness tags per queue (default: 1000)
 //!   --admin-password <pw>     Admin password (locks UI + API, enables session auth)
 //!   --help                    Show this help
@@ -102,7 +103,10 @@ fn printHelp() void {
         \\  --max-payload-size <n>    Max payload bytes (default: 65536, max: 262144)
         \\  --max-conns <n>           Max connections (default: 4096)
         \\  --max-queues <n>          Max queues (default: 100)
+        \\  --max-jobs <n>            Max total jobs (default: 0 = unlimited)
         \\  --max-tags-per-queue <n>  Max fairness tags per queue (default: 1000)
+        \\  --purge-threshold <n>     Early purge when terminal count exceeds n (default: 10000)
+        \\  --persist-completed       Keep completed jobs until purge (default: off)
         \\  --node-id <id>            Node ID (enables cluster mode)
         \\  --peers <spec>            Peers: id@host:port,id@host:port,...
         \\  --sync-repl               Enable sync replication
@@ -249,6 +253,15 @@ pub fn main() !void {
                 std.debug.print("invalid max-queues: {s}\n", .{val});
                 return;
             };
+        } else if (std.mem.eql(u8, arg, "--max-jobs")) {
+            const val = args.next() orelse {
+                std.debug.print("--max-jobs requires an argument\n", .{});
+                return;
+            };
+            config.max_jobs = std.fmt.parseInt(u32, val, 10) catch {
+                std.debug.print("invalid max-jobs: {s}\n", .{val});
+                return;
+            };
         } else if (std.mem.eql(u8, arg, "--max-tags-per-queue")) {
             const val = args.next() orelse {
                 std.debug.print("--max-tags-per-queue requires an argument\n", .{});
@@ -258,6 +271,17 @@ pub fn main() !void {
                 std.debug.print("invalid max-tags-per-queue: {s}\n", .{val});
                 return;
             };
+        } else if (std.mem.eql(u8, arg, "--purge-threshold")) {
+            const val = args.next() orelse {
+                std.debug.print("--purge-threshold requires an argument\n", .{});
+                return;
+            };
+            config.purge_threshold = std.fmt.parseInt(u32, val, 10) catch {
+                std.debug.print("invalid purge-threshold: {s}\n", .{val});
+                return;
+            };
+        } else if (std.mem.eql(u8, arg, "--persist-completed")) {
+            config.persist_completed = true;
         } else if (std.mem.eql(u8, arg, "--admin-password")) {
             config.admin_password = args.next() orelse {
                 std.debug.print("--admin-password requires an argument\n", .{});
@@ -295,7 +319,9 @@ pub fn main() !void {
     std.debug.print("corvo: rebuilding state...\n", .{});
     var handler = handler_mod.OpHandler.init(allocator);
     handler.max_queues = config.max_queues;
+    handler.max_jobs = config.max_jobs;
     handler.max_tags_per_queue = config.max_tags_per_queue;
+    handler.persist_completed = config.persist_completed;
     handler.pending.max_queues = config.max_queues;
     defer handler.deinit();
     handler.rebuildState(&stores);

@@ -431,6 +431,7 @@ fn applyPurge(self: *OpHandler, b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult 
         }
     }
 
+    self.total_jobs -|= affected;
     return .{ .affected = affected };
 }
 

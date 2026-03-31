@@ -36,7 +36,9 @@ pub const ServerConfig = struct {
 
     max_payload_size: u32 = 64 * 1024,
     max_queues: u32 = 100,
+    max_jobs: u32 = 0, // 0 = unlimited
     max_tags_per_queue: u32 = 1000,
+    persist_completed: bool = false,
 
     // Maintenance intervals (nanoseconds, 0 = disabled)
     promote_interval_ns: u64 = 1_000_000_000,
@@ -75,6 +77,7 @@ pub const ServerConfig = struct {
         var h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
         h = fnvU32(h, self.max_payload_size);
         h = fnvU32(h, self.max_queues);
+        h = fnvU32(h, self.max_jobs);
         h = fnvU32(h, self.max_tags_per_queue);
         h = fnvU64(h, self.promote_interval_ns);
         h = fnvU64(h, self.reclaim_interval_ns);
@@ -156,6 +159,10 @@ pub const ServerConfig = struct {
             self.max_payload_size = parseInt(u32, val) orelse return error.InvalidValue;
         } else if (eql(key, "max-queues")) {
             self.max_queues = parseInt(u32, val) orelse return error.InvalidValue;
+        } else if (eql(key, "max-jobs")) {
+            self.max_jobs = parseInt(u32, val) orelse return error.InvalidValue;
+        } else if (eql(key, "persist-completed")) {
+            self.persist_completed = parseBool(val) orelse return error.InvalidValue;
         } else if (eql(key, "max-tags-per-queue")) {
             self.max_tags_per_queue = parseInt(u32, val) orelse return error.InvalidValue;
         } else if (eql(key, "promote-interval")) {

@@ -83,7 +83,12 @@ pub const OpHandler = struct {
 
     // Explicit resource limits (TigerStyle: all collections must have bounds).
     max_queues: u32 = 100,
+    max_jobs: u32 = 0, // 0 = unlimited
     max_tags_per_queue: u32 = 1000,
+    persist_completed: bool = false,
+
+    /// Total live jobs in KV. Incremented on enqueue, decremented on purge.
+    total_jobs: u32 = 0,
 
     const max_side_effects = 32;
     const max_fail_results = 256;
@@ -399,6 +404,7 @@ pub const OpHandler = struct {
 
         }
 
+        self.total_jobs = total_count;
         self.recomputeMaxRateWindow();
         std.debug.print("corvo: state ready — {d} jobs ({d} pending, {d} active)\n", .{ total_count, pending_count, active_count });
     }

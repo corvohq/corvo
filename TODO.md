@@ -61,7 +61,8 @@
 
 ## Server
 
-- [ ] `--max-jobs` flag — explicit resource limit on total job count. Handler rejects enqueue when `total_jobs >= max_jobs` (boundary error, not assert). Same pattern as max_queues/max_namespaces. Enables Corvo Cloud tiered plans.
+- [x] `--max-jobs` flag — explicit resource limit on total job count. Handler rejects enqueue when `total_jobs >= max_jobs` (boundary error, not assert). Same pattern as max_queues. Enables Corvo Cloud tiered plans.
+- [x] `--persist-completed` flag — completed jobs auto-deleted on ack by default (no storage cost). `--persist-completed` keeps them until purge. `--purge-threshold` CLI flag added.
 
 ## V1 Release
 
