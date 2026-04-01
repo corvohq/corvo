@@ -91,12 +91,25 @@ pub fn httpRequest(
         return .{ .status = 0, .body = "failed to send request" };
     };
 
-    // Read response.
+    // Read response — stop when Content-Length body is complete (server may keep-alive).
     var total: usize = 0;
     while (total < resp_buf.len) {
         const n = stream.read(resp_buf[total..]) catch break;
         if (n == 0) break;
         total += n;
+        // Check if we have full headers + body.
+        const buf = resp_buf[0..total];
+        if (std.mem.indexOf(u8, buf, "\r\n\r\n")) |hdr_end| {
+            const body_start = hdr_end + 4;
+            const headers = buf[0..hdr_end];
+            if (findContentLength(headers)) |cl| {
+                if (total >= body_start + cl) break;
+            } else if (std.mem.indexOf(u8, headers, "Transfer-Encoding: chunked") != null) {
+                if (std.mem.indexOf(u8, buf[body_start..], "0\r\n\r\n") != null) break;
+            } else {
+                break; // No Content-Length, no chunked — stop after headers.
+            }
+        }
     }
 
     if (total == 0) return .{ .status = 0, .body = "empty response" };
@@ -128,6 +141,14 @@ pub fn httpRequest(
     }
 
     return .{ .status = status, .body = "" };
+}
+
+fn findContentLength(headers: []const u8) ?usize {
+    const needle = "Content-Length: ";
+    const pos = std.mem.indexOf(u8, headers, needle) orelse return null;
+    const start = pos + needle.len;
+    const end = std.mem.indexOfScalarPos(u8, headers, start, '\r') orelse headers.len;
+    return std.fmt.parseInt(usize, headers[start..end], 10) catch null;
 }
 
 // ============================================================================
@@ -412,6 +433,9 @@ pub fn dispatch(first_arg: []const u8, args: *std.process.ArgIterator) void {
     if (eql(first_arg, "cron-resume")) return cmdCronAction(args, "resume");
     if (eql(first_arg, "cron-trigger")) return cmdCronAction(args, "trigger");
 
+    // Seed data for manual testing.
+    if (eql(first_arg, "seed")) return cmdSeed(args);
+
     // Unknown command — print help.
     printHelp();
     std.process.exit(1);
@@ -462,6 +486,9 @@ pub fn printHelp() void {
         \\  cron-pause          Pause a cron job
         \\  cron-resume         Resume a cron job
         \\  cron-trigger        Trigger a cron job immediately
+        \\
+        \\Testing:
+        \\  seed                Populate server with sample data for manual testing
         \\
         \\Global Options:
         \\  --server <url>      Server URL (default: http://localhost:8080)
@@ -943,4 +970,208 @@ fn cmdCronAction(args: *std.process.ArgIterator, action: []const u8) void {
     printResponse(client.cronAction(positional[0], action, &resp_buf));
 }
 
+// ============================================================================
+// seed — populate server with sample data for manual testing
+// ============================================================================
 
+fn cmdSeed(args: *std.process.ArgIterator) void {
+    var positional: [0][]const u8 = undefined;
+    const parsed = parseOpts(args, &positional, 0);
+    const client = Client{ .server = parsed.opts.server, .api_key = parsed.opts.api_key };
+    var resp_buf: [65536]u8 = undefined;
+
+    // Verify connectivity.
+    const info = client.get("/api/v1/info", &resp_buf);
+    if (info.status == 0) {
+        fatal(info.body);
+        unreachable;
+    }
+
+    std.debug.print("Seeding {s} ...\n\n", .{parsed.opts.server});
+
+    // Collect job IDs for post-enqueue actions (cancel, hold).
+    // Store IDs inline in a flat buffer to avoid allocation.
+    var id_store: [8192]u8 = undefined;
+    var id_store_pos: usize = 0;
+    var cancel_ids: [16][]const u8 = undefined;
+    var cancel_count: usize = 0;
+
+    // --- Enqueue jobs ---
+    var total_ok: usize = 0;
+    var total_fail: usize = 0;
+
+    inline for (seed_queues) |sq| {
+        var ok: usize = 0;
+        var fail: usize = 0;
+        var queue_cancel: usize = 0;
+        for (sq.jobs) |job| {
+            const resp = client.enqueue(job, &resp_buf);
+            if (resp.status >= 200 and resp.status < 300) {
+                ok += 1;
+                if (queue_cancel < sq.cancel_first and cancel_count < cancel_ids.len) {
+                    if (extractJobId(resp.body)) |jid| {
+                        if (id_store_pos + jid.len <= id_store.len) {
+                            @memcpy(id_store[id_store_pos .. id_store_pos + jid.len], jid);
+                            cancel_ids[cancel_count] = id_store[id_store_pos .. id_store_pos + jid.len];
+                            id_store_pos += jid.len;
+                            cancel_count += 1;
+                            queue_cancel += 1;
+                        }
+                    }
+                }
+            } else {
+                fail += 1;
+            }
+        }
+        // Numbered batch for pagination testing.
+        if (sq.batch_count > 0) {
+            var i: usize = 0;
+            while (i < sq.batch_count) : (i += 1) {
+                var payload_buf: [256]u8 = undefined;
+                const payload = std.fmt.bufPrint(&payload_buf, sq.batch_template, .{i + 1}) catch continue;
+                const resp = client.enqueue(.{
+                    .queue = sq.jobs[0].queue,
+                    .payload = payload,
+                    .priority = sq.batch_priority,
+                    .tags = sq.batch_tags,
+                }, &resp_buf);
+                if (resp.status >= 200 and resp.status < 300) {
+                    ok += 1;
+                } else {
+                    fail += 1;
+                }
+            }
+        }
+        total_ok += ok;
+        total_fail += fail;
+        if (fail > 0) {
+            std.debug.print("  {s}: {d} enqueued, {d} failed\n", .{ sq.jobs[0].queue, ok, fail });
+        } else {
+            std.debug.print("  {s}: {d} enqueued\n", .{ sq.jobs[0].queue, ok });
+        }
+    }
+
+    // --- Cancel collected jobs ---
+    var cancelled: usize = 0;
+    for (cancel_ids[0..cancel_count]) |job_id| {
+        const resp = client.jobAction(job_id, "cancel", &resp_buf);
+        if (resp.status >= 200 and resp.status < 300) cancelled += 1;
+    }
+    if (cancelled > 0)
+        std.debug.print("\n  Cancelled {d} jobs\n", .{cancelled});
+
+    // --- Pause a queue ---
+    const pause_resp = client.queueAction("report-generation", "pause", &resp_buf);
+    if (pause_resp.status >= 200 and pause_resp.status < 300)
+        std.debug.print("  Paused report-generation\n", .{});
+
+    // --- Cron jobs ---
+    const crons = [_]Client.CronCreateParams{
+        .{ .name = "daily-cleanup", .queue = "data-imports", .schedule = "0 2 * * *", .payload = "{\"task\":\"cleanup\"}" },
+        .{ .name = "hourly-health-check", .queue = "webhook-delivery", .schedule = "0 * * * *", .payload = "{\"task\":\"health-check\"}" },
+        .{ .name = "weekly-digest", .queue = "email-notifications", .schedule = "0 9 * * 1", .payload = "{\"task\":\"weekly-digest\"}" },
+    };
+    var cron_ok: usize = 0;
+    for (crons) |cron| {
+        const resp = client.cronCreate(cron, &resp_buf);
+        if (resp.status >= 200 and resp.status < 300) cron_ok += 1;
+    }
+    std.debug.print("  Created {d} cron jobs\n", .{cron_ok});
+
+    std.debug.print("\nDone — {d} jobs enqueued across {d} queues.\n", .{ total_ok, seed_queues.len });
+}
+
+/// Extract job ID from enqueue response: {"job":{"id":"job_xxx"}} → "job_xxx"
+fn extractJobId(body: []const u8) ?[]const u8 {
+    const needle = "\"id\":\"";
+    const start = (std.mem.indexOf(u8, body, needle) orelse return null) + needle.len;
+    const end = std.mem.indexOfScalarPos(u8, body, start, '"') orelse return null;
+    return body[start..end];
+}
+
+const SeedQueue = struct {
+    jobs: []const Client.EnqueueParams,
+    batch_count: usize = 0,
+    batch_template: []const u8 = "",
+    batch_priority: []const u8 = "",
+    batch_tags: []const u8 = "",
+    cancel_first: usize = 0, // cancel this many of the first enqueued jobs
+};
+
+const seed_queues = [_]SeedQueue{
+    // --- email-notifications ---
+    .{
+        .jobs = &.{
+            .{ .queue = "email-notifications", .payload = "{\"to\":\"alice@example.com\",\"template\":\"welcome\",\"name\":\"Alice\"}", .tags = "[\"email\",\"onboarding\"]" },
+            .{ .queue = "email-notifications", .payload = "{\"to\":\"bob@example.com\",\"template\":\"password-reset\",\"token\":\"r3s3t\"}", .priority = "75", .tags = "[\"email\",\"security\"]" },
+            .{ .queue = "email-notifications", .payload = "{\"to\":\"carol@example.com\",\"template\":\"order-confirmation\",\"order_id\":\"ORD-1042\"}", .tags = "[\"email\",\"transactional\"]" },
+            .{ .queue = "email-notifications", .payload = "{\"to\":\"dave@example.com\",\"template\":\"shipping-update\",\"tracking\":\"1Z999AA10\"}", .tags = "[\"email\",\"transactional\"]" },
+            .{ .queue = "email-notifications", .payload = "{\"to\":\"eve@example.com\",\"template\":\"invoice\",\"amount\":249.99}", .tags = "[\"email\",\"billing\"]" },
+            .{ .queue = "email-notifications", .payload = "{\"to\":\"frank@example.com\",\"template\":\"welcome\",\"name\":\"Frank\"}", .tags = "[\"email\",\"onboarding\"]" },
+            .{ .queue = "email-notifications", .payload = "{\"to\":\"grace@example.com\",\"template\":\"password-reset\",\"token\":\"x7k2m\"}", .priority = "75", .tags = "[\"email\",\"security\"]" },
+            .{ .queue = "email-notifications", .payload = "{\"to\":\"heidi@example.com\",\"template\":\"weekly-digest\",\"week\":\"2026-W13\"}", .scheduled_at = "2026-04-07T09:00:00Z", .tags = "[\"email\",\"marketing\"]" },
+        },
+        .batch_count = 20,
+        .batch_template = "{{\"to\":\"user{d}@example.com\",\"template\":\"notification\"}}",
+        .batch_tags = "[\"email\",\"bulk\"]",
+        .cancel_first = 5,
+    },
+    // --- payment-processing ---
+    .{
+        .jobs = &.{
+            .{ .queue = "payment-processing", .payload = "{\"customer\":\"cus_A1\",\"amount\":9900,\"currency\":\"usd\",\"method\":\"card\"}", .priority = "75", .tags = "[\"payment\",\"stripe\"]" },
+            .{ .queue = "payment-processing", .payload = "{\"customer\":\"cus_B2\",\"amount\":4500,\"currency\":\"usd\",\"method\":\"card\"}", .priority = "75", .tags = "[\"payment\",\"stripe\"]" },
+            .{ .queue = "payment-processing", .payload = "{\"customer\":\"cus_C3\",\"amount\":19900,\"currency\":\"eur\",\"method\":\"sepa\"}", .priority = "90", .tags = "[\"payment\",\"sepa\"]" },
+            .{ .queue = "payment-processing", .payload = "{\"type\":\"refund\",\"charge\":\"ch_abc\",\"amount\":2500}", .priority = "90", .tags = "[\"payment\",\"refund\"]" },
+            .{ .queue = "payment-processing", .payload = "{\"type\":\"subscription\",\"customer\":\"cus_D4\",\"plan\":\"pro_monthly\"}", .tags = "[\"payment\",\"subscription\"]" },
+            .{ .queue = "payment-processing", .payload = "{\"type\":\"subscription\",\"customer\":\"cus_E5\",\"plan\":\"team_annual\"}", .tags = "[\"payment\",\"subscription\"]" },
+            .{ .queue = "payment-processing", .payload = "{\"type\":\"payout\",\"account\":\"acct_F6\",\"amount\":150000}", .priority = "50", .tags = "[\"payment\",\"payout\"]" },
+            .{ .queue = "payment-processing", .payload = "{\"customer\":\"cus_G7\",\"amount\":7200,\"currency\":\"gbp\",\"method\":\"card\"}", .priority = "75", .tags = "[\"payment\",\"stripe\"]" },
+        },
+        .batch_count = 15,
+        .batch_template = "{{\"customer\":\"cus_{d}\",\"amount\":1000,\"currency\":\"usd\"}}",
+        .batch_priority = "75",
+        .batch_tags = "[\"payment\",\"batch\"]",
+        .cancel_first = 3,
+    },
+    // --- report-generation ---
+    .{
+        .jobs = &.{
+            .{ .queue = "report-generation", .payload = "{\"type\":\"monthly-revenue\",\"month\":\"2026-03\"}", .group = "monthly", .tags = "[\"report\",\"finance\"]" },
+            .{ .queue = "report-generation", .payload = "{\"type\":\"user-activity\",\"month\":\"2026-03\"}", .group = "monthly", .tags = "[\"report\",\"analytics\"]" },
+            .{ .queue = "report-generation", .payload = "{\"type\":\"churn-analysis\",\"quarter\":\"Q1-2026\"}", .group = "quarterly", .tags = "[\"report\",\"analytics\"]" },
+            .{ .queue = "report-generation", .payload = "{\"type\":\"audit-trail\",\"month\":\"2026-03\"}", .group = "monthly", .priority = "90", .tags = "[\"report\",\"compliance\"]" },
+            .{ .queue = "report-generation", .payload = "{\"type\":\"inventory\",\"warehouse\":\"us-east\"}", .tags = "[\"report\",\"ops\"]" },
+            .{ .queue = "report-generation", .payload = "{\"type\":\"sla-compliance\",\"month\":\"2026-03\"}", .group = "monthly", .tags = "[\"report\",\"compliance\"]" },
+        },
+        .batch_count = 12,
+        .batch_template = "{{\"type\":\"export\",\"dataset\":\"table_{d}\"}}",
+        .batch_tags = "[\"report\",\"export\"]",
+    },
+    // --- data-imports ---
+    .{
+        .jobs = &.{
+            .{ .queue = "data-imports", .payload = "{\"source\":\"salesforce\",\"object\":\"contacts\",\"records\":15000}", .tags = "[\"import\",\"crm\"]" },
+            .{ .queue = "data-imports", .payload = "{\"source\":\"stripe\",\"object\":\"invoices\",\"since\":\"2026-03-01\"}", .tags = "[\"import\",\"billing\"]" },
+            .{ .queue = "data-imports", .payload = "{\"source\":\"csv\",\"file\":\"products_march.csv\",\"rows\":4200}", .tags = "[\"import\",\"catalog\"]" },
+            .{ .queue = "data-imports", .payload = "{\"source\":\"api\",\"endpoint\":\"partner-feed\",\"format\":\"json\"}", .tags = "[\"import\",\"partner\"]" },
+            .{ .queue = "data-imports", .payload = "{\"source\":\"s3\",\"bucket\":\"data-lake\",\"prefix\":\"events/2026-03/\"}", .scheduled_at = "2026-04-01T00:00:00Z", .tags = "[\"import\",\"data-lake\"]" },
+            .{ .queue = "data-imports", .payload = "{\"source\":\"postgres\",\"table\":\"legacy_orders\",\"batch_size\":5000}", .scheduled_at = "2026-04-01T02:00:00Z", .tags = "[\"import\",\"migration\"]" },
+            .{ .queue = "data-imports", .payload = "{\"source\":\"hubspot\",\"object\":\"deals\",\"records\":8300}", .scheduled_at = "2026-04-02T06:00:00Z", .tags = "[\"import\",\"crm\"]" },
+        },
+    },
+    // --- webhook-delivery ---
+    .{
+        .jobs = &.{
+            .{ .queue = "webhook-delivery", .payload = "{\"url\":\"https://acme.com/hooks\",\"event\":\"order.created\",\"order_id\":\"ORD-1042\"}", .tags = "[\"webhook\",\"order\"]", .max_retries = "5" },
+            .{ .queue = "webhook-delivery", .payload = "{\"url\":\"https://acme.com/hooks\",\"event\":\"payment.succeeded\",\"charge\":\"ch_abc\"}", .tags = "[\"webhook\",\"payment\"]", .max_retries = "5" },
+            .{ .queue = "webhook-delivery", .payload = "{\"url\":\"https://partner.io/ingest\",\"event\":\"user.signup\",\"user_id\":\"usr_123\"}", .tags = "[\"webhook\",\"user\"]", .max_retries = "5" },
+            .{ .queue = "webhook-delivery", .payload = "{\"url\":\"https://partner.io/ingest\",\"event\":\"user.upgraded\",\"plan\":\"pro\"}", .tags = "[\"webhook\",\"user\"]", .max_retries = "5" },
+            .{ .queue = "webhook-delivery", .payload = "{\"url\":\"https://analytics.co/events\",\"event\":\"report.generated\",\"report_id\":\"rpt_789\"}", .tags = "[\"webhook\",\"report\"]", .max_retries = "5" },
+            .{ .queue = "webhook-delivery", .payload = "{\"url\":\"https://slack.com/api/incoming\",\"event\":\"alert.triggered\",\"severity\":\"high\"}", .priority = "90", .tags = "[\"webhook\",\"alert\"]", .max_retries = "5" },
+        },
+        .batch_count = 15,
+        .batch_template = "{{\"url\":\"https://example.com/hook\",\"event\":\"item.processed\",\"item_id\":{d}}}",
+        .batch_tags = "[\"webhook\",\"batch\"]",
+    },
+};

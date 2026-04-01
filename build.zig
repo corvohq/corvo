@@ -120,6 +120,13 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the Corvo server");
     run_step.dependOn(&run_server.step);
 
+    // --- Seed step (runs: corvo seed [args]) ---
+    const run_seed = b.addRunArtifact(server_exe);
+    run_seed.addArg("seed");
+    if (b.args) |a| run_seed.addArgs(a);
+    const seed_step = b.step("seed", "Seed server with sample data for manual testing");
+    seed_step.dependOn(&run_seed.step);
+
     // --- corvo-inspect CLI ---
     const inspect_mod = b.createModule(.{
         .root_source_file = b.path("src/inspect.zig"),
