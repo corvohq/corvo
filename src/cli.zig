@@ -155,13 +155,13 @@ fn findContentLength(headers: []const u8) ?usize {
 // Client — testable API layer (no arg parsing, no process exit)
 //
 // Usage:
-//   const client = Client{ .server = "http://localhost:8080" };
+//   const client = Client{ .server = "http://localhost:9878" };
 //   var resp_buf: [65536]u8 = undefined;
 //   const resp = client.enqueue(.{ .queue = "emails", .payload = "{}" }, &resp_buf);
 // ============================================================================
 
 pub const Client = struct {
-    server: []const u8 = "http://localhost:8080",
+    server: []const u8 = "http://localhost:9878",
     api_key: []const u8 = "",
 
     // -- Enqueue --------------------------------------------------------------
@@ -377,7 +377,7 @@ fn errResp(msg: []const u8) HttpResponse {
 // ============================================================================
 
 const CliOpts = struct {
-    server: []const u8 = "http://localhost:8080",
+    server: []const u8 = "http://localhost:9878",
     api_key: []const u8 = "",
     json: bool = false,
 };
@@ -491,7 +491,7 @@ pub fn printHelp() void {
         \\  seed                Populate server with sample data for manual testing
         \\
         \\Global Options:
-        \\  --server <url>      Server URL (default: http://localhost:8080)
+        \\  --server <url>      Server URL (default: http://localhost:9878)
         \\  --api-key <key>     API key for authentication (env: CORVO_API_KEY)
         \\  --help              Show this help
         \\
@@ -607,7 +607,7 @@ fn cmdEnqueue(args: *std.process.ArgIterator) void {
                 \\  --scheduled-at <time>  Schedule for later (RFC3339)
                 \\  --tags <json>          Tags as JSON object
                 \\  --group <name>         Concurrency group name
-                \\  --server <url>         Server URL (default: http://localhost:8080)
+                \\  --server <url>         Server URL (default: http://localhost:9878)
                 \\  --api-key <key>        API key (env: CORVO_API_KEY)
                 \\
             , .{});
@@ -740,7 +740,7 @@ fn cmdBulk(args: *std.process.ArgIterator) void {
                 \\  --state <state>         Filter by state (dead, failed, completed, etc.)
                 \\  --target-queue <name>   Target queue (for move action)
                 \\  --limit <n>             Maximum number of jobs to affect
-                \\  --server <url>          Server URL (default: http://localhost:8080)
+                \\  --server <url>          Server URL (default: http://localhost:9878)
                 \\  --api-key <key>         API key (env: CORVO_API_KEY)
                 \\
             , .{});
@@ -847,7 +847,7 @@ fn cmdSearch(args: *std.process.ArgIterator) void {
                 \\Options:
                 \\  --queue <name>       Filter by queue
                 \\  --state <state>      Filter by state (pending, active, dead, etc.)
-                \\  --server <url>       Server URL (default: http://localhost:8080)
+                \\  --server <url>       Server URL (default: http://localhost:9878)
                 \\  --api-key <key>      API key (env: CORVO_API_KEY)
                 \\
             , .{});
@@ -911,7 +911,7 @@ fn cmdCronCreate(args: *std.process.ArgIterator) void {
                 \\  --schedule <cron>       Cron schedule expression (required)
                 \\  --payload <json>        Job payload
                 \\  --timezone <tz>         Timezone (e.g. America/New_York)
-                \\  --server <url>          Server URL (default: http://localhost:8080)
+                \\  --server <url>          Server URL (default: http://localhost:9878)
                 \\  --api-key <key>         API key (env: CORVO_API_KEY)
                 \\
             , .{});
