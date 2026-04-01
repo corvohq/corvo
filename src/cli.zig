@@ -989,12 +989,16 @@ fn cmdSeed(args: *std.process.ArgIterator) void {
 
     std.debug.print("Seeding {s} ...\n\n", .{parsed.opts.server});
 
-    // Collect job IDs for post-enqueue actions (cancel, hold).
+    // Collect job IDs for post-enqueue actions.
     // Store IDs inline in a flat buffer to avoid allocation.
     var id_store: [8192]u8 = undefined;
     var id_store_pos: usize = 0;
     var cancel_ids: [16][]const u8 = undefined;
     var cancel_count: usize = 0;
+    var hold_ids: [16][]const u8 = undefined;
+    var hold_count: usize = 0;
+    var reject_ids: [16][]const u8 = undefined;
+    var reject_count: usize = 0;
 
     // --- Enqueue jobs ---
     var total_ok: usize = 0;
@@ -1004,19 +1008,25 @@ fn cmdSeed(args: *std.process.ArgIterator) void {
         var ok: usize = 0;
         var fail: usize = 0;
         var queue_cancel: usize = 0;
+        var queue_hold: usize = 0;
+        var queue_reject: usize = 0;
         for (sq.jobs) |job| {
             const resp = client.enqueue(job, &resp_buf);
             if (resp.status >= 200 and resp.status < 300) {
                 ok += 1;
-                if (queue_cancel < sq.cancel_first and cancel_count < cancel_ids.len) {
-                    if (extractJobId(resp.body)) |jid| {
-                        if (id_store_pos + jid.len <= id_store.len) {
-                            @memcpy(id_store[id_store_pos .. id_store_pos + jid.len], jid);
-                            cancel_ids[cancel_count] = id_store[id_store_pos .. id_store_pos + jid.len];
-                            id_store_pos += jid.len;
-                            cancel_count += 1;
+                if (extractJobId(resp.body)) |jid| {
+                    if (queue_cancel < sq.cancel_first) {
+                        if (storeId(&id_store, &id_store_pos, &cancel_ids, &cancel_count, jid))
                             queue_cancel += 1;
+                    } else if (queue_reject < sq.reject_first) {
+                        // reject requires hold first — store in both lists
+                        if (storeId(&id_store, &id_store_pos, &hold_ids, &hold_count, jid)) {
+                            if (storeId(&id_store, &id_store_pos, &reject_ids, &reject_count, jid))
+                                queue_reject += 1;
                         }
+                    } else if (queue_hold < sq.hold_first) {
+                        if (storeId(&id_store, &id_store_pos, &hold_ids, &hold_count, jid))
+                            queue_hold += 1;
                     }
                 }
             } else {
@@ -1051,14 +1061,25 @@ fn cmdSeed(args: *std.process.ArgIterator) void {
         }
     }
 
-    // --- Cancel collected jobs ---
+    // --- Post-enqueue state transitions ---
     var cancelled: usize = 0;
     for (cancel_ids[0..cancel_count]) |job_id| {
         const resp = client.jobAction(job_id, "cancel", &resp_buf);
         if (resp.status >= 200 and resp.status < 300) cancelled += 1;
     }
-    if (cancelled > 0)
-        std.debug.print("\n  Cancelled {d} jobs\n", .{cancelled});
+    var held: usize = 0;
+    for (hold_ids[0..hold_count]) |job_id| {
+        const resp = client.jobAction(job_id, "hold", &resp_buf);
+        if (resp.status >= 200 and resp.status < 300) held += 1;
+    }
+    var rejected: usize = 0;
+    for (reject_ids[0..reject_count]) |job_id| {
+        const resp = client.jobAction(job_id, "reject", &resp_buf);
+        if (resp.status >= 200 and resp.status < 300) rejected += 1;
+    }
+    if (cancelled > 0) std.debug.print("\n  Cancelled {d} jobs\n", .{cancelled});
+    if (held > 0) std.debug.print("  Held {d} jobs\n", .{held});
+    if (rejected > 0) std.debug.print("  Rejected {d} jobs → dead\n", .{rejected});
 
     // --- Pause a queue ---
     const pause_resp = client.queueAction("report-generation", "pause", &resp_buf);
@@ -1081,6 +1102,15 @@ fn cmdSeed(args: *std.process.ArgIterator) void {
     std.debug.print("\nDone — {d} jobs enqueued across {d} queues.\n", .{ total_ok, seed_queues.len });
 }
 
+fn storeId(id_store: *[8192]u8, pos: *usize, ids: *[16][]const u8, count: *usize, jid: []const u8) bool {
+    if (count.* >= 16 or pos.* + jid.len > id_store.len) return false;
+    @memcpy(id_store[pos.* .. pos.* + jid.len], jid);
+    ids[count.*] = id_store[pos.* .. pos.* + jid.len];
+    pos.* += jid.len;
+    count.* += 1;
+    return true;
+}
+
 /// Extract job ID from enqueue response: {"job":{"id":"job_xxx"}} → "job_xxx"
 fn extractJobId(body: []const u8) ?[]const u8 {
     const needle = "\"id\":\"";
@@ -1095,7 +1125,9 @@ const SeedQueue = struct {
     batch_template: []const u8 = "",
     batch_priority: []const u8 = "",
     batch_tags: []const u8 = "",
-    cancel_first: usize = 0, // cancel this many of the first enqueued jobs
+    cancel_first: usize = 0,
+    hold_first: usize = 0,
+    reject_first: usize = 0, // hold then reject → dead
 };
 
 const seed_queues = [_]SeedQueue{
@@ -1147,6 +1179,7 @@ const seed_queues = [_]SeedQueue{
         .batch_count = 12,
         .batch_template = "{{\"type\":\"export\",\"dataset\":\"table_{d}\"}}",
         .batch_tags = "[\"report\",\"export\"]",
+        .hold_first = 3,
     },
     // --- data-imports ---
     .{
@@ -1159,6 +1192,7 @@ const seed_queues = [_]SeedQueue{
             .{ .queue = "data-imports", .payload = "{\"source\":\"postgres\",\"table\":\"legacy_orders\",\"batch_size\":5000}", .scheduled_at = "2026-04-01T02:00:00Z", .tags = "[\"import\",\"migration\"]" },
             .{ .queue = "data-imports", .payload = "{\"source\":\"hubspot\",\"object\":\"deals\",\"records\":8300}", .scheduled_at = "2026-04-02T06:00:00Z", .tags = "[\"import\",\"crm\"]" },
         },
+        .reject_first = 2,
     },
     // --- webhook-delivery ---
     .{
