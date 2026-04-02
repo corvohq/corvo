@@ -22,6 +22,7 @@ pub const ClusterInfo = struct {
 pub var g_cluster_info: ?*const ClusterInfo = null;
 pub var g_admin_password: []const u8 = "";
 pub var g_config: ?*const @import("config.zig").ServerConfig = null;
+pub var g_cluster_node: ?*@import("cluster.zig").ClusterNode = null;
 const ui_embed = @import("ui_embed");
 
 
@@ -76,6 +77,8 @@ pub fn dispatch(
         return authStatus(send_buf);
     if (std.mem.eql(u8, api, "/auth/login") and method == .POST)
         return handleLogin(send_buf, body);
+    if (std.mem.eql(u8, api, "/cluster/join") and method == .POST)
+        return handleClusterJoin(send_buf, body);
 
     const rdr = reader orelse return writeError(send_buf, 503, "no_mirror");
 
@@ -129,6 +132,12 @@ fn serverInfo(send_buf: []u8) u32 {
         w.fieldInt("purge_threshold", @as(i64, cfg.purge_threshold));
         w.fieldInt("purge_retention_ns", @as(i64, @intCast(cfg.purge_retention_ns)));
         w.fieldInt("worker_timeout_ns", @as(i64, @intCast(cfg.worker_timeout_ns)));
+        if (cfg.discover_dns_name.len > 0)
+            w.fieldStr("discover_dns_name", cfg.discover_dns_name);
+        if (cfg.node_id.len > 0)
+            w.fieldStr("node_id", cfg.node_id);
+        if (cfg.peers.len > 0)
+            w.fieldStr("peers", cfg.peers);
     }
 
     w.endObject();
@@ -215,6 +224,51 @@ fn hexDigit(c: u8) ?u4 {
     if (c >= 'a' and c <= 'f') return @intCast(c - 'a' + 10);
     if (c >= 'A' and c <= 'F') return @intCast(c - 'A' + 10);
     return null;
+}
+
+// ============================================================================
+// Cluster join
+// ============================================================================
+
+fn handleClusterJoin(send_buf: []u8, body: []const u8) u32 {
+    const cn = g_cluster_node orelse
+        return writeError(send_buf, 400, "not in cluster mode");
+
+    if (!cn.isLeader()) {
+        const state = cn.election.currentState();
+        var body_buf: [256]u8 = undefined;
+        var w = json.JsonWriter.init(&body_buf);
+        w.beginObject();
+        w.fieldStr("error", "not leader");
+        w.fieldStr("leader_id", state.leader_id);
+        w.endObject();
+        return http.writeResponse(send_buf, 409, w.getWritten());
+    }
+
+    const node_id = extractJSONString(body, "node_id") orelse
+        return writeError(send_buf, 400, "missing node_id");
+    const addr_str = extractJSONString(body, "addr") orelse
+        return writeError(send_buf, 400, "missing addr");
+
+    // Parse addr as host:port.
+    const colon = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse
+        return writeError(send_buf, 400, "invalid addr format");
+    const host = addr_str[0..colon];
+    const port = std.fmt.parseInt(u16, addr_str[colon + 1 ..], 10) catch
+        return writeError(send_buf, 400, "invalid addr port");
+    const addr = std.net.Address.parseIp(host, port) catch
+        return writeError(send_buf, 400, "invalid addr IP");
+
+    cn.addPeer(node_id, addr);
+
+    var resp_buf: [256]u8 = undefined;
+    var w = json.JsonWriter.init(&resp_buf);
+    w.beginObject();
+    w.fieldStr("status", "ok");
+    w.fieldStr("node_id", node_id);
+    w.fieldStr("leader_id", cn.config.node_id);
+    w.endObject();
+    return http.writeResponse(send_buf, 200, w.getWritten());
 }
 
 // ============================================================================

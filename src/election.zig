@@ -70,7 +70,8 @@ pub const Config = struct {
 pub const Election = struct {
     mu: std.Thread.Mutex = .{},
     node_id: []const u8,
-    peers: []const []const u8, // not including self
+    peer_storage: [max_peers][]const u8 = undefined,
+    peer_count: u8 = 0,
     config: Config,
 
     // Current state.
@@ -117,23 +118,29 @@ pub const Election = struct {
     ///   - config durations must be positive.
     ///   - RenewInterval < LeaseDuration.
     ///   - No peer ID may equal nodeID.
+    fn peers(self: *const Election) []const []const u8 {
+        return self.peer_storage[0..self.peer_count];
+    }
+
     pub fn init(
         allocator: std.mem.Allocator,
         node_id: []const u8,
-        peers: []const []const u8,
+        initial_peers: []const []const u8,
         config: Config,
     ) Election {
         assert.check(node_id.len > 0, "Election.init: empty nodeID", .{});
-        assert.check(peers.len <= max_peers, "Election.init: too many peers", .{});
+        assert.check(initial_peers.len <= max_peers, "Election.init: too many peers", .{});
         assert.check(config.lease_duration > 0, "Election.init: LeaseDuration must be > 0", .{});
         assert.check(config.renew_interval > 0, "Election.init: RenewInterval must be > 0", .{});
         assert.check(config.election_timeout > 0, "Election.init: ElectionTimeout must be > 0", .{});
         assert.check(config.renew_interval < config.lease_duration,
             "Election.init: RenewInterval must be < LeaseDuration", .{});
 
-        for (peers) |pid| {
+        var storage: [max_peers][]const u8 = undefined;
+        for (initial_peers, 0..) |pid, i| {
             assert.check(pid.len > 0, "Election.init: empty peer ID", .{});
             assert.check(!std.mem.eql(u8, pid, node_id), "Election.init: peer has same ID as self", .{});
+            storage[i] = pid;
         }
 
         // Hash node_id to create a deterministic jitter seed unique per node.
@@ -145,13 +152,33 @@ pub const Election = struct {
 
         return .{
             .node_id = node_id,
-            .peers = peers,
+            .peer_storage = storage,
+            .peer_count = @intCast(initial_peers.len),
             .config = config,
             .votes_received = std.StringHashMap(bool).init(allocator),
             .heartbeat_acks = std.StringHashMap(bool).init(allocator),
             .allocator = allocator,
             .jitter_state = seed,
         };
+    }
+
+    /// Add a peer at runtime (e.g., via cluster join).
+    /// Caller must ensure node_id lifetime outlives the Election.
+    pub fn addPeer(self: *Election, peer_id: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        assert.check(peer_id.len > 0, "Election.addPeer: empty peer ID", .{});
+        assert.check(!std.mem.eql(u8, peer_id, self.node_id), "Election.addPeer: peer has same ID as self", .{});
+        assert.check(self.peer_count < max_peers, "Election.addPeer: too many peers", .{});
+
+        // Check for duplicate.
+        for (self.peer_storage[0..self.peer_count]) |existing| {
+            if (std.mem.eql(u8, existing, peer_id)) return;
+        }
+
+        self.peer_storage[self.peer_count] = peer_id;
+        self.peer_count += 1;
     }
 
     pub fn deinit(self: *Election) void {
@@ -239,7 +266,7 @@ pub const Election = struct {
 
     fn tickLeader(self: *Election, now: i64) []const Message {
         // Single-node cluster: always the leader.
-        if (self.peers.len == 0) {
+        if (self.peer_count == 0) {
             self.lease_expiry = now + self.config.lease_duration;
             return self.out_buf[0..0];
         }
@@ -290,7 +317,7 @@ pub const Election = struct {
         assert.check(self.epoch == prev_epoch + 1, "becomeCandidate: epoch not monotonic", .{});
 
         // Single-node cluster: self-vote is majority.
-        if (self.peers.len == 0) {
+        if (self.peer_count == 0) {
             return self.becomeLeader(now);
         }
 
@@ -299,7 +326,7 @@ pub const Election = struct {
         }
 
         // Send proposals to all peers with our log seq so they can reject stale candidates.
-        for (self.peers, 0..) |peer, i| {
+        for (self.peers(), 0..) |peer, i| {
             self.out_buf[i] = .{
                 .type_ = .propose,
                 .from = self.node_id,
@@ -309,7 +336,7 @@ pub const Election = struct {
                 .config_hash = self.config_hash,
             };
         }
-        return self.out_buf[0..self.peers.len];
+        return self.out_buf[0..self.peer_count];
     }
 
     fn becomeLeader(self: *Election, now: i64) []const Message {
@@ -322,7 +349,7 @@ pub const Election = struct {
         self.heartbeat_acks.clearRetainingCapacity();
         self.votes_received.clearRetainingCapacity();
 
-        if (self.peers.len == 0) {
+        if (self.peer_count == 0) {
             return self.out_buf[0..0];
         }
         return self.sendHeartbeats(now);
@@ -346,7 +373,7 @@ pub const Election = struct {
         self.last_renew_time = now;
         self.heartbeat_acks.clearRetainingCapacity();
 
-        for (self.peers, 0..) |peer, i| {
+        for (self.peers(), 0..) |peer, i| {
             self.out_buf[i] = .{
                 .type_ = .heartbeat,
                 .from = self.node_id,
@@ -355,7 +382,7 @@ pub const Election = struct {
                 .config_hash = self.config_hash,
             };
         }
-        return self.out_buf[0..self.peers.len];
+        return self.out_buf[0..self.peer_count];
     }
 
     // --- Message handlers ---
@@ -550,7 +577,7 @@ pub const Election = struct {
     // --- Helpers ---
 
     fn majority(self: *const Election) u32 {
-        const total: u32 = @intCast(self.peers.len + 1);
+        const total: u32 = @as(u32, self.peer_count) + 1;
         return total / 2 + 1;
     }
 

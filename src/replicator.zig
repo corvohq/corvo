@@ -113,6 +113,19 @@ pub const Replicator = struct {
         };
     }
 
+    /// Add a follower at runtime (e.g., via cluster join).
+    pub fn addFollower(self: *Replicator, peer_id: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        assert.check(peer_id.len > 0, "Replicator.addFollower: empty peer ID", .{});
+        assert.check(!std.mem.eql(u8, peer_id, self.node_id), "Replicator.addFollower: peer same as self", .{});
+
+        // Idempotent — skip if already tracked.
+        if (self.followers.contains(peer_id)) return;
+        self.followers.put(peer_id, .{ .id = peer_id }) catch unreachable;
+    }
+
     pub fn deinit(self: *Replicator) void {
         self.followers.deinit();
         self.waiters.deinit(self.allocator);

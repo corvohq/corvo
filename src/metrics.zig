@@ -130,6 +130,7 @@ pub const ClusterEventType = enum(u8) {
     follower_started = 3,
     snapshot_sent = 4,
     snapshot_received = 5,
+    peer_joined = 6,
 };
 
 pub const ClusterEvent = struct {
@@ -150,6 +151,7 @@ pub const ClusterEvent = struct {
             .follower_started => "follower_started",
             .snapshot_sent => "snapshot_sent",
             .snapshot_received => "snapshot_received",
+            .peer_joined => "peer_joined",
         };
     }
 };

@@ -365,6 +365,8 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
                 return writeRoute(rpc.MSG_MODIFY_SETTING, "", "webhook_create");
             if (std.mem.eql(u8, api, "/auth/login"))
                 return .read;
+            if (std.mem.eql(u8, api, "/cluster/join"))
+                return .read;
 
             if (std.mem.eql(u8, api, "/jobs/bulk-get"))
                 return .read;

@@ -29,6 +29,7 @@ pub const ServerConfig = struct {
     node_id: []const u8 = "",
     peers: []const u8 = "",
     cluster_port: u16 = 0, // 0 = server port + 1000
+    discover_dns_name: []const u8 = "", // DNS name for peer auto-discovery
 
     // ================================================================
     // Shared settings (included in cluster hash — must match across nodes)
@@ -105,7 +106,6 @@ pub const ServerConfig = struct {
         InvalidMaxPayloadSize,
         InvalidMaxConns,
         InvalidMaxQueues,
-        ClusterMissingPeers,
         ClusterMissingNodeId,
     };
 
@@ -117,9 +117,9 @@ pub const ServerConfig = struct {
             return error.InvalidMaxConns;
         if (self.max_queues == 0)
             return error.InvalidMaxQueues;
-        if (self.node_id.len > 0 and self.peers.len == 0)
-            return error.ClusterMissingPeers;
         if (self.node_id.len == 0 and self.peers.len > 0)
+            return error.ClusterMissingNodeId;
+        if (self.discover_dns_name.len > 0 and self.node_id.len == 0)
             return error.ClusterMissingNodeId;
     }
 
@@ -189,6 +189,8 @@ pub const ServerConfig = struct {
             self.peers = val;
         } else if (eql(key, "cluster-port")) {
             self.cluster_port = parseInt(u16, val) orelse return error.InvalidValue;
+        } else if (eql(key, "discover-dns-name")) {
+            self.discover_dns_name = val;
         } else if (eql(key, "admin-password")) {
             self.admin_password = val;
         } else {
@@ -342,13 +344,19 @@ test "config: cluster hash ignores node-local params" {
 
 test "config: validate catches bad config" {
     {
+        // node_id alone is valid (bootstrap mode).
         var c = ServerConfig{};
         c.node_id = "node-1";
-        try testing.expectError(error.ClusterMissingPeers, c.validate());
+        try c.validate();
     }
     {
         var c = ServerConfig{};
         c.peers = "node-2@10.0.0.2:9878";
+        try testing.expectError(error.ClusterMissingNodeId, c.validate());
+    }
+    {
+        var c = ServerConfig{};
+        c.discover_dns_name = "corvo.svc.cluster.local";
         try testing.expectError(error.ClusterMissingNodeId, c.validate());
     }
     {

@@ -172,6 +172,25 @@ pub const ClusterNode = struct {
         }
     }
 
+    /// Add a peer to the cluster at runtime (called by join handler).
+    /// Updates transport, election, and replicator (if leader).
+    pub fn addPeer(self: *ClusterNode, peer_id: []const u8, addr: std.net.Address) void {
+        self.transport.addPeer(peer_id, addr);
+        self.election.addPeer(peer_id);
+        if (self.replicator) |r| r.addFollower(peer_id);
+
+        std.debug.print("cluster: added peer {s}\n", .{peer_id});
+
+        var ev = metrics_mod.ClusterEvent{
+            .type_ = .peer_joined,
+            .epoch = self.election.currentState().epoch,
+            .timestamp_ns = @intCast(@as(i128, std.time.nanoTimestamp())),
+        };
+        const detail = std.fmt.bufPrint(&ev.detail_buf, "{s}", .{peer_id}) catch "";
+        ev.detail_len = @intCast(detail.len);
+        self.events.push(ev);
+    }
+
     pub fn isLeader(self: *ClusterNode) bool {
         return self.is_leader_flag.load(.monotonic);
     }
