@@ -13,26 +13,6 @@
       <button hx-post="{{bp}}/api/v1/queues/{{queue_name}}/drain" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-indigo-500 hover:bg-indigo-600">Drain</button>
     </div>
   </div>
-  {{#has_stats}}
-  <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
-      <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Pending</div>
-      <div class="mt-2 text-2xl font-semibold tracking-tight text-blue-700 dark:text-blue-400">{{pending}}</div>
-    </div>
-    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
-      <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Active</div>
-      <div class="mt-2 text-2xl font-semibold tracking-tight text-emerald-700 dark:text-emerald-400">{{active}}</div>
-    </div>
-    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
-      <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Dead</div>
-      <div class="mt-2 text-2xl font-semibold tracking-tight text-red-600 dark:text-red-400">{{dead}}</div>
-    </div>
-    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
-      <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Completed</div>
-      <div class="mt-2 text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">{{completed_display}}</div>
-    </div>
-  </div>
-  {{/has_stats}}
   <div class="flex flex-col sm:flex-row sm:items-center gap-3">
     <div class="flex flex-wrap gap-1">
       {{#filter_tabs}}
@@ -48,7 +28,10 @@
     <button type="submit" class="rounded-md bg-zinc-900 dark:bg-zinc-100 px-3 py-1.5 text-sm font-medium text-white dark:text-zinc-900 hover:bg-zinc-700 dark:hover:bg-zinc-300">Search Tags</button>
     {{#has_tag_search}}<a href="{{clear_tag_url}}" class="rounded-md border border-zinc-300 dark:border-zinc-700 px-3 py-1.5 text-sm font-medium text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800">Clear</a>{{/has_tag_search}}
   </form>
-  {{#completed_hint}}<p class="text-sm text-zinc-500 dark:text-zinc-400 py-4">{{completed_hint}}</p>{{/completed_hint}}
+  {{#completed_hint}}<div class="flex items-start gap-3 rounded-xl border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950 p-4">
+    <svg class="w-5 h-5 shrink-0 text-blue-500 mt-0.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M12 11v5"/></svg>
+    <span class="text-sm text-blue-700 dark:text-blue-300">{{completed_hint}}</span>
+  </div>{{/completed_hint}}
   {{> job_table}}
   {{> pagination}}
 </div>

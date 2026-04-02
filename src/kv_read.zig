@@ -153,6 +153,7 @@ pub const QueueStats = struct {
     scheduled: i32 = 0,
     completed: i32 = 0,
     dead: i32 = 0,
+    cancelled: i32 = 0,
     held: i32 = 0,
     paused: bool = false,
     oldest_pending_at: [32]u8 = undefined,
@@ -533,6 +534,7 @@ pub const Reader = struct {
                 .scheduled = @intCast(q.scheduled_count),
                 .completed = @intCast(q.completed_count),
                 .dead = @intCast(q.dead_count),
+                .cancelled = @intCast(q.cancelled_count),
                 .held = @intCast(q.held_count),
             };
             copyField(&row.name, &row.name_len, q.name);

@@ -171,6 +171,7 @@ pub const Queue = struct {
     retrying_count: u32 = 0,
     completed_count: u32 = 0,
     dead_count: u32 = 0,
+    cancelled_count: u32 = 0,
     scheduled_count: u32 = 0,
     held_count: u32 = 0,
 
@@ -191,13 +192,13 @@ pub const Queue = struct {
             .dead => &self.dead_count,
             .scheduled => &self.scheduled_count,
             .held => &self.held_count,
-            .cancelled => &self.dead_count, // cancelled counted as dead
+            .cancelled => &self.cancelled_count,
         };
     }
 
     pub fn totalJobs(self: *const Queue) u32 {
         return self.pending_count +| self.active_count +| self.retrying_count +|
-            self.completed_count +| self.dead_count +| self.scheduled_count +| self.held_count;
+            self.completed_count +| self.dead_count +| self.cancelled_count +| self.scheduled_count +| self.held_count;
     }
 };
 

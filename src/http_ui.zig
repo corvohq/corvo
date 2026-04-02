@@ -167,10 +167,10 @@ fn queueDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, queue_name: []const
     const paused = if (qs) |q| q.paused else false;
 
     // Filter tabs — preserve tag params in URLs.
-    const filter_states = [_]?[]const u8{ null, "pending", "active", "retrying", "dead", "completed", "scheduled", "held" };
-    const filter_labels = [_][]const u8{ "All", "Pending", "Active", "Retrying", "Dead", "Completed", "Scheduled", "Held" };
-    var tab_url_bufs: [8][256]u8 = undefined;
-    var filter_tabs: [8]FilterTabView = undefined;
+    const filter_states = [_]?[]const u8{ null, "pending", "active", "retrying", "dead", "cancelled", "completed", "scheduled", "held" };
+    const filter_labels = [_][]const u8{ "All", "Pending", "Active", "Retrying", "Dead", "Cancelled", "Completed", "Scheduled", "Held" };
+    var tab_url_bufs: [9][256]u8 = undefined;
+    var filter_tabs: [9]FilterTabView = undefined;
     for (filter_states, filter_labels, 0..) |fs, fl, i| {
         var s = std.io.fixedBufferStream(&tab_url_bufs[i]);
         s.writer().print("/ui/queues/{s}", .{queue_name}) catch {};
@@ -236,6 +236,7 @@ fn queueDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, queue_name: []const
         .pending = if (qs) |q| q.pending else @as(i32, 0),
         .active = if (qs) |q| q.active else @as(i32, 0),
         .dead = if (qs) |q| q.dead else @as(i32, 0),
+        .cancelled = if (qs) |q| q.cancelled else @as(i32, 0),
         .completed = if (qs) |q| q.completed else @as(i32, 0),
         .completed_display = formatCompleted(&detail_completed_buf, if (qs) |q| q.completed else 0),
         .filter_tabs = tabs,
@@ -672,10 +673,12 @@ fn dashboardStatsPartial(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
     var total_pending: i64 = 0;
     var total_active: i64 = 0;
     var total_dead: i64 = 0;
+    var total_cancelled: i64 = 0;
     for (queue_buf[0..queues.len]) |q| {
         total_pending += q.pending;
         total_active += q.active;
         total_dead += q.dead;
+        total_cancelled += q.cancelled;
     }
     const worker_count: i32 = if (reader) |rdr| rdr.countWorkers() else 0;
     const bars = if (queues.len > 0) buildBarViews(queue_buf[0..queues.len], &bar_buf) else bar_buf[0..0];
@@ -687,6 +690,7 @@ fn dashboardStatsPartial(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
         .total_pending = total_pending,
         .total_active = total_active,
         .total_dead = total_dead,
+        .total_cancelled = total_cancelled,
         .queue_count = @as(i64, @intCast(queues.len)),
         .worker_count = worker_count,
         .enqueued_total = if (g_metrics) |m| m.enqueued_total else @as(u64, 0),
@@ -806,6 +810,7 @@ const QueueView = struct {
     active: i32,
     retrying: i32,
     dead: i32,
+    cancelled: i32,
     completed: i32,
     completed_display: []const u8,
     scheduled: i32,
@@ -824,6 +829,7 @@ fn getQueueViews(reader: ?*kv_read.Reader, queue_buf: []kv_read.QueueStats, view
             .active = q.active,
             .retrying = q.retrying,
             .dead = q.dead,
+            .cancelled = q.cancelled,
             .completed = q.completed,
             .completed_display = formatCompleted(&completed_bufs[i], q.completed),
             .scheduled = q.scheduled,
@@ -1013,12 +1019,13 @@ fn filterCount(q: *const kv_read.QueueStats, state: ?[]const u8) i32 {
         if (eql(s, "active")) return q.active;
         if (eql(s, "retrying")) return q.retrying;
         if (eql(s, "dead")) return q.dead;
+        if (eql(s, "cancelled")) return q.cancelled;
         if (eql(s, "completed")) return q.completed;
         if (eql(s, "scheduled")) return q.scheduled;
         if (eql(s, "held")) return q.held;
         return 0;
     }
-    return q.pending + q.active + q.retrying + q.dead + q.completed + q.scheduled + q.held;
+    return q.pending + q.active + q.retrying + q.dead + q.cancelled + q.completed + q.scheduled + q.held;
 }
 
 fn queueStateCount(q: *const kv_read.QueueStats, state: ?[]const u8) u32 {

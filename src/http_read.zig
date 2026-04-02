@@ -251,6 +251,7 @@ pub fn metrics(send_buf: []u8, reader: ?*kv_read.Reader, server_metrics: ?*const
                     .{ "scheduled", q.scheduled },
                     .{ "completed", q.completed },
                     .{ "dead", q.dead },
+                    .{ "cancelled", q.cancelled },
                     .{ "held", q.held },
                 }) |pair| {
                     pos += (std.fmt.bufPrint(
@@ -422,6 +423,7 @@ fn queues(send_buf: []u8, reader: *kv_read.Reader) u32 {
         jw.fieldInt("active", q.active);
         jw.fieldInt("retrying", q.retrying);
         jw.fieldInt("dead", q.dead);
+        jw.fieldInt("cancelled", q.cancelled);
         jw.fieldInt("completed", q.completed);
         jw.fieldInt("scheduled", q.scheduled);
         jw.fieldInt("held", q.held);

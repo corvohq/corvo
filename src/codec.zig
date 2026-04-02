@@ -340,7 +340,7 @@ pub fn decodeJob(data: []const u8) types.Job {
 // Queue Config Codec
 // ============================================================================
 //
-// Fixed fields (50 bytes):
+// Fixed fields (54 bytes):
 //   [0]     version (u8)
 //   [1]     flags (u8): bit0=paused, bit1=fairness
 //   [2..5]  max_concurrency (u32 LE)
@@ -352,13 +352,14 @@ pub fn decodeJob(data: []const u8) types.Job {
 //   [30..33] retrying_count (u32 LE)
 //   [34..37] completed_count (u32 LE)
 //   [38..41] dead_count (u32 LE)
-//   [42..45] scheduled_count (u32 LE)
-//   [46..49] held_count (u32 LE)
+//   [42..45] cancelled_count (u32 LE)
+//   [46..49] scheduled_count (u32 LE)
+//   [50..53] held_count (u32 LE)
 //
 // Variable fields:
 //   name
 
-const queue_fixed_size: usize = 50;
+const queue_fixed_size: usize = 54;
 pub const max_queue_encoded_size: usize = 512;
 
 pub fn encodeQueue(buf: []u8, q: *const types.Queue) []const u8 {
@@ -383,6 +384,7 @@ pub fn encodeQueue(buf: []u8, q: *const types.Queue) []const u8 {
     pos = writeU32LE(buf, pos, q.retrying_count);
     pos = writeU32LE(buf, pos, q.completed_count);
     pos = writeU32LE(buf, pos, q.dead_count);
+    pos = writeU32LE(buf, pos, q.cancelled_count);
     pos = writeU32LE(buf, pos, q.scheduled_count);
     pos = writeU32LE(buf, pos, q.held_count);
 
@@ -438,6 +440,9 @@ pub fn decodeQueue(data: []const u8) types.Queue {
     const dc = readU32LE(data, pos);
     pos = dc.next;
     q.dead_count = dc.val;
+    const xc = readU32LE(data, pos);
+    pos = xc.next;
+    q.cancelled_count = xc.val;
     const sc = readU32LE(data, pos);
     pos = sc.next;
     q.scheduled_count = sc.val;
@@ -860,6 +865,7 @@ test "queue encode/decode roundtrip" {
         .retrying_count = 3,
         .completed_count = 1000,
         .dead_count = 5,
+        .cancelled_count = 8,
         .scheduled_count = 12,
         .held_count = 2,
     };
@@ -881,6 +887,7 @@ test "queue encode/decode roundtrip" {
     try testing.expectEqual(@as(u32, 3), decoded.retrying_count);
     try testing.expectEqual(@as(u32, 1000), decoded.completed_count);
     try testing.expectEqual(@as(u32, 5), decoded.dead_count);
+    try testing.expectEqual(@as(u32, 8), decoded.cancelled_count);
     try testing.expectEqual(@as(u32, 12), decoded.scheduled_count);
     try testing.expectEqual(@as(u32, 2), decoded.held_count);
 }

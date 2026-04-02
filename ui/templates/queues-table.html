@@ -7,6 +7,7 @@
   <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Active</th>
   <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Retrying</th>
   <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Dead</th>
+  <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Cancelled</th>
   <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Completed</th>
   <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Scheduled</th>
   <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Held</th>
@@ -21,6 +22,7 @@
   <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{active}}</td>
   <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{retrying}}</td>
   <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{dead}}</td>
+  <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{cancelled}}</td>
   <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{completed_display}}</td>
   <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{scheduled}}</td>
   <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{held}}</td>
@@ -31,7 +33,7 @@
 </tr>
 {{/queues}}
 {{^queues}}
-<tr><td colspan="9" class="px-6 py-8 text-center text-zinc-500 dark:text-zinc-400">No queues</td></tr>
+<tr><td colspan="10" class="px-6 py-8 text-center text-zinc-500 dark:text-zinc-400">No queues</td></tr>
 {{/queues}}
 </tbody>
 </table>
