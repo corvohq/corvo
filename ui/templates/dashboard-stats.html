@@ -1,5 +1,5 @@
 {{#has_data}}
-<div class="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
+<div class="grid grid-cols-2 lg:grid-cols-7 gap-4 mb-6">
   <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
     <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Total Pending</div>
     <div class="mt-2 text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">{{total_pending}}</div>
@@ -19,6 +19,14 @@
   <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
     <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Workers</div>
     <div class="mt-2 text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">{{worker_count}}</div>
+  </div>
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
+    <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Enqueued</div>
+    <div class="mt-2 text-2xl font-semibold tracking-tight text-indigo-600 dark:text-indigo-400">{{enqueued_total}}</div>
+  </div>
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
+    <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Processed</div>
+    <div class="mt-2 text-2xl font-semibold tracking-tight text-emerald-600 dark:text-emerald-400">{{processed_total}}</div>
   </div>
 </div>
 {{#has_bars}}
@@ -50,14 +58,14 @@
   <tbody class="divide-y divide-zinc-100 dark:divide-zinc-800">
   {{#failures}}
   <tr class="hover:bg-zinc-50 dark:hover:bg-zinc-800">
-    <td class="px-6 py-3 font-mono text-xs"><a href="/ui/jobs/{{id}}" class="text-indigo-600 dark:text-indigo-400 hover:underline">{{id}}</a></td>
+    <td class="px-6 py-3 font-mono text-xs"><a href="{{bp}}/ui/jobs/{{id}}" class="text-indigo-600 dark:text-indigo-400 hover:underline">{{id}}</a></td>
     <td class="px-6 py-3 text-zinc-700 dark:text-zinc-300">{{queue}}</td>
     <td class="px-6 py-3 text-zinc-700 dark:text-zinc-300">{{priority}}</td>
     <td class="px-6 py-3 text-zinc-700 dark:text-zinc-300">{{attempt}}/{{max_retries}}</td>
     <td class="px-6 py-3 text-zinc-700 dark:text-zinc-300"><time data-ts="{{created_at}}">{{created_at}}</time></td>
     <td class="px-6 py-3"><div class="flex gap-1">
-      <button hx-post="/api/v1/jobs/{{id}}/retry" hx-swap="none" class="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-800">Retry</button>
-      <button hx-post="/api/v1/jobs/{{id}}/delete" hx-swap="none" class="text-xs font-medium text-red-600 dark:text-red-400 hover:text-red-800">Delete</button>
+      <button hx-post="{{bp}}/api/v1/jobs/{{id}}/retry" hx-swap="none" class="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-800">Retry</button>
+      <button hx-post="{{bp}}/api/v1/jobs/{{id}}/delete" hx-swap="none" class="text-xs font-medium text-red-600 dark:text-red-400 hover:text-red-800">Delete</button>
     </div></td>
   </tr>
   {{/failures}}

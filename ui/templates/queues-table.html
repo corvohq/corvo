@@ -16,12 +16,12 @@
 <tbody class="divide-y divide-zinc-100 dark:divide-zinc-800">
 {{#queues}}
 <tr class="hover:bg-zinc-50 dark:hover:bg-zinc-800">
-  <td class="px-6 py-3 font-medium"><a href="/ui/queues/{{name}}" class="text-indigo-600 dark:text-indigo-400 hover:underline">{{name}}</a></td>
+  <td class="px-6 py-3 font-medium"><a href="{{bp}}/ui/queues/{{name}}" class="text-indigo-600 dark:text-indigo-400 hover:underline">{{name}}</a></td>
   <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{pending}}</td>
   <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{active}}</td>
   <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{retrying}}</td>
   <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{dead}}</td>
-  <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{completed}}</td>
+  <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{completed_display}}</td>
   <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{scheduled}}</td>
   <td class="px-6 py-3 text-right text-zinc-700 dark:text-zinc-300 tabular-nums">{{held}}</td>
   <td class="px-6 py-3">

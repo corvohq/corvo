@@ -13,6 +13,13 @@ const ui_embed = @import("ui_embed");
 /// Whether admin password auth is enabled (set by main.zig).
 pub var g_auth_enabled: bool = false;
 
+/// Whether completed jobs are persisted in KV (set by main.zig).
+/// When false, completed counts show "-" instead of "0".
+pub var g_persist_completed: bool = false;
+
+/// Server-wide metrics (lifetime counters). Set by main.zig.
+pub var g_metrics: ?*const @import("metrics.zig").ServerMetrics = null;
+
 
 /// Max HTML body size. Pages render into a buffer of this size.
 /// Mustache templates with dark mode classes + inline SVG icons need headroom.
@@ -47,6 +54,7 @@ const login_tmpl = zigstache.Template.parse(ui_embed.login_html) catch unreachab
 const api_keys_tmpl = zigstache.Template.parse(ui_embed.api_keys_html) catch unreachable;
 const webhooks_tmpl = zigstache.Template.parse(ui_embed.webhooks_html) catch unreachable;
 const audit_logs_tmpl = zigstache.Template.parse(ui_embed.audit_logs_html) catch unreachable;
+const cron_jobs_tmpl = zigstache.Template.parse(ui_embed.cron_jobs_html) catch unreachable;
 
 // ============================================================================
 // Dispatch
@@ -70,6 +78,7 @@ pub fn dispatch(path: []const u8, query: []const u8, send_buf: []u8, reader: ?*k
     if (eql(path, "/api-keys")) return apiKeysPage(send_buf, reader);
     if (eql(path, "/webhooks")) return webhooksPage(send_buf, reader);
     if (eql(path, "/audit-logs")) return auditLogsPage(send_buf, reader);
+    if (eql(path, "/cron-jobs")) return cronJobsPage(send_buf, reader, query);
 
     // HTMX partial routes (fragments, no layout).
     if (eql(path, "/partials/dashboard-stats")) return dashboardStatsPartial(send_buf, reader);
@@ -123,7 +132,8 @@ fn dashboard(send_buf: []u8, _: ?*kv_read.Reader) u32 {
 fn queuesPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
     var queue_buf: [64]kv_read.QueueStats = undefined;
     var views: [64]QueueView = undefined;
-    const queues = getQueueViews(reader, &queue_buf, &views);
+    var completed_bufs: [64][16]u8 = undefined;
+    const queues = getQueueViews(reader, &queue_buf, &views, &completed_bufs);
 
     var content_buf: [page_buf_size]u8 = undefined;
     const content = queues_tmpl.renderWithPartials(&content_buf, .{
@@ -134,6 +144,7 @@ fn queuesPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
 }
 
 fn queueDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, queue_name: []const u8, query: []const u8) u32 {
+    var detail_completed_buf: [16]u8 = undefined;
     const state_filter = getQueryParam(query, "state");
     const tag_key = getQueryParam(query, "tag_key");
     const tag_value = getQueryParam(query, "tag_value");
@@ -226,11 +237,16 @@ fn queueDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, queue_name: []const
         .active = if (qs) |q| q.active else @as(i32, 0),
         .dead = if (qs) |q| q.dead else @as(i32, 0),
         .completed = if (qs) |q| q.completed else @as(i32, 0),
+        .completed_display = formatCompleted(&detail_completed_buf, if (qs) |q| q.completed else 0),
         .filter_tabs = tabs,
         .tag_key = if (tag_key) |tk| tk else "",
         .tag_value = if (tag_value) |tv| tv else "",
         .has_tag_search = has_tag_search,
         .clear_tag_url = clear_tag_s.getWritten(),
+        .completed_hint = if (!g_persist_completed and state_filter != null and eql(state_filter.?, "completed"))
+            "Completed jobs are not persisted. Enable --persist-completed to retain them."
+        else
+            "",
         .has_bulk = true,
         .bulk_actions = bulk_actions,
         .has_jobs = count > 0,
@@ -548,6 +564,62 @@ fn webhooksPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
     return renderPage(send_buf, "Webhooks", content);
 }
 
+fn cronJobsPage(send_buf: []u8, reader: ?*kv_read.Reader, query: []const u8) u32 {
+    const rdr = reader orelse return renderPage(send_buf, "Cron Jobs", "<p class=\"text-zinc-500 dark:text-zinc-400\">No data available</p>");
+
+    const page = parsePageParam(query);
+    const offset: u32 = page * max_table_rows;
+
+    const total: u32 = rdr.countCrons();
+    const total_pages = if (total > 0) (total + max_table_rows - 1) / max_table_rows else 1;
+
+    var cron_buf: [max_table_rows]kv_read.CronRow = undefined;
+    const count: usize = rdr.listCrons(&cron_buf, max_table_rows, offset);
+
+    const CronView = struct {
+        id: []const u8,
+        name: []const u8,
+        queue: []const u8,
+        schedule: []const u8,
+        enabled: bool,
+    };
+
+    var views: [max_table_rows]CronView = undefined;
+    for (0..count) |i| {
+        const row = &cron_buf[i];
+        views[i] = .{
+            .id = row.idSlice(),
+            .name = row.nameSlice(),
+            .queue = row.queueSlice(),
+            .schedule = row.scheduleSlice(),
+            .enabled = row.enabled,
+        };
+    }
+
+    // Pagination.
+    var nav_bufs: [4][256]u8 = undefined;
+    var page_links: [10]PageLink = undefined;
+    var page_url_bufs: [10][256]u8 = undefined;
+    const pag = buildPaginationData("/ui/cron-jobs?", page, total_pages, &nav_bufs, &page_links, &page_url_bufs);
+
+    var content_buf: [page_buf_size]u8 = undefined;
+    const content = cron_jobs_tmpl.renderWithPartials(&content_buf, .{
+        .crons = views[0..count],
+        .has_pages = pag.has_pages,
+        .page_display = pag.page_display,
+        .total_pages = pag.total_pages,
+        .has_prev = pag.has_prev,
+        .prev_url = pag.prev_url,
+        .first_url = pag.first_url,
+        .has_next = pag.has_next,
+        .next_url = pag.next_url,
+        .last_url = pag.last_url,
+        .pages = pag.pages,
+    }, .{ .pagination = &pagination_tmpl }) catch
+        return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
+    return renderPage(send_buf, "Cron Jobs", content);
+}
+
 fn auditLogsPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
     var entries_buf: [200]kv_read.AuditEntryRow = undefined;
     const count: usize = if (reader) |rdr| rdr.listAuditEntries(&entries_buf) else 0;
@@ -589,12 +661,13 @@ fn auditLogsPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
 fn dashboardStatsPartial(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
     var queue_buf: [max_table_rows]kv_read.QueueStats = undefined;
     var queue_views: [max_table_rows]QueueView = undefined;
+    var completed_bufs: [64][16]u8 = undefined;
     var bar_buf: [max_table_rows]BarView = undefined;
     var job_buf: [10]kv_read.JobRow = undefined;
     var failure_views: [10]FailureView = undefined;
 
     const has_data = reader != null;
-    const queues = getQueueViews(reader, &queue_buf, &queue_views);
+    const queues = getQueueViews(reader, &queue_buf, &queue_views, &completed_bufs);
 
     var total_pending: i64 = 0;
     var total_active: i64 = 0;
@@ -616,6 +689,8 @@ fn dashboardStatsPartial(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
         .total_dead = total_dead,
         .queue_count = @as(i64, @intCast(queues.len)),
         .worker_count = worker_count,
+        .enqueued_total = if (g_metrics) |m| m.enqueued_total else @as(u64, 0),
+        .processed_total = if (g_metrics) |m| m.completed_total else @as(u64, 0),
         .has_bars = queues.len > 0,
         .chart_w = @as(u32, 600),
         .chart_total_h = @as(u32, 190),
@@ -632,7 +707,8 @@ fn dashboardStatsPartial(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
 fn queuesTablePartial(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
     var queue_buf: [64]kv_read.QueueStats = undefined;
     var views: [64]QueueView = undefined;
-    const queues = getQueueViews(reader, &queue_buf, &views);
+    var completed_bufs: [64][16]u8 = undefined;
+    const queues = getQueueViews(reader, &queue_buf, &views, &completed_bufs);
 
     var buf: [page_buf_size]u8 = undefined;
     const result = queues_table_tmpl.render(&buf, .{
@@ -731,12 +807,13 @@ const QueueView = struct {
     retrying: i32,
     dead: i32,
     completed: i32,
+    completed_display: []const u8,
     scheduled: i32,
     held: i32,
     paused: bool,
 };
 
-fn getQueueViews(reader: ?*kv_read.Reader, queue_buf: []kv_read.QueueStats, views: []QueueView) []const QueueView {
+fn getQueueViews(reader: ?*kv_read.Reader, queue_buf: []kv_read.QueueStats, views: []QueueView, completed_bufs: *[64][16]u8) []const QueueView {
     const rdr = reader orelse return views[0..0];
     const count = rdr.getQueueStats(queue_buf[0..@min(queue_buf.len, 64)]);
     for (0..count) |i| {
@@ -748,12 +825,19 @@ fn getQueueViews(reader: ?*kv_read.Reader, queue_buf: []kv_read.QueueStats, view
             .retrying = q.retrying,
             .dead = q.dead,
             .completed = q.completed,
+            .completed_display = formatCompleted(&completed_bufs[i], q.completed),
             .scheduled = q.scheduled,
             .held = q.held,
             .paused = q.paused,
         };
     }
     return views[0..count];
+}
+
+/// Format completed count: "-" when persist_completed=false and count is 0.
+fn formatCompleted(buf: *[16]u8, count: i32) []const u8 {
+    if (!g_persist_completed and count == 0) return "-";
+    return std.fmt.bufPrint(buf, "{d}", .{count}) catch "0";
 }
 
 fn getJobViews(

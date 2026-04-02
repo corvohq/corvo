@@ -4,16 +4,16 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Login - Corvo</title>
-  <link rel="icon" href="/ui/favicon.svg">
-  <link rel="stylesheet" href="/ui/tailwind.css">
+  <link rel="icon" href="{{bp}}/ui/favicon.svg">
+  <link rel="stylesheet" href="{{bp}}/ui/tailwind.css">
   <script>if(localStorage.getItem('theme')==='dark'||(localStorage.getItem('theme')===null&&matchMedia('(prefers-color-scheme:dark)').matches))document.documentElement.classList.add('dark')</script>
 </head>
 <body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 min-h-screen flex items-center justify-center">
   <div class="w-full max-w-sm px-4">
     <div class="text-center mb-8">
-      <img src="/ui/logo-full.svg" alt="Corvo" class="h-8 mx-auto mb-2">
+      <img src="{{bp}}/ui/logo-full.svg" alt="Corvo" class="h-8 mx-auto mb-2">
     </div>
-    <form method="POST" action="/api/v1/auth/login" class="bg-white dark:bg-zinc-900 rounded-lg shadow-sm p-6 border border-zinc-200 dark:border-zinc-800">
+    <form method="POST" action="{{bp}}/api/v1/auth/login" class="bg-white dark:bg-zinc-900 rounded-lg shadow-sm p-6 border border-zinc-200 dark:border-zinc-800">
       {{#has_error}}<div class="mb-4 text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 rounded-md px-3 py-2">Invalid password.</div>{{/has_error}}
       <label class="block text-sm font-medium mb-2" for="password">Admin Password</label>
       <input type="password" name="password" id="password" required autofocus

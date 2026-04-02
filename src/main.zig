@@ -470,9 +470,12 @@ pub fn main() !void {
         http_read.g_cluster_info = &cluster_info;
     }
 
-    // --- Admin auth ---
+    // --- Admin auth + config ---
     http_read.g_admin_password = config.admin_password;
+    http_read.g_config = &config;
     corvo.http_ui.g_auth_enabled = config.admin_password.len > 0;
+    corvo.http_ui.g_persist_completed = config.persist_completed;
+    corvo.http_ui.g_metrics = &handler.metrics;
 
     std.debug.print("corvo: listening on {s}:{d} (rpc+http)\n", .{ config.bind, config.port });
 

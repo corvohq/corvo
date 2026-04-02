@@ -617,7 +617,40 @@ pub const Reader = struct {
         return cronToRow(&c);
     }
 
-    pub fn listCrons(self: *Reader, results: []CronRow) u32 {
+    pub fn listCrons(self: *Reader, results: []CronRow, limit: u32, offset: u32) u32 {
+        var batch = self.store.newBatch();
+        defer batch.close();
+
+        var lower_buf: keys.KeyBuf = undefined;
+        var upper_buf: keys.KeyBuf = undefined;
+        const p = keys.prefix_cron;
+        @memcpy(lower_buf[0..p.len], p);
+        const upper = keys.prefixEnd(&upper_buf, lower_buf[0..p.len]) orelse return 0;
+
+        var iter = batch.newIter(lower_buf[0..p.len], upper);
+        defer iter.close();
+
+        const actual_limit = @min(limit, @as(u32, @intCast(results.len)));
+        var skipped: u32 = 0;
+        var count: u32 = 0;
+        if (!iter.first()) return 0;
+        while (true) {
+            if (skipped < offset) {
+                skipped += 1;
+                if (!iter.next()) break;
+                continue;
+            }
+            if (count >= actual_limit) break;
+            const val = iter.value();
+            const c = codec.decodeCron(val);
+            results[count] = cronToRow(&c);
+            count += 1;
+            if (!iter.next()) break;
+        }
+        return count;
+    }
+
+    pub fn countCrons(self: *Reader) u32 {
         var batch = self.store.newBatch();
         defer batch.close();
 
@@ -633,10 +666,6 @@ pub const Reader = struct {
         var count: u32 = 0;
         if (!iter.first()) return 0;
         while (true) {
-            if (count >= results.len) break;
-            const val = iter.value();
-            const c = codec.decodeCron(val);
-            results[count] = cronToRow(&c);
             count += 1;
             if (!iter.next()) break;
         }

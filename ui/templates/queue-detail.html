@@ -8,9 +8,9 @@
     <div class="flex items-center gap-2">
       <button onclick="corvoExport('json','{{export_state}}','{{queue_name}}')" class="border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md px-3 py-1.5 text-xs font-medium text-zinc-600 dark:text-zinc-400">JSON</button>
       <button onclick="corvoExport('csv','{{export_state}}','{{queue_name}}')" class="border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md px-3 py-1.5 text-xs font-medium text-zinc-600 dark:text-zinc-400">CSV</button>
-      <button hx-post="/api/v1/queues/{{queue_name}}/pause" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-amber-500 hover:bg-amber-600">Pause</button>
-      <button hx-post="/api/v1/queues/{{queue_name}}/resume" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-emerald-500 hover:bg-emerald-600">Resume</button>
-      <button hx-post="/api/v1/queues/{{queue_name}}/drain" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-indigo-500 hover:bg-indigo-600">Drain</button>
+      <button hx-post="{{bp}}/api/v1/queues/{{queue_name}}/pause" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-amber-500 hover:bg-amber-600">Pause</button>
+      <button hx-post="{{bp}}/api/v1/queues/{{queue_name}}/resume" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-emerald-500 hover:bg-emerald-600">Resume</button>
+      <button hx-post="{{bp}}/api/v1/queues/{{queue_name}}/drain" hx-swap="none" class="px-3 py-1.5 text-xs font-medium text-white rounded-md bg-indigo-500 hover:bg-indigo-600">Drain</button>
     </div>
   </div>
   {{#has_stats}}
@@ -29,7 +29,7 @@
     </div>
     <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm p-6">
       <div class="text-sm font-medium text-zinc-500 dark:text-zinc-400">Completed</div>
-      <div class="mt-2 text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">{{completed}}</div>
+      <div class="mt-2 text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">{{completed_display}}</div>
     </div>
   </div>
   {{/has_stats}}
@@ -48,6 +48,7 @@
     <button type="submit" class="rounded-md bg-zinc-900 dark:bg-zinc-100 px-3 py-1.5 text-sm font-medium text-white dark:text-zinc-900 hover:bg-zinc-700 dark:hover:bg-zinc-300">Search Tags</button>
     {{#has_tag_search}}<a href="{{clear_tag_url}}" class="rounded-md border border-zinc-300 dark:border-zinc-700 px-3 py-1.5 text-sm font-medium text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800">Clear</a>{{/has_tag_search}}
   </form>
+  {{#completed_hint}}<p class="text-sm text-zinc-500 dark:text-zinc-400 py-4">{{completed_hint}}</p>{{/completed_hint}}
   {{> job_table}}
   {{> pagination}}
 </div>

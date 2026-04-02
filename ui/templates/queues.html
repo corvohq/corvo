@@ -1,3 +1,3 @@
-<div id="queues-table" hx-get="/ui/partials/queues-table" hx-trigger="every 5s, corvo:refresh from:body" hx-swap="innerHTML">
+<div id="queues-table" hx-get="{{bp}}/ui/partials/queues-table" hx-trigger="every 5s, corvo:refresh from:body" hx-swap="innerHTML">
 {{> table}}
 </div>

@@ -21,6 +21,7 @@ pub const ClusterInfo = struct {
 
 pub var g_cluster_info: ?*const ClusterInfo = null;
 pub var g_admin_password: []const u8 = "";
+pub var g_config: ?*const @import("config.zig").ServerConfig = null;
 const ui_embed = @import("ui_embed");
 
 
@@ -67,7 +68,7 @@ pub fn dispatch(
 
     // Static routes (no mirror needed).
     if (std.mem.eql(u8, api, "/info"))
-        return http.writeResponse(send_buf, 200, "{\"version\":\"0.1.0b\",\"engine\":\"zig\"}");
+        return serverInfo(send_buf);
     if (std.mem.eql(u8, api, "/debug/runtime")) return debugRuntime(send_buf);
     if (std.mem.eql(u8, api, "/cluster/status"))
         return clusterStatus(send_buf);
@@ -99,6 +100,39 @@ pub fn dispatch(
     if (std.mem.eql(u8, api, "/metrics/throughput"))
         return throughputMetrics(send_buf, server_metrics);
     return writeError(send_buf, 404, "not found");
+}
+
+// ============================================================================
+// Server info
+// ============================================================================
+
+fn serverInfo(send_buf: []u8) u32 {
+    var body_buf: [4096]u8 = undefined;
+    var w = json.JsonWriter.init(&body_buf);
+    w.beginObject();
+    w.fieldStr("version", "0.1.0b");
+    w.fieldStr("engine", "zig");
+
+    if (g_config) |cfg| {
+        w.fieldStr("bind", cfg.bind);
+        w.fieldInt("port", cfg.port);
+        w.fieldStr("data_dir", cfg.data_dir);
+        w.fieldInt("max_conns", cfg.max_conns);
+        w.fieldInt("max_payload_size", @as(i64, cfg.max_payload_size));
+        w.fieldInt("max_queues", @as(i64, cfg.max_queues));
+        w.fieldInt("max_jobs", @as(i64, cfg.max_jobs));
+        w.fieldInt("max_tags_per_queue", @as(i64, cfg.max_tags_per_queue));
+        w.fieldBool("persist_completed", cfg.persist_completed);
+        w.fieldBool("sync_replication", cfg.sync_replication);
+        w.fieldBool("cluster_mode", cfg.clusterMode());
+        w.fieldBool("admin_password_set", cfg.admin_password.len > 0);
+        w.fieldInt("purge_threshold", @as(i64, cfg.purge_threshold));
+        w.fieldInt("purge_retention_ns", @as(i64, @intCast(cfg.purge_retention_ns)));
+        w.fieldInt("worker_timeout_ns", @as(i64, @intCast(cfg.worker_timeout_ns)));
+    }
+
+    w.endObject();
+    return http.writeResponse(send_buf, 200, w.getWritten());
 }
 
 // ============================================================================
@@ -349,6 +383,9 @@ fn throughputMetrics(send_buf: []u8, server_metrics: ?*const metrics_mod.ServerM
     const snap = sm.throughput.snapshot(now_ns);
 
     w.beginObject();
+    w.fieldInt("enqueued_total", sm.enqueued_total);
+    w.fieldInt("completed_total", sm.completed_total);
+    w.fieldInt("failed_total", sm.failed_total);
     w.fieldInt("enqueue_rate", snap.enqueue_rate);
     w.fieldInt("complete_rate", snap.complete_rate);
     w.fieldInt("fail_rate", snap.fail_rate);
@@ -419,7 +456,7 @@ fn workers(send_buf: []u8, reader: *kv_read.Reader) u32 {
 
 fn crons(send_buf: []u8, reader: *kv_read.Reader) u32 {
     var cron_buf: [64]kv_read.CronRow = undefined;
-    const count = reader.listCrons(&cron_buf);
+    const count = reader.listCrons(&cron_buf, 64, 0);
 
     var body_buf: [16384]u8 = undefined;
     var jw = json.JsonWriter.init(&body_buf);

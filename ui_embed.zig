@@ -29,6 +29,7 @@ pub const login_html = @embedFile("ui/templates/login.html");
 pub const api_keys_html = @embedFile("ui/templates/api-keys.html");
 pub const webhooks_html = @embedFile("ui/templates/webhooks.html");
 pub const audit_logs_html = @embedFile("ui/templates/audit-logs.html");
+pub const cron_jobs_html = @embedFile("ui/templates/cron-jobs.html");
 
 /// Largest embedded asset size. send_buf must fit this + HTTP headers (~200B).
 pub const max_asset_size: usize = htmx_js_gz.len;

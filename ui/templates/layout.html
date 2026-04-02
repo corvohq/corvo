@@ -4,10 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{{title}} - Corvo</title>
-  <link rel="icon" href="/ui/favicon.svg">
-  <link rel="stylesheet" href="/ui/tailwind.css">
-  <script src="/ui/htmx.min.js"></script>
-  <script>if(localStorage.getItem('theme')==='dark'||(localStorage.getItem('theme')===null&&matchMedia('(prefers-color-scheme:dark)').matches))document.documentElement.classList.add('dark')</script>
+  <link rel="icon" href="{{bp}}/ui/favicon.svg">
+  <link rel="stylesheet" href="{{bp}}/ui/tailwind.css">
+  <script src="{{bp}}/ui/htmx.min.js"></script>
+  <script>if(localStorage.getItem('theme')==='dark'||(localStorage.getItem('theme')===null&&matchMedia('(prefers-color-scheme:dark)').matches))document.documentElement.classList.add('dark');var corvoBasePath='{{bp}}';</script>
 </head>
 <body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 min-h-screen">
 
@@ -24,21 +24,22 @@
   <div class="absolute inset-0 bg-black/50" onclick="document.getElementById('mobile-sidebar').classList.add('hidden')"></div>
   <div class="absolute inset-y-0 left-0 w-56 bg-zinc-950 flex flex-col z-50">
     <div class="h-14 flex items-center px-4 border-b border-zinc-800">
-      <a href="/ui/" class="flex items-center gap-2">
-        <img src="/ui/logo-full.svg" alt="Corvo" class="h-6">
+      <a href="{{bp}}/ui/" class="flex items-center gap-2">
+        <img src="{{bp}}/ui/logo-full.svg" alt="Corvo" class="h-6">
       </a>
     </div>
     <nav class="flex-1 px-3 py-4 space-y-1">
-      <a href="/ui/" data-nav="/" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>Dashboard</a>
-      <a href="/ui/queues" data-nav="/queues" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3.75 12h16.5m-16.5-5.25h16.5m-16.5 10.5h16.5"/></svg>Queues</a>
-      <a href="/ui/scheduled" data-nav="/scheduled" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>Scheduled</a>
-      <a href="/ui/dead-letter" data-nav="/dead-letter" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>Dead Letter</a>
-      <a href="/ui/held" data-nav="/held" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>Held Jobs</a>
-      <a href="/ui/workers" data-nav="/workers" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M20 21a8 8 0 00-16 0"/></svg>Workers</a>
-      <a href="/ui/cluster" data-nav="/cluster" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><circle cx="6" cy="6" r="1" fill="currentColor"/><circle cx="6" cy="18" r="1" fill="currentColor"/></svg>Cluster</a>
-      <a href="/ui/api-keys" data-nav="/api-keys" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>API Keys</a>
-      <a href="/ui/webhooks" data-nav="/webhooks" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/></svg>Webhooks</a>
-      <a href="/ui/audit-logs" data-nav="/audit-logs" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/></svg>Audit Log</a>
+      <a href="{{bp}}/ui/" data-nav="/" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>Dashboard</a>
+      <a href="{{bp}}/ui/queues" data-nav="/queues" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3.75 12h16.5m-16.5-5.25h16.5m-16.5 10.5h16.5"/></svg>Queues</a>
+      <a href="{{bp}}/ui/scheduled" data-nav="/scheduled" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>Scheduled</a>
+      <a href="{{bp}}/ui/cron-jobs" data-nav="/cron-jobs" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h5"/><path d="M20 12A8 8 0 006.93 6.93L4 9"/><path d="M20 20v-5h-5"/><path d="M4 12a8 8 0 0013.07 5.07L20 15"/></svg>Cron Jobs</a>
+      <a href="{{bp}}/ui/dead-letter" data-nav="/dead-letter" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>Dead Letter</a>
+      <a href="{{bp}}/ui/held" data-nav="/held" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>Held Jobs</a>
+      <a href="{{bp}}/ui/workers" data-nav="/workers" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M20 21a8 8 0 00-16 0"/></svg>Workers</a>
+      <a href="{{bp}}/ui/cluster" data-nav="/cluster" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><circle cx="6" cy="6" r="1" fill="currentColor"/><circle cx="6" cy="18" r="1" fill="currentColor"/></svg>Cluster</a>
+      <a href="{{bp}}/ui/api-keys" data-nav="/api-keys" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>API Keys</a>
+      <a href="{{bp}}/ui/webhooks" data-nav="/webhooks" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/></svg>Webhooks</a>
+      <a href="{{bp}}/ui/audit-logs" data-nav="/audit-logs" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white"><svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/></svg>Audit Log</a>
     </nav>
   </div>
 </div>
@@ -48,21 +49,22 @@
 <!-- Sidebar (desktop) -->
 <aside class="hidden md:flex w-56 bg-zinc-950 flex-col min-h-screen">
   <div class="h-14 flex items-center px-4 border-b border-zinc-800">
-    <a href="/ui/" class="flex items-center gap-2">
-      <img src="/ui/logo-full.svg" alt="Corvo" class="h-6">
+    <a href="{{bp}}/ui/" class="flex items-center gap-2">
+      <img src="{{bp}}/ui/logo-full.svg" alt="Corvo" class="h-6">
     </a>
   </div>
   <nav class="flex-1 px-3 py-4 space-y-1">
-    <a href="/ui/" data-nav="/" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Dashboard</a>
-    <a href="/ui/queues" data-nav="/queues" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Queues</a>
-    <a href="/ui/scheduled" data-nav="/scheduled" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Scheduled</a>
-    <a href="/ui/dead-letter" data-nav="/dead-letter" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Dead Letter</a>
-    <a href="/ui/held" data-nav="/held" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Held Jobs</a>
-    <a href="/ui/workers" data-nav="/workers" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Workers</a>
-    <a href="/ui/cluster" data-nav="/cluster" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Cluster</a>
-    <a href="/ui/api-keys" data-nav="/api-keys" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">API Keys</a>
-    <a href="/ui/webhooks" data-nav="/webhooks" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Webhooks</a>
-    <a href="/ui/audit-logs" data-nav="/audit-logs" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Audit Log</a>
+    <a href="{{bp}}/ui/" data-nav="/" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Dashboard</a>
+    <a href="{{bp}}/ui/queues" data-nav="/queues" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Queues</a>
+    <a href="{{bp}}/ui/scheduled" data-nav="/scheduled" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Scheduled</a>
+    <a href="{{bp}}/ui/cron-jobs" data-nav="/cron-jobs" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Cron Jobs</a>
+    <a href="{{bp}}/ui/dead-letter" data-nav="/dead-letter" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Dead Letter</a>
+    <a href="{{bp}}/ui/held" data-nav="/held" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Held Jobs</a>
+    <a href="{{bp}}/ui/workers" data-nav="/workers" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Workers</a>
+    <a href="{{bp}}/ui/cluster" data-nav="/cluster" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Cluster</a>
+    <a href="{{bp}}/ui/api-keys" data-nav="/api-keys" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">API Keys</a>
+    <a href="{{bp}}/ui/webhooks" data-nav="/webhooks" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Webhooks</a>
+    <a href="{{bp}}/ui/audit-logs" data-nav="/audit-logs" class="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors text-zinc-400 hover:bg-zinc-800 hover:text-white">Audit Log</a>
   </nav>
 </aside>
 
@@ -82,9 +84,9 @@
         <svg class="w-5 h-5 dark:hidden" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
         <svg class="w-5 h-5 hidden dark:block" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
       </button>
-      <button hx-get="/ui/partials/enqueue-form" hx-target="#modal" hx-swap="innerHTML"
+      <button hx-get="{{bp}}/ui/partials/enqueue-form" hx-target="#modal" hx-swap="innerHTML"
         class="bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:bg-zinc-800 dark:hover:bg-zinc-200 rounded-md px-3 py-1.5 md:px-4 md:py-2 text-xs md:text-sm font-medium">Enqueue</button>
-      {{#show_logout}}<a href="/ui/logout" class="p-2 rounded-md text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800" title="Logout">
+      {{#show_logout}}<a href="{{bp}}/ui/logout" class="p-2 rounded-md text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800" title="Logout">
         <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
       </a>{{/show_logout}}
     </div>
@@ -143,12 +145,12 @@ var msg=action.charAt(0).toUpperCase()+action.slice(1)+' '+ids.length+' job'+(id
 if(action==='delete')msg+=' This cannot be undone.';
 if(!confirm(msg))return;
 }
-fetch('/api/v1/jobs/bulk',{method:'POST',headers:{'Content-Type':'application/json'},
+fetch(corvoBasePath+'/api/v1/jobs/bulk',{method:'POST',headers:{'Content-Type':'application/json'},
 body:JSON.stringify({action:action,job_ids:ids})})
 .then(function(){sessionStorage.setItem('corvo_toast','Bulk action completed');location.reload()})
 }
 (function(){
-var p=location.pathname.replace(/^\/ui/,'').replace(/\/$/,'')||'/';
+var p=location.pathname.replace(new RegExp('^'+corvoBasePath+'/ui'),'').replace(/\/$/,'')||'/';
 document.querySelectorAll('[data-nav]').forEach(function(a){
 var d=a.dataset.nav;
 if(d==='/'?(p==='/'||p===''):p.indexOf(d)===0)
@@ -178,7 +180,7 @@ function corvoExport(fmt,state,queue){
 var body={limit:500};
 if(state)body.state=[state];
 if(queue)body.queue=queue;
-fetch('/api/v1/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+fetch(corvoBasePath+'/api/v1/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
 .then(function(r){return r.json()})
 .then(function(data){
 var jobs=data.jobs||[];
@@ -214,7 +216,7 @@ var pri=d.get('priority');if(pri)body.priority=pri;
 var mr=d.get('max_retries');if(mr!=='')body.max_retries=parseInt(mr,10);
 var sa=d.get('scheduled_at');if(sa)body.scheduled_at=new Date(sa).toISOString();
 var uk=d.get('unique_key');if(uk)body.unique_key=uk;
-fetch('/api/v1/enqueue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+fetch(corvoBasePath+'/api/v1/enqueue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
 .then(function(r){
 if(r.ok){
 document.getElementById('modal').innerHTML='';

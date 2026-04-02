@@ -24,7 +24,7 @@
 {{#jobs}}
 <tr class="hover:bg-zinc-50 dark:hover:bg-zinc-800">
   {{#has_cb}}<td class="px-6 py-3"><input type="checkbox" class="job-cb rounded" data-id="{{id}}" onchange="corvoUpdateBulk()"></td>{{/has_cb}}
-  <td class="px-6 py-3 font-mono text-xs"><a href="/ui/jobs/{{id}}" class="text-indigo-600 dark:text-indigo-400 hover:underline">{{id}}</a></td>
+  <td class="px-6 py-3 font-mono text-xs"><a href="{{bp}}/ui/jobs/{{id}}" class="text-indigo-600 dark:text-indigo-400 hover:underline">{{id}}</a></td>
   <td class="px-6 py-3 text-zinc-700 dark:text-zinc-300">{{queue}}</td>
   <td class="px-6 py-3"><span class="{{state_class}}">{{state}}</span></td>
   <td class="px-6 py-3 text-zinc-700 dark:text-zinc-300">{{priority}}</td>
