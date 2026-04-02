@@ -400,7 +400,7 @@ fn rpcLifecycleWorker(config: BenchConfig, _: u32) WorkerResult {
     var client = RpcClient.connect(config.host, config.port) catch return .{ .errors = 1 };
     defer client.close();
 
-    const timeval = std.posix.timeval{ .sec = 1, .usec = 0 };
+    const timeval = std.posix.timeval{ .sec = 0, .usec = 10_000 }; // 10ms
     std.posix.setsockopt(client.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
 
     var total_ops: u64 = 0;
@@ -420,7 +420,7 @@ fn rpcLifecycleWorker(config: BenchConfig, _: u32) WorkerResult {
         const header = rpc.readHeader(client.stream) catch {
             if (g_lifecycle_done.load(.monotonic) >= g_lifecycle_target) break;
             empty_streak += 1;
-            if (empty_streak > 5) break;
+            if (empty_streak > 100) break;
             continue;
         };
 
@@ -433,7 +433,7 @@ fn rpcLifecycleWorker(config: BenchConfig, _: u32) WorkerResult {
                 const fetched = parseFetchPayload(client.recv_buf[0..header.payload_len], &fetched_buf);
                 if (fetched == 0) {
                     empty_streak += 1;
-                    if (empty_streak > 5) break;
+                    if (empty_streak > 100) break;
                     continue;
                 }
                 empty_streak = 0;
