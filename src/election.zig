@@ -778,3 +778,45 @@ test "matching config hash allows election" {
     _ = e1.step(votes[0], 100);
     try testing.expect(e1.isLeader());
 }
+
+test "addPeer dynamically adds a peer" {
+    const allocator = testing.allocator;
+
+    // Start as single node — becomes leader immediately.
+    var e1 = Election.init(allocator, "node-1", &.{}, testConfig());
+    defer e1.deinit();
+    _ = e1.tick(100);
+    try testing.expect(e1.isLeader());
+    try testing.expectEqual(@as(u8, 0), e1.peer_count);
+
+    // Add a peer at runtime.
+    e1.addPeer("node-2");
+    try testing.expectEqual(@as(u8, 1), e1.peer_count);
+    try testing.expectEqualStrings("node-2", e1.peers()[0]);
+
+    // Duplicate add is idempotent.
+    e1.addPeer("node-2");
+    try testing.expectEqual(@as(u8, 1), e1.peer_count);
+
+    // Heartbeats now include the new peer.
+    const msgs = e1.tick(300);
+    try testing.expectEqual(@as(usize, 1), msgs.len);
+    try testing.expectEqualStrings("node-2", msgs[0].to);
+}
+
+test "addPeer updates majority calculation" {
+    const allocator = testing.allocator;
+
+    // Single node: majority = 1 (self).
+    var e = Election.init(allocator, "node-1", &.{}, testConfig());
+    defer e.deinit();
+    try testing.expectEqual(@as(u32, 1), e.majority());
+
+    // Add one peer: 2 nodes, majority = 2.
+    e.addPeer("node-2");
+    try testing.expectEqual(@as(u32, 2), e.majority());
+
+    // Add another: 3 nodes, majority = 2.
+    e.addPeer("node-3");
+    try testing.expectEqual(@as(u32, 2), e.majority());
+}

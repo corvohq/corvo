@@ -429,3 +429,27 @@ test "replicator stale epoch ack ignored" {
     r.step(.{ .type_ = .ack, .from = "node-2", .to = "node-1", .epoch = 1, .seq = 5 });
     try t.expectEqual(@as(u64, 0), r.minAcked()); // not updated
 }
+
+test "addFollower adds peer at runtime" {
+    const t = std.testing;
+    var r = Replicator.init(testing_alloc, "node-1", 1, &.{}, 1000);
+    defer r.deinit();
+
+    // No followers initially.
+    try t.expectEqual(@as(usize, 0), r.followers.count());
+
+    // Add a follower.
+    r.addFollower("node-2");
+    try t.expectEqual(@as(usize, 1), r.followers.count());
+
+    // Idempotent.
+    r.addFollower("node-2");
+    try t.expectEqual(@as(usize, 1), r.followers.count());
+
+    // Replicate reaches the new follower.
+    const entries = [_]Entry{.{ .seq = 1, .shard_id = 0, .data = "hello" }};
+    const msgs = r.replicate(&entries);
+    defer testing_alloc.free(msgs);
+    try t.expectEqual(@as(usize, 1), msgs.len);
+    try t.expectEqualStrings("node-2", msgs[0].to);
+}
