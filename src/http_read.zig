@@ -245,9 +245,9 @@ fn handleClusterJoin(send_buf: []u8, body: []const u8) u32 {
         return http.writeResponse(send_buf, 409, w.getWritten());
     }
 
-    const node_id = extractJSONString(body, "node_id") orelse
+    const node_id = http.extractJSONString(body, "node_id") orelse
         return writeError(send_buf, 400, "missing node_id");
-    const addr_str = extractJSONString(body, "addr") orelse
+    const addr_str = http.extractJSONString(body, "addr") orelse
         return writeError(send_buf, 400, "missing addr");
 
     // Parse addr as host:port.
@@ -693,21 +693,28 @@ fn jobSearchPost(send_buf: []u8, reader: *kv_read.Reader, body_input: []const u8
     jw.beginObject();
     jw.beginArrayField("jobs");
 
-    const text_filter = extractJSONString(body_input, "payload_contains");
-    const queue_filter = extractJSONString(body_input, "queue");
-    var state_strs: [1][]const u8 = undefined;
-    const state_count = extractJSONStringArray(body_input, "state", &state_strs);
-    const state_filter = if (state_count > 0) state_strs[0] else null;
-    const limit_val = extractJSONInt(body_input, "limit");
+    const text_filter = http.extractJSONString(body_input, "payload_contains");
+    const queue_filter = http.extractJSONString(body_input, "queue");
+    var state_strs: [8][]const u8 = undefined;
+    const state_count = http.extractJSONStringArray(body_input, "state", &state_strs);
+    const limit_val = http.extractJSONInt(body_input, "limit");
     const limit: u32 = if (limit_val) |l| @intCast(@min(@max(l, 1), 500)) else 100;
 
-    var job_buf: [100]kv_read.JobRow = undefined;
+    var job_buf: [500]kv_read.JobRow = undefined;
     const actual_limit = @min(limit, @as(u32, @intCast(job_buf.len)));
     var count: u32 = 0;
 
     if (text_filter) |q| {
         count = reader.searchPayload(q, job_buf[0..actual_limit]);
+    } else if (state_count > 1) {
+        // Multi-state: query each state separately, accumulate results up to limit.
+        for (0..state_count) |si| {
+            const remaining = actual_limit - count;
+            if (remaining == 0) break;
+            count += reader.queryJobsByQueueState(queue_filter, state_strs[si], remaining, 0, job_buf[count..]);
+        }
     } else {
+        const state_filter = if (state_count > 0) state_strs[0] else null;
         count = reader.queryJobsByQueueState(queue_filter, state_filter, actual_limit, 0, &job_buf);
     }
 
@@ -722,7 +729,7 @@ fn jobSearchPost(send_buf: []u8, reader: *kv_read.Reader, body_input: []const u8
 
 fn bulkGetJobs(send_buf: []u8, reader: *kv_read.Reader, body: []const u8) u32 {
     var id_buf: [100][]const u8 = undefined;
-    const id_count = extractJSONStringArray(body, "job_ids", &id_buf);
+    const id_count = http.extractJSONStringArray(body, "job_ids", &id_buf);
     if (id_count == 0) return writeError(send_buf, 400, "job_ids required");
 
     var body_buf: [32768]u8 = undefined;
@@ -874,59 +881,3 @@ fn writeError(send_buf: []u8, status: u16, msg: []const u8) u32 {
     return http.writeResponse(send_buf, status, jw.getWritten());
 }
 
-// ============================================================================
-// JSON extraction helpers (moved from pipeline — needed by jobSearchPost)
-// ============================================================================
-
-pub fn extractJSONString(body: []const u8, key: []const u8) ?[]const u8 {
-    // Find "key":"value" pattern.
-    var search_buf: [128]u8 = undefined;
-    const search_key = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;
-    const start = std.mem.indexOf(u8, body, search_key) orelse return null;
-    const val_start = start + search_key.len;
-    if (val_start >= body.len) return null;
-    const end = std.mem.indexOfScalar(u8, body[val_start..], '"') orelse return null;
-    return body[val_start..][0..end];
-}
-
-pub fn extractJSONInt(body: []const u8, key: []const u8) ?i64 {
-    var search_buf: [128]u8 = undefined;
-    const search_key = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
-    const start = std.mem.indexOf(u8, body, search_key) orelse return null;
-    const val_start = start + search_key.len;
-    if (val_start >= body.len) return null;
-
-    // Skip whitespace.
-    var i = val_start;
-    while (i < body.len and (body[i] == ' ' or body[i] == '\t')) i += 1;
-    if (i >= body.len) return null;
-
-    // Parse integer.
-    var end = i;
-    if (end < body.len and body[end] == '-') end += 1;
-    while (end < body.len and body[end] >= '0' and body[end] <= '9') end += 1;
-    if (end == i) return null;
-    return std.fmt.parseInt(i64, body[i..end], 10) catch null;
-}
-
-pub fn extractJSONStringArray(body: []const u8, key: []const u8, out: [][]const u8) usize {
-    var search_buf: [128]u8 = undefined;
-    const search_key = std.fmt.bufPrint(&search_buf, "\"{s}\":[", .{key}) catch return 0;
-    const start = std.mem.indexOf(u8, body, search_key) orelse return 0;
-    const arr_start = start + search_key.len;
-    if (arr_start >= body.len) return 0;
-
-    var count: usize = 0;
-    var i = arr_start;
-    while (i < body.len and count < out.len) {
-        // Find next string.
-        const q1 = std.mem.indexOfScalar(u8, body[i..], '"') orelse break;
-        const str_start = i + q1 + 1;
-        if (str_start >= body.len) break;
-        const q2 = std.mem.indexOfScalar(u8, body[str_start..], '"') orelse break;
-        out[count] = body[str_start..][0..q2];
-        count += 1;
-        i = str_start + q2 + 1;
-    }
-    return count;
-}
