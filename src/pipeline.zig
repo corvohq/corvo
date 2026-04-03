@@ -136,6 +136,52 @@ pub fn Pipeline(comptime IoBackend: type) type {
         subscriptions_fulfilled: u64 = 0,
         maintenance_runs: u64 = 0,
 
+        // Per-phase timing accumulators (nanoseconds). Reset every 100 ticks.
+        // Set enable_phase_timing to true to profile tick phases.
+        // When false, Timer becomes a no-op struct — zero cost at comptime.
+        phase_drain_ns: u64 = 0,
+        phase_extract_ns: u64 = 0,
+        phase_execute_ns: u64 = 0,
+        phase_encode_ns: u64 = 0,
+        phase_fulfill_ns: u64 = 0,
+        phase_flush_ns: u64 = 0,
+        phase_compact_ns: u64 = 0,
+        phase_requeue_ns: u64 = 0,
+        phase_submit_ns: u64 = 0,
+        phase_cancel_ns: u64 = 0,
+        phase_webhook_ns: u64 = 0,
+        phase_maint_ns: u64 = 0,
+        phase_ticks: u64 = 0,
+        phase_frames: u64 = 0,
+        phase_fulfills: u64 = 0,
+
+        // Sub-phase accumulators for executeBatch breakdown.
+        exec_apply_ns: u64 = 0,
+        exec_commit_ns: u64 = 0,
+        exec_notify_ns: u64 = 0,
+        exec_oplog_ns: u64 = 0,
+        exec_ticks: u64 = 0,
+
+        // Phase timing — flip to true to profile tick phases.
+        const enable_phase_timing = false;
+
+        const Timer = if (enable_phase_timing) struct {
+            t: i64,
+            pub fn start(clock: *const fn () i64) @This() {
+                return .{ .t = clock() };
+            }
+            pub fn elapsed(self: @This(), clock: *const fn () i64) u64 {
+                return @intCast(@max(0, clock() - self.t));
+            }
+        } else struct {
+            pub fn start(_: anytype) @This() { return .{}; }
+            pub fn elapsed(_: @This(), _: anytype) u64 { return 0; }
+        };
+
+        fn addPhase(val: *u64, ns: u64) void {
+            if (enable_phase_timing) val.* +|= ns;
+        }
+
         const max_batch_jobs = rpc.MAX_BATCH_JOBS;
         const max_frames: u32 = 256;
         const max_completions: u32 = 256;
@@ -366,13 +412,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
             // ---- Phase 3: Normal batch processing ----
 
+            const clock = self.config.clock_fn;
+            const t_drain = Timer.start(clock);
+
             // 1. Drain IO completions.
-            //    When prepare slots are pending (waiting for follower ack), use
-            //    non-blocking drain: the ack arrives via atomic (TCP thread), not
-            //    via io_uring CQE, so blocking drain would stall forever when no
-            //    other SQEs are in-flight.
-            //    With coalescing (sync-repl + no pending slots), the IO layer
-            //    collects CQEs for up to coalesce_window_ns to build a larger batch.
             const has_pending = self.prepare_count > 0;
             const coalesce = !has_pending and self.config.sync_replication and
                 self.config.repl_hook != null and self.config.coalesce_window_ns > 0;
@@ -381,11 +424,13 @@ pub fn Pipeline(comptime IoBackend: type) type {
             else if (coalesce)
                 self.io.drainCoalescing(
                     &self.completions,
-                    self.config.clock_fn,
-                    @as(u64, @intCast(self.config.clock_fn())) + self.config.coalesce_window_ns,
+                    clock,
+                    @as(u64, @intCast(clock())) + self.config.coalesce_window_ns,
                 )
             else
                 self.io.drain(&self.completions);
+
+            addPhase(&self.phase_drain_ns, t_drain.elapsed(clock));
 
             // Reset per-tick state.
             self.frame_count = 0;
@@ -417,7 +462,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     .send_done => {
                         const c = self.io.conn(completion.conn_id);
                         if (c.protocol == .webhook) {
-                            // Webhook send done → wait for HTTP response.
                             self.io.queueRecv(completion.conn_id);
                         } else if (c.recv_pos > 0) {
                             var dup = false;
@@ -451,38 +495,53 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
             self.deferred_recv_conn_count = 0;
 
+            const t_extract = Timer.start(clock);
             for (recv_conns[0..recv_conn_count]) |conn_id| {
                 self.extractFrames(conn_id);
             }
+            addPhase(&self.phase_extract_ns, t_extract.elapsed(clock));
 
             // Run scheduled maintenance in its own batch, committed before client ops.
+            const t_maint = Timer.start(clock);
             self.runMaintenance();
+            addPhase(&self.phase_maint_ns, t_maint.elapsed(clock));
 
             if (self.frame_count == 0) {
                 if (self.notified_queue_count > 0) {
+                    const tf = Timer.start(clock);
                     self.fulfillSubscriptions();
+                    addPhase(&self.phase_fulfill_ns, tf.elapsed(clock));
+                    const tfl = Timer.start(clock);
                     self.flushSends();
+                    addPhase(&self.phase_flush_ns, tfl.elapsed(clock));
                 }
+                const tc = Timer.start(clock);
                 self.compactRecvBufs();
+                addPhase(&self.phase_compact_ns, tc.elapsed(clock));
+                const tr = Timer.start(clock);
                 self.requeueRecvs(recv_conns[0..recv_conn_count]);
+                addPhase(&self.phase_requeue_ns, tr.elapsed(clock));
+                const ts = Timer.start(clock);
                 self.io.submit();
+                addPhase(&self.phase_submit_ns, ts.elapsed(clock));
+                if (enable_phase_timing) {
+                    self.phase_frames += self.frame_count;
+                    self.phase_ticks += 1;
+                }
                 self.ticks_total += 1;
+                self.maybePrintPhaseStats();
                 return;
             }
 
             // 3. Execute: decode + apply in single kv.Batch.
+            const t_exec = Timer.start(clock);
             const seq_before = self.last_recorded_seq;
             self.executeBatch();
             const has_new_mutations = self.last_recorded_seq > seq_before;
+            addPhase(&self.phase_execute_ns, t_exec.elapsed(clock));
 
-            // 4. Sync replication with mutations: encode responses now (while
-            //    recv_buf slices are still valid), compact recv_bufs, then defer
-            //    sends until follower ack. No mutations = no replication needed.
+            // 4. Sync replication with mutations.
             if (self.config.sync_replication and self.config.repl_hook != null and has_new_mutations) {
-                // Capture ack_seq from executeBatch BEFORE fulfillSubscriptions,
-                // which may produce additional oplog entries for worker registration.
-                // Those entries are replicated but not waited for (matches old behavior
-                // where fulfillSubscriptions ran after the ack arrived).
                 const batch_ack_seq = self.last_recorded_seq;
 
                 self.encodeResponses();
@@ -491,12 +550,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 self.fulfillSubscriptions();
                 self.compactRecvBufs();
 
-                // Fast path: ack already arrived (TCP thread can race ahead).
                 if (self.last_acked_seq.load(.acquire) >= batch_ack_seq) {
                     self.flushSends();
                     self.requeueRecvs(recv_conns[0..recv_conn_count]);
                 } else {
-                    // Save to prepare slot — sends deferred until follower ack.
                     assert.check(
                         self.prepare_count < max_prepare_slots,
                         "pipeline: prepare slot overflow",
@@ -522,7 +579,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
 
             self.io.submit();
+            if (enable_phase_timing) {
+                self.phase_frames += self.frame_count;
+                self.phase_ticks += 1;
+            }
             self.ticks_total += 1;
+            self.maybePrintPhaseStats();
         }
 
         // ====================================================================
@@ -962,12 +1024,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
         // ====================================================================
 
         fn executeBatch(self: *Self) void {
+            const clock = self.config.clock_fn;
             self.handler.resetEffects();
             var kv_batch = self.stores[0].newBatch();
             defer kv_batch.close();
 
-            // Record mutations if we have a file-backed oplog OR a repl_hook
-            // (cluster mode needs mutation recording even without a file).
             const record_mutations = self.config.repl_hook != null;
             if (record_mutations) {
                 self.mut_list.clearRetainingCapacity();
@@ -975,20 +1036,52 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
             defer if (record_mutations) kv_batch.freeMutations();
 
+            const t_apply = Timer.start(clock);
             for (self.frames[0..self.frame_count], 0..) |*frame, i| {
                 self.results[i] = self.decodeAndApply(&kv_batch, frame, @intCast(i));
             }
+            addPhase(&self.exec_apply_ns, t_apply.elapsed(clock));
 
+            // Flush deferred indexes into the same batch AFTER all reads.
+            // Index writes don't pollute the overlay during handler.apply,
+            // but they're captured by mutation recording for replication.
+            self.handler.indexer.flush(&kv_batch);
+
+            const t_commit = Timer.start(clock);
             kv_batch.commit();
+            addPhase(&self.exec_commit_ns, t_commit.elapsed(clock));
             self.applied_total += self.frame_count;
 
             if (record_mutations and self.mut_list.items.len > 0) {
+                const t_oplog = Timer.start(clock);
                 self.recordOplog();
+                addPhase(&self.exec_oplog_ns, t_oplog.elapsed(clock));
             }
 
-            // Post-commit: notify queue waiters
+            const t_notify = Timer.start(clock);
             for (self.frames[0..self.frame_count], 0..) |frame, i| {
                 self.notifyForFrame(&frame, &self.results[i]);
+            }
+            addPhase(&self.exec_notify_ns, t_notify.elapsed(clock));
+
+            if (enable_phase_timing) {
+                self.exec_ticks += 1;
+                if (self.exec_ticks >= 100) {
+                    const t = self.exec_ticks;
+                    std.debug.print(
+                        \\  EXEC BREAKDOWN ({d} ticks, {d} frames): apply={d}us commit={d}us notify={d}us oplog={d}us
+                        \\
+                    , .{
+                        t, self.applied_total,
+                        self.exec_apply_ns / (t * 1000), self.exec_commit_ns / (t * 1000),
+                        self.exec_notify_ns / (t * 1000), self.exec_oplog_ns / (t * 1000),
+                    });
+                    self.exec_apply_ns = 0;
+                    self.exec_commit_ns = 0;
+                    self.exec_notify_ns = 0;
+                    self.exec_oplog_ns = 0;
+                    self.exec_ticks = 0;
+                }
             }
         }
 
@@ -1638,6 +1731,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
 
             if (did_fulfill) {
+                // Flush deferred indexes (fetch transitions) into same batch.
+                self.handler.indexer.flush(&kv_batch);
                 kv_batch.commit();
                 if (record_mutations and self.mut_list.items.len > 0) {
                     self.recordOplog();
@@ -1912,6 +2007,41 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
         /// No-op — mirror removed. Kept to avoid touching every callsite.
         fn emitMirrorOp(_: *Self, _: ops_mod.OpType, _: *const ops_mod.OpData, _: *const ops_mod.OpResult) void {}
+
+        fn maybePrintPhaseStats(self: *Self) void {
+            if (!enable_phase_timing) return;
+            if (self.phase_ticks < 100) return;
+            const t = self.phase_ticks;
+            std.debug.print(
+                \\TICK PHASES ({d} ticks, {d} frames, {d} fulfills):
+                \\  drain:    {d}us  extract:  {d}us  maint:   {d}us
+                \\  execute:  {d}us  encode:   {d}us  cancel:  {d}us
+                \\  webhook:  {d}us  fulfill:  {d}us  flush:   {d}us
+                \\  compact:  {d}us  requeue:  {d}us  submit:  {d}us
+                \\
+            , .{
+                t, self.phase_frames, self.phase_fulfills,
+                self.phase_drain_ns / (t * 1000), self.phase_extract_ns / (t * 1000), self.phase_maint_ns / (t * 1000),
+                self.phase_execute_ns / (t * 1000), self.phase_encode_ns / (t * 1000), self.phase_cancel_ns / (t * 1000),
+                self.phase_webhook_ns / (t * 1000), self.phase_fulfill_ns / (t * 1000), self.phase_flush_ns / (t * 1000),
+                self.phase_compact_ns / (t * 1000), self.phase_requeue_ns / (t * 1000), self.phase_submit_ns / (t * 1000),
+            });
+            self.phase_drain_ns = 0;
+            self.phase_extract_ns = 0;
+            self.phase_execute_ns = 0;
+            self.phase_encode_ns = 0;
+            self.phase_fulfill_ns = 0;
+            self.phase_flush_ns = 0;
+            self.phase_compact_ns = 0;
+            self.phase_requeue_ns = 0;
+            self.phase_submit_ns = 0;
+            self.phase_cancel_ns = 0;
+            self.phase_webhook_ns = 0;
+            self.phase_maint_ns = 0;
+            self.phase_ticks = 0;
+            self.phase_frames = 0;
+            self.phase_fulfills = 0;
+        }
 
         fn nowNs(self: *const Self) u64 {
             const ts = self.config.clock_fn();

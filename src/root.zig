@@ -21,6 +21,7 @@ pub const transport = @import("transport.zig");
 pub const tcp_transport = @import("tcp_transport.zig");
 pub const pipeline = @import("pipeline.zig");
 pub const pending_index = @import("pending_index.zig");
+pub const indexer = @import("indexer.zig");
 
 // KV read layer — reads directly from Talon KV store.
 pub const kv_read = @import("kv_read.zig");
@@ -73,6 +74,7 @@ test {
     testing.refAllDecls(@import("transport.zig"));
     testing.refAllDecls(@import("pipeline.zig"));
     testing.refAllDecls(@import("pending_index.zig"));
+    testing.refAllDecls(@import("indexer.zig"));
     testing.refAllDecls(@import("cluster_sim.zig"));
     testing.refAllDecls(@import("io.zig"));
     testing.refAllDecls(@import("config.zig"));

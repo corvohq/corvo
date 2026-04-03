@@ -400,27 +400,27 @@ fn rpcLifecycleWorker(config: BenchConfig, _: u32) WorkerResult {
     var client = RpcClient.connect(config.host, config.port) catch return .{ .errors = 1 };
     defer client.close();
 
-    const timeval = std.posix.timeval{ .sec = 0, .usec = 10_000 }; // 10ms
+    // 2s recv timeout — long enough for server to push, short enough to
+    // notice when all jobs are done.
+    const timeval = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(client.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
 
     var total_ops: u64 = 0;
     var total_errors: u64 = 0;
     var timer = std.time.Timer.start() catch return .{ .errors = 1 };
     var fetched_buf: [512]FetchedId = undefined;
-    var empty_streak: u32 = 0;
 
     // Subscribe once — server pushes up to prefetch jobs, replenishes on ack.
     const prefetch: u16 = @intCast(@min(config.batch_size, 512));
     rpcSendSubscribe(&client, config.queue, prefetch) catch return .{ .errors = 1 };
 
-    // Message loop: server can push FETCH_BATCH_RESP at any time (persistent
-    // subscription), interleaved with ACK_BATCH_RESP. Read whatever arrives,
-    // dispatch by type.
+    // Message loop: server pushes FETCH_BATCH_RESP and ACK_BATCH_RESP.
     while (g_lifecycle_done.load(.monotonic) < g_lifecycle_target) {
         const header = rpc.readHeader(client.stream) catch {
+            // Timeout — check if we're done.
             if (g_lifecycle_done.load(.monotonic) >= g_lifecycle_target) break;
-            empty_streak += 1;
-            if (empty_streak > 100) break;
+            // Re-subscribe in case connection state is stale.
+            rpcSendSubscribe(&client, config.queue, prefetch) catch break;
             continue;
         };
 
@@ -431,12 +431,7 @@ fn rpcLifecycleWorker(config: BenchConfig, _: u32) WorkerResult {
         switch (header.msg_type) {
             rpc.MSG_FETCH_BATCH_RESP => {
                 const fetched = parseFetchPayload(client.recv_buf[0..header.payload_len], &fetched_buf);
-                if (fetched == 0) {
-                    empty_streak += 1;
-                    if (empty_streak > 100) break;
-                    continue;
-                }
-                empty_streak = 0;
+                if (fetched == 0) continue;
 
                 // Send ack (fire-and-forget — response handled by this loop).
                 rpcSendAck(&client, fetched_buf[0..fetched]) catch {
@@ -866,18 +861,18 @@ fn runScale(comptime ClientType: type, config: BenchConfig, alloc: std.mem.Alloc
         var queue_buf: [64]u8 = undefined;
         const step_queue = std.fmt.bufPrint(&queue_buf, "{s}.s{d}", .{ config.queue, step }) catch config.queue;
 
+        // Half producers, half consumers, running simultaneously.
+        const producers = @max(1, conns / 2);
+        const consumers = @max(1, conns - producers);
+
         var step_config = config;
         step_config.total_jobs = config.burst;
-        step_config.concurrency = conns;
+        step_config.producers = producers;
+        step_config.consumers = consumers;
         step_config.queue = step_queue;
 
-        // Enqueue phase.
-        const enq = try runPhase(ClientType, enqueueWorker, step_config, alloc);
-
-        // Lifecycle phase.
-        g_lifecycle_done.store(0, .monotonic);
-        g_lifecycle_target = config.burst;
-        const lc = try runPhase(ClientType, lifecycleWorker, step_config, alloc);
+        // Combined mode — producers and consumers run simultaneously.
+        const result = try runCombined(ClientType, step_config, alloc);
 
         // Scrape server metrics.
         const latency = scrapeMetrics(config.host, config.port);
@@ -885,8 +880,9 @@ fn runScale(comptime ClientType: type, config: BenchConfig, alloc: std.mem.Alloc
         if (step == 0) first_del_p99 = latency.delivery_p99;
         const saturated = first_del_p99 > 0 and latency.delivery_p99 > first_del_p99 * 2;
 
-        const enq_ops = if (enq.wall_ns > 0) enq.ops * 1_000_000_000 / enq.wall_ns else 0;
-        const lc_ops = if (lc.wall_ns > 0) lc.ops * 1_000_000_000 / lc.wall_ns else 0;
+        const wall_s = if (result.wall_ns > 0) result.wall_ns else 1;
+        const enq_ops = result.enqueue_ops * 1_000_000_000 / wall_s;
+        const lc_ops = result.lifecycle_ops * 1_000_000_000 / wall_s;
 
         var dp50: [16]u8 = undefined;
         var dp99: [16]u8 = undefined;

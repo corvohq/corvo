@@ -49,6 +49,7 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{
         .root_module = test_mod,
     });
+    if (b.args) |a| tests.filters = a;
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);

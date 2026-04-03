@@ -12,6 +12,7 @@ const keys = @import("keys.zig");
 const codec = @import("codec.zig");
 const kv = @import("kv.zig");
 const pending_index_mod = @import("pending_index.zig");
+const indexer_mod = @import("indexer.zig");
 pub const metrics_mod = @import("metrics.zig");
 
 const Allocator = std.mem.Allocator;
@@ -35,6 +36,9 @@ pub const OpHandler = struct {
     /// Cached queue configs. Avoids KV read on every fetch.
     /// Invalidated on queue_config, clear_queue, delete_queue ops.
     queue_configs: std.StringHashMap(types.Queue),
+    /// Deferred read-index writer. Hot-path handlers record effects here;
+    /// pipeline flushes them in a separate KV batch after the main commit.
+    indexer: indexer_mod.Indexer = .{},
     /// Whether to verify index consistency after each mutation.
     verify_indexes: bool = false,
     /// Monotonic counter for lease tokens. Unique per fetch claim.
@@ -420,6 +424,7 @@ pub const OpHandler = struct {
         self.cancel_signal_count = 0;
         self.webhook_event_count = 0;
         self.promote_queue_count = 0;
+        self.indexer.reset();
     }
 
     /// Record a queue that had jobs promoted to pending (dedup by name).
@@ -932,6 +937,28 @@ pub const OpHandler = struct {
         var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
         b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
         _ = self.putQueueConfig(queue, q);
+    }
+
+    /// In-memory-only counter increment. KV write deferred to indexer.
+    pub fn incrQueueCounterMem(self: *OpHandler, queue: []const u8, state: types.JobState) void {
+        if (self.queue_configs.getPtr(queue)) |q| {
+            q.incrState(state);
+        }
+    }
+
+    /// In-memory-only counter decrement. KV write deferred to indexer.
+    pub fn decrQueueCounterMem(self: *OpHandler, queue: []const u8, state: types.JobState) void {
+        if (self.queue_configs.getPtr(queue)) |q| {
+            q.decrState(state);
+        }
+    }
+
+    /// In-memory-only counter transition. KV write deferred to indexer.
+    pub fn updateQueueCounterMem(self: *OpHandler, queue: []const u8, old_state: types.JobState, new_state: types.JobState) void {
+        if (self.queue_configs.getPtr(queue)) |q| {
+            q.decrState(old_state);
+            q.incrState(new_state);
+        }
     }
 
     // ========================================================================

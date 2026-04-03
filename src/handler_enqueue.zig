@@ -169,10 +169,9 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
             }
         }
 
-        // Write read indexes + tag indexes + increment queue counter
-        OpHandler.writeReadIndexes(b, &job);
-        OpHandler.writeTagIndexes(b, &job);
-        self.incrQueueCounter(b, job.queue, job.state);
+        // Defer read indexes + tag indexes + queue counter to indexer.
+        self.indexer.recordCreate(job.id, job.queue, job.state, job.created_at_ns);
+        self.incrQueueCounterMem(job.queue, job.state);
 
         self.verifyJobIndexes(b, &job, "enqueue");
         self.metrics.recordEnqueue(job.queue, 1, op.now_ns);

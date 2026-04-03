@@ -5,8 +5,7 @@
     .minimum_zig_version = "0.14.0",
     .dependencies = .{
         .@"talon-zig" = .{
-            .url = "https://github.com/corvohq/talon/archive/refs/tags/v0.1.0.tar.gz",
-            .hash = "talon_zig-0.1.0-iuh4zmISAgBUsW_9Z8IkQX-XvgGxE2m-tyu371TaJvrK",
+            .path = "../talon",
         },
         .zigstache = .{
             .path = "../zigstache",

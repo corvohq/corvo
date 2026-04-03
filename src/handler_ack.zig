@@ -56,8 +56,11 @@ pub fn applyAck(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.AckOp) ops.O
         if (next_state == .completed) {
             job.completed_at_ns = op.now_ns;
             self.metrics.recordComplete(job.queue, job.created_at_ns, job.started_at_ns, op.now_ns);
+
+            // Dead key for purge to find and clean up deferred indexes.
             var dk_buf: keys.KeyBuf = undefined;
             b.set(keys.deadKey(&dk_buf, op.now_ns, job.id), "");
+            self.dead_since_purge += 1;
 
             // Record webhook events for matching webhooks.
             self.checkWebhooks(job.id, job.queue, .completed, op.now_ns);
@@ -112,41 +115,22 @@ pub fn applyAck(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.AckOp) ops.O
         job.state = next_state;
 
         if (next_state == .completed and !self.persist_completed) {
-            // Auto-delete: remove job entirely — no storage cost.
+            // Auto-delete: remove job + payload from hot-path batch.
+            // Read indexes + tags + error keys deferred to indexer + purge.
             b.delete(keys.jobKey(&jk_buf, ack.job_id));
             var jpk_buf: keys.KeyBuf = undefined;
             b.delete(keys.jobPayloadKey(&jpk_buf, ack.job_id));
-            // Delete active-state read indexes
-            var old_js_buf: keys.KeyBuf = undefined;
-            var old_jqs_buf: keys.KeyBuf = undefined;
-            b.delete(keys.jobStateKey(&old_js_buf, @intFromEnum(types.JobState.active), job.created_at_ns, job.id));
-            b.delete(keys.jobQueueStateKey(&old_jqs_buf, job.queue, @intFromEnum(types.JobState.active), job.created_at_ns, job.id));
-            // Delete time + queue read indexes
-            var jt_buf: keys.KeyBuf = undefined;
-            var jq_buf: keys.KeyBuf = undefined;
-            b.delete(keys.jobTimeKey(&jt_buf, job.created_at_ns, job.id));
-            b.delete(keys.jobQueueKey(&jq_buf, job.queue, job.created_at_ns, job.id));
-            OpHandler.deleteTagIndexes(b, &job);
-            // Decrement active counter (no completed counter to worry about)
-            self.decrQueueCounter(b, job.queue, .active);
-            // Delete d| key (written above in completion block)
-            var dk_del_buf: keys.KeyBuf = undefined;
-            b.delete(keys.deadKey(&dk_del_buf, op.now_ns, job.id));
-            // Delete error keys
-            var jep_buf: keys.KeyBuf = undefined;
-            var jee_buf: keys.KeyBuf = undefined;
-            const err_prefix = keys.jobErrorPrefix(&jep_buf, job.id);
-            if (keys.prefixEnd(&jee_buf, err_prefix)) |err_end| {
-                b.deleteRange(err_prefix, err_end);
-            }
+            self.indexer.recordDeleteAll(job.id, job.queue, .active, job.created_at_ns);
+            self.decrQueueCounterMem(job.queue, .active);
             self.total_jobs -|= 1;
         } else {
             // Write updated job
             var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;
             b.set(keys.jobKey(&jk_buf, ack.job_id), codec.encodeJob(&job_enc_buf, &job));
 
-            // Update read indexes: active → next_state
-            self.transitionReadIndexes(b, &job, .active, next_state);
+            // Defer read index transition to indexer.
+            self.indexer.recordTransition(job.id, job.queue, .active, next_state, job.created_at_ns);
+            self.updateQueueCounterMem(job.queue, .active, next_state);
 
             self.verifyJobIndexes(b, &job, "ack");
         }

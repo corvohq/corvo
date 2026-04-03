@@ -148,7 +148,8 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
                 var gl_rlk_buf: keys.KeyBuf = undefined;
                 b.set(keys.globalRateLimitKey(&gl_rlk_buf, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected)) +% 0x80000000), "");
             }
-            self.transitionReadIndexes(b, &job, .pending, .active);
+            self.indexer.recordTransition(job_id, queue_name, .pending, .active, job.created_at_ns);
+            self.updateQueueCounterMem(queue_name, .pending, .active);
             self.verifyJobIndexes(b, &job, "fetch");
 
             // Store fetch result inline (no allocation).
@@ -327,7 +328,8 @@ fn fetchWithFairness(
             var gl_rlk_buf: keys.KeyBuf = undefined;
             b.set(keys.globalRateLimitKey(&gl_rlk_buf, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected)) +% 0x80000000), "");
         }
-        self.transitionReadIndexes(b, &job, .pending, .active);
+        self.indexer.recordTransition(sel_job_id, queue_name, .pending, .active, job.created_at_ns);
+        self.updateQueueCounterMem(queue_name, .pending, .active);
         self.verifyJobIndexes(b, &job, "fetch-fairness");
 
         assert.check(result.affected < ops.OpResult.max_inline_fetch, "fetch-fairness: result.affected ({d}) >= max_inline_fetch", .{result.affected});
