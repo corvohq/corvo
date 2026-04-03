@@ -103,6 +103,23 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run saturation benchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    // --- Async Benchmark executable (io_uring) ---
+    const bench_async_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_async.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Self-contained: no corvo module dependency (inlined RPC constants).
+    const bench_async_exe = b.addExecutable(.{
+        .name = "bench-async",
+        .root_module = bench_async_mod,
+    });
+    b.installArtifact(bench_async_exe);
+    const run_bench_async = b.addRunArtifact(bench_async_exe);
+    if (b.args) |a| run_bench_async.addArgs(a);
+    const bench_async_step = b.step("bench-async", "Run async io_uring benchmarks");
+    bench_async_step.dependOn(&run_bench_async.step);
+
     // --- Corvo server executable ---
     const main_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

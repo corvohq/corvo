@@ -1,0 +1,17 @@
+{{#has_errors}}
+<div class="divide-y divide-zinc-100 dark:divide-zinc-800">
+  {{#errors}}
+  <div class="px-6 py-4">
+    <div class="flex items-center gap-2 mb-1">
+      <span class="text-xs font-medium text-zinc-500 dark:text-zinc-400">Attempt {{attempt}}</span>
+      {{#has_timestamp}}<span class="text-xs text-zinc-400 dark:text-zinc-500"><time data-ts="{{created_at}}">{{created_at}}</time></span>{{/has_timestamp}}
+    </div>
+    <pre class="text-xs text-red-700 dark:text-red-400 bg-red-50 dark:bg-red-950 rounded-lg p-3 overflow-x-auto">{{message}}</pre>
+  </div>
+  {{/errors}}
+</div>
+{{/has_errors}}
+{{>pagination}}
+{{^has_errors}}
+<p class="px-6 py-8 text-sm text-zinc-500 dark:text-zinc-400 text-center">No errors</p>
+{{/has_errors}}

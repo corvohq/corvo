@@ -1,0 +1,3 @@
+{{#has_payload}}<div class="flex justify-end px-6 pt-3"><button onclick="corvoPayloadCopy(this)" class="text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 font-medium">Copy</button></div>
+<pre id="job-payload" class="px-6 pb-6 text-xs font-mono overflow-x-auto text-zinc-800 dark:text-zinc-200 bg-zinc-50 dark:bg-zinc-950 rounded-b-xl whitespace-pre-wrap break-all">{{payload}}</pre>{{/has_payload}}
+{{^has_payload}}<p class="px-6 py-8 text-sm text-zinc-500 dark:text-zinc-400 text-center">No payload</p>{{/has_payload}}

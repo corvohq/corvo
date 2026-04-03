@@ -399,6 +399,51 @@ pub const Reader = struct {
 
     /// Get errors for a job.
     pub fn getJobErrors(self: *Reader, job_id: []const u8, results: []JobError) u32 {
+        return self.getJobErrorsPaged(job_id, results, 0);
+    }
+
+    pub fn getJobErrorsPaged(self: *Reader, job_id: []const u8, results: []JobError, skip: u32) u32 {
+        var batch = self.store.newBatch();
+        defer batch.close();
+
+        var lower_buf: keys.KeyBuf = undefined;
+        var upper_buf: keys.KeyBuf = undefined;
+        const lower = keys.jobErrorPrefix(&lower_buf, job_id);
+        const upper = keys.prefixEnd(&upper_buf, lower) orelse return 0;
+
+        var iter = batch.newIter(lower, upper);
+        defer iter.close();
+
+        var skipped: u32 = 0;
+        var count: u32 = 0;
+        if (!iter.first()) return 0;
+        while (true) {
+            if (skipped < skip) {
+                skipped += 1;
+                if (!iter.next()) break;
+                continue;
+            }
+            if (count >= results.len) break;
+            const k = iter.key();
+            const v = iter.value();
+
+            var row = JobError{};
+            const attempt_offset = keys.prefix_job_error.len + job_id.len + 1;
+            if (k.len >= attempt_offset + 4) {
+                row.attempt = @intCast(keys.getU32BE(k[attempt_offset..]));
+            }
+            const len: u16 = @intCast(@min(v.len, row.error_msg.len));
+            @memcpy(row.error_msg[0..len], v[0..len]);
+            row.error_msg_len = len;
+
+            results[count] = row;
+            count += 1;
+            if (!iter.next()) break;
+        }
+        return count;
+    }
+
+    pub fn countJobErrors(self: *Reader, job_id: []const u8) u32 {
         var batch = self.store.newBatch();
         defer batch.close();
 
@@ -413,22 +458,6 @@ pub const Reader = struct {
         var count: u32 = 0;
         if (!iter.first()) return 0;
         while (true) {
-            if (count >= results.len) break;
-            const k = iter.key();
-            const v = iter.value();
-
-            var row = JobError{};
-            // Extract attempt from key: je|{job_id}\x00{attempt:4BE}
-            const attempt_offset = keys.prefix_job_error.len + job_id.len + 1;
-            if (k.len >= attempt_offset + 4) {
-                row.attempt = @intCast(keys.getU32BE(k[attempt_offset..]));
-            }
-            // Value is the error message
-            const len: u16 = @intCast(@min(v.len, row.error_msg.len));
-            @memcpy(row.error_msg[0..len], v[0..len]);
-            row.error_msg_len = len;
-
-            results[count] = row;
             count += 1;
             if (!iter.next()) break;
         }
@@ -550,6 +579,10 @@ pub const Reader = struct {
     // ====================================================================
 
     pub fn getWorkers(self: *Reader, results: []WorkerRow) u32 {
+        return self.getWorkersPaged(results, 0);
+    }
+
+    pub fn getWorkersPaged(self: *Reader, results: []WorkerRow, skip: u32) u32 {
         var batch = self.store.newBatch();
         defer batch.close();
 
@@ -562,9 +595,15 @@ pub const Reader = struct {
         var iter = batch.newIter(lower_buf[0..p.len], upper);
         defer iter.close();
 
+        var skipped: u32 = 0;
         var count: u32 = 0;
         if (!iter.first()) return 0;
         while (true) {
+            if (skipped < skip) {
+                skipped += 1;
+                if (!iter.next()) break;
+                continue;
+            }
             if (count >= results.len) break;
             const val = iter.value();
             const w = codec.decodeWorker(val);
@@ -747,6 +786,14 @@ pub const Reader = struct {
         return self.scanPrefix(keys.prefix_webhook, WebhookRow, results, webhookFromValue);
     }
 
+    pub fn listWebhooksPaged(self: *Reader, results: []WebhookRow, skip: u32) u32 {
+        return self.scanPrefixPaged(keys.prefix_webhook, WebhookRow, results, webhookFromValue, skip);
+    }
+
+    pub fn countWebhooks(self: *Reader) u32 {
+        return self.countPrefix(keys.prefix_webhook);
+    }
+
     pub fn getWebhookById(self: *Reader, webhook_id: []const u8) ?WebhookRow {
         var batch = self.store.newBatch();
         defer batch.close();
@@ -762,8 +809,23 @@ pub const Reader = struct {
 
     /// List audit entries, newest first. Returns up to results.len entries.
     pub fn listAuditEntries(self: *Reader, results: []AuditEntryRow) u32 {
-        const count = self.scanPrefix(keys.prefix_audit, AuditEntryRow, results, auditEntryFromValue);
-        // Reverse for newest-first (forward scan gives oldest-first).
+        return self.listAuditEntriesPaged(results, 0);
+    }
+
+    pub fn listAuditEntriesPaged(self: *Reader, results: []AuditEntryRow, skip: u32) u32 {
+        // Scan forward, load into buffer, then reverse for newest-first.
+        // For paging, we need to skip from the END (newest), so: forward-skip = total - skip - limit.
+        const total = self.countAuditEntries();
+        if (total == 0) return 0;
+        const limit: u32 = @intCast(results.len);
+        // Items we want: [total - skip - limit .. total - skip] in forward order, then reverse.
+        const end_pos = if (total > skip) total - skip else 0;
+        if (end_pos == 0) return 0;
+        const start_pos = if (end_pos > limit) end_pos - limit else 0;
+        const want: u32 = end_pos - start_pos;
+
+        const count = self.scanPrefixPaged(keys.prefix_audit, AuditEntryRow, results[0..want], auditEntryFromValue, start_pos);
+        // Reverse for newest-first.
         if (count > 1) {
             var lo: u32 = 0;
             var hi: u32 = count - 1;
@@ -963,6 +1025,46 @@ pub const Reader = struct {
         results: []T,
         parseFn: *const fn ([]const u8) T,
     ) u32 {
+        return self.scanPrefixPaged(prefix, T, results, parseFn, 0);
+    }
+
+    fn scanPrefixPaged(
+        self: *Reader,
+        prefix: []const u8,
+        comptime T: type,
+        results: []T,
+        parseFn: *const fn ([]const u8) T,
+        skip: u32,
+    ) u32 {
+        var batch = self.store.newBatch();
+        defer batch.close();
+
+        var lower_buf: keys.KeyBuf = undefined;
+        var upper_buf: keys.KeyBuf = undefined;
+        @memcpy(lower_buf[0..prefix.len], prefix);
+        const upper = keys.prefixEnd(&upper_buf, lower_buf[0..prefix.len]) orelse return 0;
+
+        var iter = batch.newIter(lower_buf[0..prefix.len], upper);
+        defer iter.close();
+
+        var skipped: u32 = 0;
+        var count: u32 = 0;
+        if (!iter.first()) return 0;
+        while (true) {
+            if (skipped < skip) {
+                skipped += 1;
+                if (!iter.next()) break;
+                continue;
+            }
+            if (count >= results.len) break;
+            results[count] = parseFn(iter.value());
+            count += 1;
+            if (!iter.next()) break;
+        }
+        return count;
+    }
+
+    pub fn countPrefix(self: *Reader, prefix: []const u8) u32 {
         var batch = self.store.newBatch();
         defer batch.close();
 
@@ -977,8 +1079,6 @@ pub const Reader = struct {
         var count: u32 = 0;
         if (!iter.first()) return 0;
         while (true) {
-            if (count >= results.len) break;
-            results[count] = parseFn(iter.value());
             count += 1;
             if (!iter.next()) break;
         }

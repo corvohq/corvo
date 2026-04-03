@@ -52,29 +52,31 @@
       </div>
     </div>
   </div>
+{{#has_tags}}
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm">
+    <div class="px-6 py-4 border-b border-zinc-200 dark:border-zinc-800">
+      <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Tags</h3>
+    </div>
+    <div class="px-6 py-4" hx-get="{{bp}}/ui/jobs/{{job_id}}/tags" hx-trigger="load" hx-swap="innerHTML">
+      <span class="text-xs text-zinc-400">Loading...</span>
+    </div>
+  </div>
+{{/has_tags}}
   <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm">
     <div class="px-6 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between">
       <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Payload</h3>
-      {{#has_payload}}<button onclick="corvoPayloadCopy(this)" class="text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 font-medium">Copy</button>{{/has_payload}}
     </div>
-    {{#has_payload}}<pre id="job-payload" class="p-6 text-xs font-mono overflow-x-auto text-zinc-800 dark:text-zinc-200 bg-zinc-50 dark:bg-zinc-950 rounded-b-xl">{{payload}}</pre>{{/has_payload}}
-    {{^has_payload}}<p class="px-6 py-8 text-sm text-zinc-500 dark:text-zinc-400 text-center">No payload</p>{{/has_payload}}
+    <div hx-get="/ui/jobs/{{job_id}}/payload" hx-trigger="load" hx-swap="innerHTML">
+      <p class="px-6 py-8 text-sm text-zinc-400 text-center">Loading...</p>
+    </div>
   </div>
 {{#has_errors}}
   <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm">
     <div class="px-6 py-4 border-b border-zinc-200 dark:border-zinc-800">
       <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Error History</h3>
     </div>
-    <div class="divide-y divide-zinc-100 dark:divide-zinc-800">
-      {{#errors}}
-      <div class="px-6 py-4">
-        <div class="flex items-center gap-2 mb-1">
-          <span class="text-xs font-medium text-zinc-500 dark:text-zinc-400">Attempt {{attempt}}</span>
-          {{#has_timestamp}}<span class="text-xs text-zinc-400 dark:text-zinc-500"><time data-ts="{{created_at}}">{{created_at}}</time></span>{{/has_timestamp}}
-        </div>
-        <pre class="text-xs text-red-700 dark:text-red-400 bg-red-50 dark:bg-red-950 rounded-lg p-3 overflow-x-auto">{{message}}</pre>
-      </div>
-      {{/errors}}
+    <div hx-get="/ui/jobs/{{job_id}}/errors" hx-trigger="load" hx-swap="innerHTML">
+      <p class="px-6 py-8 text-sm text-zinc-400 text-center">Loading...</p>
     </div>
   </div>
 {{/has_errors}}

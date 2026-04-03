@@ -400,9 +400,8 @@ fn rpcLifecycleWorker(config: BenchConfig, _: u32) WorkerResult {
     var client = RpcClient.connect(config.host, config.port) catch return .{ .errors = 1 };
     defer client.close();
 
-    // 2s recv timeout — long enough for server to push, short enough to
-    // notice when all jobs are done.
-    const timeval = std.posix.timeval{ .sec = 2, .usec = 0 };
+    // 100ms recv timeout — fast enough for scale mode, long enough for push delivery.
+    const timeval = std.posix.timeval{ .sec = 0, .usec = 100_000 };
     std.posix.setsockopt(client.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
 
     var total_ops: u64 = 0;
@@ -415,11 +414,12 @@ fn rpcLifecycleWorker(config: BenchConfig, _: u32) WorkerResult {
     rpcSendSubscribe(&client, config.queue, prefetch) catch return .{ .errors = 1 };
 
     // Message loop: server pushes FETCH_BATCH_RESP and ACK_BATCH_RESP.
+    // Bail after 10s wall time to prevent scale mode from hanging.
+    const deadline_ns: u64 = timer.read() + 10_000_000_000;
     while (g_lifecycle_done.load(.monotonic) < g_lifecycle_target) {
+        if (timer.read() > deadline_ns) break;
         const header = rpc.readHeader(client.stream) catch {
-            // Timeout — check if we're done.
             if (g_lifecycle_done.load(.monotonic) >= g_lifecycle_target) break;
-            // Re-subscribe in case connection state is stale.
             rpcSendSubscribe(&client, config.queue, prefetch) catch break;
             continue;
         };
@@ -870,6 +870,8 @@ fn runScale(comptime ClientType: type, config: BenchConfig, alloc: std.mem.Alloc
         step_config.producers = producers;
         step_config.consumers = consumers;
         step_config.queue = step_queue;
+        // Realistic prefetch: cap at 8, scale down with more consumers.
+        step_config.batch_size = @max(1, @min(8, config.burst / @as(u32, consumers)));
 
         // Combined mode — producers and consumers run simultaneously.
         const result = try runCombined(ClientType, step_config, alloc);

@@ -391,7 +391,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     switch (completion.event) {
                         .recv => self.deferRecvConn(completion.conn_id),
                         .accept => {},
-                        .closed => self.onConnClosed(completion.conn_id),
+                        .closed => {}, // deferred to second pass
                         .connected => self.handleWebhookConnected(completion.conn_id),
                         .send_done => {
                             const sc = self.io.conn(completion.conn_id);
@@ -404,6 +404,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
                             }
                         },
                     }
+                }
+                // Closed events last — send_done and closed for the same conn_id
+                // can arrive in one CQE batch. Closing first would free the conn
+                // before send_done sees it.
+                for (self.completions[0..n_full]) |completion| {
+                    if (completion.event == .closed) self.onConnClosed(completion.conn_id);
                 }
                 self.io.submit();
                 self.ticks_total += 1;
@@ -457,7 +463,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         }
                     },
                     .accept => {},
-                    .closed => self.onConnClosed(completion.conn_id),
+                    .closed => {}, // deferred to second pass
                     .connected => self.handleWebhookConnected(completion.conn_id),
                     .send_done => {
                         const c = self.io.conn(completion.conn_id);
@@ -477,6 +483,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         }
                     },
                 }
+            }
+            // Closed events last — same reason as drain loop above.
+            for (self.completions[0..n]) |completion| {
+                if (completion.event == .closed) self.onConnClosed(completion.conn_id);
             }
 
             // Include connections that received data while all prepare slots were full.
@@ -1834,7 +1844,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
         /// Triggers the HTTP POST send (data already in send_buf).
         fn handleWebhookConnected(self: *Self, conn_id: u16) void {
             const c = self.io.conn(conn_id);
-            if (c.phase == .free) return;
+            assert.check(c.phase != .free, "handleWebhookConnected: conn {d} is free", .{conn_id});
             if (c.send_len == 0) {
                 self.io.queueClose(conn_id);
                 return;

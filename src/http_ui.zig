@@ -48,6 +48,9 @@ const queue_detail_tmpl = zigstache.Template.parse(ui_embed.queue_detail_html) c
 const job_list_tmpl = zigstache.Template.parse(ui_embed.job_list_html) catch unreachable;
 const job_table_tmpl = zigstache.Template.parse(ui_embed.job_table_html) catch unreachable;
 const job_detail_tmpl = zigstache.Template.parse(ui_embed.job_detail_html) catch unreachable;
+const job_tags_tmpl = zigstache.Template.parse(ui_embed.job_tags_html) catch unreachable;
+const job_payload_tmpl = zigstache.Template.parse(ui_embed.job_payload_html) catch unreachable;
+const job_errors_tmpl = zigstache.Template.parse(ui_embed.job_errors_html) catch unreachable;
 const workers_tmpl = zigstache.Template.parse(ui_embed.workers_html) catch unreachable;
 const pagination_tmpl = zigstache.Template.parse(ui_embed.pagination_html) catch unreachable;
 const login_tmpl = zigstache.Template.parse(ui_embed.login_html) catch unreachable;
@@ -72,12 +75,18 @@ pub fn dispatch(path: []const u8, query: []const u8, send_buf: []u8, reader: ?*k
     if (eql(path, "/dead-letter")) return deadLetterPage(send_buf, reader, query);
     if (eql(path, "/held")) return heldJobsPage(send_buf, reader, query);
     if (eql(path, "/scheduled")) return scheduledJobsPage(send_buf, reader, query);
-    if (std.mem.startsWith(u8, path, "/jobs/")) return jobDetailPage(send_buf, reader, path["/jobs/".len..]);
-    if (eql(path, "/workers")) return workersPage(send_buf, reader);
+    if (std.mem.startsWith(u8, path, "/jobs/")) {
+        const rest = path["/jobs/".len..];
+        if (std.mem.endsWith(u8, rest, "/tags")) return jobTagsFragment(send_buf, reader, rest[0 .. rest.len - "/tags".len], query);
+        if (std.mem.endsWith(u8, rest, "/payload")) return jobPayloadFragment(send_buf, reader, rest[0 .. rest.len - "/payload".len]);
+        if (std.mem.endsWith(u8, rest, "/errors")) return jobErrorsFragment(send_buf, reader, rest[0 .. rest.len - "/errors".len], query);
+        return jobDetailPage(send_buf, reader, rest);
+    }
+    if (eql(path, "/workers")) return workersPage(send_buf, reader, query);
     if (eql(path, "/cluster")) return clusterPage(send_buf, reader);
     if (eql(path, "/api-keys")) return apiKeysPage(send_buf, reader);
-    if (eql(path, "/webhooks")) return webhooksPage(send_buf, reader);
-    if (eql(path, "/audit-logs")) return auditLogsPage(send_buf, reader);
+    if (eql(path, "/webhooks")) return webhooksPage(send_buf, reader, query);
+    if (eql(path, "/audit-logs")) return auditLogsPage(send_buf, reader, query);
     if (eql(path, "/cron-jobs")) return cronJobsPage(send_buf, reader, query);
 
     // HTMX partial routes (fragments, no layout).
@@ -386,27 +395,8 @@ fn jobDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, job_id: []const u8) u
         tl_count += 1;
     }
 
-    // Payload.
-    var raw_payload: [4096]u8 = undefined;
-    const payload = rdr.getJobPayload(job_id, &raw_payload);
-
-    // Errors.
-    var err_rows: [16]kv_read.JobError = undefined;
-    const err_count = rdr.getJobErrors(job_id, &err_rows);
-    var error_views: [16]ErrorView = undefined;
-    for (0..err_count) |i| {
-        const err = &err_rows[i];
-        error_views[i] = .{
-            .attempt = err.attempt,
-            .message = err.errorSlice(),
-            .created_at = err.created_at[0..err.created_at_len],
-            .has_timestamp = err.created_at_len > 0,
-        };
-    }
-
     const properties: []const PropView = props[0..prop_count];
     const tl: []const TimelineView = timeline[0..tl_count];
-    const errors: []const ErrorView = error_views[0..err_count];
 
     const state_str = j.stateSlice();
     const is_terminal = std.mem.eql(u8, state_str, "completed") or
@@ -423,10 +413,8 @@ fn jobDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, job_id: []const u8) u
         .state_class = stateBadgeClassDark(state_str),
         .properties = properties,
         .timeline = tl,
-        .has_payload = payload != null,
-        .payload = if (payload) |p| p else "",
-        .has_errors = err_count > 0,
-        .errors = errors,
+        .has_tags = j.tags_len > 0,
+        .has_errors = j.attempt > 0,
         .can_requeue = is_terminal,
         .can_promote = is_scheduled,
         .can_cancel = !is_terminal and !is_held,
@@ -438,7 +426,127 @@ fn jobDetailPage(send_buf: []u8, reader: ?*kv_read.Reader, job_id: []const u8) u
     return renderPage(send_buf, "Job Detail", content);
 }
 
-fn workersPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
+// ============================================================================
+// Job Detail Fragments (htmx lazy-loaded)
+// ============================================================================
+
+fn jobTagsFragment(send_buf: []u8, reader: ?*kv_read.Reader, job_id: []const u8, query: []const u8) u32 {
+    const r = reader orelse return http.writeResponseHtml(send_buf, 503, "");
+    var j = r.getJob(job_id) orelse return http.writeResponseHtml(send_buf, 404, "");
+    if (j.tags_len == 0) return http.writeResponseHtml(send_buf, 200, "");
+
+    const page_size: usize = 20;
+    var offset: usize = 0;
+    if (getQueryParam(query, "offset")) |off_str| {
+        offset = std.fmt.parseInt(usize, off_str, 10) catch 0;
+    }
+
+    const TagView = struct { key: []const u8, value: []const u8 };
+    var all_tags: [64]TagView = undefined;
+    var all_count: usize = 0;
+    var tag_value_bufs: [64][128]u8 = undefined;
+    const tag_str = j.tagsSlice();
+    var tpos: usize = 0;
+    while (tpos < tag_str.len and all_count < 64) {
+        const k_start = std.mem.indexOfScalarPos(u8, tag_str, tpos, '"') orelse break;
+        const k_end = std.mem.indexOfScalarPos(u8, tag_str, k_start + 1, '"') orelse break;
+        const colon = std.mem.indexOfScalarPos(u8, tag_str, k_end + 1, ':') orelse break;
+        const v_start = std.mem.indexOfScalarPos(u8, tag_str, colon + 1, '"') orelse break;
+        const v_end = std.mem.indexOfScalarPos(u8, tag_str, v_start + 1, '"') orelse break;
+        const tag_value = tag_str[v_start + 1 .. v_end];
+        const vl = @min(tag_value.len, tag_value_bufs[all_count].len);
+        @memcpy(tag_value_bufs[all_count][0..vl], tag_value[0..vl]);
+        all_tags[all_count] = .{ .key = tag_str[k_start + 1 .. k_end], .value = tag_value_bufs[all_count][0..vl] };
+        all_count += 1;
+        tpos = v_end + 1;
+    }
+
+    const start = @min(offset, all_count);
+    const end = @min(start + page_size, all_count);
+    const has_more = end < all_count;
+    var next_offset_buf: [16]u8 = undefined;
+    const next_offset = std.fmt.bufPrint(&next_offset_buf, "{d}", .{end}) catch "0";
+
+    var content_buf: [8192]u8 = undefined;
+    const content = job_tags_tmpl.render(&content_buf, .{
+        .tags = all_tags[start..end],
+        .has_more = has_more,
+        .next_offset = next_offset,
+        .job_id = job_id,
+    }) catch return http.writeResponseHtml(send_buf, 500, "");
+    return http.writeResponseHtml(send_buf, 200, content);
+}
+
+fn jobPayloadFragment(send_buf: []u8, reader: ?*kv_read.Reader, job_id: []const u8) u32 {
+    const r = reader orelse return http.writeResponseHtml(send_buf, 503, "");
+    var raw_payload: [32768]u8 = undefined;
+    const payload = r.getJobPayload(job_id, &raw_payload);
+
+    var content_buf: [34000]u8 = undefined;
+    const content = job_payload_tmpl.render(&content_buf, .{
+        .has_payload = payload != null,
+        .payload = if (payload) |p| p else "",
+    }) catch return http.writeResponseHtml(send_buf, 500, "");
+    return http.writeResponseHtml(send_buf, 200, content);
+}
+
+fn jobErrorsFragment(send_buf: []u8, reader: ?*kv_read.Reader, job_id: []const u8, query: []const u8) u32 {
+    const r = reader orelse return http.writeResponseHtml(send_buf, 503, "");
+    const page = parsePageParam(query);
+    const errors_per_page: u32 = 10;
+    const offset = page * errors_per_page;
+    const total = r.countJobErrors(job_id);
+    const total_pages = if (total > 0) (total + errors_per_page - 1) / errors_per_page else 0;
+
+    var err_rows: [10]kv_read.JobError = undefined;
+    const err_count = r.getJobErrorsPaged(job_id, &err_rows, offset);
+    var error_views: [10]ErrorView = undefined;
+    for (0..err_count) |i| {
+        const err = &err_rows[i];
+        error_views[i] = .{
+            .attempt = err.attempt,
+            .message = err.errorSlice(),
+            .created_at = err.created_at[0..err.created_at_len],
+            .has_timestamp = err.created_at_len > 0,
+        };
+    }
+
+    var base_url_buf: [256]u8 = undefined;
+    const base_url = std.fmt.bufPrint(&base_url_buf, "/ui/jobs/{s}/errors", .{job_id}) catch "/ui";
+    var nav_bufs: [4][256]u8 = undefined;
+    var page_links: [10]PageLink = undefined;
+    var page_url_bufs: [10][256]u8 = undefined;
+    const pag = buildPaginationData(base_url, page, total_pages, &nav_bufs, &page_links, &page_url_bufs);
+
+    var content_buf: [16384]u8 = undefined;
+    const content = job_errors_tmpl.renderWithPartials(&content_buf, .{
+        .has_errors = err_count > 0,
+        .errors = error_views[0..err_count],
+        .has_pages = pag.has_pages,
+        .page_display = pag.page_display,
+        .total_pages = pag.total_pages,
+        .has_prev = pag.has_prev,
+        .prev_url = pag.prev_url,
+        .first_url = pag.first_url,
+        .has_next = pag.has_next,
+        .next_url = pag.next_url,
+        .last_url = pag.last_url,
+        .pages = pag.pages,
+    }, .{ .pagination = &pagination_tmpl }) catch return http.writeResponseHtml(send_buf, 500, "");
+    return http.writeResponseHtml(send_buf, 200, content);
+}
+
+// ============================================================================
+// Workers (paginated)
+// ============================================================================
+
+fn workersPage(send_buf: []u8, reader: ?*kv_read.Reader, query: []const u8) u32 {
+    const rdr = reader orelse return renderPage(send_buf, "Workers", "");
+    const page = parsePageParam(query);
+    const offset = page * max_table_rows;
+    const total: u32 = @intCast(@max(0, rdr.countWorkers()));
+    const total_pages = if (total > 0) (total + max_table_rows - 1) / max_table_rows else 0;
+
     const WorkerView = struct {
         id: []const u8,
         hostname: []const u8,
@@ -447,10 +555,10 @@ fn workersPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
         started_at: []const u8,
     };
 
-    var worker_buf: [64]kv_read.WorkerRow = undefined;
-    const count: usize = if (reader) |rdr| rdr.getWorkers(&worker_buf) else 0;
+    var worker_buf: [max_table_rows]kv_read.WorkerRow = undefined;
+    const count: usize = rdr.getWorkersPaged(&worker_buf, offset);
 
-    var views: [64]WorkerView = undefined;
+    var views: [max_table_rows]WorkerView = undefined;
     for (0..count) |i| {
         const wk = &worker_buf[i];
         views[i] = .{
@@ -462,11 +570,25 @@ fn workersPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
         };
     }
 
+    var nav_bufs: [4][256]u8 = undefined;
+    var page_links: [10]PageLink = undefined;
+    var page_url_bufs: [10][256]u8 = undefined;
+    const pag = buildPaginationData("/ui/workers", page, total_pages, &nav_bufs, &page_links, &page_url_bufs);
+
     var content_buf: [page_buf_size]u8 = undefined;
-    const workers: []const WorkerView = views[0..count];
-    const content = workers_tmpl.render(&content_buf, .{
-        .workers = workers,
-    }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
+    const content = workers_tmpl.renderWithPartials(&content_buf, .{
+        .workers = views[0..count],
+        .has_pages = pag.has_pages,
+        .page_display = pag.page_display,
+        .total_pages = pag.total_pages,
+        .has_prev = pag.has_prev,
+        .prev_url = pag.prev_url,
+        .first_url = pag.first_url,
+        .has_next = pag.has_next,
+        .next_url = pag.next_url,
+        .last_url = pag.last_url,
+        .pages = pag.pages,
+    }, .{ .pagination = &pagination_tmpl }) catch return http.writeResponseHtml(send_buf, 500, "<h1>Page too large</h1>");
     return renderPage(send_buf, "Workers", content);
 }
 
@@ -509,9 +631,15 @@ fn apiKeysPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
     return renderPage(send_buf, "API Keys", content);
 }
 
-fn webhooksPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
-    var wh_buf: [64]kv_read.WebhookRow = undefined;
-    const count: usize = if (reader) |rdr| rdr.listWebhooks(&wh_buf) else 0;
+fn webhooksPage(send_buf: []u8, reader: ?*kv_read.Reader, query: []const u8) u32 {
+    const rdr = reader orelse return renderPage(send_buf, "Webhooks", "");
+    const page = parsePageParam(query);
+    const offset = page * max_table_rows;
+    const total = rdr.countWebhooks();
+    const total_pages = if (total > 0) (total + max_table_rows - 1) / max_table_rows else 0;
+
+    var wh_buf: [max_table_rows]kv_read.WebhookRow = undefined;
+    const count: usize = rdr.listWebhooksPaged(&wh_buf, offset);
 
     const WebhookView = struct {
         id: []const u8,
@@ -522,15 +650,13 @@ fn webhooksPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
         created_at: []const u8,
     };
 
-    var views: [64]WebhookView = undefined;
-    // Pre-split event strings into arrays for mustache iteration.
-    var event_slices: [64][3][]const u8 = undefined;
-    var event_counts: [64]usize = undefined;
+    var views: [max_table_rows]WebhookView = undefined;
+    var event_slices: [max_table_rows][3][]const u8 = undefined;
+    var event_counts: [max_table_rows]usize = undefined;
     for (0..count) |i| {
         const row = &wh_buf[i];
         const ev = row.eventsSlice();
         var ec: usize = 0;
-        // Split comma-separated events.
         var start: usize = 0;
         for (ev, 0..) |c, j| {
             if (c == ',') {
@@ -557,11 +683,26 @@ fn webhooksPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
         };
     }
 
+    var nav_bufs: [4][256]u8 = undefined;
+    var page_links: [10]PageLink = undefined;
+    var page_url_bufs: [10][256]u8 = undefined;
+    const pag = buildPaginationData("/ui/webhooks", page, total_pages, &nav_bufs, &page_links, &page_url_bufs);
+
     var content_buf: [page_buf_size]u8 = undefined;
-    const content = webhooks_tmpl.render(&content_buf, .{
+    const content = webhooks_tmpl.renderWithPartials(&content_buf, .{
         .has_webhooks = count > 0,
         .webhooks = views[0..count],
-    }) catch return renderPage(send_buf, "Webhooks", "<p>Page too large</p>");
+        .has_pages = pag.has_pages,
+        .page_display = pag.page_display,
+        .total_pages = pag.total_pages,
+        .has_prev = pag.has_prev,
+        .prev_url = pag.prev_url,
+        .first_url = pag.first_url,
+        .has_next = pag.has_next,
+        .next_url = pag.next_url,
+        .last_url = pag.last_url,
+        .pages = pag.pages,
+    }, .{ .pagination = &pagination_tmpl }) catch return renderPage(send_buf, "Webhooks", "<p>Page too large</p>");
     return renderPage(send_buf, "Webhooks", content);
 }
 
@@ -621,9 +762,15 @@ fn cronJobsPage(send_buf: []u8, reader: ?*kv_read.Reader, query: []const u8) u32
     return renderPage(send_buf, "Cron Jobs", content);
 }
 
-fn auditLogsPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
-    var entries_buf: [200]kv_read.AuditEntryRow = undefined;
-    const count: usize = if (reader) |rdr| rdr.listAuditEntries(&entries_buf) else 0;
+fn auditLogsPage(send_buf: []u8, reader: ?*kv_read.Reader, query: []const u8) u32 {
+    const rdr = reader orelse return renderPage(send_buf, "Audit Log", "");
+    const page = parsePageParam(query);
+    const offset = page * max_table_rows;
+    const total = rdr.countAuditEntries();
+    const total_pages = if (total > 0) (total + max_table_rows - 1) / max_table_rows else 0;
+
+    var entries_buf: [max_table_rows]kv_read.AuditEntryRow = undefined;
+    const count: usize = rdr.listAuditEntriesPaged(&entries_buf, offset);
 
     const AuditView = struct {
         op: []const u8,
@@ -633,8 +780,8 @@ fn auditLogsPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
         created_at: []const u8,
     };
 
-    var views: [200]AuditView = undefined;
-    var count_bufs: [200][16]u8 = undefined;
+    var views: [max_table_rows]AuditView = undefined;
+    var count_bufs: [max_table_rows][16]u8 = undefined;
     for (0..count) |i| {
         const row = &entries_buf[i];
         const count_str = std.fmt.bufPrint(&count_bufs[i], "{d}", .{row.count}) catch "0";
@@ -647,11 +794,26 @@ fn auditLogsPage(send_buf: []u8, reader: ?*kv_read.Reader) u32 {
         };
     }
 
+    var nav_bufs: [4][256]u8 = undefined;
+    var page_links: [10]PageLink = undefined;
+    var page_url_bufs: [10][256]u8 = undefined;
+    const pag = buildPaginationData("/ui/audit-logs", page, total_pages, &nav_bufs, &page_links, &page_url_bufs);
+
     var content_buf: [page_buf_size]u8 = undefined;
-    const content = audit_logs_tmpl.render(&content_buf, .{
+    const content = audit_logs_tmpl.renderWithPartials(&content_buf, .{
         .has_entries = count > 0,
         .entries = views[0..count],
-    }) catch return renderPage(send_buf, "Audit Log", "<p>Page too large</p>");
+        .has_pages = pag.has_pages,
+        .page_display = pag.page_display,
+        .total_pages = pag.total_pages,
+        .has_prev = pag.has_prev,
+        .prev_url = pag.prev_url,
+        .first_url = pag.first_url,
+        .has_next = pag.has_next,
+        .next_url = pag.next_url,
+        .last_url = pag.last_url,
+        .pages = pag.pages,
+    }, .{ .pagination = &pagination_tmpl }) catch return renderPage(send_buf, "Audit Log", "<p>Page too large</p>");
     return renderPage(send_buf, "Audit Log", content);
 }
 
