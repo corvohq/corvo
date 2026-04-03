@@ -372,6 +372,48 @@ test "SimBackend: connect exhaustion" {
     try std.testing.expect(id4 != null);
 }
 
+test "SimBackend: send_done and closed in same batch" {
+    // Reproduces the scenario that caused the queueRecv assert:
+    // io_uring can return both send_done and closed for the same conn_id
+    // in one CQE batch. Pipeline must process closed LAST to avoid
+    // operating on a freed connection.
+    const allocator = std.testing.allocator;
+    var backend = try SimBackend.init(allocator, .{
+        .listen_fd = -1,
+        .max_conns = 8,
+        .recv_buf_size = 1024,
+        .send_buf_size = 1024,
+    });
+    defer backend.deinit(allocator);
+
+    const id = backend.connect().?;
+    const c = backend.conn(id);
+
+    // Queue a send and submit — stages send_done completion.
+    @memcpy(c.send_buf[0..5], "hello");
+    backend.queueSend(id, 5);
+    backend.submit();
+
+    // Stage a closed completion for the same conn (simulates peer disconnect
+    // arriving in the same CQE batch as the send completion).
+    // Use stageCompletion directly — disconnect() would free the conn immediately
+    // which doesn't match production behavior (conn freed on closed processing).
+    backend.stageCompletion(.{ .conn_id = id, .event = .closed });
+
+    // Drain returns both completions in one batch.
+    var completions: [8]Completion = undefined;
+    const n = backend.drain(&completions);
+    try std.testing.expectEqual(@as(u32, 2), n);
+    try std.testing.expect(completions[0].event == .send_done);
+    try std.testing.expect(completions[1].event == .closed);
+    try std.testing.expectEqual(id, completions[0].conn_id);
+    try std.testing.expectEqual(id, completions[1].conn_id);
+
+    // Conn is still alive at this point — pipeline's two-pass processing
+    // handles send_done first, then closed frees the conn.
+    try std.testing.expect(c.phase != .free);
+}
+
 test "SimBackend: readResponse" {
     const allocator = std.testing.allocator;
     var backend = try SimBackend.init(allocator, .{
