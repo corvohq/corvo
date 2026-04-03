@@ -107,6 +107,27 @@ Management operations only — cancel, delete, pause, promote, requeue, queue cr
 - [x] **Server**: Cancel signal push via `MSG_CANCEL_SIGNAL` (0x08). Handler records worker_id before transition, pipeline scans waiting_conns to push signal to worker's connection. Bulk cancel also notifies queue (frees concurrency slot for waiting subscribers). Pipeline overrides RPC bulk action `now_ns` with server clock.
 - [x] **SDK cancel signal handling**: All 6 SDKs handle CANCEL_SIGNAL in message loop (Zig, Go, Python, TypeScript, Rust, Haskell).
 
+## Console (`~/dev/corvohq/console`)
+
+- [x] Go API: auth, PostgreSQL, CORS, prefixed IDs, cluster registry, health checks, node management
+- [x] Member management: invites, roles (owner/admin/member), team page
+- [x] RBAC: cluster_access table, viewer blocks writes
+- [x] License: ed25519 validation, cluster count enforcement
+- [x] React UI: Vite + TanStack Query + Tailwind + React Router
+- [x] Cluster UI: queues (list + pause/resume/delete), queue detail (jobs + state filter + tag search), job detail, workers, crons (CRUD)
+- [x] API key provisioning: create/list/delete scoped keys on clusters, one-time key display, role selector
+- [x] Cluster audit log tab: proxies Corvo's audit-logs endpoint
+- [x] Bulk job actions: select + bulk cancel/requeue/approve/reject/delete
+- [x] Held jobs: approve/reject buttons on queue detail and job detail
+- [x] Admin token required for cluster registration
+- [x] Workers empty state: getting-started guide linking to API Keys tab
+- [x] Corvo branding: favicon, logo in sidebar/login/signup
+- [x] Build tags: `go build` = on-prem, `go build -tags cloud` = cloud
+- [ ] GitHub OAuth, SSO/SAML
+- [ ] Aggregate cluster audit logs — enrich with Console user identity
+- [ ] Cloud mode: Stripe billing, auto-provisioning, billing page
+- [ ] Full node auto-discovery (needs Corvo to expose peer endpoints)
+
 ## V2
 
 - [ ] SSE streaming (`/events`) — pipeline-level connection tracking, push job lifecycle events to subscribers. Was planned for mirror-lag workaround; unnecessary now that reads go direct to KV. Revisit for API consumers who want push notifications.
