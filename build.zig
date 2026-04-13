@@ -69,7 +69,7 @@ pub fn build(b: *std.Build) void {
     const sim_step = b.step("sim", "Run VOPR simulator");
     sim_step.dependOn(&run_sim_tests.step);
 
-    // --- RPC Benchmark executable ---
+    // --- RPC Benchmark executable (zig build bench-rpc) ---
     const bench_rpc_mod = b.createModule(.{
         .root_source_file = b.path("src/bench_rpc.zig"),
         .target = target,
@@ -80,13 +80,12 @@ pub fn build(b: *std.Build) void {
         .name = "bench-rpc",
         .root_module = bench_rpc_mod,
     });
-    b.installArtifact(bench_rpc_exe);
     const run_bench_rpc = b.addRunArtifact(bench_rpc_exe);
     if (b.args) |a| run_bench_rpc.addArgs(a);
     const bench_rpc_step = b.step("bench-rpc", "Run RPC benchmarks");
     bench_rpc_step.dependOn(&run_bench_rpc.step);
 
-    // --- Saturation Benchmark executable ---
+    // --- Saturation Benchmark executable (zig build bench) ---
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench.zig"),
         .target = target,
@@ -97,28 +96,10 @@ pub fn build(b: *std.Build) void {
         .name = "bench",
         .root_module = bench_mod,
     });
-    b.installArtifact(bench_exe);
     const run_bench = b.addRunArtifact(bench_exe);
     if (b.args) |a| run_bench.addArgs(a);
     const bench_step = b.step("bench", "Run saturation benchmarks");
     bench_step.dependOn(&run_bench.step);
-
-    // --- Async Benchmark executable (io_uring) ---
-    const bench_async_mod = b.createModule(.{
-        .root_source_file = b.path("src/bench_async.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    // Self-contained: no corvo module dependency (inlined RPC constants).
-    const bench_async_exe = b.addExecutable(.{
-        .name = "bench-async",
-        .root_module = bench_async_mod,
-    });
-    b.installArtifact(bench_async_exe);
-    const run_bench_async = b.addRunArtifact(bench_async_exe);
-    if (b.args) |a| run_bench_async.addArgs(a);
-    const bench_async_step = b.step("bench-async", "Run async io_uring benchmarks");
-    bench_async_step.dependOn(&run_bench_async.step);
 
     // --- Corvo server executable ---
     const main_mod = b.createModule(.{
