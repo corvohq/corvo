@@ -12,10 +12,8 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact: corvo-linux-amd64
-            deps: libsqlite3-dev
           - os: ubuntu-latest
             artifact: corvo-linux-arm64
-            deps: libsqlite3-dev:arm64
             cross: aarch64-linux
           - os: macos-latest
             artifact: corvo-darwin-arm64
@@ -29,19 +27,6 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
-
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux' && !matrix.cross
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.deps }}
-
-      - name: Install cross-compile dependencies (Linux arm64)
-        if: matrix.cross
-        run: |
-          sudo dpkg --add-architecture arm64
-          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list.d/*.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe" | sudo tee /etc/apt/sources.list.d/arm64.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main restricted universe" | sudo tee -a /etc/apt/sources.list.d/arm64.list
-          sudo apt-get update && sudo apt-get install -y libsqlite3-dev:arm64
 
       - name: Build
         run: |
@@ -81,6 +66,7 @@ jobs:
         with:
           files: "*.tar.gz"
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref, 'rc') || contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
 
   docker:
     needs: build
@@ -104,7 +90,14 @@ jobs:
 
       - name: Extract version
         id: version
-        run: echo "tag=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" == *rc* ]] || [[ "$TAG" == *beta* ]] || [[ "$TAG" == *alpha* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -114,4 +107,4 @@ jobs:
           push: true
           tags: |
             corvohq/corvo:${{ steps.version.outputs.tag }}
-            corvohq/corvo:latest
+            ${{ steps.version.outputs.prerelease == 'false' && 'corvohq/corvo:latest' || '' }}

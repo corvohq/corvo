@@ -4,7 +4,7 @@ ARG TARGETARCH
 ARG ZIG_VERSION=0.15.2
 
 RUN apt-get update && \
-    apt-get install -y wget xz-utils libsqlite3-dev ca-certificates && \
+    apt-get install -y wget xz-utils ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 RUN case "${TARGETARCH}" in \
@@ -23,7 +23,7 @@ RUN zig build -Drelease
 
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates libsqlite3-0 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/zig-out/bin/corvo /usr/local/bin/corvo
 COPY --from=build /app/zig-out/bin/corvo-inspect /usr/local/bin/corvo-inspect

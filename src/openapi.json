@@ -3,7 +3,7 @@
   "info": {
     "title": "Corvo API",
     "description": "Distributed job queue with priorities, scheduling, and batches.",
-    "version": "0.1.0"
+    "version": "1.0.0-rc1"
   },
   "paths": {
     "/api/v1/enqueue": {

@@ -9,6 +9,7 @@ const json = @import("json_writer.zig");
 const kv_read = @import("kv_read.zig");
 const http_ui = @import("http_ui.zig");
 const metrics_mod = @import("metrics.zig");
+const version = @import("version.zig");
 
 /// Cluster info for /cluster/status. Set by main.zig after election.
 pub const ClusterInfo = struct {
@@ -113,7 +114,7 @@ fn serverInfo(send_buf: []u8) u32 {
     var body_buf: [4096]u8 = undefined;
     var w = json.JsonWriter.init(&body_buf);
     w.beginObject();
-    w.fieldStr("version", "0.1.0b");
+    w.fieldStr("version", version.string);
     w.fieldStr("engine", "zig");
 
     if (g_config) |cfg| {
