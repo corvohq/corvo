@@ -699,30 +699,52 @@ fn jobSearchPost(send_buf: []u8, reader: *kv_read.Reader, body_input: []const u8
     const state_count = http.extractJSONStringArray(body_input, "state", &state_strs);
     const limit_val = http.extractJSONInt(body_input, "limit");
     const limit: u32 = if (limit_val) |l| @intCast(@min(@max(l, 1), 500)) else 100;
+    const offset_val = http.extractJSONInt(body_input, "offset");
+    const offset: u32 = if (offset_val) |o| @intCast(@max(o, 0)) else 0;
 
-    var job_buf: [500]kv_read.JobRow = undefined;
-    const actual_limit = @min(limit, @as(u32, @intCast(job_buf.len)));
+    var job_buf: [501]kv_read.JobRow = undefined;
+    const fetch_limit = limit + 1; // +1 to detect has_more
     var count: u32 = 0;
 
     if (text_filter) |q| {
-        count = reader.searchPayload(q, job_buf[0..actual_limit]);
+        count = reader.searchPayload(q, job_buf[0..fetch_limit]);
     } else if (state_count > 1) {
-        // Multi-state: query each state separately, accumulate results up to limit.
+        // Multi-state: distribute global offset across states using counters.
+        var skip_left: u32 = offset;
         for (0..state_count) |si| {
-            const remaining = actual_limit - count;
+            const remaining = fetch_limit - count;
             if (remaining == 0) break;
-            count += reader.queryJobsByQueueState(queue_filter, state_strs[si], remaining, 0, job_buf[count..]);
+
+            if (skip_left > 0) {
+                const state_total: u32 = @intCast(@max(
+                    if (queue_filter) |qf| reader.countJobsByQueueState(qf, state_strs[si]) else reader.countJobsByState(state_strs[si]),
+                    0,
+                ));
+                if (state_total <= skip_left) {
+                    skip_left -= state_total;
+                    continue;
+                }
+            }
+
+            count += reader.queryJobsByQueueState(queue_filter, state_strs[si], remaining, skip_left, job_buf[count..]);
+            skip_left = 0;
         }
     } else {
         const state_filter = if (state_count > 0) state_strs[0] else null;
-        count = reader.queryJobsByQueueState(queue_filter, state_filter, actual_limit, 0, &job_buf);
+        count = reader.queryJobsByQueueState(queue_filter, state_filter, fetch_limit, offset, &job_buf);
+    }
+
+    var has_more = false;
+    if (count > limit) {
+        has_more = true;
+        count = limit;
     }
 
     for (0..count) |i| writeJobRowSummary(&jw, &job_buf[i]);
 
     jw.endArray();
     jw.fieldInt("total", count);
-    jw.fieldBool("has_more", false);
+    jw.fieldBool("has_more", has_more);
     jw.endObject();
     return http.writeResponse(send_buf, 200, jw.getWritten());
 }

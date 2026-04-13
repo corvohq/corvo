@@ -468,16 +468,16 @@ pub const Reader = struct {
     pub fn getJobs(self: *Reader, results: []JobRow) u32 {
         var batch = self.store.newBatch();
         defer batch.close();
-        return self.scanJobsByIndex(&batch, keys.prefix_job_time, results);
+        return self.scanJobsByIndex(&batch, keys.prefix_job_time, results, 0);
     }
 
-    /// Query jobs by queue and state with cursor-based pagination.
+    /// Query jobs by queue and state with offset-based pagination.
     pub fn queryJobsByQueueState(
         self: *Reader,
         queue: ?[]const u8,
         state: ?[]const u8,
         limit: u32,
-        _: u32, // offset — ignored, kept for API compat during migration
+        offset: u32,
         results: []JobRow,
     ) u32 {
         var batch = self.store.newBatch();
@@ -487,23 +487,19 @@ pub const Reader = struct {
         const actual_limit = @min(limit, @as(u32, @intCast(results.len)));
 
         if (queue != null and state_byte != null) {
-            // jqs|{queue}\x00{state}...
             var prefix_buf: keys.KeyBuf = undefined;
             const prefix = keys.jobQueueStatePrefix(&prefix_buf, queue.?, state_byte.?);
-            return self.scanJobsByPrefix(&batch, prefix, actual_limit, results);
+            return self.scanJobsByPrefix(&batch, prefix, actual_limit, offset, results);
         } else if (queue != null) {
-            // jq|{queue}\x00...
             var prefix_buf: keys.KeyBuf = undefined;
             const prefix = keys.jobQueuePrefix(&prefix_buf, queue.?);
-            return self.scanJobsByPrefix(&batch, prefix, actual_limit, results);
+            return self.scanJobsByPrefix(&batch, prefix, actual_limit, offset, results);
         } else if (state_byte != null) {
-            // js|{state}...
             var prefix_buf: keys.KeyBuf = undefined;
             const prefix = keys.jobStatePrefix(&prefix_buf, state_byte.?);
-            return self.scanJobsByPrefix(&batch, prefix, actual_limit, results);
+            return self.scanJobsByPrefix(&batch, prefix, actual_limit, offset, results);
         } else {
-            // All jobs by creation time
-            return self.scanJobsByIndex(&batch, keys.prefix_job_time, results[0..actual_limit]);
+            return self.scanJobsByIndex(&batch, keys.prefix_job_time, results[0..actual_limit], offset);
         }
     }
 
@@ -956,7 +952,7 @@ pub const Reader = struct {
     // ====================================================================
 
     /// Scan a prefix index, look up j|{id} for each, populate results.
-    fn scanJobsByIndex(self: *Reader, batch: *kv.WriteBatch, prefix: []const u8, results: []JobRow) u32 {
+    fn scanJobsByIndex(self: *Reader, batch: *kv.WriteBatch, prefix: []const u8, results: []JobRow, offset: u32) u32 {
         _ = self;
         var lower_buf: keys.KeyBuf = undefined;
         var upper_buf: keys.KeyBuf = undefined;
@@ -966,8 +962,15 @@ pub const Reader = struct {
         var iter = batch.newIter(lower_buf[0..prefix.len], upper);
         defer iter.close();
 
-        var count: u32 = 0;
         if (!iter.first()) return 0;
+
+        // Skip offset entries.
+        var skipped: u32 = 0;
+        while (skipped < offset) : (skipped += 1) {
+            if (!iter.next()) return 0;
+        }
+
+        var count: u32 = 0;
         while (true) {
             if (count >= results.len) break;
             const k = iter.key();
@@ -985,7 +988,7 @@ pub const Reader = struct {
     }
 
     /// Scan any prefix that maps to job IDs, look up j|{id} for each.
-    fn scanJobsByPrefix(self: *Reader, batch: *kv.WriteBatch, prefix: []const u8, limit: u32, results: []JobRow) u32 {
+    fn scanJobsByPrefix(self: *Reader, batch: *kv.WriteBatch, prefix: []const u8, limit: u32, offset: u32, results: []JobRow) u32 {
         _ = self;
         var upper_buf: keys.KeyBuf = undefined;
         const upper = keys.prefixEnd(&upper_buf, prefix) orelse return 0;
@@ -993,8 +996,15 @@ pub const Reader = struct {
         var iter = batch.newIter(prefix, upper);
         defer iter.close();
 
-        var count: u32 = 0;
         if (!iter.first()) return 0;
+
+        // Skip offset entries.
+        var skipped: u32 = 0;
+        while (skipped < offset) : (skipped += 1) {
+            if (!iter.next()) return 0;
+        }
+
+        var count: u32 = 0;
         while (true) {
             if (count >= limit) break;
             const k = iter.key();
