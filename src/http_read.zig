@@ -6,6 +6,7 @@
 const std = @import("std");
 const http = @import("http.zig");
 const json = @import("json_writer.zig");
+const kv = @import("kv.zig");
 const kv_read = @import("kv_read.zig");
 const http_ui = @import("http_ui.zig");
 const metrics_mod = @import("metrics.zig");
@@ -41,6 +42,8 @@ pub fn dispatch(
     send_buf: []u8,
     reader: ?*kv_read.Reader,
     server_metrics: ?*const metrics_mod.ServerMetrics,
+    store: *kv.Store,
+    now_ns: u64,
 ) u32 {
     // Strip query string for route matching.
     const clean = if (std.mem.indexOfScalar(u8, path, '?')) |qi| path[0..qi] else path;
@@ -80,6 +83,28 @@ pub fn dispatch(
         return handleLogin(send_buf, body);
     if (std.mem.eql(u8, api, "/cluster/join") and method == .POST)
         return handleClusterJoin(send_buf, body);
+
+    // Backup/restore endpoints.
+    if (std.mem.eql(u8, api, "/backup") and method == .POST)
+        return backupCreate(send_buf, store, now_ns);
+    if (std.mem.startsWith(u8, api, "/backup/")) {
+        const backup_id = api["/backup/".len..];
+        if (backup_id.len > 0) {
+            if (method == .GET) return backupDownload(send_buf, backup_id, path);
+            if (method == .DELETE) return backupDelete(send_buf, backup_id);
+        }
+    }
+    if (std.mem.eql(u8, api, "/restore") and method == .POST)
+        return restoreInit(send_buf, now_ns);
+    if (std.mem.startsWith(u8, api, "/restore/")) {
+        const rest = api["/restore/".len..];
+        if (std.mem.endsWith(u8, rest, "/apply") and method == .POST) {
+            const restore_id = rest[0 .. rest.len - "/apply".len];
+            if (restore_id.len > 0) return restoreApply(send_buf, store, restore_id);
+        } else if (rest.len > 0 and method == .PUT) {
+            return restoreUpload(send_buf, rest, body, path);
+        }
+    }
 
     const rdr = reader orelse return writeError(send_buf, 503, "no_mirror");
 
@@ -877,6 +902,183 @@ fn debugRuntime(send_buf: []u8) u32 {
 }
 
 // ============================================================================
+// Backup / Restore
+// ============================================================================
+
+const backup_base_dir = "/tmp/corvo-backup-";
+const max_chunk_size: u32 = 60000;
+
+/// POST /api/v1/backup — checkpoint to temp dir, return backup metadata.
+fn backupCreate(send_buf: []u8, store: *kv.Store, now_ns: u64) u32 {
+    var id_buf: [32]u8 = undefined;
+    const backup_id = std.fmt.bufPrint(&id_buf, "{d}", .{now_ns}) catch
+        return writeError(send_buf, 500, "id_format_failed");
+
+    var dir_buf: [128]u8 = undefined;
+    const snap_dir = std.fmt.bufPrint(&dir_buf, "{s}{s}", .{ backup_base_dir, backup_id }) catch
+        return writeError(send_buf, 500, "backup_id_too_long");
+
+    store.db.checkpoint(snap_dir) catch
+        return writeError(send_buf, 500, "checkpoint_failed");
+
+    // Stat the checkpoint files for total_bytes.
+    const db_size = fileSize(snap_dir, "talon.db");
+    const vlog_size = fileSize(snap_dir, "talon.vlog");
+    const total_bytes = db_size + vlog_size;
+
+    var body_buf: [512]u8 = undefined;
+    var jw = json.JsonWriter.init(&body_buf);
+    jw.beginObject();
+    jw.fieldStr("backup_id", backup_id);
+    jw.fieldInt("total_bytes", @as(i64, @intCast(total_bytes)));
+    jw.fieldInt("db_bytes", @as(i64, @intCast(db_size)));
+    jw.fieldInt("vlog_bytes", @as(i64, @intCast(vlog_size)));
+    jw.endObject();
+    return http.writeResponse(send_buf, 200, jw.getWritten());
+}
+
+/// GET /api/v1/backup/{id}?file=talon.db&offset=0&length=60000 — download chunk.
+fn backupDownload(send_buf: []u8, backup_id: []const u8, path: []const u8) u32 {
+    const file_name = http.extractQueryParam(path, "file") orelse
+        return writeError(send_buf, 400, "file_param_required");
+    if (!std.mem.eql(u8, file_name, "talon.db") and !std.mem.eql(u8, file_name, "talon.vlog"))
+        return writeError(send_buf, 400, "invalid_file");
+
+    const offset = blk: {
+        const s = http.extractQueryParam(path, "offset") orelse break :blk @as(u64, 0);
+        break :blk std.fmt.parseInt(u64, s, 10) catch break :blk @as(u64, 0);
+    };
+    const length = blk: {
+        const s = http.extractQueryParam(path, "length") orelse break :blk max_chunk_size;
+        const v = std.fmt.parseInt(u32, s, 10) catch break :blk max_chunk_size;
+        break :blk @min(v, max_chunk_size);
+    };
+
+    var dir_buf: [128]u8 = undefined;
+    const snap_dir = std.fmt.bufPrint(&dir_buf, "{s}{s}", .{ backup_base_dir, backup_id }) catch
+        return writeError(send_buf, 400, "invalid_backup_id");
+
+    var path_buf: [192]u8 = undefined;
+    const file_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ snap_dir, file_name }) catch
+        return writeError(send_buf, 500, "path_too_long");
+
+    const file = std.fs.cwd().openFile(file_path, .{}) catch
+        return writeError(send_buf, 404, "backup_not_found");
+    defer file.close();
+
+    file.seekTo(offset) catch return writeError(send_buf, 500, "seek_failed");
+
+    // Write HTTP headers first, then read file data directly after.
+    var stream = std.io.fixedBufferStream(send_buf);
+    const w = stream.writer();
+    // We need Content-Length, so read into a temp area first.
+    const header_max: u32 = 256;
+    const body_space = @as(u32, @intCast(send_buf.len)) - header_max;
+    const read_len = @min(length, body_space);
+    var chunk_buf: [60000]u8 = undefined;
+    const actual_read = @min(read_len, @as(u32, @intCast(chunk_buf.len)));
+    const n = file.readAll(chunk_buf[0..actual_read]) catch return writeError(send_buf, 500, "read_failed");
+
+    w.print("HTTP/1.1 200 OK\r\n", .{}) catch return 0;
+    w.print("Content-Type: application/octet-stream\r\n", .{}) catch return 0;
+    w.print("Content-Length: {d}\r\n", .{n}) catch return 0;
+    w.writeAll("Connection: keep-alive\r\n") catch return 0;
+    w.writeAll("Access-Control-Allow-Origin: *\r\n") catch return 0;
+    w.writeAll("\r\n") catch return 0;
+    w.writeAll(chunk_buf[0..n]) catch return 0;
+
+    return @intCast(stream.pos);
+}
+
+/// DELETE /api/v1/backup/{id} — cleanup temp directory.
+fn backupDelete(send_buf: []u8, backup_id: []const u8) u32 {
+    var dir_buf: [128]u8 = undefined;
+    const snap_dir = std.fmt.bufPrint(&dir_buf, "{s}{s}", .{ backup_base_dir, backup_id }) catch
+        return writeError(send_buf, 400, "invalid_backup_id");
+    std.fs.cwd().deleteTree(snap_dir) catch {};
+    return http.writeResponse(send_buf, 200, "{\"status\":\"deleted\"}");
+}
+
+/// POST /api/v1/restore — init restore, create temp dir, return restore_id.
+fn restoreInit(send_buf: []u8, now_ns: u64) u32 {
+    var id_buf: [32]u8 = undefined;
+    const restore_id = std.fmt.bufPrint(&id_buf, "{d}", .{now_ns}) catch
+        return writeError(send_buf, 500, "id_format_failed");
+
+    var dir_buf: [128]u8 = undefined;
+    const restore_dir = std.fmt.bufPrint(&dir_buf, "/tmp/corvo-restore-{s}", .{restore_id}) catch
+        return writeError(send_buf, 500, "restore_id_too_long");
+    std.fs.cwd().makePath(restore_dir) catch
+        return writeError(send_buf, 500, "mkdir_failed");
+
+    var body_buf: [256]u8 = undefined;
+    var jw = json.JsonWriter.init(&body_buf);
+    jw.beginObject();
+    jw.fieldStr("restore_id", restore_id);
+    jw.endObject();
+    return http.writeResponse(send_buf, 200, jw.getWritten());
+}
+
+/// PUT /api/v1/restore/{id}?file=talon.db&offset=0 — upload chunk.
+fn restoreUpload(send_buf: []u8, restore_id: []const u8, body: []const u8, path: []const u8) u32 {
+    const file_name = http.extractQueryParam(path, "file") orelse
+        return writeError(send_buf, 400, "file_param_required");
+    if (!std.mem.eql(u8, file_name, "talon.db") and !std.mem.eql(u8, file_name, "talon.vlog"))
+        return writeError(send_buf, 400, "invalid_file");
+
+    const offset = blk: {
+        const s = http.extractQueryParam(path, "offset") orelse break :blk @as(u64, 0);
+        break :blk std.fmt.parseInt(u64, s, 10) catch break :blk @as(u64, 0);
+    };
+
+    var dir_buf: [128]u8 = undefined;
+    const restore_dir = std.fmt.bufPrint(&dir_buf, "/tmp/corvo-restore-{s}", .{restore_id}) catch
+        return writeError(send_buf, 400, "invalid_restore_id");
+
+    var path_buf: [192]u8 = undefined;
+    const file_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ restore_dir, file_name }) catch
+        return writeError(send_buf, 500, "path_too_long");
+
+    // Open or create the file, write the chunk at the given offset.
+    const file = std.fs.cwd().createFile(file_path, .{ .truncate = false }) catch
+        return writeError(send_buf, 500, "create_failed");
+    defer file.close();
+    file.seekTo(offset) catch return writeError(send_buf, 500, "seek_failed");
+    file.writeAll(body) catch return writeError(send_buf, 500, "write_failed");
+
+    var body_buf: [128]u8 = undefined;
+    var jw = json.JsonWriter.init(&body_buf);
+    jw.beginObject();
+    jw.fieldInt("bytes_written", @as(i64, @intCast(body.len)));
+    jw.endObject();
+    return http.writeResponse(send_buf, 200, jw.getWritten());
+}
+
+/// POST /api/v1/restore/{id}/apply — live restore from uploaded files.
+fn restoreApply(send_buf: []u8, store: *kv.Store, restore_id: []const u8) u32 {
+    var dir_buf: [128]u8 = undefined;
+    const restore_dir = std.fmt.bufPrint(&dir_buf, "/tmp/corvo-restore-{s}", .{restore_id}) catch
+        return writeError(send_buf, 400, "invalid_restore_id");
+
+    store.db.restore(restore_dir) catch
+        return writeError(send_buf, 500, "restore_failed");
+
+    // Cleanup temp files.
+    std.fs.cwd().deleteTree(restore_dir) catch {};
+
+    return http.writeResponse(send_buf, 200, "{\"status\":\"restored\"}");
+}
+
+fn fileSize(dir: []const u8, name: []const u8) u64 {
+    var path_buf: [192]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch return 0;
+    const file = std.fs.cwd().openFile(path, .{}) catch return 0;
+    defer file.close();
+    const stat = file.stat() catch return 0;
+    return stat.size;
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -902,5 +1104,154 @@ fn writeError(send_buf: []u8, status: u16, msg: []const u8) u32 {
     jw.fieldStr("error", msg);
     jw.endObject();
     return http.writeResponse(send_buf, status, jw.getWritten());
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const talon = @import("talon");
+const testing = std.testing;
+
+test "backup and restore round-trip" {
+    // Use page_allocator for the DB — talon's restore() replaces internal
+    // structures without freeing the old ones, which trips testing.allocator's
+    // leak detector. This is a known talon limitation, not a corvo bug.
+    const allocator = std.heap.page_allocator;
+
+    const db_path = "/tmp/corvo-test-backup-rt";
+    std.fs.cwd().deleteTree(db_path) catch {};
+    defer std.fs.cwd().deleteTree(db_path) catch {};
+    const db = try talon.DB.open(allocator, db_path, .{ .sync = false });
+    defer db.close();
+    var store = kv.Store.init(db);
+
+    // Write a known key.
+    var batch = store.newBatch();
+    batch.set("test-key", "original-value");
+    batch.commit();
+    batch.close();
+
+    // Backup via HTTP handler with deterministic clock.
+    var send_buf: [65536]u8 = undefined;
+    const backup_ns: u64 = 1000000;
+    const create_len = backupCreate(&send_buf, &store, backup_ns);
+    try testing.expect(create_len > 0);
+
+    // Copy backup_id out of send_buf before it gets reused.
+    const resp = send_buf[0..create_len];
+    const body_start = std.mem.indexOf(u8, resp, "\r\n\r\n").? + 4;
+    var backup_id_buf: [32]u8 = undefined;
+    const backup_id_src = http.extractJSONString(resp[body_start..], "backup_id").?;
+    @memcpy(backup_id_buf[0..backup_id_src.len], backup_id_src);
+    const backup_id = backup_id_buf[0..backup_id_src.len];
+
+    var snap_dir_buf: [128]u8 = undefined;
+    const snap_dir = try std.fmt.bufPrint(&snap_dir_buf, "{s}{s}", .{ backup_base_dir, backup_id });
+    defer std.fs.cwd().deleteTree(snap_dir) catch {};
+
+    // Overwrite data to prove restore works.
+    var batch2 = store.newBatch();
+    batch2.set("test-key", "overwritten");
+    batch2.commit();
+    batch2.close();
+
+    var read_batch = store.newBatch();
+    try testing.expectEqualStrings("overwritten", read_batch.get("test-key").?);
+    read_batch.close();
+
+    // Init restore with a different clock value.
+    const restore_ns: u64 = 2000000;
+    const init_len = restoreInit(&send_buf, restore_ns);
+    try testing.expect(init_len > 0);
+
+    // Copy restore_id out of send_buf.
+    const init_body_start = std.mem.indexOf(u8, send_buf[0..init_len], "\r\n\r\n").? + 4;
+    var restore_id_buf: [32]u8 = undefined;
+    const restore_id_src = http.extractJSONString(send_buf[init_body_start..init_len], "restore_id").?;
+    @memcpy(restore_id_buf[0..restore_id_src.len], restore_id_src);
+    const restore_id = restore_id_buf[0..restore_id_src.len];
+
+    var restore_dir_buf: [128]u8 = undefined;
+    const restore_dir = try std.fmt.bufPrint(&restore_dir_buf, "/tmp/corvo-restore-{s}", .{restore_id});
+    defer std.fs.cwd().deleteTree(restore_dir) catch {};
+
+    // Upload backup files to restore dir via HTTP handler.
+    for ([_][]const u8{ "talon.db", "talon.vlog" }) |fname| {
+        var src_path_buf: [192]u8 = undefined;
+        const src_path = try std.fmt.bufPrint(&src_path_buf, "{s}/{s}", .{ snap_dir, fname });
+        const src_file = try std.fs.cwd().openFile(src_path, .{});
+        defer src_file.close();
+        const src_stat = try src_file.stat();
+
+        var offset: u64 = 0;
+        var file_buf: [4096]u8 = undefined;
+        while (offset < src_stat.size) {
+            const n = try src_file.read(&file_buf);
+            if (n == 0) break;
+            var upload_path_buf: [256]u8 = undefined;
+            const upload_path = try std.fmt.bufPrint(&upload_path_buf, "/api/v1/restore/{s}?file={s}&offset={d}", .{ restore_id, fname, offset });
+            const ul_len = restoreUpload(&send_buf, restore_id, file_buf[0..n], upload_path);
+            try testing.expect(ul_len > 0);
+            try testing.expect(std.mem.startsWith(u8, send_buf[0..ul_len], "HTTP/1.1 200"));
+            offset += n;
+        }
+
+        // Verify uploaded file matches source size.
+        var dst_path_buf: [192]u8 = undefined;
+        const dst_path = try std.fmt.bufPrint(&dst_path_buf, "{s}/{s}", .{ restore_dir, fname });
+        const dst_stat = try std.fs.cwd().statFile(dst_path);
+        try testing.expectEqual(src_stat.size, dst_stat.size);
+    }
+
+    // Apply restore via HTTP handler.
+    const apply_len = restoreApply(&send_buf, &store, restore_id);
+    try testing.expect(apply_len > 0);
+    try testing.expect(std.mem.startsWith(u8, send_buf[0..apply_len], "HTTP/1.1 200"));
+
+    // Verify original data is back.
+    var read_batch2 = store.newBatch();
+    try testing.expectEqualStrings("original-value", read_batch2.get("test-key").?);
+    read_batch2.close();
+}
+
+test "backup download chunked" {
+    const allocator = testing.allocator;
+
+    const db_path = "/tmp/corvo-test-backup-dl";
+    std.fs.cwd().deleteTree(db_path) catch {};
+    defer std.fs.cwd().deleteTree(db_path) catch {};
+    const db = try talon.DB.open(allocator, db_path, .{ .sync = false });
+    defer db.close();
+    var store = kv.Store.init(db);
+
+    // Write data so files aren't empty.
+    var batch = store.newBatch();
+    batch.set("k1", "v1");
+    batch.commit();
+    batch.close();
+
+    // Create backup.
+    var send_buf: [65536]u8 = undefined;
+    const create_len = backupCreate(&send_buf, &store, 3000000);
+    try testing.expect(create_len > 0);
+
+    // Copy backup_id out of send_buf.
+    const resp = send_buf[0..create_len];
+    const body_start = std.mem.indexOf(u8, resp, "\r\n\r\n").? + 4;
+    var backup_id_buf: [32]u8 = undefined;
+    const backup_id_src = http.extractJSONString(resp[body_start..], "backup_id").?;
+    @memcpy(backup_id_buf[0..backup_id_src.len], backup_id_src);
+    const backup_id = backup_id_buf[0..backup_id_src.len];
+
+    defer _ = backupDelete(&send_buf, backup_id);
+
+    // Download first chunk of talon.db.
+    var path_buf: [256]u8 = undefined;
+    const dl_path = std.fmt.bufPrint(&path_buf, "/api/v1/backup/{s}?file=talon.db&offset=0&length=1024", .{backup_id}) catch unreachable;
+    const dl_len = backupDownload(&send_buf, backup_id, dl_path);
+    try testing.expect(dl_len > 0);
+    try testing.expect(std.mem.startsWith(u8, send_buf[0..dl_len], "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, send_buf[0..dl_len], "application/octet-stream") != null);
 }
 

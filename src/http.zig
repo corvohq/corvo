@@ -210,6 +210,11 @@ pub fn writeResponseHtml(send_buf: []u8, status: u16, html_body: []const u8) u32
     return writeResponseInner(send_buf, status, "text/html; charset=utf-8", html_body);
 }
 
+/// Write an HTTP/1.1 binary response with custom content type and optional headers.
+pub fn writeResponseBinary(send_buf: []u8, status: u16, content_type: []const u8, body: []const u8) u32 {
+    return writeResponseInner(send_buf, status, content_type, body);
+}
+
 /// Write an HTTP/1.1 response for a static embedded file.
 /// If gzipped=true, adds Content-Encoding: gzip header.
 pub fn writeResponseStatic(send_buf: []u8, data: []const u8, content_type: []const u8, gzipped: bool) u32 {
@@ -410,9 +415,15 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
                 if (queue.len > 0) return writeRoute(rpc.MSG_ENQUEUE_BATCH, queue, "webhook");
             }
 
+            // Backup/restore (read-path — no KV mutation via pipeline)
+            if (std.mem.eql(u8, api, "/backup")) return .read;
+            if (std.mem.eql(u8, api, "/restore")) return .read;
+            if (std.mem.startsWith(u8, api, "/restore/")) return .read;
         },
 
         .PUT => {
+            // PUT /restore/{id} — upload chunk (read-path, writes to temp file)
+            if (std.mem.startsWith(u8, api, "/restore/")) return .read;
             // PUT /cron-jobs/{id} or /crons/{id}
             if (std.mem.startsWith(u8, api, "/cron-jobs/")) {
                 const id = api["/cron-jobs/".len..];
@@ -474,6 +485,9 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
             // DELETE /audit-logs — clear all audit entries
             if (std.mem.eql(u8, api, "/audit-logs"))
                 return writeRoute(rpc.MSG_MODIFY_SETTING, "", "audit_clear");
+
+            // DELETE /backup/{id} — cleanup temp files (read-path, no KV mutation)
+            if (std.mem.startsWith(u8, api, "/backup/")) return .read;
         },
 
         .GET => return .read,
@@ -2204,6 +2218,18 @@ test "classifyRoute — queue throttle delete" {
     try std.testing.expect(del == .write);
     try std.testing.expectEqual(rpc.MSG_QUEUE_CONFIG, del.write.msg_type);
     try std.testing.expectEqualStrings("throttle_remove", del.write.sub_action);
+}
+
+test "classifyRoute — backup/restore" {
+    // Backup
+    try std.testing.expect(classifyRoute(.POST, "/api/v1/backup") == .read);
+    try std.testing.expect(classifyRoute(.GET, "/api/v1/backup/123") == .read);
+    try std.testing.expect(classifyRoute(.DELETE, "/api/v1/backup/123") == .read);
+
+    // Restore
+    try std.testing.expect(classifyRoute(.POST, "/api/v1/restore") == .read);
+    try std.testing.expect(classifyRoute(.PUT, "/api/v1/restore/123") == .read);
+    try std.testing.expect(classifyRoute(.POST, "/api/v1/restore/123/apply") == .read);
 }
 
 test "decodeBulkAction — single job cancel" {

@@ -732,6 +732,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         c.send_buf,
                         self.reader,
                         &self.handler.metrics,
+                        &self.stores[0],
+                        @intCast(@max(0, self.config.clock_fn())),
                     );
                     if (resp_len > 0) {
                         c.send_len = resp_len;
