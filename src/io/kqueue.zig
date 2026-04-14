@@ -123,18 +123,46 @@ pub const KqueueBackend = struct {
 
     pub fn drain(self: *KqueueBackend, out: []Completion) u32 {
         if (comptime !is_macos) unreachable;
-
         assert.check(out.len > 0, "drain: output buffer must be non-empty", .{});
+        return self.drainWithTimeout(out, null);
+    }
 
+    /// Drain with zero timeout — return immediately with any ready events.
+    pub fn drainNonBlocking(self: *KqueueBackend, out: []Completion) u32 {
+        if (comptime !is_macos) unreachable;
+        assert.check(out.len > 0, "drainNonBlocking: output buffer must be non-empty", .{});
+        const zero = posix.timespec{ .sec = 0, .nsec = 0 };
+        return self.drainWithTimeout(out, &zero);
+    }
+
+    /// Drain coalescing: blocking first call for at least one event, then keep
+    /// polling with zero timeout until buffer full or deadline reached.
+    pub fn drainCoalescing(self: *KqueueBackend, out: []Completion, clock_fn: *const fn () i64, deadline_ns: u64) u32 {
+        if (comptime !is_macos) unreachable;
+        assert.check(out.len > 0, "drainCoalescing: output buffer must be non-empty", .{});
+        var total = self.drainWithTimeout(out, null);
+        if (total >= out.len) return total;
+        const zero = posix.timespec{ .sec = 0, .nsec = 0 };
+        while (total < out.len) {
+            const now: u64 = @intCast(clock_fn());
+            if (now >= deadline_ns) break;
+            const more = self.drainWithTimeout(out[total..], &zero);
+            if (more == 0) break;
+            total += more;
+        }
+        return total;
+    }
+
+    fn drainWithTimeout(self: *KqueueBackend, out: []Completion, timeout: ?*const posix.timespec) u32 {
         const n_events = kevent(
             self.kq_fd,
             self.changes[0..self.change_count],
             &self.event_buf,
-            null,
+            timeout,
         );
         self.change_count = 0;
 
-        if (n_events < 0) return 0;
+        if (n_events <= 0) return 0;
 
         var out_count: u32 = 0;
         for (self.event_buf[0..@intCast(n_events)]) |ev| {
@@ -363,8 +391,11 @@ pub const KqueueBackend = struct {
 
     fn setNonBlocking(fd: posix.fd_t) void {
         if (comptime !is_macos) return;
-        const flags = posix.fcntl(fd, .GETFL) catch return;
-        _ = posix.fcntl(fd, .SETFL, .{ .bits = @as(u32, @bitCast(flags)) | @as(u32, @bitCast(posix.O{ .NONBLOCK = true })) }) catch {};
+        const F_GETFL: i32 = 3;
+        const F_SETFL: i32 = 4;
+        const O_NONBLOCK: usize = 0x0004;
+        const flags = posix.fcntl(fd, F_GETFL, 0) catch return;
+        _ = posix.fcntl(fd, F_SETFL, flags | O_NONBLOCK) catch {};
     }
 
     fn setTcpNodelay(fd: posix.fd_t) void {
