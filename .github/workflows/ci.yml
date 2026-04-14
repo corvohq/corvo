@@ -37,6 +37,26 @@ jobs:
         run: zig build sim
         timeout-minutes: 10
 
+  cross-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-linux
+          - aarch64-macos
+          - x86_64-macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Cross-compile (${{ matrix.target }})
+        run: zig build -Dtarget=${{ matrix.target }}
+
   docker:
     runs-on: ubuntu-latest
     steps:
