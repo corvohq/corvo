@@ -242,24 +242,34 @@ pub const Client = struct {
 
     pub const BulkParams = struct {
         action: []const u8,
-        queue: []const u8,
-        state: []const u8 = "",
-        target_queue: []const u8 = "",
-        limit: []const u8 = "",
+        job_ids: []const u8, // comma-separated
+        move_to_queue: []const u8 = "",
     };
 
     pub fn bulk(self: Client, params: BulkParams, resp_buf: []u8) HttpResponse {
-        var body_buf: [4096]u8 = undefined;
+        var body_buf: [65536]u8 = undefined;
         var body_pos: usize = 0;
 
-        body_pos += (std.fmt.bufPrint(body_buf[body_pos..], "{{\"action\":\"{s}\",\"queue\":\"{s}\"", .{ params.action, params.queue }) catch return errResp("body too large")).len;
+        body_pos += (std.fmt.bufPrint(body_buf[body_pos..], "{{\"action\":\"{s}\",\"job_ids\":[", .{params.action}) catch return errResp("body too large")).len;
 
-        if (params.state.len > 0)
-            body_pos += (std.fmt.bufPrint(body_buf[body_pos..], ",\"state\":\"{s}\"", .{params.state}) catch return errResp("body too large")).len;
-        if (params.target_queue.len > 0)
-            body_pos += (std.fmt.bufPrint(body_buf[body_pos..], ",\"target_queue\":\"{s}\"", .{params.target_queue}) catch return errResp("body too large")).len;
-        if (params.limit.len > 0)
-            body_pos += (std.fmt.bufPrint(body_buf[body_pos..], ",\"limit\":{s}", .{params.limit}) catch return errResp("body too large")).len;
+        // Parse comma-separated job_ids, emit as JSON array.
+        var first = true;
+        var it = std.mem.splitScalar(u8, params.job_ids, ',');
+        while (it.next()) |id| {
+            const trimmed = std.mem.trim(u8, id, " ");
+            if (trimmed.len == 0) continue;
+            if (!first) {
+                body_buf[body_pos] = ',';
+                body_pos += 1;
+            }
+            body_pos += (std.fmt.bufPrint(body_buf[body_pos..], "\"{s}\"", .{trimmed}) catch return errResp("body too large")).len;
+            first = false;
+        }
+        body_buf[body_pos] = ']';
+        body_pos += 1;
+
+        if (params.move_to_queue.len > 0)
+            body_pos += (std.fmt.bufPrint(body_buf[body_pos..], ",\"move_to_queue\":\"{s}\"", .{params.move_to_queue}) catch return errResp("body too large")).len;
 
         body_buf[body_pos] = '}';
         body_pos += 1;
@@ -403,7 +413,7 @@ fn printResponse(resp: HttpResponse) void {
 pub fn dispatch(first_arg: []const u8, args: *std.process.ArgIterator) void {
     if (eql(first_arg, "enqueue")) return cmdEnqueue(args);
     if (eql(first_arg, "inspect")) return cmdInspect(args);
-    if (eql(first_arg, "retry")) return cmdJobAction(args, "retry");
+    if (eql(first_arg, "requeue")) return cmdJobAction(args, "requeue");
     if (eql(first_arg, "cancel")) return cmdJobAction(args, "cancel");
     if (eql(first_arg, "hold")) return cmdJobAction(args, "hold");
     if (eql(first_arg, "approve")) return cmdJobAction(args, "approve");
@@ -457,14 +467,14 @@ pub fn printHelp() void {
         \\Job Operations:
         \\  enqueue             Enqueue a job
         \\  inspect             Show full job detail                        ~ mirror
-        \\  retry               Retry a failed/dead job
+        \\  requeue             Requeue a failed/dead job
         \\  cancel              Cancel a pending/active job
         \\  delete              Delete a job
         \\  hold                Move a job to held state
         \\  approve             Approve a held job back to pending
         \\  reject              Reject a held job to dead state
         \\  move                Move a job to another queue
-        \\  bulk                Apply bulk action (retry, delete, cancel, move, requeue)
+        \\  bulk                Apply bulk action to explicit job IDs
         \\
         \\Queue Management:
         \\  queues              List all queues with stats                  ~ mirror
@@ -653,7 +663,7 @@ fn cmdInspect(args: *std.process.ArgIterator) void {
 }
 
 // ============================================================================
-// retry/cancel/hold/approve/reject <job-id>
+// requeue/cancel/hold/approve/reject <job-id>
 // ============================================================================
 
 fn cmdJobAction(args: *std.process.ArgIterator, action: []const u8) void {
@@ -706,10 +716,8 @@ fn cmdMove(args: *std.process.ArgIterator) void {
 fn cmdBulk(args: *std.process.ArgIterator) void {
     var opts = CliOpts{};
     var action: []const u8 = "";
-    var queue: []const u8 = "";
-    var state: []const u8 = "";
-    var target_queue: []const u8 = "";
-    var limit: []const u8 = "";
+    var job_ids: []const u8 = "";
+    var move_to_queue: []const u8 = "";
     var pos_count: usize = 0;
 
     if (std.posix.getenv("CORVO_API_KEY")) |key| opts.api_key = key;
@@ -719,29 +727,23 @@ fn cmdBulk(args: *std.process.ArgIterator) void {
             opts.server = args.next() orelse { fatal("--server requires an argument"); unreachable; };
         } else if (eql(arg, "--api-key")) {
             opts.api_key = args.next() orelse { fatal("--api-key requires an argument"); unreachable; };
-        } else if (eql(arg, "--queue")) {
-            queue = args.next() orelse { fatal("--queue requires an argument"); unreachable; };
-        } else if (eql(arg, "--state")) {
-            state = args.next() orelse { fatal("--state requires an argument"); unreachable; };
-        } else if (eql(arg, "--target-queue")) {
-            target_queue = args.next() orelse { fatal("--target-queue requires an argument"); unreachable; };
-        } else if (eql(arg, "--limit")) {
-            limit = args.next() orelse { fatal("--limit requires an argument"); unreachable; };
+        } else if (eql(arg, "--job-ids")) {
+            job_ids = args.next() orelse { fatal("--job-ids requires an argument"); unreachable; };
+        } else if (eql(arg, "--move-to-queue")) {
+            move_to_queue = args.next() orelse { fatal("--move-to-queue requires an argument"); unreachable; };
         } else if (eql(arg, "--help") or eql(arg, "-h")) {
             std.debug.print(
-                \\Usage: corvo bulk <action> --queue <queue> [options]
+                \\Usage: corvo bulk <action> --job-ids <id1,id2,...> [options]
                 \\
-                \\Apply a bulk action to jobs in a queue.
+                \\Apply a bulk action to an explicit list of jobs.
                 \\
-                \\Actions: retry, delete, cancel, move, requeue
+                \\Actions: requeue, cancel, delete, move, hold, approve, reject, promote
                 \\
                 \\Options:
-                \\  --queue <name>          Queue name (required)
-                \\  --state <state>         Filter by state (dead, failed, completed, etc.)
-                \\  --target-queue <name>   Target queue (for move action)
-                \\  --limit <n>             Maximum number of jobs to affect
-                \\  --server <url>          Server URL (default: http://localhost:9878)
-                \\  --api-key <key>         API key (env: CORVO_API_KEY)
+                \\  --job-ids <ids>          Comma-separated job IDs (required)
+                \\  --move-to-queue <name>   Target queue (for move action)
+                \\  --server <url>           Server URL (default: http://localhost:9878)
+                \\  --api-key <key>          API key (env: CORVO_API_KEY)
                 \\
             , .{});
             std.process.exit(0);
@@ -754,17 +756,15 @@ fn cmdBulk(args: *std.process.ArgIterator) void {
         }
     }
 
-    if (action.len == 0) { fatal("usage: corvo bulk <action> --queue <queue>"); unreachable; }
-    if (queue.len == 0) { fatal("--queue is required for bulk operations"); unreachable; }
+    if (action.len == 0) { fatal("usage: corvo bulk <action> --job-ids <ids>"); unreachable; }
+    if (job_ids.len == 0) { fatal("--job-ids is required"); unreachable; }
 
     const client = Client{ .server = opts.server, .api_key = opts.api_key };
     var resp_buf: [65536]u8 = undefined;
     printResponse(client.bulk(.{
         .action = action,
-        .queue = queue,
-        .state = state,
-        .target_queue = target_queue,
-        .limit = limit,
+        .job_ids = job_ids,
+        .move_to_queue = move_to_queue,
     }, &resp_buf));
 }
 
