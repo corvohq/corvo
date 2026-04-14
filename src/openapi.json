@@ -2,250 +2,1177 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Corvo API",
-    "description": "Distributed job queue with priorities, scheduling, and batches.",
+    "description": "Distributed job queue with priorities, scheduling, clustering, and operational controls.",
     "version": "1.0.0-rc1"
   },
   "paths": {
     "/api/v1/enqueue": {
       "post": {
-        "summary": "Enqueue a job",
+        "summary": "Enqueue one or more jobs",
         "tags": ["Jobs"],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EnqueueRequest" } } } },
-        "responses": { "201": { "description": "Job created" }, "409": { "description": "Unique conflict" } }
-      }
-    },
-    "/api/v1/enqueue/batch": {
-      "post": {
-        "summary": "Enqueue multiple jobs",
-        "tags": ["Jobs"],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "jobs": { "type": "array", "items": { "$ref": "#/components/schemas/EnqueueRequest" } } } } } } },
-        "responses": { "200": { "description": "Jobs created" } }
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  { "$ref": "#/components/schemas/EnqueueRequest" },
+                  { "$ref": "#/components/schemas/EnqueueBatchRequest" }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Job or jobs created" },
+          "409": { "description": "Unique conflict" }
+        }
       }
     },
     "/api/v1/fetch": {
       "post": {
-        "summary": "Fetch a job (long-poll)",
+        "summary": "Fetch jobs for a worker",
         "tags": ["Jobs"],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FetchRequest" } } } },
-        "responses": { "200": { "description": "Job fetched or empty" } }
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/FetchRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Job fetched or no work available" }
+        }
       }
     },
-    "/api/v1/fetch/batch": {
+    "/api/v1/ack": {
       "post": {
-        "summary": "Fetch multiple jobs (long-poll)",
+        "summary": "Acknowledge one or more jobs",
         "tags": ["Jobs"],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FetchRequest" } } } },
-        "responses": { "200": { "description": "Jobs fetched" } }
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AckBatchRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Jobs acknowledged" }
+        }
       }
     },
     "/api/v1/ack/{id}": {
       "post": {
-        "summary": "Acknowledge a job",
+        "summary": "Acknowledge a single job",
         "tags": ["Jobs"],
-        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AckRequest" } } } },
-        "responses": { "200": { "description": "Job acknowledged" } }
-      }
-    },
-    "/api/v1/ack/batch": {
-      "post": {
-        "summary": "Acknowledge multiple jobs",
-        "tags": ["Jobs"],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "acks": { "type": "array" } } } } } },
-        "responses": { "200": { "description": "Jobs acknowledged" } }
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AckRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Job acknowledged" }
+        }
       }
     },
     "/api/v1/fail/{id}": {
       "post": {
         "summary": "Fail a job",
         "tags": ["Jobs"],
-        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" }, "backtrace": { "type": "string" } } } } } },
-        "responses": { "200": { "description": "Job failed" } }
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/FailRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Job failed" }
+        }
       }
     },
     "/api/v1/heartbeat": {
       "post": {
-        "summary": "Heartbeat for active jobs",
+        "summary": "Record worker heartbeats and progress",
         "tags": ["Jobs"],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HeartbeatRequest" } } } },
-        "responses": { "200": { "description": "Heartbeat recorded" } }
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/HeartbeatRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Heartbeat recorded" }
+        }
+      }
+    },
+    "/api/v1/jobs": {
+      "get": {
+        "summary": "List jobs or search by payload text",
+        "tags": ["Jobs"],
+        "parameters": [
+          { "name": "q", "in": "query", "schema": { "type": "string" }, "description": "Optional payload search query." }
+        ],
+        "responses": {
+          "200": { "description": "Job list" }
+        }
+      },
+      "post": {
+        "summary": "Search jobs with filters",
+        "tags": ["Jobs"],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/JobSearchRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Search results" }
+        }
+      }
+    },
+    "/api/v1/jobs/search": {
+      "get": {
+        "summary": "Alias for GET /api/v1/jobs",
+        "tags": ["Jobs"],
+        "parameters": [
+          { "name": "q", "in": "query", "schema": { "type": "string" }, "description": "Optional payload search query." }
+        ],
+        "responses": {
+          "200": { "description": "Job list" }
+        }
+      },
+      "post": {
+        "summary": "Alias for POST /api/v1/jobs",
+        "tags": ["Jobs"],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/JobSearchRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Search results" }
+        }
+      }
+    },
+    "/api/v1/jobs/search-by-tag": {
+      "get": {
+        "summary": "Search jobs by tag",
+        "tags": ["Jobs"],
+        "parameters": [
+          { "name": "tag_key", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "tag_value", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "queue", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "state", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Tagged jobs" }
+        }
+      }
+    },
+    "/api/v1/jobs/bulk": {
+      "post": {
+        "summary": "Apply a bulk action to jobs",
+        "tags": ["Jobs"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BulkRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Bulk action result" }
+        }
+      }
+    },
+    "/api/v1/jobs/bulk-get": {
+      "post": {
+        "summary": "Fetch multiple jobs by ID",
+        "tags": ["Jobs"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/JobIdListRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Job list" }
+        }
       }
     },
     "/api/v1/jobs/{id}": {
       "get": {
         "summary": "Get job details",
         "tags": ["Jobs"],
-        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "200": { "description": "Job details" }, "404": { "description": "Not found" } }
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Job details" },
+          "404": { "description": "Not found" }
+        }
       },
       "delete": {
         "summary": "Delete a job",
         "tags": ["Jobs"],
-        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "200": { "description": "Job deleted" } }
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Job deleted" }
+        }
       }
     },
-    "/api/v1/jobs/{id}/retry": {
-      "post": { "summary": "Retry a job", "tags": ["Jobs"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+    "/api/v1/jobs/{id}/requeue": {
+      "post": {
+        "summary": "Requeue a job",
+        "tags": ["Jobs"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Job requeued" }
+        }
+      }
     },
     "/api/v1/jobs/{id}/cancel": {
-      "post": { "summary": "Cancel a job", "tags": ["Jobs"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Cancel a job",
+        "tags": ["Jobs"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Job cancelled" }
+        }
+      }
+    },
+    "/api/v1/jobs/{id}/delete": {
+      "post": {
+        "summary": "Delete a job (POST alias)",
+        "tags": ["Jobs"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Job deleted" }
+        }
+      }
     },
     "/api/v1/jobs/{id}/hold": {
-      "post": { "summary": "Hold a job for approval", "tags": ["Jobs"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Hold a job for approval",
+        "tags": ["Jobs"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Job held" }
+        }
+      }
     },
     "/api/v1/jobs/{id}/approve": {
-      "post": { "summary": "Approve a held job", "tags": ["Jobs"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Approve a held job",
+        "tags": ["Jobs"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Job approved" }
+        }
+      }
     },
     "/api/v1/jobs/{id}/reject": {
-      "post": { "summary": "Reject a held job", "tags": ["Jobs"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Reject a held job",
+        "tags": ["Jobs"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Job rejected" }
+        }
+      }
     },
     "/api/v1/jobs/{id}/move": {
-      "post": { "summary": "Move job to another queue", "tags": ["Jobs"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "queue": { "type": "string" } } } } } }, "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Move a job to another queue",
+        "tags": ["Jobs"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MoveJobRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Job moved" }
+        }
+      }
     },
-    "/api/v1/jobs/bulk": {
-      "post": { "summary": "Bulk action on jobs", "tags": ["Jobs"], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BulkRequest" } } } }, "responses": { "200": { "description": "Bulk result" } } }
+    "/api/v1/jobs/{id}/promote": {
+      "post": {
+        "summary": "Promote a scheduled or retrying job",
+        "tags": ["Jobs"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Job promoted" }
+        }
+      }
     },
-    "/api/v1/jobs/bulk-get": {
-      "post": { "summary": "Get multiple jobs by ID", "tags": ["Jobs"], "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "job_ids": { "type": "array", "items": { "type": "string" } } } } } } }, "responses": { "200": { "description": "Jobs" } } }
-    },
-    "/api/v1/jobs/search": {
-      "get": { "summary": "Search jobs", "tags": ["Search"], "parameters": [{ "name": "queue", "in": "query", "schema": { "type": "string" } }, { "name": "state", "in": "query", "schema": { "type": "string" } }, { "name": "limit", "in": "query", "schema": { "type": "integer" } }], "responses": { "200": { "description": "Search results" } } },
-      "post": { "summary": "Search jobs (POST)", "tags": ["Search"], "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "Search results" } } }
-    },
-    "/api/v1/search/fulltext": {
-      "get": { "summary": "Full-text search", "tags": ["Search"], "parameters": [{ "name": "q", "in": "query", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "Search results" } } }
+    "/api/v1/search": {
+      "get": {
+        "summary": "Search job payloads",
+        "tags": ["Search"],
+        "parameters": [
+          { "name": "q", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Search results" }
+        }
+      }
     },
     "/api/v1/queues": {
-      "get": { "summary": "List queues", "tags": ["Queues"], "responses": { "200": { "description": "Queue list with stats" } } }
+      "get": {
+        "summary": "List queues",
+        "tags": ["Queues"],
+        "responses": {
+          "200": { "description": "Queue list with stats" }
+        }
+      }
     },
     "/api/v1/queues/{name}/pause": {
-      "post": { "summary": "Pause a queue", "tags": ["Queues"], "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Pause a queue",
+        "tags": ["Queues"],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Queue paused" }
+        }
+      }
     },
     "/api/v1/queues/{name}/resume": {
-      "post": { "summary": "Resume a queue", "tags": ["Queues"], "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Resume a queue",
+        "tags": ["Queues"],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Queue resumed" }
+        }
+      }
     },
     "/api/v1/queues/{name}/concurrency": {
-      "post": { "summary": "Set queue concurrency", "tags": ["Queues"], "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }], "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "concurrency": { "type": "integer" } } } } } }, "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Set queue concurrency",
+        "tags": ["Queues"],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/QueueConcurrencyRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Queue concurrency updated" }
+        }
+      }
     },
     "/api/v1/queues/{name}/throttle": {
-      "post": { "summary": "Set queue throttle", "tags": ["Queues"], "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } },
-      "delete": { "summary": "Remove queue throttle", "tags": ["Queues"], "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Set queue throttle",
+        "tags": ["Queues"],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/QueueThrottleRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Queue throttle updated" }
+        }
+      },
+      "delete": {
+        "summary": "Remove queue throttle",
+        "tags": ["Queues"],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Queue throttle removed" }
+        }
+      }
     },
     "/api/v1/queues/{name}/fairness": {
-      "post": { "summary": "Set queue fairness", "tags": ["Queues"], "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } },
-      "delete": { "summary": "Remove queue fairness", "tags": ["Queues"], "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Enable queue fairness",
+        "tags": ["Queues"],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Queue fairness enabled" }
+        }
+      },
+      "delete": {
+        "summary": "Disable queue fairness",
+        "tags": ["Queues"],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Queue fairness disabled" }
+        }
+      }
     },
     "/api/v1/queues/{name}/clear": {
-      "post": { "summary": "Clear all jobs from queue", "tags": ["Queues"], "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Clear all jobs from a queue",
+        "tags": ["Queues"],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Queue cleared" }
+        }
+      }
     },
     "/api/v1/queues/{name}/drain": {
-      "post": { "summary": "Drain queue (cancel pending)", "tags": ["Queues"], "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Drain a queue",
+        "tags": ["Queues"],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Queue draining" }
+        }
+      }
     },
     "/api/v1/queues/{name}": {
-      "delete": { "summary": "Delete a queue", "tags": ["Queues"], "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "delete": {
+        "summary": "Delete a queue",
+        "tags": ["Queues"],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Queue deleted" }
+        }
+      }
+    },
+    "/api/v1/throttle": {
+      "post": {
+        "summary": "Set the global throttle",
+        "tags": ["Queues"],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/GlobalThrottleRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Global throttle updated" }
+        }
+      },
+      "delete": {
+        "summary": "Remove the global throttle",
+        "tags": ["Queues"],
+        "responses": {
+          "200": { "description": "Global throttle removed" }
+        }
+      }
     },
     "/api/v1/batch": {
-      "post": { "summary": "Create a batch", "tags": ["Batches"], "responses": { "201": { "description": "Batch created" } } }
+      "post": {
+        "summary": "Create a batch",
+        "tags": ["Batches"],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BatchCreateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Batch created" }
+        }
+      }
     },
     "/api/v1/batch/{id}/seal": {
-      "post": { "summary": "Seal a batch", "tags": ["Batches"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "Batch sealed" } } }
+      "post": {
+        "summary": "Seal a batch",
+        "tags": ["Batches"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Batch sealed" }
+        }
+      }
     },
     "/api/v1/cron-jobs": {
-      "get": { "summary": "List cron schedules", "tags": ["Crons"], "responses": { "200": { "description": "Cron list" } } },
-      "post": { "summary": "Create a cron schedule", "tags": ["Crons"], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CronRequest" } } } }, "responses": { "201": { "description": "Cron created" } } }
+      "get": {
+        "summary": "List cron schedules",
+        "tags": ["Crons"],
+        "responses": {
+          "200": { "description": "Cron list" }
+        }
+      },
+      "post": {
+        "summary": "Create a cron schedule",
+        "tags": ["Crons"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CronRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Cron created" }
+        }
+      }
+    },
+    "/api/v1/crons": {
+      "get": {
+        "summary": "Alias for GET /api/v1/cron-jobs",
+        "tags": ["Crons"],
+        "responses": {
+          "200": { "description": "Cron list" }
+        }
+      },
+      "post": {
+        "summary": "Alias for POST /api/v1/cron-jobs",
+        "tags": ["Crons"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CronRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Cron created" }
+        }
+      }
     },
     "/api/v1/cron-jobs/{id}": {
-      "get": { "summary": "Get cron schedule", "tags": ["Crons"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "Cron details" } } },
-      "put": { "summary": "Update cron schedule", "tags": ["Crons"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "Cron updated" } } },
-      "delete": { "summary": "Delete cron schedule", "tags": ["Crons"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "get": {
+        "summary": "Get a cron schedule",
+        "tags": ["Crons"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Cron details" },
+          "404": { "description": "Not found" }
+        }
+      },
+      "put": {
+        "summary": "Update a cron schedule",
+        "tags": ["Crons"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CronUpdateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Cron updated" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a cron schedule",
+        "tags": ["Crons"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Cron deleted" }
+        }
+      }
+    },
+    "/api/v1/crons/{id}": {
+      "put": {
+        "summary": "Alias for PUT /api/v1/cron-jobs/{id}",
+        "tags": ["Crons"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CronUpdateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Cron updated" }
+        }
+      },
+      "delete": {
+        "summary": "Alias for DELETE /api/v1/cron-jobs/{id}",
+        "tags": ["Crons"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Cron deleted" }
+        }
+      }
     },
     "/api/v1/cron-jobs/{id}/pause": {
-      "post": { "summary": "Pause cron", "tags": ["Crons"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Pause a cron schedule",
+        "tags": ["Crons"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Cron paused" }
+        }
+      }
     },
     "/api/v1/cron-jobs/{id}/resume": {
-      "post": { "summary": "Resume cron", "tags": ["Crons"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Resume a cron schedule",
+        "tags": ["Crons"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Cron resumed" }
+        }
+      }
     },
     "/api/v1/cron-jobs/{id}/trigger": {
-      "post": { "summary": "Trigger cron immediately", "tags": ["Crons"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Trigger a cron schedule immediately",
+        "tags": ["Crons"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Cron triggered" }
+        }
+      }
+    },
+    "/api/v1/crons/{id}/pause": {
+      "post": {
+        "summary": "Alias for POST /api/v1/cron-jobs/{id}/pause",
+        "tags": ["Crons"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Cron paused" }
+        }
+      }
+    },
+    "/api/v1/crons/{id}/resume": {
+      "post": {
+        "summary": "Alias for POST /api/v1/cron-jobs/{id}/resume",
+        "tags": ["Crons"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Cron resumed" }
+        }
+      }
+    },
+    "/api/v1/crons/{id}/trigger": {
+      "post": {
+        "summary": "Alias for POST /api/v1/cron-jobs/{id}/trigger",
+        "tags": ["Crons"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Cron triggered" }
+        }
+      }
     },
     "/api/v1/budgets": {
-      "get": { "summary": "List budgets", "tags": ["Budgets"], "responses": { "200": { "description": "Budget list" } } },
-      "post": { "summary": "Set a budget", "tags": ["Budgets"], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BudgetRequest" } } } }, "responses": { "200": { "description": "Budget set" } } }
+      "get": {
+        "summary": "List budgets",
+        "tags": ["Budgets"],
+        "responses": {
+          "200": { "description": "Budget list" }
+        }
+      },
+      "post": {
+        "summary": "Create or update a budget",
+        "tags": ["Budgets"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BudgetRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Budget saved" }
+        }
+      }
     },
     "/api/v1/budgets/{scope}/{target}": {
-      "delete": { "summary": "Delete a budget", "tags": ["Budgets"], "parameters": [{ "name": "scope", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "target", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
-    },
-    "/api/v1/approval-policies": {
-      "get": { "summary": "List approval policies", "tags": ["Approval"], "responses": { "200": { "description": "Policy list" } } },
-      "post": { "summary": "Create approval policy", "tags": ["Approval"], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApprovalPolicyRequest" } } } }, "responses": { "200": { "description": "Policy created" } } }
-    },
-    "/api/v1/approval-policies/{id}": {
-      "delete": { "summary": "Delete approval policy", "tags": ["Approval"], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "OK" } } }
+      "delete": {
+        "summary": "Delete a budget",
+        "tags": ["Budgets"],
+        "parameters": [
+          { "name": "scope", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "target", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Budget deleted" }
+        }
+      }
     },
     "/api/v1/workers": {
-      "get": { "summary": "List workers", "tags": ["Workers"], "responses": { "200": { "description": "Worker list" } } }
+      "get": {
+        "summary": "List workers",
+        "tags": ["Workers"],
+        "responses": {
+          "200": { "description": "Worker list" }
+        }
+      }
     },
     "/api/v1/auth/status": {
-      "get": { "summary": "Auth status", "tags": ["Auth"], "responses": { "200": { "description": "Auth config" } } }
+      "get": {
+        "summary": "Get auth status",
+        "tags": ["Auth"],
+        "security": [],
+        "responses": {
+          "200": { "description": "Auth configuration" }
+        }
+      }
+    },
+    "/api/v1/auth/login": {
+      "post": {
+        "summary": "Log in with the admin password",
+        "tags": ["Auth"],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "required": ["password"],
+                "properties": {
+                  "password": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "303": { "description": "Redirect to the UI after login" },
+          "400": { "description": "No admin password configured" }
+        }
+      }
+    },
+    "/api/v1/api-keys": {
+      "get": {
+        "summary": "List API keys",
+        "tags": ["Auth"],
+        "responses": {
+          "200": { "description": "API key list" }
+        }
+      }
     },
     "/api/v1/auth/keys": {
-      "get": { "summary": "List API keys", "tags": ["Auth"], "responses": { "200": { "description": "API key list" } } },
-      "post": { "summary": "Create API key", "tags": ["Auth"], "responses": { "201": { "description": "API key created" } } },
-      "delete": { "summary": "Delete API key", "tags": ["Auth"], "responses": { "200": { "description": "OK" } } }
+      "post": {
+        "summary": "Create an API key",
+        "tags": ["Auth"],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ApiKeyCreateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "API key created" }
+        }
+      },
+      "delete": {
+        "summary": "Delete an API key",
+        "tags": ["Auth"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ApiKeyDeleteRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "API key deleted" }
+        }
+      }
+    },
+    "/api/v1/webhooks": {
+      "get": {
+        "summary": "List webhook subscriptions",
+        "tags": ["Webhooks"],
+        "responses": {
+          "200": { "description": "Webhook list" }
+        }
+      },
+      "post": {
+        "summary": "Create a webhook subscription",
+        "tags": ["Webhooks"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/WebhookCreateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Webhook created" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a webhook subscription",
+        "tags": ["Webhooks"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/WebhookDeleteRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Webhook deleted" }
+        }
+      }
     },
     "/api/v1/webhooks/{queue}": {
-      "post": { "summary": "Enqueue via webhook", "tags": ["Webhooks"], "parameters": [{ "name": "queue", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "201": { "description": "Job created" } } }
+      "post": {
+        "summary": "Enqueue a job through a queue webhook",
+        "tags": ["Webhooks"],
+        "parameters": [
+          { "name": "queue", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "priority", "in": "query", "schema": { "type": "string" }, "description": "Priority name such as critical, high, normal, or low." },
+          { "name": "unique_key", "in": "query", "schema": { "type": "string" } },
+          { "name": "max_retries", "in": "query", "schema": { "type": "integer" } },
+          { "name": "scheduled_at", "in": "query", "schema": { "type": "string", "format": "date-time" } }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Job created" }
+        }
+      }
     },
-    "/api/v1/metrics/throughput": {
-      "get": { "summary": "Throughput metrics (rolling 60-second window with per-second ops/sec)", "tags": ["Metrics"], "responses": { "200": { "description": "Throughput rates and per-second breakdown" } } }
+    "/api/v1/audit-logs": {
+      "get": {
+        "summary": "List audit log entries",
+        "tags": ["Admin"],
+        "responses": {
+          "200": { "description": "Audit log list" }
+        }
+      },
+      "delete": {
+        "summary": "Clear audit logs",
+        "tags": ["Admin"],
+        "responses": {
+          "200": { "description": "Audit logs cleared" }
+        }
+      }
+    },
+    "/api/v1/cluster/status": {
+      "get": {
+        "summary": "Get cluster status",
+        "tags": ["Cluster"],
+        "responses": {
+          "200": { "description": "Cluster status" }
+        }
+      }
     },
     "/api/v1/cluster/events": {
-      "get": { "summary": "Recent cluster state transition events (leader elected, stepped down, snapshots)", "tags": ["Cluster"], "responses": { "200": { "description": "Array of cluster events" } } }
+      "get": {
+        "summary": "Get recent cluster events",
+        "tags": ["Cluster"],
+        "responses": {
+          "200": { "description": "Cluster events" }
+        }
+      }
+    },
+    "/api/v1/cluster/join": {
+      "post": {
+        "summary": "Join a node to the cluster",
+        "tags": ["Cluster"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ClusterJoinRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Node joined" },
+          "400": { "description": "Invalid join request" },
+          "409": { "description": "Node is not the leader" }
+        }
+      }
+    },
+    "/api/v1/metrics/throughput": {
+      "get": {
+        "summary": "Get throughput metrics",
+        "tags": ["Metrics"],
+        "responses": {
+          "200": { "description": "Throughput metrics" }
+        }
+      }
+    },
+    "/api/v1/backup": {
+      "post": {
+        "summary": "Create a backup snapshot",
+        "tags": ["Admin"],
+        "responses": {
+          "200": { "description": "Backup metadata returned" }
+        }
+      }
+    },
+    "/api/v1/backup/{id}": {
+      "get": {
+        "summary": "Download a backup chunk",
+        "tags": ["Admin"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "file", "in": "query", "required": true, "schema": { "type": "string", "enum": ["talon.db", "talon.vlog"] } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
+          { "name": "length", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 60000 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Backup chunk",
+            "content": {
+              "application/octet-stream": {
+                "schema": { "type": "string", "format": "binary" }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a backup snapshot",
+        "tags": ["Admin"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Backup deleted" }
+        }
+      }
+    },
+    "/api/v1/restore": {
+      "post": {
+        "summary": "Initialize a restore upload",
+        "tags": ["Admin"],
+        "responses": {
+          "200": { "description": "Restore session created" }
+        }
+      }
+    },
+    "/api/v1/restore/{id}": {
+      "put": {
+        "summary": "Upload a restore chunk",
+        "tags": ["Admin"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "file", "in": "query", "required": true, "schema": { "type": "string", "enum": ["talon.db", "talon.vlog"] } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": { "type": "string", "format": "binary" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Restore chunk written" }
+        }
+      }
+    },
+    "/api/v1/restore/{id}/apply": {
+      "post": {
+        "summary": "Apply an uploaded restore",
+        "tags": ["Admin"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Restore applied" }
+        }
+      }
     },
     "/api/v1/info": {
-      "get": { "summary": "Server info", "tags": ["System"], "responses": { "200": { "description": "Version and engine info" } } }
+      "get": {
+        "summary": "Get server info",
+        "tags": ["System"],
+        "security": [],
+        "responses": {
+          "200": { "description": "Server information" }
+        }
+      }
     },
     "/api/v1/debug/runtime": {
-      "get": { "summary": "Runtime debug info", "tags": ["Admin"], "responses": { "200": { "description": "Debug info" } } }
+      "get": {
+        "summary": "Get runtime debug info",
+        "tags": ["Admin"],
+        "responses": {
+          "200": { "description": "Runtime debug info" }
+        }
+      }
     },
     "/healthz": {
-      "get": { "summary": "Health check", "tags": ["System"], "responses": { "200": { "description": "OK" } } }
+      "get": {
+        "summary": "Health check",
+        "tags": ["System"],
+        "security": [],
+        "responses": {
+          "200": { "description": "OK" }
+        }
+      }
     },
     "/metrics": {
-      "get": { "summary": "Prometheus metrics", "tags": ["Metrics"], "responses": { "200": { "description": "Prometheus text format" } } }
+      "get": {
+        "summary": "Prometheus metrics",
+        "tags": ["Metrics"],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Prometheus metrics",
+            "content": {
+              "text/plain": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
     "schemas": {
       "EnqueueRequest": {
         "type": "object",
+        "required": ["queue"],
         "properties": {
           "queue": { "type": "string" },
           "payload": {},
-          "priority": { "type": "integer", "default": 2 },
-          "max_retries": { "type": "integer", "default": 3 },
-          "retry_backoff": { "type": "string", "enum": ["none", "fixed", "exponential"] },
+          "priority": {
+            "oneOf": [
+              { "type": "integer", "minimum": 0, "maximum": 100 },
+              { "type": "string", "enum": ["critical", "high", "normal", "low"] }
+            ]
+          },
+          "max_retries": { "type": "integer", "minimum": 0, "maximum": 100, "default": 3 },
+          "retry_backoff": { "type": "string", "enum": ["exponential", "linear"], "default": "exponential" },
+          "retry_base_delay_ms": { "type": "integer" },
+          "retry_max_delay_ms": { "type": "integer" },
           "unique_key": { "type": "string" },
           "unique_period": { "type": "integer" },
-          "tags": { "type": "object" },
+          "tags": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "checkpoint": {},
           "group": { "type": "string" },
           "scheduled_at": { "type": "string", "format": "date-time" },
           "batch_id": { "type": "string" },
           "parent_id": { "type": "string" },
           "chain_id": { "type": "string" },
+          "chain_step": { "type": "integer" },
+          "chain_config": {},
+          "chain": {},
           "expire_after_ms": { "type": "integer" }
+        }
+      },
+      "EnqueueBatchRequest": {
+        "type": "object",
+        "required": ["jobs"],
+        "properties": {
+          "jobs": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/EnqueueRequest" }
+          }
         }
       },
       "FetchRequest": {
         "type": "object",
         "required": ["queues"],
         "properties": {
-          "queues": { "type": "array", "items": { "type": "string" } },
-          "count": { "type": "integer", "default": 1 },
+          "queues": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
           "worker_id": { "type": "string" },
-          "wait_timeout_ms": { "type": "integer" }
+          "hostname": { "type": "string" },
+          "count": { "type": "integer", "minimum": 1, "maximum": 512, "default": 1 }
         }
       },
       "AckRequest": {
@@ -254,23 +1181,132 @@
           "result": {},
           "checkpoint": {},
           "ack_status": { "type": "string", "enum": ["done", "hold"] },
+          "hold_reason": { "type": "string" },
+          "lease_token": { "type": "integer" }
+        }
+      },
+      "AckBatchItem": {
+        "type": "object",
+        "required": ["job_id"],
+        "properties": {
+          "job_id": { "type": "string" },
+          "result": {},
+          "checkpoint": {},
+          "ack_status": { "type": "string", "enum": ["done", "hold"] },
           "hold_reason": { "type": "string" }
+        }
+      },
+      "AckBatchRequest": {
+        "type": "object",
+        "properties": {
+          "acks": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/AckBatchItem" }
+          },
+          "job_ids": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "FailRequest": {
+        "type": "object",
+        "properties": {
+          "error": { "type": "string" },
+          "backtrace": { "type": "string" },
+          "lease_token": { "type": "integer" }
         }
       },
       "HeartbeatRequest": {
         "type": "object",
+        "required": ["worker_id"],
         "properties": {
-          "jobs": { "type": "array", "items": { "type": "object", "properties": { "job_id": { "type": "string" }, "progress": {}, "checkpoint": {} } } }
+          "worker_id": { "type": "string" },
+          "jobs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["job_id"],
+              "properties": {
+                "job_id": { "type": "string" },
+                "progress": {},
+                "checkpoint": {}
+              }
+            }
+          }
+        }
+      },
+      "MoveJobRequest": {
+        "type": "object",
+        "required": ["queue"],
+        "properties": {
+          "queue": { "type": "string" }
         }
       },
       "BulkRequest": {
         "type": "object",
-        "required": ["action"],
+        "required": ["action", "job_ids"],
         "properties": {
-          "action": { "type": "string", "enum": ["retry", "cancel", "delete", "hold", "approve", "reject", "move", "requeue"] },
-          "job_ids": { "type": "array", "items": { "type": "string" } },
-          "filter": { "type": "object", "properties": { "queue": { "type": "string" }, "state": { "type": "string" } } },
-          "queue": { "type": "string" }
+          "action": {
+            "type": "string",
+            "enum": ["delete", "cancel", "move", "requeue", "change_priority", "hold", "approve", "reject", "promote"]
+          },
+          "job_ids": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "move_to_queue": { "type": "string" },
+          "priority": { "type": "integer", "minimum": 0, "maximum": 255 }
+        }
+      },
+      "JobIdListRequest": {
+        "type": "object",
+        "required": ["job_ids"],
+        "properties": {
+          "job_ids": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "JobSearchRequest": {
+        "type": "object",
+        "properties": {
+          "payload_contains": { "type": "string" },
+          "queue": { "type": "string" },
+          "state": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 },
+          "offset": { "type": "integer", "minimum": 0, "default": 0 }
+        }
+      },
+      "QueueConcurrencyRequest": {
+        "type": "object",
+        "properties": {
+          "max": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "QueueThrottleRequest": {
+        "type": "object",
+        "properties": {
+          "rate": { "type": "integer", "minimum": 0 },
+          "window_ms": { "type": "integer", "minimum": 0, "default": 1000 }
+        }
+      },
+      "GlobalThrottleRequest": {
+        "type": "object",
+        "properties": {
+          "rate": { "type": "integer", "minimum": 0 },
+          "window_ms": { "type": "integer", "minimum": 0, "default": 1000 }
+        }
+      },
+      "BatchCreateRequest": {
+        "type": "object",
+        "properties": {
+          "callback_queue": { "type": "string" },
+          "callback_payload": {}
         }
       },
       "CronRequest": {
@@ -283,7 +1319,21 @@
           "timezone": { "type": "string", "default": "UTC" },
           "payload": {},
           "max_retries": { "type": "integer" },
-          "unique_key": { "type": "string" }
+          "unique_key": { "type": "string" },
+          "enabled": { "type": "boolean", "default": true }
+        }
+      },
+      "CronUpdateRequest": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "queue": { "type": "string" },
+          "schedule": { "type": "string" },
+          "timezone": { "type": "string" },
+          "payload": {},
+          "max_retries": { "type": "integer" },
+          "unique_key": { "type": "string" },
+          "enabled": { "type": "boolean" }
         }
       },
       "BudgetRequest": {
@@ -297,22 +1347,57 @@
           "on_exceed": { "type": "string", "enum": ["block", "warn"], "default": "block" }
         }
       },
-      "ApprovalPolicyRequest": {
+      "ApiKeyCreateRequest": {
         "type": "object",
-        "required": ["name"],
         "properties": {
           "name": { "type": "string" },
-          "mode": { "type": "string", "enum": ["any", "all"], "default": "any" },
-          "enabled": { "type": "boolean", "default": true },
-          "queue": { "type": "string" },
-          "tag_key": { "type": "string" },
-          "tag_value": { "type": "string" }
+          "role": { "type": "string", "enum": ["admin", "worker", "producer"], "default": "admin" }
+        }
+      },
+      "ApiKeyDeleteRequest": {
+        "type": "object",
+        "required": ["key_hash"],
+        "properties": {
+          "key_hash": { "type": "string" }
+        }
+      },
+      "WebhookCreateRequest": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+          "url": { "type": "string", "format": "uri" },
+          "queue": { "type": "string", "default": "*" },
+          "events": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["job.completed", "job.failed", "job.dead"] }
+          }
+        }
+      },
+      "WebhookDeleteRequest": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" }
+        }
+      },
+      "ClusterJoinRequest": {
+        "type": "object",
+        "required": ["node_id", "addr"],
+        "properties": {
+          "node_id": { "type": "string" },
+          "addr": { "type": "string", "description": "IP:port" }
         }
       }
     },
     "securitySchemes": {
-      "ApiKeyAuth": { "type": "apiKey", "in": "header", "name": "X-API-Key" }
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key"
+      }
     }
   },
-  "security": [{ "ApiKeyAuth": [] }]
+  "security": [
+    { "ApiKeyAuth": [] }
+  ]
 }
