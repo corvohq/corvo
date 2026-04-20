@@ -382,7 +382,7 @@ pub fn metrics(send_buf: []u8, reader: ?*kv_read.Reader, server_metrics: ?*const
 }
 
 fn clusterStatus(send_buf: []u8) u32 {
-    var body_buf: [512]u8 = undefined;
+    var body_buf: [2048]u8 = undefined;
     var w = json.JsonWriter.init(&body_buf);
 
     const ci = g_cluster_info orelse {
@@ -410,6 +410,24 @@ fn clusterStatus(send_buf: []u8) u32 {
     w.fieldStr("node_id", ci.node_id);
     w.fieldStr("leader", es.leader_id);
     w.fieldInt("epoch", es.epoch);
+
+    // Expose peer endpoints so Console can auto-discover all nodes.
+    if (g_cluster_node) |cn| {
+        w.beginArrayField("peers");
+        for (cn.config.peer_ids, cn.config.peer_addrs) |pid, addr| {
+            var addr_buf: [64]u8 = undefined;
+            // Expose HTTP port (cluster port - 1000).
+            var http_addr = addr;
+            http_addr.setPort(addr.getPort() -| 1000);
+            const addr_str = std.fmt.bufPrint(&addr_buf, "{any}", .{http_addr}) catch continue;
+            w.beginObject();
+            w.fieldStr("id", pid);
+            w.fieldStr("addr", addr_str);
+            w.endObject();
+        }
+        w.endArray();
+    }
+
     w.endObject();
     return http.writeResponse(send_buf, 200, w.getWritten());
 }
