@@ -466,7 +466,7 @@ pub fn printHelp() void {
         \\
         \\Job Operations:
         \\  enqueue             Enqueue a job
-        \\  inspect             Show full job detail                        ~ mirror
+        \\  inspect             Show full job detail
         \\  requeue             Requeue a failed/dead job
         \\  cancel              Cancel a pending/active job
         \\  delete              Delete a job
@@ -477,7 +477,7 @@ pub fn printHelp() void {
         \\  bulk                Apply bulk action to explicit job IDs
         \\
         \\Queue Management:
-        \\  queues              List all queues with stats                  ~ mirror
+        \\  queues              List all queues with stats
         \\  pause               Pause a queue
         \\  resume              Resume a paused queue
         \\  clear               Clear pending/scheduled jobs in a queue
@@ -485,12 +485,12 @@ pub fn printHelp() void {
         \\  drain               Drain a queue (pause + wait for active)
         \\
         \\Search & Observability:
-        \\  search              Search jobs with filters                    ~ mirror
-        \\  workers             List connected workers                      ~ mirror
+        \\  search              Search jobs with filters
+        \\  workers             List connected workers
         \\  status              Show server status and queue summary
         \\
         \\Cron Jobs:
-        \\  cron-list           List cron jobs                              ~ mirror
+        \\  cron-list           List cron jobs
         \\  cron-create         Create a cron job
         \\  cron-delete         Delete a cron job
         \\  cron-pause          Pause a cron job
@@ -504,8 +504,6 @@ pub fn printHelp() void {
         \\  --server <url>      Server URL (default: http://localhost:9878)
         \\  --api-key <key>     API key for authentication (env: CORVO_API_KEY)
         \\  --help              Show this help
-        \\
-        \\Commands marked ~ mirror read from the SQLite mirror (eventually consistent).
         \\
     , .{});
 }
@@ -839,7 +837,7 @@ fn cmdSearch(args: *std.process.ArgIterator) void {
             std.debug.print(
                 \\Usage: corvo search [query] [options]
                 \\
-                \\Search jobs with filters. Reads from SQLite mirror (eventually consistent).
+                \\Search jobs with filters.
                 \\
                 \\Arguments:
                 \\  [query]              Search query string (optional)
