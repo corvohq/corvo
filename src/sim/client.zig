@@ -273,9 +273,15 @@ pub const SimClient = struct {
             128;
         w.writeU8(priority);
         w.writeU16(3); // max_retries
-        w.writeU8(0); // backoff = none
-        w.writeU32(0); // base_delay_ms
-        w.writeU32(0); // max_delay_ms
+
+        // Retry backoff strategy
+        const backoff: u8 = if (self.chance(0.2))
+            self.rng.intRangeAtMost(u8, 1, 3) // fixed, linear, or exponential
+        else
+            0; // none
+        w.writeU8(backoff);
+        w.writeU32(if (backoff > 0) 100 else 0); // base_delay_ms
+        w.writeU32(if (backoff > 0) 2000 else 0); // max_delay_ms
 
         // Unique key
         var flags: u16 = rpc.FLAG_PAYLOAD;
@@ -301,6 +307,16 @@ pub const SimClient = struct {
             flags |= rpc.FLAG_GROUP;
         }
 
+        // Tags
+        var tag_buf: [64]u8 = undefined;
+        var tag_len: usize = 0;
+        if (self.chance(0.15)) {
+            const t_idx = self.rng.intRangeAtMost(u32, 0, 4);
+            const tag = std.fmt.bufPrint(&tag_buf, "{{\"env\":\"sim\",\"tier\":\"{d}\"}}", .{t_idx}) catch unreachable;
+            tag_len = tag.len;
+            flags |= rpc.FLAG_TAGS;
+        }
+
         w.writeU32(unique_period_s);
 
         // Scheduled job
@@ -310,7 +326,12 @@ pub const SimClient = struct {
             0;
         w.writeU64(scheduled_at_ns);
 
-        w.writeU32(0); // expire_after_ms
+        // Job TTL — 10% chance of expiry (exercises x| key creation/cleanup)
+        const expire_after_ms: u32 = if (scheduled_at_ns == 0 and self.chance(0.1))
+            self.rng.intRangeAtMost(u32, 500, 5000)
+        else
+            0;
+        w.writeU32(expire_after_ms);
         w.writeU16(0); // chain_step
         w.writeU16(flags);
 
@@ -319,7 +340,10 @@ pub const SimClient = struct {
         if (flags & rpc.FLAG_UNIQUE_KEY != 0) {
             w.writePrefixed(unique_key_buf[0..unique_key_len]);
         }
-        // TAGS, BATCH_ID, CHAIN_ID, CHAIN_CONFIG not used by sim
+        if (flags & rpc.FLAG_TAGS != 0) {
+            w.writePrefixed(tag_buf[0..tag_len]);
+        }
+        // BATCH_ID, CHAIN_ID, CHAIN_CONFIG not used by sim
         if (flags & rpc.FLAG_GROUP != 0) {
             w.writePrefixed(group_buf[0..group_len]);
         }
@@ -527,7 +551,7 @@ pub const SimClient = struct {
             self.completed_count,
         );
 
-        const actions = [_]ops.BulkAction{ .requeue, .delete, .cancel };
+        const actions = [_]ops.BulkAction{ .requeue, .delete, .cancel, .hold, .approve, .reject, .promote };
         const action = actions[self.rng.intRangeAtMost(usize, 0, actions.len - 1)];
 
         const now_ns: u64 = @intCast(clock_mod.globalClockNow());
@@ -578,12 +602,21 @@ pub const SimClient = struct {
         const queue_idx = self.rng.intRangeAtMost(usize, 0, self.queues.len - 1);
         const q = self.queues[queue_idx];
 
-        // 10% chance of clear
-        if (self.chance(0.1)) {
+        // 8% chance of clear
+        if (self.chance(0.08)) {
             var w = self.payloadWriter();
             w.writePrefixed(q);
             self.sendFrame(rpc.MSG_CLEAR_QUEUE, w.pos);
             self.clear_queues += 1;
+            self.queue_ops += 1;
+            return;
+        }
+
+        // 2% chance of delete queue (full cleanup including terminal jobs)
+        if (self.chance(0.02)) {
+            var w = self.payloadWriter();
+            w.writePrefixed(q);
+            self.sendFrame(rpc.MSG_DELETE_QUEUE, w.pos);
             self.queue_ops += 1;
             return;
         }
@@ -613,6 +646,22 @@ pub const SimClient = struct {
             w.writeU32(0); // rate_limit
             w.writeU32(0); // rate_window_ms
             w.writeU8(1); // fairness = true
+
+            self.sendFrame(rpc.MSG_QUEUE_CONFIG, w.pos);
+            self.queue_ops += 1;
+            return;
+        }
+
+        // 10% chance of setting rate limit
+        if (self.chance(0.1)) {
+            const rate = self.rng.intRangeAtMost(u32, 1, 10);
+            var w = self.payloadWriter();
+            w.writePrefixed(q);
+            w.writeU8(@intFromEnum(ops.QueueAction.throttle));
+            w.writeU32(0); // max_concurrency
+            w.writeU32(rate); // rate_limit
+            w.writeU32(1000); // rate_window_ms (1 second)
+            w.writeU8(0); // fairness
 
             self.sendFrame(rpc.MSG_QUEUE_CONFIG, w.pos);
             self.queue_ops += 1;

@@ -689,7 +689,16 @@ fn checkConcurrencyLimit(handler: *OpHandler, tick: u32, seed: u64) CheckResult 
     while (it.next()) |entry| {
         const queue_name = entry.key_ptr.*;
         const config = entry.value_ptr.*;
-        if (config.max_concurrency == 0) continue;
+
+        // When max_concurrency is 0 (unlimited), clear the grace entry so
+        // that if the limit is re-enabled later, we freshly capture the
+        // current active count. Without this, the grace retains the old
+        // max_concurrency value and doesn't detect the 0→N transition.
+        if (config.max_concurrency == 0) {
+            const gi = findOrAddGrace(&concurrency_grace, &concurrency_grace_count, queue_name);
+            if (gi) |idx| concurrency_grace[idx].max_concurrency = 0;
+            continue;
+        }
 
         const active = handler.getActiveCount(queue_name);
         if (active < 0) continue;

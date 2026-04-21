@@ -80,13 +80,12 @@ pub fn applyClearQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Clear
     // PendingIndex already drained inside deleteAllQueueJobs.
 
     // Reset in-memory counters for cleared states. deleteAllQueueJobs removes
-    // pending, scheduled, and retrying jobs but does not touch counters.
-    // Active jobs are left in flight; terminal jobs are untouched.
+    // pending, scheduled, and retrying jobs. Active and held jobs are NOT
+    // deleted — active are in-flight, held need explicit approve/reject.
     if (self.queue_configs.getPtr(op.queue)) |q| {
         q.pending_count = 0;
         q.scheduled_count = 0;
         q.retrying_count = 0;
-        q.held_count = 0;
     }
 
     // Also zero counters in KV.
@@ -98,7 +97,6 @@ pub fn applyClearQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Clear
         q.pending_count = 0;
         q.scheduled_count = 0;
         q.retrying_count = 0;
-        q.held_count = 0;
         var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
         b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
     }
@@ -258,6 +256,16 @@ fn deleteTerminalQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u
                             adjustBatchForDeletedJob(self, b, batch_id, now_ns);
                         }
                     }
+                }
+
+                // Active jobs: clean up a| key and in-memory counts.
+                // deleteAllQueueJobs leaves active jobs alone, but
+                // deleteTerminalQueueJobs (full delete) removes everything.
+                if (job.state == .active) {
+                    var ak_buf: keys.KeyBuf = undefined;
+                    b.delete(OpHandler.jobActiveKey(&ak_buf, &job));
+                    self.decrActiveCount(job.queue);
+                    if (job.group) |g| self.decrFairnessActive(job.queue, g);
                 }
 
                 var jk_buf: keys.KeyBuf = undefined;
