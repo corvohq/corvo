@@ -3034,6 +3034,578 @@ test "sync-repl pipelined prepares — multiple batches in flight" {
     try testing.expectEqual(@as(u32, 2), resp2.header.req_id);
 }
 
+// ============================================================================
+// Handler Guard Condition Tests
+// ============================================================================
+
+test "ack with wrong lease_token is rejected" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-lease-reject");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Enqueue a job via RPC
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("lease-q");
+    ew.writePrefixed("lease-job-1");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0);
+
+    ctx.injectFrame(conn_id, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+    ctx.pipeline.tick();
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Fetch via RPC (subscribe then fulfilled immediately since job exists)
+    const fetch_conn = ctx.backend.connect().?;
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1); // prefetch
+    fw.writeU32(2000); // lease_ms = 2s
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("lease-q");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 1, fw.written());
+    ctx.pipeline.tick();
+
+    // Subscription should be fulfilled immediately (job already pending)
+    const fetch_c = ctx.backend.conn(fetch_conn);
+    try testing.expect(fetch_c.send_len > 0);
+
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Verify job is now active with lease_token=1
+    var key_buf: keys.KeyBuf = undefined;
+    var vb = ctx.stores[0].newBatch();
+    var job_buf: [4096]u8 = undefined;
+    var job_bytes = vb.getInto(keys.jobKey(&key_buf, "lease-job-1"), &job_buf);
+    try testing.expect(job_bytes != null);
+    var job = codec.decodeJob(job_bytes.?);
+    try testing.expectEqual(types.JobState.active, job.state);
+    const first_token = job.lease_token;
+    try testing.expect(first_token > 0);
+    vb.close();
+
+    // Advance clock past lease expiry (2s) and trigger reclaim
+    advanceTestClock(3_000_000_000);
+    ctx.pipeline.config.reclaim_interval_ns = 1_000_000_000;
+    ctx.pipeline.tick(); // auto-maintenance reclaims the job
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Fetch again on a different connection — gets new lease_token
+    const fetch_conn2 = ctx.backend.connect().?;
+    fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-2");
+    fw.writeU8(1);
+    fw.writePrefixed("lease-q");
+
+    ctx.injectFrame(fetch_conn2, rpc.MSG_FETCH_BATCH, 2, fw.written());
+    ctx.pipeline.tick();
+
+    const fetch_c2 = ctx.backend.conn(fetch_conn2);
+    try testing.expect(fetch_c2.send_len > 0); // re-fetched
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Verify job has a new (different) lease_token
+    var vb2 = ctx.stores[0].newBatch();
+    job_bytes = vb2.getInto(keys.jobKey(&key_buf, "lease-job-1"), &job_buf);
+    try testing.expect(job_bytes != null);
+    job = codec.decodeJob(job_bytes.?);
+    try testing.expectEqual(types.JobState.active, job.state);
+    try testing.expect(job.lease_token != first_token); // new token
+    vb2.close();
+
+    // Now try to ack with wrong lease_token via HTTP
+    const ack_conn = ctx.backend.connect().?;
+    const ack_body = "{\"job_id\":\"lease-job-1\",\"queue\":\"lease-q\",\"lease_token\":1}";
+    var http_buf: [512]u8 = undefined;
+    var http_w = BufWriter{ .buf = &http_buf };
+    http_w.writeBytes("POST /api/v1/ack HTTP/1.1\r\nHost: localhost\r\nContent-Length: ");
+    http_w.writeBytes(std.fmt.comptimePrint("{d}", .{ack_body.len}));
+    http_w.writeBytes("\r\n\r\n");
+    http_w.writeBytes(ack_body);
+    ctx.backend.injectRecv(ack_conn, http_w.written());
+    ctx.pipeline.tick();
+
+    // Job should still be active (stale ack rejected)
+    var vb3 = ctx.stores[0].newBatch();
+    defer vb3.close();
+    job_bytes = vb3.getInto(keys.jobKey(&key_buf, "lease-job-1"), &job_buf);
+    try testing.expect(job_bytes != null);
+    job = codec.decodeJob(job_bytes.?);
+    try testing.expectEqual(types.JobState.active, job.state);
+}
+
+test "ack non-active job is no-op" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-ack-nonactive");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Enqueue a job
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("noack-q");
+    ew.writePrefixed("noack-job-1");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0);
+
+    ctx.injectFrame(conn_id, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+    ctx.pipeline.tick();
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Try to ack it while it's still pending (never fetched)
+    var ack_buf: [256]u8 = undefined;
+    var aw = BufWriter{ .buf = &ack_buf };
+    aw.writeU16(1);
+    aw.writePrefixed("noack-job-1");
+    aw.writePrefixed("noack-q");
+    aw.writeU8(0); // ack_status = done
+    aw.writeU8(0); // flags
+
+    ctx.injectFrame(conn_id, rpc.MSG_ACK_BATCH, 2, aw.written());
+    ctx.pipeline.tick();
+
+    // Job should still be pending
+    var key_buf: keys.KeyBuf = undefined;
+    var verify_batch = ctx.stores[0].newBatch();
+    defer verify_batch.close();
+    var job_buf: [4096]u8 = undefined;
+    const job_bytes = verify_batch.getInto(keys.jobKey(&key_buf, "noack-job-1"), &job_buf);
+    try testing.expect(job_bytes != null);
+    const job = codec.decodeJob(job_bytes.?);
+    try testing.expectEqual(types.JobState.pending, job.state);
+}
+
+test "ack nonexistent job is no-op" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-ack-noexist");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Ack a job that doesn't exist
+    var ack_buf: [256]u8 = undefined;
+    var aw = BufWriter{ .buf = &ack_buf };
+    aw.writeU16(1);
+    aw.writePrefixed("ghost-job-xyz");
+    aw.writePrefixed("some-queue");
+    aw.writeU8(0); // ack_status = done
+    aw.writeU8(0); // flags
+
+    ctx.injectFrame(conn_id, rpc.MSG_ACK_BATCH, 1, aw.written());
+    ctx.pipeline.tick();
+
+    // Should not crash, applied_total should reflect the op was processed
+    try testing.expectEqual(@as(u64, 1), ctx.pipeline.applied_total);
+}
+
+test "fail with wrong lease_token is rejected" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fail-lease");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Enqueue
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("fail-lease-q");
+    ew.writePrefixed("fail-lease-1");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0);
+
+    ctx.injectFrame(conn_id, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+    ctx.pipeline.tick();
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Fetch with short lease
+    const fetch_conn = ctx.backend.connect().?;
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(2000); // 2s lease
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("fail-lease-q");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 1, fw.written());
+    ctx.pipeline.tick();
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Reclaim + re-fetch (new lease_token)
+    advanceTestClock(3_000_000_000);
+    ctx.pipeline.config.reclaim_interval_ns = 1_000_000_000;
+    ctx.pipeline.tick();
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    const fetch_conn2 = ctx.backend.connect().?;
+    fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-2");
+    fw.writeU8(1);
+    fw.writePrefixed("fail-lease-q");
+
+    ctx.injectFrame(fetch_conn2, rpc.MSG_FETCH_BATCH, 2, fw.written());
+    ctx.pipeline.tick();
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Fail with stale lease_token via HTTP
+    const fail_conn = ctx.backend.connect().?;
+    const fail_body = "{\"job_id\":\"fail-lease-1\",\"queue\":\"fail-lease-q\",\"lease_token\":1,\"error\":\"oops\"}";
+    var http_buf: [512]u8 = undefined;
+    var http_w = BufWriter{ .buf = &http_buf };
+    http_w.writeBytes("POST /api/v1/fail HTTP/1.1\r\nHost: localhost\r\nContent-Length: ");
+    http_w.writeBytes(std.fmt.comptimePrint("{d}", .{fail_body.len}));
+    http_w.writeBytes("\r\n\r\n");
+    http_w.writeBytes(fail_body);
+    ctx.backend.injectRecv(fail_conn, http_w.written());
+    ctx.pipeline.tick();
+
+    // Job should still be active (stale fail rejected)
+    var key_buf: keys.KeyBuf = undefined;
+    var verify_batch = ctx.stores[0].newBatch();
+    defer verify_batch.close();
+    var job_buf: [4096]u8 = undefined;
+    const job_bytes = verify_batch.getInto(keys.jobKey(&key_buf, "fail-lease-1"), &job_buf);
+    try testing.expect(job_bytes != null);
+    const job = codec.decodeJob(job_bytes.?);
+    try testing.expectEqual(types.JobState.active, job.state);
+}
+
+test "fetch from paused queue returns empty" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fetch-paused");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Enqueue a job
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("pause-q");
+    ew.writePrefixed("pause-job-1");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0);
+
+    ctx.injectFrame(conn_id, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+    ctx.pipeline.tick();
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Pause the queue via RPC (MSG_QUEUE_CONFIG with pause action)
+    var qcfg_buf: [256]u8 = undefined;
+    var qw = BufWriter{ .buf = &qcfg_buf };
+    qw.writePrefixed("pause-q");
+    qw.writeU8(@intFromEnum(ops_mod.QueueAction.pause)); // action = pause
+    qw.writeU32(0); // max_concurrency
+    qw.writeU32(0); // rate_limit
+    qw.writeU32(0); // rate_window_ms
+    qw.writeU8(0); // fairness
+
+    ctx.injectFrame(conn_id, rpc.MSG_QUEUE_CONFIG, 2, qw.written());
+    ctx.pipeline.tick();
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Try to fetch — should get no jobs (subscription waits, queue paused)
+    const fetch_conn = ctx.backend.connect().?;
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("pause-q");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 3, fw.written());
+    ctx.pipeline.tick();
+
+    // No response — subscription is held (queue paused)
+    const fetch_c = ctx.backend.conn(fetch_conn);
+    try testing.expectEqual(@as(u32, 0), fetch_c.send_len);
+}
+
+test "double ack same job is no-op" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-double-ack");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Enqueue
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("dack-q");
+    ew.writePrefixed("dack-job-1");
+    ew.writeU8(128);
+    ew.writeU16(3);
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0);
+
+    ctx.injectFrame(conn_id, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+    ctx.pipeline.tick();
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Fetch
+    const fetch_conn = ctx.backend.connect().?;
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("dack-q");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 2, fw.written());
+    ctx.pipeline.tick();
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    const applied_before = ctx.pipeline.applied_total;
+
+    // Ack once
+    var ack_buf: [256]u8 = undefined;
+    var aw = BufWriter{ .buf = &ack_buf };
+    aw.writeU16(1);
+    aw.writePrefixed("dack-job-1");
+    aw.writePrefixed("dack-q");
+    aw.writeU8(0);
+    aw.writeU8(0);
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_ACK_BATCH, 3, aw.written());
+    ctx.pipeline.tick();
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Job is auto-deleted after ack (persist_completed=false by default)
+    var key_buf: keys.KeyBuf = undefined;
+    var vb = ctx.stores[0].newBatch();
+    var job_buf: [4096]u8 = undefined;
+    const job_bytes = vb.getInto(keys.jobKey(&key_buf, "dack-job-1"), &job_buf);
+    try testing.expect(job_bytes == null); // deleted
+    vb.close();
+
+    // Ack again — should be no-op (job doesn't exist), no crash
+    aw = BufWriter{ .buf = &ack_buf };
+    aw.writeU16(1);
+    aw.writePrefixed("dack-job-1");
+    aw.writePrefixed("dack-q");
+    aw.writeU8(0);
+    aw.writeU8(0);
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_ACK_BATCH, 4, aw.written());
+    ctx.pipeline.tick();
+
+    // Should not crash — op was processed
+    try testing.expect(ctx.pipeline.applied_total > applied_before);
+}
+
+test "fetch respects max_concurrency" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-maxconc");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Enqueue two jobs (creates the queue)
+    var enq_buf: [512]u8 = undefined;
+    for ([_][]const u8{ "conc-job-1", "conc-job-2" }) |job_id| {
+        var ew = BufWriter{ .buf = &enq_buf };
+        ew.writeU16(1);
+        ew.writePrefixed("conc-q");
+        ew.writePrefixed(job_id);
+        ew.writeU8(128);
+        ew.writeU16(3);
+        ew.writeU8(0);
+        ew.writeU32(0);
+        ew.writeU32(0);
+        ew.writeU32(0);
+        ew.writeU64(0);
+        ew.writeU32(0);
+        ew.writeU16(0);
+        ew.writeU16(0);
+
+        ctx.injectFrame(conn_id, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+        ctx.pipeline.tick();
+        ctx.backend.submit();
+        _ = ctx.backend.drain(&ctx.pipeline.completions);
+    }
+
+    // Set queue max_concurrency=1 via RPC
+    var qcfg_buf: [256]u8 = undefined;
+    var qw = BufWriter{ .buf = &qcfg_buf };
+    qw.writePrefixed("conc-q");
+    qw.writeU8(@intFromEnum(ops_mod.QueueAction.concurrency));
+    qw.writeU32(1); // max_concurrency = 1
+    qw.writeU32(0);
+    qw.writeU32(0);
+    qw.writeU8(0);
+
+    ctx.injectFrame(conn_id, rpc.MSG_QUEUE_CONFIG, 2, qw.written());
+    ctx.pipeline.tick();
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Fetch 1 job (saturates max_concurrency)
+    const fetch_conn = ctx.backend.connect().?;
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1); // prefetch=1
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("conc-q");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 3, fw.written());
+    ctx.pipeline.tick();
+
+    const fetch_c = ctx.backend.conn(fetch_conn);
+    try testing.expect(fetch_c.send_len > 0); // got job 1
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Second fetch on different connection — should get nothing (at max_concurrency)
+    const fetch_conn2 = ctx.backend.connect().?;
+    fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-2");
+    fw.writeU8(1);
+    fw.writePrefixed("conc-q");
+
+    ctx.injectFrame(fetch_conn2, rpc.MSG_FETCH_BATCH, 4, fw.written());
+    ctx.pipeline.tick();
+
+    // No response — subscription waits because concurrency is saturated
+    const fetch_c2 = ctx.backend.conn(fetch_conn2);
+    try testing.expectEqual(@as(u32, 0), fetch_c2.send_len);
+}
+
+test "reclaim transitions expired active job back to pending" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-reclaim");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Enqueue
+    var enq_buf: [512]u8 = undefined;
+    var ew = BufWriter{ .buf = &enq_buf };
+    ew.writeU16(1);
+    ew.writePrefixed("reclaim-q");
+    ew.writePrefixed("reclaim-job-1");
+    ew.writeU8(128);
+    ew.writeU16(3); // max_retries=3
+    ew.writeU8(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU32(0);
+    ew.writeU64(0);
+    ew.writeU32(0);
+    ew.writeU16(0);
+    ew.writeU16(0);
+
+    ctx.injectFrame(conn_id, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+    ctx.pipeline.tick();
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Fetch with short lease (2s)
+    const fetch_conn = ctx.backend.connect().?;
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(2000); // 2s lease
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("reclaim-q");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 2, fw.written());
+    ctx.pipeline.tick();
+
+    // Verify it was fetched (active)
+    var key_buf: keys.KeyBuf = undefined;
+    var vb = ctx.stores[0].newBatch();
+    var job_buf: [4096]u8 = undefined;
+    var job_bytes = vb.getInto(keys.jobKey(&key_buf, "reclaim-job-1"), &job_buf);
+    try testing.expect(job_bytes != null);
+    var job = codec.decodeJob(job_bytes.?);
+    try testing.expectEqual(types.JobState.active, job.state);
+    vb.close();
+
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Advance past lease expiry and trigger reclaim
+    advanceTestClock(3_000_000_000); // +3s (past 2s lease)
+    ctx.pipeline.config.reclaim_interval_ns = 1_000_000_000;
+    ctx.pipeline.tick();
+
+    // Job should be back to pending (reclaimed)
+    var vb2 = ctx.stores[0].newBatch();
+    defer vb2.close();
+    job_bytes = vb2.getInto(keys.jobKey(&key_buf, "reclaim-job-1"), &job_buf);
+    try testing.expect(job_bytes != null);
+    job = codec.decodeJob(job_bytes.?);
+    try testing.expectEqual(types.JobState.pending, job.state);
+}
+
+// ============================================================================
+// Sync Replication Tests
+// ============================================================================
+
 test "sync-repl pipelined prepares — fast path when ack races ahead" {
     const ctx = try TestContext.create("/tmp/corvo-pv2-sync-repl-fastpath");
     defer ctx.destroy();
