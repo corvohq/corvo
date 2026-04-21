@@ -127,6 +127,8 @@ pub const FLAG_PARENT_ID = lifecycle.FLAG_PARENT_ID;
 pub const ACK_FLAG_RESULT = lifecycle.ACK_FLAG_RESULT;
 pub const ACK_FLAG_CHECKPOINT = lifecycle.ACK_FLAG_CHECKPOINT;
 pub const ACK_FLAG_HOLD_REASON = lifecycle.ACK_FLAG_HOLD_REASON;
+pub const ACK_FLAG_LEASE_TOKEN = lifecycle.ACK_FLAG_LEASE_TOKEN;
+pub const FAIL_FLAG_LEASE_TOKEN = lifecycle.FAIL_FLAG_LEASE_TOKEN;
 pub const HB_FLAG_PROGRESS = lifecycle.HB_FLAG_PROGRESS;
 pub const HB_FLAG_CHECKPOINT = lifecycle.HB_FLAG_CHECKPOINT;
 

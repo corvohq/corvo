@@ -3534,6 +3534,73 @@ test "fetch respects max_concurrency" {
     try testing.expectEqual(@as(u32, 0), fetch_c2.send_len);
 }
 
+test "single fetch with prefetch > max_concurrency only returns max_concurrency jobs" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-maxconc-prefetch");
+    defer ctx.destroy();
+
+    const conn_id = ctx.backend.connect().?;
+
+    // Enqueue 5 jobs
+    var enq_buf: [512]u8 = undefined;
+    for ([_][]const u8{ "mc-job-1", "mc-job-2", "mc-job-3", "mc-job-4", "mc-job-5" }) |job_id| {
+        var ew = BufWriter{ .buf = &enq_buf };
+        ew.writeU16(1);
+        ew.writePrefixed("mc-q");
+        ew.writePrefixed(job_id);
+        ew.writeU8(128);
+        ew.writeU16(3);
+        ew.writeU8(0);
+        ew.writeU32(0);
+        ew.writeU32(0);
+        ew.writeU32(0);
+        ew.writeU64(0);
+        ew.writeU32(0);
+        ew.writeU16(0);
+        ew.writeU16(0);
+
+        ctx.injectFrame(conn_id, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+        ctx.pipeline.tick();
+        ctx.backend.submit();
+        _ = ctx.backend.drain(&ctx.pipeline.completions);
+    }
+
+    // Set queue max_concurrency=1
+    var qcfg_buf: [256]u8 = undefined;
+    var qw = BufWriter{ .buf = &qcfg_buf };
+    qw.writePrefixed("mc-q");
+    qw.writeU8(@intFromEnum(ops_mod.QueueAction.concurrency));
+    qw.writeU32(1); // max_concurrency = 1
+    qw.writeU32(0);
+    qw.writeU32(0);
+    qw.writeU8(0);
+
+    ctx.injectFrame(conn_id, rpc.MSG_QUEUE_CONFIG, 2, qw.written());
+    ctx.pipeline.tick();
+    ctx.backend.submit();
+    _ = ctx.backend.drain(&ctx.pipeline.completions);
+
+    // Fetch with prefetch=5 — should only get 1 job due to max_concurrency=1
+    const fetch_conn = ctx.backend.connect().?;
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(5); // prefetch=5
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-mc");
+    fw.writeU8(1);
+    fw.writePrefixed("mc-q");
+
+    ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 3, fw.written());
+    ctx.pipeline.tick();
+
+    const resp = ctx.readResponse(fetch_conn).?;
+    try testing.expectEqual(rpc.MSG_FETCH_BATCH_RESP, resp.header.msg_type);
+
+    var r = BufReader{ .data = resp.payload };
+    const fetched_count = try r.readU16();
+    // Must be exactly 1, not 5 — max_concurrency caps it within a single fetch batch
+    try testing.expectEqual(@as(u16, 1), fetched_count);
+}
+
 test "reclaim transitions expired active job back to pending" {
     const ctx = try TestContext.create("/tmp/corvo-pv2-reclaim");
     defer ctx.destroy();

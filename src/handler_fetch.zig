@@ -84,7 +84,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
         // Separate from the normal pop loop to avoid any overhead on non-fairness queues.
         if (queue.fairness) {
             var fairness_budget: u32 = @max((@min(op.count, ops.OpResult.max_inline_fetch) - result.affected) * 2, 64);
-            fetchWithFairness(self, b, &result, queue_name, &fairness_budget, max_fetch, lease_expires_ns, lease_duration_ms, op, has_rl, has_global_rl);
+            fetchWithFairness(self, b, &result, queue_name, &fairness_budget, max_fetch, lease_expires_ns, lease_duration_ms, op, has_rl, has_global_rl, queue.max_concurrency);
             continue; // next queue
         }
 
@@ -134,6 +134,12 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             b.set(OpHandler.jobActiveKey(&ak_buf, &job), &lease_val);
 
             self.incrActiveCount(queue_name);
+
+            // Re-check concurrency after claiming — prevents overshooting when
+            // prefetch > max_concurrency (the outer loop only checks once per queue).
+            const conc_reached = queue.max_concurrency > 0 and
+                self.getActiveCount(queue_name) >= @as(i32, @intCast(queue.max_concurrency));
+
             if (job.group) |g| {
                 self.incrFairnessActive(queue_name, g);
                 self.incrFairnessServed(queue_name, g);
@@ -166,6 +172,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             f.lease_duration_ms = lease_duration_ms;
             f.lease_token = job.lease_token;
             result.affected += 1;
+            if (conc_reached) break;
         }
     }
 
@@ -217,6 +224,7 @@ fn fetchWithFairness(
     op: *const ops.FetchOp,
     has_rl: bool,
     has_global_rl: bool,
+    max_concurrency: u32,
 ) void {
     const max_candidates: u32 = 16;
 
@@ -315,6 +323,12 @@ fn fetchWithFairness(
         b.set(OpHandler.jobActiveKey(&ak_buf, &job), &lease_val);
 
         self.incrActiveCount(queue_name);
+
+        // Re-check concurrency after claiming — prevents overshooting when
+        // prefetch > max_concurrency (the outer loop only checks once per queue).
+        const conc_reached = max_concurrency > 0 and
+            self.getActiveCount(queue_name) >= @as(i32, @intCast(max_concurrency));
+
         if (job.group) |g| {
             self.incrFairnessActive(queue_name, g);
             self.incrFairnessServed(queue_name, g);
@@ -345,5 +359,6 @@ fn fetchWithFairness(
         f.lease_duration_ms = lease_duration_ms;
         f.lease_token = job.lease_token;
         result.affected += 1;
+        if (conc_reached) break;
     }
 }

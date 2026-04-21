@@ -210,6 +210,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     var total_maintenance: u32 = 0;
     var total_heartbeats: u32 = 0;
     var total_queue_ops: u32 = 0;
+    var total_stale_acks: u32 = 0;
 
     for (clients[0..num_clients]) |c| {
         total_enqueued += c.enqueued;
@@ -220,14 +221,16 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         total_maintenance += c.maintenance_ops;
         total_heartbeats += c.heartbeats;
         total_queue_ops += c.queue_ops;
+        total_stale_acks += c.stale_acks;
     }
 
     std.debug.print(
-        "OK seed={d} ticks={d} clients={d} queues={d} | enq={d} fetch={d} ack={d} fail={d} bulk={d} maint={d} hb={d} qop={d}\n",
+        "OK seed={d} ticks={d} clients={d} queues={d} | enq={d} fetch={d} ack={d} fail={d} bulk={d} maint={d} hb={d} qop={d} stale={d}\n",
         .{
             seed,            config.ticks,       num_clients,        num_queues,
             total_enqueued,  total_fetched,      total_acked,        total_failed,
             total_bulk,      total_maintenance,  total_heartbeats,   total_queue_ops,
+            total_stale_acks,
         },
     );
 }

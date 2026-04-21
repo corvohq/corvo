@@ -23,6 +23,7 @@ const clock_mod = @import("clock.zig");
 
 const max_active_jobs = 64;
 const max_completed_ids = 128;
+const max_stale_jobs = 8;
 
 pub const SimClient = struct {
     id: u32,
@@ -52,6 +53,11 @@ pub const SimClient = struct {
     completed_ids: [max_completed_ids]IdBuf = undefined,
     completed_count: usize = 0,
 
+    // Stale jobs: jobs we "forgot" to ack, letting leases expire.
+    // Used to later send stale acks that should be rejected.
+    stale_jobs: [max_stale_jobs]JobEntry = undefined,
+    stale_count: usize = 0,
+
     // Queue pause state tracking.
     paused_queues: [8]bool = [_]bool{false} ** 8,
 
@@ -66,6 +72,7 @@ pub const SimClient = struct {
     queue_ops: u32 = 0,
     unique_conflicts: u32 = 0,
     double_acks: u32 = 0,
+    stale_acks: u32 = 0,
     clear_queues: u32 = 0,
 
     // Fetch subscription: true when we sent a fetch that got no immediate response.
@@ -177,6 +184,12 @@ pub const SimClient = struct {
         // Adversarial: double-ack or ack non-existent
         if (self.chance(0.02)) {
             self.doAdversarialAck();
+            return;
+        }
+
+        // Stale ack: send an ack for a job we previously "forgot" about.
+        if (self.stale_count > 0 and self.chance(0.02)) {
+            self.doStaleAck();
             return;
         }
 
@@ -373,6 +386,18 @@ pub const SimClient = struct {
         const job_id = entry.jobID();
         const job_queue = entry.queue();
 
+        // Small chance: "forget" this job instead of acking it.
+        // The lease will expire, maintenance will reclaim it, another client
+        // may re-fetch it, and our later stale ack will be rejected.
+        if (self.stale_count < max_stale_jobs and self.chance(self.config.stale_rate)) {
+            self.stale_jobs[self.stale_count] = self.active_jobs[idx];
+            self.stale_count += 1;
+            // Swap-remove from active (without sending any RPC)
+            self.active_jobs[idx] = self.active_jobs[self.active_count - 1];
+            self.active_count -= 1;
+            return;
+        }
+
         if (entry.will_fail) {
             var w = self.payloadWriter();
             w.writeU16(1);
@@ -421,6 +446,31 @@ pub const SimClient = struct {
 
         self.sendFrame(rpc.MSG_ACK_BATCH, w.pos);
         self.double_acks += 1;
+    }
+
+    // ====================================================================
+    // Stale ack — ack a job whose lease has (likely) expired
+    // ====================================================================
+
+    fn doStaleAck(self: *SimClient) void {
+        if (self.stale_count == 0) return;
+
+        const idx = self.rng.intRangeAtMost(usize, 0, self.stale_count - 1);
+        const entry = self.stale_jobs[idx];
+
+        var w = self.payloadWriter();
+        w.writeU16(1);
+        w.writePrefixed(entry.jobID());
+        w.writePrefixed(entry.queue());
+        w.writeU8(0); // ack_status = done
+        w.writeU8(0); // flags
+
+        self.sendFrame(rpc.MSG_ACK_BATCH, w.pos);
+        self.stale_acks += 1;
+
+        // Swap-remove from stale_jobs
+        self.stale_jobs[idx] = self.stale_jobs[self.stale_count - 1];
+        self.stale_count -= 1;
     }
 
     // ====================================================================

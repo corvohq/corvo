@@ -36,6 +36,13 @@ pub const FLAG_PARENT_ID: u16 = 0x0080;
 pub const ACK_FLAG_RESULT: u8 = 0x01;
 pub const ACK_FLAG_CHECKPOINT: u8 = 0x02;
 pub const ACK_FLAG_HOLD_REASON: u8 = 0x04;
+pub const ACK_FLAG_LEASE_TOKEN: u8 = 0x08;
+
+// ============================================================================
+// Fail optional field flags
+// ============================================================================
+
+pub const FAIL_FLAG_LEASE_TOKEN: u8 = 0x01;
 
 // ============================================================================
 // Heartbeat optional field flags
@@ -115,6 +122,7 @@ pub fn parseAck(reader: *BufReader, acks_buf: []ops_mod.AckJob) ParseError!struc
         if (flags & ACK_FLAG_RESULT != 0) ack.result = try reader.readPrefixed();
         if (flags & ACK_FLAG_CHECKPOINT != 0) ack.checkpoint = try reader.readPrefixed();
         if (flags & ACK_FLAG_HOLD_REASON != 0) ack.hold_reason = try reader.readPrefixed();
+        if (flags & ACK_FLAG_LEASE_TOKEN != 0) ack.lease_token = try reader.readU64();
 
         acks_buf[i] = ack;
     }
@@ -142,6 +150,9 @@ pub fn parseFail(reader: *BufReader, fails_buf: []ops_mod.FailJob) ParseError!st
 
         const backtrace = try reader.readPrefixed();
         fail.backtrace = if (backtrace.len > 0) backtrace else null;
+
+        const flags = try reader.readU8();
+        if (flags & FAIL_FLAG_LEASE_TOKEN != 0) fail.lease_token = try reader.readU64();
 
         fails_buf[i] = fail;
     }
@@ -272,6 +283,8 @@ pub fn encodeFetchResp(writer: *BufWriter, result: *const ops_mod.OpResult, payl
         } else {
             writer.writeU16(0);
         }
+
+        writer.writeU64(fetched.lease_token);
     }
 }
 
@@ -322,8 +335,9 @@ test "parseAck roundtrip" {
     w.writePrefixed("job-001");
     w.writePrefixed("test-queue");
     w.writeU8(0); // done
-    w.writeU8(ACK_FLAG_RESULT);
+    w.writeU8(ACK_FLAG_RESULT | ACK_FLAG_LEASE_TOKEN);
     w.writePrefixed("ok");
+    w.writeU64(0xDEADBEEF_12345678);
 
     var acks_buf: [MAX_BATCH_JOBS]ops_mod.AckJob = undefined;
     var r = BufReader{ .data = w.written() };
@@ -333,6 +347,26 @@ test "parseAck roundtrip" {
     try std.testing.expectEqualStrings("job-001", result.op.acks[0].job_id);
     try std.testing.expectEqual(types.AckStatus.done, result.op.acks[0].ack_status);
     try std.testing.expectEqualStrings("ok", result.op.acks[0].result.?);
+    try std.testing.expectEqual(@as(u64, 0xDEADBEEF_12345678), result.op.acks[0].lease_token);
+}
+
+test "parseAck roundtrip without lease_token" {
+    var buf: [256]u8 = undefined;
+    var w = BufWriter{ .buf = &buf };
+
+    w.writeU16(1);
+    w.writePrefixed("job-001");
+    w.writePrefixed("test-queue");
+    w.writeU8(0); // done
+    w.writeU8(ACK_FLAG_RESULT);
+    w.writePrefixed("ok");
+
+    var acks_buf: [MAX_BATCH_JOBS]ops_mod.AckJob = undefined;
+    var r = BufReader{ .data = w.written() };
+    const result = try parseAck(&r, &acks_buf);
+
+    try std.testing.expectEqual(@as(u16, 1), result.count);
+    try std.testing.expectEqual(@as(u64, 0), result.op.acks[0].lease_token);
 }
 
 test "parseFail roundtrip" {
@@ -344,6 +378,8 @@ test "parseFail roundtrip" {
     w.writePrefixed("test-queue");
     w.writePrefixed("connection timeout");
     w.writePrefixed("");
+    w.writeU8(FAIL_FLAG_LEASE_TOKEN);
+    w.writeU64(0xCAFEBABE_00000001);
 
     var fails_buf: [MAX_BATCH_JOBS]ops_mod.FailJob = undefined;
     var r = BufReader{ .data = w.written() };
@@ -352,6 +388,27 @@ test "parseFail roundtrip" {
     try std.testing.expectEqual(@as(u16, 1), result.count);
     try std.testing.expectEqualStrings("connection timeout", result.op.jobs[0].error_msg);
     try std.testing.expect(result.op.jobs[0].backtrace == null);
+    try std.testing.expectEqual(@as(u64, 0xCAFEBABE_00000001), result.op.jobs[0].lease_token);
+}
+
+test "parseFail roundtrip without lease_token" {
+    var buf: [256]u8 = undefined;
+    var w = BufWriter{ .buf = &buf };
+
+    w.writeU16(1);
+    w.writePrefixed("job-001");
+    w.writePrefixed("test-queue");
+    w.writePrefixed("connection timeout");
+    w.writePrefixed("");
+    w.writeU8(0); // no flags
+
+    var fails_buf: [MAX_BATCH_JOBS]ops_mod.FailJob = undefined;
+    var r = BufReader{ .data = w.written() };
+    const result = try parseFail(&r, &fails_buf);
+
+    try std.testing.expectEqual(@as(u16, 1), result.count);
+    try std.testing.expectEqualStrings("connection timeout", result.op.jobs[0].error_msg);
+    try std.testing.expectEqual(@as(u64, 0), result.op.jobs[0].lease_token);
 }
 
 test "parseFetchSubscribe roundtrip" {

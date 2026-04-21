@@ -34,6 +34,9 @@ pub const Config = struct {
     // Heartbeat
     heartbeat_rate: f64 = 0.1, // prob of heartbeat for active jobs
 
+    // Stale acks (lease expiry testing)
+    stale_rate: f64 = 0.03, // prob of "forgetting" a job instead of acking (lets lease expire)
+
     // Time jumps
     time_jump_prob: f64 = 0.02, // prob of a large time jump per tick
     time_jump_max_ns: i64 = 120_000_000_000, // 120s max jump

@@ -902,17 +902,19 @@ pub fn run(allocator: std.mem.Allocator, config: Config, node_count: u8) !void {
     var total_fetched: u32 = 0;
     var total_acked: u32 = 0;
     var total_failed: u32 = 0;
+    var total_stale_acks: u32 = 0;
 
     for (clients[0..num_clients]) |c| {
         total_enqueued += c.enqueued;
         total_fetched += c.fetched;
         total_acked += c.acked;
         total_failed += c.failed;
+        total_stale_acks += c.stale_acks;
     }
 
     std.debug.print(
-        "OK seed={d} ticks={d} nodes={d} clients={d} | enq={d} fetch={d} ack={d} fail={d}\n",
-        .{ seed, config.ticks, node_count, num_clients, total_enqueued, total_fetched, total_acked, total_failed },
+        "OK seed={d} ticks={d} nodes={d} clients={d} | enq={d} fetch={d} ack={d} fail={d} stale={d}\n",
+        .{ seed, config.ticks, node_count, num_clients, total_enqueued, total_fetched, total_acked, total_failed, total_stale_acks },
     );
 }
 
