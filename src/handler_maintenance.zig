@@ -229,6 +229,7 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
                     var dk_buf: keys.KeyBuf = undefined;
                     b.set(keys.deadKey(&dk_buf, now_ns, job_id), "");
+                    self.dead_since_purge += 1;
 
                     // Batch failure tracking.
                     if (job.batch_id) |bid| {
@@ -355,6 +356,7 @@ fn applyExpire(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                 self.verifyJobIndexes(b, &job, "expire");
                 var dk_buf: keys.KeyBuf = undefined;
                 b.set(keys.deadKey(&dk_buf, now_ns, job_id), "");
+                self.dead_since_purge += 1;
                 self.recordBulkResult(job_id, .update_state, "dead", "", now_ns);
 
                 affected += 1;

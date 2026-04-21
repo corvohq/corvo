@@ -137,6 +137,11 @@ pub const Indexer = struct {
     fn flushCreate(_: *const Indexer, b: *kv.WriteBatch, e: *const IndexEffect) void {
         const job_id = e.jobId();
         const queue = e.queue();
+
+        // Skip if job was deleted in the same batch (clear/delete queue).
+        var jk_check: keys.KeyBuf = undefined;
+        if (b.get(keys.jobKey(&jk_check, job_id)) == null) return;
+
         const state_byte = @intFromEnum(e.new_state);
 
         var jt_buf: keys.KeyBuf = undefined;
@@ -157,13 +162,18 @@ pub const Indexer = struct {
         const job_id = e.jobId();
         const queue = e.queue();
         const old_byte = @intFromEnum(e.old_state);
-        const new_byte = @intFromEnum(e.new_state);
 
+        // Always delete old state indexes (cleanup even if job was deleted).
         var old_js_buf: keys.KeyBuf = undefined;
         var old_jqs_buf: keys.KeyBuf = undefined;
         b.delete(keys.jobStateKey(&old_js_buf, old_byte, e.created_at_ns, job_id));
         b.delete(keys.jobQueueStateKey(&old_jqs_buf, queue, old_byte, e.created_at_ns, job_id));
 
+        // Skip writing new state indexes if job was deleted in the same batch.
+        var jk_check: keys.KeyBuf = undefined;
+        if (b.get(keys.jobKey(&jk_check, job_id)) == null) return;
+
+        const new_byte = @intFromEnum(e.new_state);
         var new_js_buf: keys.KeyBuf = undefined;
         var new_jqs_buf: keys.KeyBuf = undefined;
         b.set(keys.jobStateKey(&new_js_buf, new_byte, e.created_at_ns, job_id), "");

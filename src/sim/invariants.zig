@@ -99,6 +99,12 @@ pub fn checkAll(
     // Job state FSM field consistency.
     if (checkJobStateFields(store, tick, seed)) |err| return err;
 
+    // total_jobs counter matches actual j| key count.
+    if (checkTotalJobsAccuracy(store, handler, tick, seed)) |err| return err;
+
+    // No orphaned jq| keys pointing to non-existent jobs.
+    if (checkNoOrphanedQueueIndexes(store, tick, seed)) |err| return err;
+
     return null;
 }
 
@@ -529,6 +535,43 @@ fn checkBatchCounters(store: *kv.Store, tick: u32, seed: u64) CheckResult {
     var batch = store.newBatch();
     defer batch.close();
 
+    // Phase 1: Count actual non-terminal jobs per batch from j| scan.
+    const max_batches = 64;
+    var batch_ids: [max_batches][128]u8 = undefined;
+    var batch_id_lens: [max_batches]u8 = [_]u8{0} ** max_batches;
+    var actual_pending: [max_batches]u32 = [_]u32{0} ** max_batches;
+    var batch_count: usize = 0;
+
+    {
+        var j_upper_buf: keys.KeyBuf = undefined;
+        const j_upper = keys.prefixEnd(&j_upper_buf, keys.prefix_job) orelse return null;
+        var j_iter = batch.newIter(keys.prefix_job, j_upper);
+        defer j_iter.close();
+
+        if (j_iter.first()) {
+            while (true) {
+                const jkey = j_iter.key();
+                if (jkey.len > 2 and jkey[0] == 'j' and jkey[1] == '|') {
+                    const jval = j_iter.value();
+                    if (jval.len > 0) {
+                        const job = codec.decodeJob(jval);
+                        if (job.batch_id) |bid| {
+                            if (bid.len > 0 and !job.state.isTerminal()) {
+                                // Find or add batch.
+                                const bi = findOrAddBatch(&batch_ids, &batch_id_lens, &batch_count, bid);
+                                if (bi) |idx| {
+                                    actual_pending[idx] += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!j_iter.next()) break;
+            }
+        }
+    }
+
+    // Phase 2: Scan batch KV entries and compare.
     var upper_buf: keys.KeyBuf = undefined;
     const upper = keys.prefixEnd(&upper_buf, keys.prefix_batch) orelse return null;
 
@@ -558,6 +601,24 @@ fn checkBatchCounters(store: *kv.Store, tick: u32, seed: u64) CheckResult {
                 return makeErrorFmt("batch-counter-underflow", tick, seed,
                     "batch {s}: suspiciously large counters p={d} s={d} f={d} (underflow?)",
                     .{ b.id, b.pending, b.succeeded, b.failed });
+            }
+
+            // Verify batch.pending matches actual non-terminal job count.
+            if (b.id.len > 0) {
+                var actual: u32 = 0;
+                for (0..batch_count) |i| {
+                    if (batch_id_lens[i] == @as(u8, @intCast(b.id.len)) and
+                        std.mem.eql(u8, batch_ids[i][0..batch_id_lens[i]], b.id))
+                    {
+                        actual = actual_pending[i];
+                        break;
+                    }
+                }
+                if (b.pending != actual) {
+                    return makeErrorFmt("batch-pending-accuracy", tick, seed,
+                        "batch {s}: pending={d} but {d} non-terminal jobs in KV",
+                        .{ b.id, b.pending, actual });
+                }
             }
         }
 
@@ -668,6 +729,28 @@ fn findOrAddQueue(
     const len = @min(queue.len, 64);
     @memcpy(names[idx][0..len], queue[0..len]);
     lens[idx] = @intCast(len);
+    count.* += 1;
+    return idx;
+}
+
+fn findOrAddBatch(
+    ids: *[64][128]u8,
+    lens: *[64]u8,
+    count: *usize,
+    batch_id: []const u8,
+) ?usize {
+    const bid_len: u8 = @intCast(@min(batch_id.len, 128));
+    for (0..count.*) |i| {
+        if (lens[i] == bid_len and
+            std.mem.eql(u8, ids[i][0..lens[i]], batch_id[0..bid_len]))
+        {
+            return i;
+        }
+    }
+    if (count.* >= 64) return null;
+    const idx = count.*;
+    @memcpy(ids[idx][0..bid_len], batch_id[0..bid_len]);
+    lens[idx] = bid_len;
     count.* += 1;
     return idx;
 }
@@ -1030,6 +1113,77 @@ fn checkJobStateFields(store: *kv.Store, tick: u32, seed: u64) CheckResult {
 
         if (!iter.next()) break;
     }
+    return null;
+}
+
+// ============================================================================
+// total_jobs accuracy — handler.total_jobs must match j| key count in KV
+// ============================================================================
+
+fn checkTotalJobsAccuracy(store: *kv.Store, handler: *OpHandler, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_job, upper);
+    defer iter.close();
+
+    var kv_count: u32 = 0;
+    if (iter.first()) {
+        while (true) {
+            const key = iter.key();
+            // Only count j| keys (not jp|, je|, etc.)
+            if (key.len > 2 and key[0] == 'j' and key[1] == '|') {
+                kv_count += 1;
+            }
+            if (!iter.next()) break;
+        }
+    }
+
+    if (handler.total_jobs != kv_count) {
+        return makeErrorFmt("total-jobs-accuracy", tick, seed,
+            "handler.total_jobs={d} but KV has {d} j| keys",
+            .{ handler.total_jobs, kv_count });
+    }
+
+    return null;
+}
+
+// ============================================================================
+// No orphaned jq| keys — every jq| index must reference an existing j| key
+// ============================================================================
+
+fn checkNoOrphanedQueueIndexes(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job_queue) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_job_queue, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const key = iter.key();
+        // jq|{queue}\x00{inv_created_ns:8BE}{job_id}
+        const job_id = extractJobIDStructured(key, keys.prefix_job_queue.len, 8) orelse {
+            if (!iter.next()) break;
+            continue;
+        };
+
+        var jk_buf: keys.KeyBuf = undefined;
+        if (batch.get(keys.jobKey(&jk_buf, job_id)) == null) {
+            return makeErrorFmt("orphaned-queue-index", tick, seed,
+                "jq| key references job {s} but no j| key exists", .{job_id});
+        }
+
+        if (!iter.next()) break;
+    }
+
     return null;
 }
 

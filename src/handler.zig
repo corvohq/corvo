@@ -838,6 +838,26 @@ pub const OpHandler = struct {
         b.delete(keys.jobQueueStateKey(&jqs_buf, job.queue, state_byte, job.created_at_ns, job.id));
     }
 
+    /// Delete queue-specific read indexes for a job under a given queue.
+    /// Used by bulk move to clean up old queue's indexes before writing new ones.
+    pub fn deleteQueueReadIndexes(b: *kv.WriteBatch, queue: []const u8, job: *const types.Job) void {
+        var jq_buf: keys.KeyBuf = undefined;
+        var jqs_buf: keys.KeyBuf = undefined;
+        const state_byte = @intFromEnum(job.state);
+        b.delete(keys.jobQueueKey(&jq_buf, queue, job.created_at_ns, job.id));
+        b.delete(keys.jobQueueStateKey(&jqs_buf, queue, state_byte, job.created_at_ns, job.id));
+    }
+
+    /// Write queue-specific read indexes for a job (using job.queue).
+    /// Used by bulk move to write new queue's indexes after updating job.queue.
+    pub fn writeQueueReadIndexes(b: *kv.WriteBatch, job: *const types.Job) void {
+        var jq_buf: keys.KeyBuf = undefined;
+        var jqs_buf: keys.KeyBuf = undefined;
+        const state_byte = @intFromEnum(job.state);
+        b.set(keys.jobQueueKey(&jq_buf, job.queue, job.created_at_ns, job.id), "");
+        b.set(keys.jobQueueStateKey(&jqs_buf, job.queue, state_byte, job.created_at_ns, job.id), "");
+    }
+
     /// Update read indexes when a job transitions state.
     /// Deletes old state entries, writes new state entries, updates queue counters.
     pub fn transitionReadIndexes(self: *OpHandler, b: *kv.WriteBatch, job: *const types.Job, old_state: types.JobState, new_state: types.JobState) void {

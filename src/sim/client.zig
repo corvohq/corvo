@@ -551,7 +551,7 @@ pub const SimClient = struct {
             self.completed_count,
         );
 
-        const actions = [_]ops.BulkAction{ .requeue, .delete, .cancel, .hold, .approve, .reject, .promote };
+        const actions = [_]ops.BulkAction{ .requeue, .delete, .cancel, .hold, .approve, .reject, .promote, .move };
         const action = actions[self.rng.intRangeAtMost(usize, 0, actions.len - 1)];
 
         const now_ns: u64 = @intCast(clock_mod.globalClockNow());
@@ -566,7 +566,14 @@ pub const SimClient = struct {
             w.writePrefixed(self.completed_ids[ci].slice());
         }
 
-        w.writeU8(0); // flags (no move_to, no priority)
+        // Flags: set move_to for .move action.
+        if (action == .move) {
+            w.writeU8(0x01); // BULK_FLAG_MOVE_TO
+            const move_q = self.queues[self.rng.intRangeAtMost(usize, 0, self.queues.len - 1)];
+            w.writePrefixed(move_q);
+        } else {
+            w.writeU8(0); // flags (no move_to, no priority)
+        }
         w.writeU64(now_ns);
 
         self.sendFrame(rpc.MSG_BULK_ACTION, w.pos);

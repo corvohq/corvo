@@ -76,7 +76,8 @@ pub fn applyClearQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Clear
     if (b.get(keys.queueNameKey(&qn_buf, op.queue)) == null) {
         return .{ .err = "queue not found" };
     }
-    deleteAllQueueJobs(self, b, op.queue, op.now_ns);
+    const deleted = deleteAllQueueJobs(self, b, op.queue, op.now_ns);
+    self.total_jobs -|= deleted;
     // PendingIndex already drained inside deleteAllQueueJobs.
 
     // Reset in-memory counters for cleared states. deleteAllQueueJobs removes
@@ -109,8 +110,9 @@ pub fn applyDeleteQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Dele
     if (b.get(keys.queueNameKey(&qn_buf, op.queue)) == null) {
         return .{ .err = "queue not found" };
     }
-    deleteAllQueueJobs(self, b, op.queue, op.now_ns);
-    deleteTerminalQueueJobs(self, b, op.queue, op.now_ns);
+    const deleted1 = deleteAllQueueJobs(self, b, op.queue, op.now_ns);
+    const deleted2 = deleteTerminalQueueJobs(self, b, op.queue, op.now_ns);
+    self.total_jobs -|= deleted1 + deleted2;
     // PendingIndex already drained inside deleteAllQueueJobs.
     self.removeQueueConfig(op.queue);
 
@@ -134,16 +136,17 @@ pub fn applyDeleteQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Dele
 // Internal helpers
 // ============================================================================
 
-fn deleteAllQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, now_ns: u64) void {
+fn deleteAllQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, now_ns: u64) u32 {
     // NOTE: active jobs are NOT deleted — they have a worker processing them.
     // They will complete naturally via ack/fail, or be reclaimed by maintenance.
+    var deleted: u32 = 0;
 
     // Delete scheduled jobs
     var sp_buf: keys.KeyBuf = undefined;
     var spe_buf: keys.KeyBuf = undefined;
     const sp = keys.scheduledScanPrefix(&sp_buf, queue);
     if (keys.prefixEnd(&spe_buf, sp)) |end| {
-        deleteJobsByPrefix(self, b, sp, end, extractJobIDFromTimeSorted, now_ns);
+        deleted += deleteJobsByPrefix(self, b, sp, end, extractJobIDFromTimeSorted, now_ns);
     }
 
     // Delete retrying jobs
@@ -151,7 +154,7 @@ fn deleteAllQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, no
     var rpe_buf: keys.KeyBuf = undefined;
     const rp = keys.retryingScanPrefix(&rp_buf, queue);
     if (keys.prefixEnd(&rpe_buf, rp)) |end| {
-        deleteJobsByPrefix(self, b, rp, end, extractJobIDFromTimeSorted, now_ns);
+        deleted += deleteJobsByPrefix(self, b, rp, end, extractJobIDFromTimeSorted, now_ns);
     }
 
     // Delete pending jobs — tracked in PendingIndex only (no KV index key).
@@ -186,6 +189,9 @@ fn deleteAllQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, no
             var pxk_buf: keys.KeyBuf = undefined;
             b.delete(keys.expireKey(&pxk_buf, pjob.expire_at_ns, pjob_id));
         }
+        // Clean up read indexes + tag indexes.
+        OpHandler.deleteReadIndexes(b, &pjob);
+        OpHandler.deleteTagIndexes(b, &pjob);
         b.delete(keys.jobKey(&pjk_buf, pjob_id));
         var pjpk_buf: keys.KeyBuf = undefined;
         b.delete(keys.jobPayloadKey(&pjpk_buf, pjob_id));
@@ -195,6 +201,7 @@ fn deleteAllQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, no
         if (keys.prefixEnd(&pjee_buf, perr_prefix)) |perr_end| {
             b.deleteRange(perr_prefix, perr_end);
         }
+        deleted += 1;
     }
 
     // Clean up qa| with DeleteRange — do NOT iterate because qa| entries
@@ -225,9 +232,12 @@ fn deleteAllQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, no
     if (keys.prefixEnd(&rle_buf, rl)) |end| {
         b.deleteRange(rl, end);
     }
+
+    return deleted;
 }
 
-fn deleteTerminalQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, now_ns: u64) void {
+fn deleteTerminalQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, now_ns: u64) u32 {
+    var deleted: u32 = 0;
     var jp_buf: keys.KeyBuf = undefined;
     var jpe_buf: keys.KeyBuf = undefined;
     const jp = keys.prefix_job;
@@ -249,8 +259,9 @@ fn deleteTerminalQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u
 
                 const job_id = key[jp.len..];
 
-                // Held jobs haven't decremented their batch Pending counter.
-                if (job.state == .held) {
+                // Held and active jobs haven't decremented their batch
+                // Pending counter (fetch doesn't touch batch counters).
+                if (job.state == .held or job.state == .active) {
                     if (job.batch_id) |batch_id| {
                         if (batch_id.len > 0) {
                             adjustBatchForDeletedJob(self, b, batch_id, now_ns);
@@ -268,6 +279,10 @@ fn deleteTerminalQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u
                     if (job.group) |g| self.decrFairnessActive(job.queue, g);
                 }
 
+                // Clean up read indexes + tag indexes.
+                OpHandler.deleteReadIndexes(b, &job);
+                OpHandler.deleteTagIndexes(b, &job);
+
                 var jk_buf: keys.KeyBuf = undefined;
                 b.delete(keys.jobKey(&jk_buf, job_id));
                 var jpk_buf: keys.KeyBuf = undefined;
@@ -282,14 +297,17 @@ fn deleteTerminalQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u
                     var dk_buf: keys.KeyBuf = undefined;
                     b.delete(keys.deadKey(&dk_buf, job.completed_at_ns, job_id));
                 }
+                deleted += 1;
 
                 if (!iter.next()) break;
             }
         }
     }
+    return deleted;
 }
 
 /// Iterate a prefix, extract job IDs, delete index key + job data.
+/// Returns count of jobs deleted.
 fn deleteJobsByPrefix(
     self: *OpHandler,
     b: *kv.WriteBatch,
@@ -297,12 +315,13 @@ fn deleteJobsByPrefix(
     end: []const u8,
     extractJobID: *const fn (key: []const u8, prefix_len: usize) []const u8,
     now_ns: u64,
-) void {
+) u32 {
+    var deleted: u32 = 0;
     var iter = b.newIter(prefix, end);
     defer iter.close();
     const prefix_len = prefix.len;
 
-    if (!iter.first()) return;
+    if (!iter.first()) return 0;
     while (true) {
         const key = iter.key();
         b.delete(key);
@@ -336,6 +355,10 @@ fn deleteJobsByPrefix(
                     adjustBatchForDeletedJob(self, b, batch_id, now_ns);
                 }
             }
+
+            // Clean up read indexes + tag indexes.
+            OpHandler.deleteReadIndexes(b, &job);
+            OpHandler.deleteTagIndexes(b, &job);
         }
 
         b.delete(keys.jobKey(&jk_buf, job_id));
@@ -348,8 +371,10 @@ fn deleteJobsByPrefix(
             b.deleteRange(err_prefix, err_end);
         }
 
+        deleted += 1;
         if (!iter.next()) break;
     }
+    return deleted;
 }
 
 /// Adjust batch counters when a non-terminal job is force-deleted (clear/delete queue).
