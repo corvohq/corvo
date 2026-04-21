@@ -1560,6 +1560,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 } else {
                     writer.writeU16(0);
                 }
+
+                writer.writeU64(fetched.lease_token);
             }
         }
 

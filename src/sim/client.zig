@@ -97,6 +97,7 @@ pub const SimClient = struct {
         queue_buf: [64]u8 = undefined,
         queue_len: usize = 0,
         will_fail: bool = false,
+        lease_token: u64 = 0,
 
         fn jobID(self: *const JobEntry) []const u8 {
             return self.id_buf[0..self.id_len];
@@ -358,6 +359,7 @@ pub const SimClient = struct {
         _ = r.readPrefixed() catch return; // tags (empty)
         const plen = r.readU16() catch return;
         r.skip(plen) catch return; // payload bytes
+        const lease_token = r.readU64() catch return;
 
         if (job_id.len == 0) return;
         if (self.active_count >= max_active_jobs) return;
@@ -370,6 +372,7 @@ pub const SimClient = struct {
         @memcpy(entry.queue_buf[0..ql], job_queue[0..ql]);
         entry.queue_len = ql;
         entry.will_fail = self.chance(self.config.fail_rate);
+        entry.lease_token = lease_token;
         self.active_count += 1;
         self.fetched += 1;
     }
@@ -405,6 +408,8 @@ pub const SimClient = struct {
             w.writePrefixed(job_queue);
             w.writePrefixed("sim-failure");
             w.writePrefixed(""); // backtrace
+            w.writeU8(rpc.FAIL_FLAG_LEASE_TOKEN); // flags
+            w.writeU64(entry.lease_token);
             self.sendFrame(rpc.MSG_FAIL_BATCH, w.pos);
             self.failed += 1;
         } else {
@@ -413,7 +418,8 @@ pub const SimClient = struct {
             w.writePrefixed(job_id);
             w.writePrefixed(job_queue);
             w.writeU8(0); // ack_status = done
-            w.writeU8(0); // flags (no optional fields)
+            w.writeU8(rpc.ACK_FLAG_LEASE_TOKEN); // flags
+            w.writeU64(entry.lease_token);
             self.sendFrame(rpc.MSG_ACK_BATCH, w.pos);
             self.acked += 1;
         }
@@ -463,7 +469,8 @@ pub const SimClient = struct {
         w.writePrefixed(entry.jobID());
         w.writePrefixed(entry.queue());
         w.writeU8(0); // ack_status = done
-        w.writeU8(0); // flags
+        w.writeU8(rpc.ACK_FLAG_LEASE_TOKEN); // flags
+        w.writeU64(entry.lease_token); // stale token — server should reject
 
         self.sendFrame(rpc.MSG_ACK_BATCH, w.pos);
         self.stale_acks += 1;
@@ -563,6 +570,22 @@ pub const SimClient = struct {
             w.writePrefixed(q);
             self.sendFrame(rpc.MSG_CLEAR_QUEUE, w.pos);
             self.clear_queues += 1;
+            self.queue_ops += 1;
+            return;
+        }
+
+        // 20% chance of setting max_concurrency
+        if (self.chance(0.2)) {
+            const max_conc = self.rng.intRangeAtMost(u32, 1, 5);
+            var w = self.payloadWriter();
+            w.writePrefixed(q);
+            w.writeU8(@intFromEnum(ops.QueueAction.concurrency));
+            w.writeU32(max_conc); // max_concurrency
+            w.writeU32(0); // rate_limit
+            w.writeU32(0); // rate_window_ms
+            w.writeU8(0); // fairness
+
+            self.sendFrame(rpc.MSG_QUEUE_CONFIG, w.pos);
             self.queue_ops += 1;
             return;
         }

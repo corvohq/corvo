@@ -33,6 +33,12 @@ pub const InvariantError = struct {
 
 pub const CheckResult = ?InvariantError;
 
+/// Reset module-level state between sim runs.
+pub fn reset() void {
+    concurrency_grace = [_]ConcurrencyGrace{.{}} ** 16;
+    concurrency_grace_count = 0;
+}
+
 /// Run all KV invariant checks.
 pub fn checkAll(
     store: *kv.Store,
@@ -74,6 +80,24 @@ pub fn checkAll(
 
     // Pending jobs in KV are in the PendingIndex (no orphaned pending jobs).
     if (checkPendingIndexCompleteness(store, &handler.pending, tick, seed)) |err| return err;
+
+    // Active count does not exceed max_concurrency.
+    if (checkConcurrencyLimit(handler, tick, seed)) |err| return err;
+
+    // Queue per-state counters match actual job counts in KV.
+    if (checkQueueStateCounters(store, handler, tick, seed)) |err| return err;
+
+    // Lease consistency: a| key value matches job.lease_expires_at_ns.
+    if (checkLeaseConsistency(store, tick, seed)) |err| return err;
+
+    // Expire index: x| keys point to existing pending jobs.
+    if (checkExpireIndexConsistency(store, tick, seed)) |err| return err;
+
+    // No orphaned jp| payload keys without a corresponding j| key.
+    if (checkNoOrphanedPayloads(store, tick, seed)) |err| return err;
+
+    // Job state FSM field consistency.
+    if (checkJobStateFields(store, tick, seed)) |err| return err;
 
     return null;
 }
@@ -646,6 +670,358 @@ fn findOrAddQueue(
     lens[idx] = @intCast(len);
     count.* += 1;
     return idx;
+}
+
+// ============================================================================
+// Concurrency limit — active_count must not exceed max_concurrency
+// ============================================================================
+
+fn checkConcurrencyLimit(handler: *OpHandler, tick: u32, seed: u64) CheckResult {
+    // When max_concurrency is lowered while jobs are already active, those
+    // jobs drain naturally but temporarily exceed the new limit. To avoid
+    // false positives we track a per-queue "grace" — the active count at the
+    // time max_concurrency was last set. The invariant allows:
+    //   active_count <= max(max_concurrency, grace_active)
+    // As jobs complete, the grace shrinks until max_concurrency governs.
+    const max_tracked = 16;
+
+    var it = handler.queue_configs.iterator();
+    while (it.next()) |entry| {
+        const queue_name = entry.key_ptr.*;
+        const config = entry.value_ptr.*;
+        if (config.max_concurrency == 0) continue;
+
+        const active = handler.getActiveCount(queue_name);
+        if (active < 0) continue;
+        const active_u: u32 = @intCast(active);
+
+        // Update grace tracking.
+        const gi = findOrAddGrace(&concurrency_grace, &concurrency_grace_count, queue_name);
+        if (gi) |idx| {
+            const grace = &concurrency_grace[idx];
+            // If max_concurrency changed since last check, record current active as grace.
+            if (grace.max_concurrency != config.max_concurrency) {
+                grace.max_concurrency = config.max_concurrency;
+                grace.grace_active = active_u;
+            }
+            // Once active drops to or below max_concurrency, clear the grace —
+            // from this point any overshoot is a real bug.
+            if (active_u <= config.max_concurrency) {
+                grace.grace_active = config.max_concurrency;
+            }
+
+            const effective_limit = @max(config.max_concurrency, grace.grace_active);
+            if (active_u > effective_limit) {
+                return makeErrorFmt("concurrency-limit", tick, seed,
+                    "queue '{s}': active_count={d} exceeds max_concurrency={d}",
+                    .{ queue_name, active_u, config.max_concurrency });
+            }
+        }
+    }
+    _ = max_tracked;
+    return null;
+}
+
+const ConcurrencyGrace = struct {
+    name_buf: [64]u8 = undefined,
+    name_len: u8 = 0,
+    max_concurrency: u32 = 0,
+    grace_active: u32 = 0,
+};
+
+var concurrency_grace: [16]ConcurrencyGrace = [_]ConcurrencyGrace{.{}} ** 16;
+var concurrency_grace_count: usize = 0;
+
+fn findOrAddGrace(
+    graces: *[16]ConcurrencyGrace,
+    count: *usize,
+    queue: []const u8,
+) ?usize {
+    for (0..count.*) |i| {
+        if (graces[i].name_len == @as(u8, @intCast(@min(queue.len, 64))) and
+            std.mem.eql(u8, graces[i].name_buf[0..graces[i].name_len], queue[0..@min(queue.len, 64)]))
+        {
+            return i;
+        }
+    }
+    if (count.* >= 16) return null;
+    const idx = count.*;
+    const len = @min(queue.len, 64);
+    @memcpy(graces[idx].name_buf[0..len], queue[0..len]);
+    graces[idx].name_len = @intCast(len);
+    count.* += 1;
+    return idx;
+}
+
+// ============================================================================
+// Queue per-state counter accuracy — cached counters must match KV scan
+// ============================================================================
+
+fn checkQueueStateCounters(store: *kv.Store, handler: *OpHandler, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    // Count jobs per state per queue from KV scan.
+    const max_q = 16;
+    const num_states = 8;
+    var queue_names: [max_q][64]u8 = undefined;
+    var queue_name_lens: [max_q]u8 = [_]u8{0} ** max_q;
+    var kv_counts: [max_q][num_states]u32 = [_][num_states]u32{[_]u32{0} ** num_states} ** max_q;
+    var queue_count: usize = 0;
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job) orelse return null;
+    var iter = batch.newIter(keys.prefix_job, upper);
+    defer iter.close();
+
+    if (iter.first()) {
+        while (true) {
+            const key = iter.key();
+            if (key.len > 2 and key[0] == 'j' and key[1] == '|') {
+                const val = iter.value();
+                if (val.len > 0) {
+                    const job = codec.decodeJob(val);
+                    const qi = findOrAddQueue(&queue_names, &queue_name_lens, &queue_count, job.queue);
+                    if (qi) |idx| {
+                        kv_counts[idx][@intFromEnum(job.state)] += 1;
+                    }
+                }
+            }
+            if (!iter.next()) break;
+        }
+    }
+
+    // Compare with cached Queue counters.
+    for (0..queue_count) |qi| {
+        const qname = queue_names[qi][0..queue_name_lens[qi]];
+        const cached = handler.queue_configs.get(qname) orelse continue;
+
+        const expected = [num_states]u32{
+            kv_counts[qi][@intFromEnum(types.JobState.pending)],
+            kv_counts[qi][@intFromEnum(types.JobState.active)],
+            kv_counts[qi][@intFromEnum(types.JobState.retrying)],
+            kv_counts[qi][@intFromEnum(types.JobState.completed)],
+            kv_counts[qi][@intFromEnum(types.JobState.dead)],
+            kv_counts[qi][@intFromEnum(types.JobState.cancelled)],
+            kv_counts[qi][@intFromEnum(types.JobState.scheduled)],
+            kv_counts[qi][@intFromEnum(types.JobState.held)],
+        };
+        const actual = [num_states]u32{
+            cached.pending_count,
+            cached.active_count,
+            cached.retrying_count,
+            cached.completed_count,
+            cached.dead_count,
+            cached.cancelled_count,
+            cached.scheduled_count,
+            cached.held_count,
+        };
+        const labels = [num_states][]const u8{
+            "pending", "active", "retrying", "completed",
+            "dead", "cancelled", "scheduled", "held",
+        };
+
+        for (0..num_states) |si| {
+            if (actual[si] != expected[si]) {
+                return makeErrorFmt("queue-state-counter", tick, seed,
+                    "queue '{s}': {s}_count={d} but KV has {d}",
+                    .{ qname, labels[si], actual[si], expected[si] });
+            }
+        }
+    }
+
+    return null;
+}
+
+// ============================================================================
+// Lease consistency — a| key value must match job.lease_expires_at_ns
+// ============================================================================
+
+fn checkLeaseConsistency(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_active) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_active, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const key = iter.key();
+        const val = iter.value();
+
+        if (val.len != 8) {
+            if (!iter.next()) break;
+            continue;
+        }
+
+        const index_lease_ns = keys.getU64BE(val);
+
+        // Parse job ID from active key: a|{queue}\x00{job_id}
+        const key_offset = keys.prefix_active.len;
+        const sep_pos = std.mem.indexOfScalarPos(u8, key, key_offset, 0x00) orelse {
+            if (!iter.next()) break;
+            continue;
+        };
+        const job_id = key[sep_pos + 1 ..];
+
+        var jk_buf: keys.KeyBuf = undefined;
+        if (batch.get(keys.jobKey(&jk_buf, job_id))) |job_val| {
+            const job = codec.decodeJob(job_val);
+            if (job.lease_expires_at_ns != index_lease_ns) {
+                return makeErrorFmt("lease-consistency", tick, seed,
+                    "job {s}: a| lease={d} but job.lease_expires_at_ns={d}",
+                    .{ job_id, index_lease_ns, job.lease_expires_at_ns });
+            }
+        }
+
+        if (!iter.next()) break;
+    }
+    return null;
+}
+
+// ============================================================================
+// Expire index consistency — x| keys must point to existing pending jobs
+// ============================================================================
+
+fn checkExpireIndexConsistency(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_expire) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_expire, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const key = iter.key();
+        const prefix_len = keys.prefix_expire.len;
+        if (key.len <= prefix_len + 8) {
+            if (!iter.next()) break;
+            continue;
+        }
+        const job_id = key[prefix_len + 8 ..];
+
+        var jk_buf: keys.KeyBuf = undefined;
+        if (batch.get(keys.jobKey(&jk_buf, job_id))) |job_val| {
+            const job = codec.decodeJob(job_val);
+            if (job.state != .pending) {
+                return makeErrorFmt("expire-index", tick, seed,
+                    "x| key for job {s} but state={s} (expected pending)",
+                    .{ job_id, job.state.toString() });
+            }
+        } else {
+            return makeErrorFmt("expire-index", tick, seed,
+                "x| key for job {s} but job not found in KV", .{job_id});
+        }
+
+        if (!iter.next()) break;
+    }
+    return null;
+}
+
+// ============================================================================
+// No orphaned payload keys — every jp| must have a corresponding j| key
+// ============================================================================
+
+fn checkNoOrphanedPayloads(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job_payload) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_job_payload, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const key = iter.key();
+        if (key.len > keys.prefix_job_payload.len) {
+            const job_id = key[keys.prefix_job_payload.len..];
+
+            var jk_buf: keys.KeyBuf = undefined;
+            if (batch.get(keys.jobKey(&jk_buf, job_id)) == null) {
+                return makeErrorFmt("orphaned-payload", tick, seed,
+                    "jp| key for job {s} but no j| key exists", .{job_id});
+            }
+        }
+
+        if (!iter.next()) break;
+    }
+    return null;
+}
+
+// ============================================================================
+// Job state FSM field consistency — fields must match state
+// ============================================================================
+
+fn checkJobStateFields(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_job, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const key = iter.key();
+        if (key.len > 2 and key[0] == 'j' and key[1] == '|') {
+            const val = iter.value();
+            if (val.len > 0) {
+                const job = codec.decodeJob(val);
+                const job_id = key[keys.prefix_job.len..];
+
+                switch (job.state) {
+                    .active => {
+                        if (job.lease_expires_at_ns == 0) {
+                            return makeErrorFmt("job-field-fsm", tick, seed,
+                                "active job {s} has lease_expires_at_ns=0", .{job_id});
+                        }
+                        if (job.attempt == 0) {
+                            return makeErrorFmt("job-field-fsm", tick, seed,
+                                "active job {s} has attempt=0", .{job_id});
+                        }
+                    },
+                    .completed, .dead => {
+                        if (job.completed_at_ns == 0) {
+                            return makeErrorFmt("job-field-fsm", tick, seed,
+                                "{s} job {s} has completed_at_ns=0",
+                                .{ job.state.toString(), job_id });
+                        }
+                    },
+                    .pending => {
+                        if (job.lease_expires_at_ns != 0) {
+                            return makeErrorFmt("job-field-fsm", tick, seed,
+                                "pending job {s} has lease_expires_at_ns={d}",
+                                .{ job_id, job.lease_expires_at_ns });
+                        }
+                    },
+                    .scheduled => {
+                        if (job.scheduled_at_ns == 0) {
+                            return makeErrorFmt("job-field-fsm", tick, seed,
+                                "scheduled job {s} has scheduled_at_ns=0", .{job_id});
+                        }
+                    },
+                    .retrying, .cancelled, .held => {},
+                }
+            }
+        }
+
+        if (!iter.next()) break;
+    }
+    return null;
 }
 
 // ============================================================================

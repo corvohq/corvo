@@ -141,6 +141,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         clients[i].rng = clients[i].prng.random();
     }
 
+    // Reset invariant state from previous runs.
+    invariants.reset();
+
     // --- Main tick loop ---
     var tick: u32 = 0;
     while (tick < config.ticks) : (tick += 1) {

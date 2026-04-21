@@ -899,6 +899,10 @@ pub const OpHandler = struct {
     }
 
     /// Increment counter for new_state, decrement for old_state on a queue.
+    /// Updates KV from the batch overlay and in-memory cache independently.
+    /// The KV path reads from the batch (which may lag behind the cache when
+    /// indexer deltas are still deferred), so we must NOT putQueueConfig here —
+    /// that would overwrite in-memory deltas from the same batch.
     fn updateQueueCounter(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, old_state: types.JobState, new_state: types.JobState) void {
         var qc_buf: keys.KeyBuf = undefined;
         var qc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
@@ -907,10 +911,9 @@ pub const OpHandler = struct {
         var q = codec.decodeQueue(qc_bytes);
         q.decrState(old_state);
         q.incrState(new_state);
-        // Re-encode with updated name pointer (decodeQueue returns slice into qc_val_buf)
         var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
         b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
-        _ = self.putQueueConfig(queue, q);
+        self.updateQueueCounterMem(queue, old_state, new_state);
     }
 
     /// Increment a single state counter on a queue (for enqueue).
@@ -923,7 +926,7 @@ pub const OpHandler = struct {
         q.incrState(state);
         var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
         b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
-        _ = self.putQueueConfig(queue, q);
+        self.incrQueueCounterMem(queue, state);
     }
 
     /// Decrement a single state counter on a queue (for purge).
@@ -936,7 +939,7 @@ pub const OpHandler = struct {
         q.decrState(state);
         var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
         b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
-        _ = self.putQueueConfig(queue, q);
+        self.decrQueueCounterMem(queue, state);
     }
 
     /// In-memory-only counter increment. KV write deferred to indexer.

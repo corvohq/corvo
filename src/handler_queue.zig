@@ -28,7 +28,16 @@ pub fn applyQueueConfig(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Queu
         b.set(keys.queueNameKey(&qn_buf, op.queue), "");
     }
 
-    var queue = if (!is_new) codec.decodeQueue(qc_bytes.?) else types.Queue{};
+    // Read from in-memory cache for existing queues to preserve counter
+    // accuracy. The KV batch overlay may have stale counters when indexer
+    // deltas (from enqueue/fetch in the same batch) haven't flushed yet.
+    // For new queues, start from default; for existing, start from cache.
+    var queue = if (self.queue_configs.get(op.queue)) |cached|
+        cached
+    else if (!is_new)
+        codec.decodeQueue(qc_bytes.?)
+    else
+        types.Queue{};
     queue.name = op.queue;
 
     switch (op.action) {
@@ -69,6 +78,31 @@ pub fn applyClearQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Clear
     }
     deleteAllQueueJobs(self, b, op.queue, op.now_ns);
     // PendingIndex already drained inside deleteAllQueueJobs.
+
+    // Reset in-memory counters for cleared states. deleteAllQueueJobs removes
+    // pending, scheduled, and retrying jobs but does not touch counters.
+    // Active jobs are left in flight; terminal jobs are untouched.
+    if (self.queue_configs.getPtr(op.queue)) |q| {
+        q.pending_count = 0;
+        q.scheduled_count = 0;
+        q.retrying_count = 0;
+        q.held_count = 0;
+    }
+
+    // Also zero counters in KV.
+    var qc_buf: keys.KeyBuf = undefined;
+    var qc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
+    const qc_key = keys.queueConfigKey(&qc_buf, op.queue);
+    if (b.getInto(qc_key, &qc_val_buf)) |qc_bytes| {
+        var q = codec.decodeQueue(qc_bytes);
+        q.pending_count = 0;
+        q.scheduled_count = 0;
+        q.retrying_count = 0;
+        q.held_count = 0;
+        var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
+        b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
+    }
+
     return .{};
 }
 

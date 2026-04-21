@@ -55,7 +55,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
 
         // Check concurrency limit
         if (queue.max_concurrency > 0) {
-            if (self.getActiveCount(queue.name) >= @as(i32, @intCast(queue.max_concurrency))) continue;
+            if (self.getActiveCount(queue_name) >= @as(i32, @intCast(queue.max_concurrency))) continue;
         }
 
         // Check per-queue rate limit
@@ -134,6 +134,11 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             b.set(OpHandler.jobActiveKey(&ak_buf, &job), &lease_val);
 
             self.incrActiveCount(queue_name);
+            assert.check(
+                queue.max_concurrency == 0 or self.getActiveCount(queue_name) <= @as(i32, @intCast(queue.max_concurrency)),
+                "fetch: active_count ({d}) exceeded max_concurrency ({d}) for queue after incrActiveCount",
+                .{ self.getActiveCount(queue_name), queue.max_concurrency },
+            );
 
             // Re-check concurrency after claiming — prevents overshooting when
             // prefetch > max_concurrency (the outer loop only checks once per queue).
@@ -323,6 +328,11 @@ fn fetchWithFairness(
         b.set(OpHandler.jobActiveKey(&ak_buf, &job), &lease_val);
 
         self.incrActiveCount(queue_name);
+        assert.check(
+            max_concurrency == 0 or self.getActiveCount(queue_name) <= @as(i32, @intCast(max_concurrency)),
+            "fetch-fairness: active_count ({d}) exceeded max_concurrency ({d}) for queue after incrActiveCount",
+            .{ self.getActiveCount(queue_name), max_concurrency },
+        );
 
         // Re-check concurrency after claiming — prevents overshooting when
         // prefetch > max_concurrency (the outer loop only checks once per queue).
