@@ -291,6 +291,16 @@ pub const SimClient = struct {
             flags |= rpc.FLAG_UNIQUE_KEY;
         }
 
+        // Group (for fairness scoring)
+        var group_buf: [16]u8 = undefined;
+        var group_len: usize = 0;
+        if (self.chance(0.3)) {
+            const g_idx = self.rng.intRangeAtMost(u32, 0, 3);
+            const g = std.fmt.bufPrint(&group_buf, "grp_{d}", .{g_idx}) catch unreachable;
+            group_len = g.len;
+            flags |= rpc.FLAG_GROUP;
+        }
+
         w.writeU32(unique_period_s);
 
         // Scheduled job
@@ -308,6 +318,10 @@ pub const SimClient = struct {
         w.writeU16Prefixed("{\"sim\":true}"); // payload
         if (flags & rpc.FLAG_UNIQUE_KEY != 0) {
             w.writePrefixed(unique_key_buf[0..unique_key_len]);
+        }
+        // TAGS, BATCH_ID, CHAIN_ID, CHAIN_CONFIG not used by sim
+        if (flags & rpc.FLAG_GROUP != 0) {
+            w.writePrefixed(group_buf[0..group_len]);
         }
 
         self.sendFrame(rpc.MSG_ENQUEUE_BATCH, w.pos);
@@ -584,6 +598,21 @@ pub const SimClient = struct {
             w.writeU32(0); // rate_limit
             w.writeU32(0); // rate_window_ms
             w.writeU8(0); // fairness
+
+            self.sendFrame(rpc.MSG_QUEUE_CONFIG, w.pos);
+            self.queue_ops += 1;
+            return;
+        }
+
+        // 15% chance of toggling fairness
+        if (self.chance(0.15)) {
+            var w = self.payloadWriter();
+            w.writePrefixed(q);
+            w.writeU8(@intFromEnum(ops.QueueAction.fairness));
+            w.writeU32(0); // max_concurrency
+            w.writeU32(0); // rate_limit
+            w.writeU32(0); // rate_window_ms
+            w.writeU8(1); // fairness = true
 
             self.sendFrame(rpc.MSG_QUEUE_CONFIG, w.pos);
             self.queue_ops += 1;

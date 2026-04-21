@@ -304,10 +304,13 @@ pub const OpHandler = struct {
         // Clear pending index.
         self.pending.clear();
 
-        // Clear fairness maps (nested hashmaps — free inner maps).
+        // Clear fairness maps (nested hashmaps — free outer keys + inner maps).
         {
             var it = self.fairness_active.iterator();
             while (it.next()) |entry| {
+                self.allocator.free(@constCast(entry.key_ptr.*));
+                var inner_it = entry.value_ptr.iterator();
+                while (inner_it.next()) |ie| self.allocator.free(@constCast(ie.key_ptr.*));
                 entry.value_ptr.deinit();
             }
             self.fairness_active.clearRetainingCapacity();
@@ -315,6 +318,9 @@ pub const OpHandler = struct {
         {
             var it = self.fairness_served.iterator();
             while (it.next()) |entry| {
+                self.allocator.free(@constCast(entry.key_ptr.*));
+                var inner_it = entry.value_ptr.iterator();
+                while (inner_it.next()) |ie| self.allocator.free(@constCast(ie.key_ptr.*));
                 entry.value_ptr.deinit();
             }
             self.fairness_served.clearRetainingCapacity();
@@ -732,7 +738,10 @@ pub const OpHandler = struct {
 
         const queue = codec.decodeQueue(qc_bytes.?);
         _ = self.putQueueConfig(queue_name, queue);
-        return queue;
+        // Return from cache — putQueueConfig fixes up the name slice to
+        // point at the owned HashMap key. The local `queue` has name
+        // pointing into qc_val_buf which dies when this function returns.
+        return self.queue_configs.get(queue_name);
     }
 
     /// Update cache after a queue config change.
@@ -747,6 +756,11 @@ pub const OpHandler = struct {
             entry.key_ptr.* = self.allocator.dupe(u8, queue_name) catch return false;
         }
         entry.value_ptr.* = queue;
+        // Fix up name to point at the owned HashMap key — the original
+        // queue.name slice points into transient memory (frame payload,
+        // stack decode buffer, KV iterator) that becomes dangling after
+        // the calling function returns.
+        entry.value_ptr.*.name = entry.key_ptr.*;
         return true;
     }
 

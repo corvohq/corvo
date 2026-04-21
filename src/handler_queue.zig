@@ -209,7 +209,16 @@ fn deleteAllQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, no
     }
 
     // Don't reset active counts — active jobs are still in flight.
-    _ = self.fairness_served.remove(queue);
+    // Free the inner fairness map before removing — remove() drops the
+    // entry but doesn't deinit the nested StringHashMap or its keys.
+    if (self.fairness_served.getPtr(queue)) |inner| {
+        var inner_it = inner.iterator();
+        while (inner_it.next()) |ie| self.allocator.free(@constCast(ie.key_ptr.*));
+        inner.deinit();
+    }
+    if (self.fairness_served.fetchRemove(queue)) |entry| {
+        self.allocator.free(@constCast(entry.key));
+    }
 
     // Delete rate limit data
     var rl_buf: keys.KeyBuf = undefined;
