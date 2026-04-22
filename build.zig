@@ -69,36 +69,49 @@ pub fn build(b: *std.Build) void {
     const sim_step = b.step("sim", "Run VOPR simulator");
     sim_step.dependOn(&run_sim_tests.step);
 
-    // --- RPC Benchmark executable (zig build bench-rpc) ---
-    const bench_rpc_mod = b.createModule(.{
-        .root_source_file = b.path("src/bench_rpc.zig"),
+    // --- Benchmark executable (zig build bench) — always ReleaseFast ---
+    // Build a ReleaseFast corvo module for the bench (independent of user's -Drelease).
+    const bench_corvo_mod = b.addModule("corvo-bench", .{
+        .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseFast,
     });
-    bench_rpc_mod.addImport("corvo", corvo_mod);
-    const bench_rpc_exe = b.addExecutable(.{
-        .name = "bench-rpc",
-        .root_module = bench_rpc_mod,
-    });
-    const run_bench_rpc = b.addRunArtifact(bench_rpc_exe);
-    if (b.args) |a| run_bench_rpc.addArgs(a);
-    const bench_rpc_step = b.step("bench-rpc", "Run RPC benchmarks");
-    bench_rpc_step.dependOn(&run_bench_rpc.step);
+    bench_corvo_mod.addImport("talon", talon_mod);
+    bench_corvo_mod.addImport("zigstache", zigstache_mod);
+    bench_corvo_mod.addAnonymousImport("ui_embed", .{ .root_source_file = b.path("ui_embed.zig") });
+    bench_corvo_mod.link_libc = true;
 
-    // --- Saturation Benchmark executable (zig build bench) ---
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseFast,
     });
-    bench_mod.addImport("corvo", corvo_mod);
+    bench_mod.addImport("corvo", bench_corvo_mod);
     const bench_exe = b.addExecutable(.{
         .name = "bench",
         .root_module = bench_mod,
     });
+    b.installArtifact(bench_exe);
+
+    // Also build a ReleaseFast server for bench to spawn.
+    const bench_server_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_server_mod.addImport("talon", talon_mod);
+    bench_server_mod.addImport("corvo", bench_corvo_mod);
+    const bench_server_exe = b.addExecutable(.{
+        .name = "corvo-bench-server",
+        .root_module = bench_server_mod,
+    });
+    b.installArtifact(bench_server_exe);
+
     const run_bench = b.addRunArtifact(bench_exe);
     if (b.args) |a| run_bench.addArgs(a);
-    const bench_step = b.step("bench", "Run saturation benchmarks");
+    const install_bench_server = b.addInstallArtifact(bench_server_exe, .{});
+    run_bench.step.dependOn(&install_bench_server.step); // ensure server is installed first
+    const bench_step = b.step("bench", "Run self-contained benchmarks (ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
 
     // --- Corvo server executable ---

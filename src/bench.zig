@@ -1,26 +1,16 @@
-//! Corvo Saturation Benchmark
+//! Corvo Self-Contained Benchmark
 //!
-//! Drives load against a Corvo server and reports performance metrics.
-//! Client-side: enqueue + lifecycle throughput (ops/sec).
-//! Server-side: delivery latency, e2e latency (scraped from /metrics).
+//! Starts a Corvo server as a child process, runs benchmark phases over
+//! binary RPC, prints results, and cleans up.
 //!
-//! Modes:
-//!   throughput — sequential enqueue then lifecycle phases (default)
-//!   scale      — ramp connections, find saturation point
+//! Phases:
+//!   1. Enqueue throughput     — batch-enqueue jobs, measure ops/sec
+//!   2. Lifecycle throughput   — fetch+ack jobs, measure ops/sec
+//!   3. Combined throughput    — enqueue + lifecycle simultaneously
+//!   4. Latency percentiles    — measure enqueue-to-fetch latency
 //!
 //! Usage:
-//!   bench [options]
-//!     --mode <throughput|scale>           Benchmark mode (default: throughput)
-//!     --protocol <rpc|http>              Protocol (default: rpc)
-//!     --server <host:port>               Server address (default: 127.0.0.1:9878)
-//!     --jobs <n>                         Total jobs (default: 100000)
-//!     --concurrency <n>                  Worker threads (default: 8)
-//!     --batch <n>                        Jobs per batch (default: 64)
-//!     --queue <name>                     Queue name (default: bench.q)
-//!     --json <path>                      Write JSON results to file
-//!     --steps <n>                        Scale mode: number of steps (default: 8)
-//!     --max-conns <n>                    Scale mode: max connections (default: 256)
-//!     --burst <n>                        Scale mode: jobs per step (default: 5000)
+//!   zig build bench          (builds + runs with ReleaseFast)
 
 const std = @import("std");
 const net = std.net;
@@ -28,50 +18,35 @@ const corvo = @import("corvo");
 const rpc = corvo.rpc;
 
 // ============================================================================
-// Config
+// Constants
 // ============================================================================
 
-const Protocol = enum { rpc, http };
-const Mode = enum { combined, throughput, scale };
-
-const BenchConfig = struct {
-    host: []const u8 = "127.0.0.1",
-    port: u16 = 9878,
-    protocol: Protocol = .rpc,
-    mode: Mode = .combined,
-    total_jobs: u32 = 100_000,
-    producers: u16 = 4,
-    consumers: u16 = 4,
-    batch_size: u16 = 64,
-    queue: []const u8 = "bench.q",
-    json_path: ?[]const u8 = null,
-    // Scale mode.
-    steps: u16 = 8,
-    max_conns: u16 = 256,
-    burst: u32 = 5_000,
-
-    /// For throughput/scale modes that use a single concurrency value.
-    concurrency: u16 = 8,
-};
+const TOTAL_JOBS: u32 = 100_000;
+const BATCH_SIZE: u16 = 64;
+const THREAD_COUNT: u16 = 8;
+const WARMUP_OPS: u32 = 5_000;
+const PHASE_TIMEOUT_NS: u64 = 5_000_000_000; // 5 seconds
+const COMBINED_DURATION_NS: u64 = 10_000_000_000; // 10 seconds
+const LATENCY_SAMPLE_COUNT: u32 = 10_000;
 
 // ============================================================================
-// FetchedId
+// FetchedId — stores job_id + queue from fetch response
 // ============================================================================
 
 const FetchedId = struct {
-    id_buf: [64]u8 = undefined,
+    id_buf: [128]u8 = undefined,
     id_len: u8 = 0,
-    queue_buf: [64]u8 = undefined,
+    queue_buf: [128]u8 = undefined,
     queue_len: u8 = 0,
+    lease_token: u64 = 0,
 };
 
 // ============================================================================
-// RPC Client
+// RPC Client (one per thread)
 // ============================================================================
 
-const CLIENT_BUF_SIZE = 65536;
+const CLIENT_BUF_SIZE = 131072; // 128KB — room for batch-64 with headroom
 
-/// Write a complete RPC frame (header + payload) to a blocking TCP stream.
 fn writeFrame(stream: net.Stream, msg_type: u8, req_id: u32, payload: []const u8) !void {
     var buf: [rpc.FRAME_HEADER_SIZE]u8 = undefined;
     buf[0] = msg_type;
@@ -94,11 +69,14 @@ const RpcClient = struct {
     send_buf: [CLIENT_BUF_SIZE]u8 = undefined,
     recv_buf: [CLIENT_BUF_SIZE]u8 = undefined,
 
-    fn connect(host: []const u8, port: u16) !RpcClient {
-        const addr = try net.Address.parseIp(host, port);
+    fn connect(port: u16) !RpcClient {
+        const addr = try net.Address.parseIp("127.0.0.1", port);
         const stream = try net.tcpConnectToAddress(addr);
         const TCP_NODELAY = 1;
         std.posix.setsockopt(stream.handle, std.posix.IPPROTO.TCP, TCP_NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+        // 10 second recv timeout to prevent indefinite blocking.
+        const timeval = std.posix.timeval{ .sec = 10, .usec = 0 };
+        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
         return .{ .stream = stream };
     }
 
@@ -106,13 +84,14 @@ const RpcClient = struct {
         self.stream.close();
     }
 
-    fn enqueueBatch(self: *RpcClient, queue_name: []const u8, id_prefix: []const u8, start_idx: u32, count: u16) !u16 {
+    /// Enqueue a batch of jobs. Returns count enqueued.
+    fn enqueueBatch(self: *RpcClient, queue: []const u8, id_prefix: []const u8, start_idx: u32, count: u16) !u16 {
         self.req_id +%= 1;
         var w = rpc.BufWriter{ .buf = &self.send_buf };
         w.writeU16(count);
         for (0..count) |i| {
-            w.writePrefixed(queue_name);
-            var id_buf: [64]u8 = undefined;
+            w.writePrefixed(queue);
+            var id_buf: [128]u8 = undefined;
             const job_id = std.fmt.bufPrint(&id_buf, "{s}-{d}", .{ id_prefix, start_idx + @as(u32, @intCast(i)) }) catch "err";
             w.writePrefixed(job_id);
             w.writeU8(50); // priority
@@ -124,9 +103,10 @@ const RpcClient = struct {
             w.writeU64(0); // scheduled_at_ns
             w.writeU32(0); // expire_after_ms
             w.writeU16(0); // chain_step
-            w.writeU16(0); // flags
+            w.writeU16(0); // flags (no optional fields)
         }
         try writeFrame(self.stream, rpc.MSG_ENQUEUE_BATCH, self.req_id, w.written());
+
         const header = try rpc.readHeader(self.stream);
         if (header.msg_type == rpc.MSG_ERROR) {
             if (header.payload_len > 0) try rpc.readExact(self.stream, self.recv_buf[0..header.payload_len]);
@@ -137,21 +117,50 @@ const RpcClient = struct {
         return r.readU16() catch 0;
     }
 
-    fn fetchBatch(self: *RpcClient, queue_name: []const u8, count: u16, fetched_ids: []FetchedId) !u16 {
+    /// Enqueue a single job with a specific ID (for latency measurement).
+    fn enqueueSingle(self: *RpcClient, queue: []const u8, job_id: []const u8) !u16 {
+        self.req_id +%= 1;
+        var w = rpc.BufWriter{ .buf = &self.send_buf };
+        w.writeU16(1); // count = 1
+        w.writePrefixed(queue);
+        w.writePrefixed(job_id);
+        w.writeU8(50); // priority
+        w.writeU16(3); // max_retries
+        w.writeU8(0); // backoff
+        w.writeU32(0); // base_delay_ms
+        w.writeU32(0); // max_delay_ms
+        w.writeU32(0); // unique_period_s
+        w.writeU64(0); // scheduled_at_ns
+        w.writeU32(0); // expire_after_ms
+        w.writeU16(0); // chain_step
+        w.writeU16(0); // flags
+        try writeFrame(self.stream, rpc.MSG_ENQUEUE_BATCH, self.req_id, w.written());
+
+        const header = try rpc.readHeader(self.stream);
+        if (header.payload_len > 0) try rpc.readExact(self.stream, self.recv_buf[0..header.payload_len]);
+        if (header.msg_type == rpc.MSG_ERROR) return 0;
+        var r = rpc.BufReader{ .data = self.recv_buf[0..header.payload_len] };
+        return r.readU16() catch 0;
+    }
+
+    /// Fetch a batch of jobs. Returns count fetched.
+    fn fetchBatch(self: *RpcClient, queue: []const u8, count: u16, fetched_ids: []FetchedId) !u16 {
         self.req_id +%= 1;
         var w = rpc.BufWriter{ .buf = &self.send_buf };
         w.writeU16(count);
-        w.writeU32(30_000);
+        w.writeU32(30_000); // lease_ms
         w.writePrefixed("bench-worker");
-        w.writeU8(1);
-        w.writePrefixed(queue_name);
+        w.writeU8(1); // queue_count
+        w.writePrefixed(queue);
         try writeFrame(self.stream, rpc.MSG_FETCH_BATCH, self.req_id, w.written());
+
         const header = try rpc.readHeader(self.stream);
         if (header.msg_type == rpc.MSG_ERROR) {
             if (header.payload_len > 0) try rpc.readExact(self.stream, self.recv_buf[0..header.payload_len]);
             return 0;
         }
         if (header.payload_len > 0) try rpc.readExact(self.stream, self.recv_buf[0..header.payload_len]);
+
         var r = rpc.BufReader{ .data = self.recv_buf[0..header.payload_len] };
         const fetched_count = r.readU16() catch 0;
         const n = @min(fetched_count, @as(u16, @intCast(fetched_ids.len)));
@@ -162,18 +171,20 @@ const RpcClient = struct {
             fetched_ids[i].id_len = @intCast(fid.len);
             @memcpy(fetched_ids[i].queue_buf[0..q.len], q);
             fetched_ids[i].queue_len = @intCast(q.len);
-            _ = r.readU16() catch break;
-            _ = r.readU16() catch break;
+            _ = r.readU16() catch break; // attempt
+            _ = r.readU16() catch break; // max_retries
             const ckpt_len = r.readU8() catch break;
             r.skip(ckpt_len) catch break;
             const tags_len = r.readU8() catch break;
             r.skip(tags_len) catch break;
             const pl = r.readU16() catch break;
             r.skip(pl) catch break;
+            fetched_ids[i].lease_token = r.readU64() catch break; // lease_token
         }
         return n;
     }
 
+    /// Ack a batch of jobs. Returns count acked.
     fn ackBatch(self: *RpcClient, acks: []const FetchedId) !u16 {
         self.req_id +%= 1;
         var w = rpc.BufWriter{ .buf = &self.send_buf };
@@ -181,10 +192,11 @@ const RpcClient = struct {
         for (acks) |a| {
             w.writePrefixed(a.id_buf[0..a.id_len]);
             w.writePrefixed(a.queue_buf[0..a.queue_len]);
-            w.writeU8(0);
-            w.writeU8(0);
+            w.writeU8(0); // ack_status: done
+            w.writeU8(0); // flags: no optional fields
         }
         try writeFrame(self.stream, rpc.MSG_ACK_BATCH, self.req_id, w.written());
+
         const header = try rpc.readHeader(self.stream);
         if (header.msg_type == rpc.MSG_ERROR) {
             if (header.payload_len > 0) try rpc.readExact(self.stream, self.recv_buf[0..header.payload_len]);
@@ -195,150 +207,6 @@ const RpcClient = struct {
         return r.readU16() catch 0;
     }
 };
-
-// ============================================================================
-// HTTP Client
-// ============================================================================
-
-const HttpClient = struct {
-    stream: net.Stream,
-    send_buf: [CLIENT_BUF_SIZE]u8 = undefined,
-    recv_buf: [CLIENT_BUF_SIZE]u8 = undefined,
-    host_header: [128]u8 = undefined,
-    host_header_len: u8 = 0,
-
-    fn connect(host: []const u8, port: u16) !HttpClient {
-        const addr = try net.Address.parseIp(host, port);
-        const stream = try net.tcpConnectToAddress(addr);
-        const TCP_NODELAY = 1;
-        std.posix.setsockopt(stream.handle, std.posix.IPPROTO.TCP, TCP_NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
-        var client = HttpClient{ .stream = stream };
-        const hdr = std.fmt.bufPrint(&client.host_header, "{s}:{d}", .{ host, port }) catch "localhost:9878";
-        client.host_header_len = @intCast(hdr.len);
-        return client;
-    }
-
-    fn close(self: *HttpClient) void {
-        self.stream.close();
-    }
-
-    fn hostHeader(self: *const HttpClient) []const u8 {
-        return self.host_header[0..self.host_header_len];
-    }
-
-    fn doPost(self: *HttpClient, path: []const u8, body: []const u8) !HttpResponse {
-        var len: usize = 0;
-        len += (std.fmt.bufPrint(self.send_buf[len..], "POST {s} HTTP/1.1\r\nHost: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{ path, self.hostHeader(), body.len }) catch return error.BufferOverflow).len;
-        if (len + body.len > self.send_buf.len) return error.BufferOverflow;
-        @memcpy(self.send_buf[len..][0..body.len], body);
-        len += body.len;
-        var sent: usize = 0;
-        while (sent < len) {
-            sent += try self.stream.write(self.send_buf[sent..len]);
-        }
-        return self.readResponse();
-    }
-
-    fn readResponse(self: *HttpClient) !HttpResponse {
-        var total: usize = 0;
-        while (total < self.recv_buf.len) {
-            const n = try self.stream.read(self.recv_buf[total..]);
-            if (n == 0) return error.ConnectionClosed;
-            total += n;
-            if (std.mem.indexOf(u8, self.recv_buf[0..total], "\r\n\r\n")) |_| break;
-        }
-        const status = std.fmt.parseInt(u16, self.recv_buf[9..12], 10) catch 0;
-        const header_end = (std.mem.indexOf(u8, self.recv_buf[0..total], "\r\n\r\n") orelse return error.MalformedResponse) + 4;
-        const content_length = extractContentLength(self.recv_buf[0..header_end]);
-        const body_end = header_end + content_length;
-        while (total < body_end and total < self.recv_buf.len) {
-            const n = try self.stream.read(self.recv_buf[total..]);
-            if (n == 0) return error.ConnectionClosed;
-            total += n;
-        }
-        return .{ .status = status, .body = self.recv_buf[header_end..@min(body_end, total)] };
-    }
-
-    fn enqueueBatch(self: *HttpClient, queue_name: []const u8, _: []const u8, _: u32, count: u16) !u16 {
-        var body_buf: [32768]u8 = undefined;
-        var pos: usize = 0;
-        if (count == 1) {
-            pos += (std.fmt.bufPrint(body_buf[pos..], "{{\"queue\":\"{s}\",\"payload\":\"{{}}\"}}", .{queue_name}) catch return error.BufferOverflow).len;
-        } else {
-            pos += (std.fmt.bufPrint(body_buf[pos..], "{{\"jobs\":[", .{}) catch return error.BufferOverflow).len;
-            for (0..count) |i| {
-                if (i > 0) {
-                    body_buf[pos] = ',';
-                    pos += 1;
-                }
-                pos += (std.fmt.bufPrint(body_buf[pos..], "{{\"queue\":\"{s}\",\"payload\":\"{{}}\"}}", .{queue_name}) catch return error.BufferOverflow).len;
-            }
-            pos += (std.fmt.bufPrint(body_buf[pos..], "]}}", .{}) catch return error.BufferOverflow).len;
-        }
-        const resp = try self.doPost("/api/v1/enqueue", body_buf[0..pos]);
-        if (resp.status == 201) return count;
-        return 0;
-    }
-
-    fn fetchBatch(self: *HttpClient, queue_name: []const u8, _: u16, fetched_ids: []FetchedId) !u16 {
-        var body_buf: [512]u8 = undefined;
-        const body = std.fmt.bufPrint(&body_buf, "{{\"queues\":[\"{s}\"],\"worker_id\":\"bench-http\",\"count\":1}}", .{queue_name}) catch return error.BufferOverflow;
-        const resp = try self.doPost("/api/v1/fetch", body);
-        if (resp.status != 200) return 0;
-        const job_id = extractJsonString(resp.body, "job_id") orelse return 0;
-        if (job_id.len == 0) return 0;
-        const q = extractJsonString(resp.body, "queue") orelse queue_name;
-        @memcpy(fetched_ids[0].id_buf[0..job_id.len], job_id);
-        fetched_ids[0].id_len = @intCast(job_id.len);
-        @memcpy(fetched_ids[0].queue_buf[0..q.len], q);
-        fetched_ids[0].queue_len = @intCast(q.len);
-        return 1;
-    }
-
-    fn ackBatch(self: *HttpClient, acks: []const FetchedId) !u16 {
-        var body_buf: [16384]u8 = undefined;
-        var pos: usize = 0;
-        pos += (std.fmt.bufPrint(body_buf[pos..], "{{\"job_ids\":[", .{}) catch return error.BufferOverflow).len;
-        for (acks, 0..) |a, i| {
-            if (i > 0) {
-                body_buf[pos] = ',';
-                pos += 1;
-            }
-            pos += (std.fmt.bufPrint(body_buf[pos..], "\"{s}\"", .{a.id_buf[0..a.id_len]}) catch return error.BufferOverflow).len;
-        }
-        pos += (std.fmt.bufPrint(body_buf[pos..], "]}}", .{}) catch return error.BufferOverflow).len;
-        const resp = try self.doPost("/api/v1/ack", body_buf[0..pos]);
-        if (resp.status == 200) return @intCast(acks.len);
-        return 0;
-    }
-};
-
-const HttpResponse = struct {
-    status: u16,
-    body: []const u8,
-};
-
-fn extractContentLength(headers: []const u8) usize {
-    const needle = "Content-Length: ";
-    const start = std.mem.indexOf(u8, headers, needle) orelse {
-        const lower = "content-length: ";
-        const s2 = std.mem.indexOf(u8, headers, lower) orelse return 0;
-        const val_start = s2 + lower.len;
-        const val_end = std.mem.indexOfScalar(u8, headers[val_start..], '\r') orelse return 0;
-        return std.fmt.parseInt(usize, headers[val_start..][0..val_end], 10) catch 0;
-    };
-    const val_start = start + needle.len;
-    const val_end = std.mem.indexOfScalar(u8, headers[val_start..], '\r') orelse return 0;
-    return std.fmt.parseInt(usize, headers[val_start..][0..val_end], 10) catch 0;
-}
-
-fn extractJsonString(body: []const u8, key: []const u8) ?[]const u8 {
-    var search_buf: [128]u8 = undefined;
-    const needle = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;
-    const start = (std.mem.indexOf(u8, body, needle) orelse return null) + needle.len;
-    const end = std.mem.indexOfScalar(u8, body[start..], '"') orelse return null;
-    return body[start..][0..end];
-}
 
 // ============================================================================
 // Worker results
@@ -351,11 +219,22 @@ const WorkerResult = struct {
 };
 
 // ============================================================================
-// Enqueue worker
+// Shared state for combined mode + lifecycle
 // ============================================================================
 
-fn enqueueWorker(comptime ClientType: type, config: BenchConfig, worker_id: u16, jobs_per_worker: u32) WorkerResult {
-    var client = ClientType.connect(config.host, config.port) catch return .{ .errors = 1 };
+var g_stop = std.atomic.Value(bool).init(false);
+var g_lifecycle_done = std.atomic.Value(u64).init(0);
+var g_enqueue_done = std.atomic.Value(u64).init(0);
+
+// ============================================================================
+// Phase 1: Enqueue throughput
+// ============================================================================
+
+fn enqueueWorkerFn(port: u16, worker_id: u16, total_per_worker: u32, queue: []const u8, result: *WorkerResult) void {
+    var client = RpcClient.connect(port) catch {
+        result.* = .{ .errors = 1 };
+        return;
+    };
     defer client.close();
 
     var prefix_buf: [32]u8 = undefined;
@@ -365,12 +244,19 @@ fn enqueueWorker(comptime ClientType: type, config: BenchConfig, worker_id: u16,
     var total_enqueued: u64 = 0;
     var total_errors: u64 = 0;
     var idx: u32 = 0;
-    var timer = std.time.Timer.start() catch return .{ .errors = 1 };
+    var timer = std.time.Timer.start() catch {
+        result.* = .{ .errors = 1 };
+        return;
+    };
 
-    while (idx < jobs_per_worker) {
-        const remaining = jobs_per_worker - idx;
-        const batch: u16 = @intCast(@min(config.batch_size, remaining));
-        const enqueued = client.enqueueBatch(config.queue, prefix, idx, batch) catch {
+    while (idx < total_per_worker) {
+        // Check timeout.
+        if (timer.read() > PHASE_TIMEOUT_NS) break;
+        if (g_stop.load(.monotonic)) break;
+
+        const remaining = total_per_worker - idx;
+        const batch: u16 = @intCast(@min(BATCH_SIZE, remaining));
+        const enqueued = client.enqueueBatch(queue, prefix, idx, batch) catch {
             total_errors += 1;
             break;
         };
@@ -378,49 +264,77 @@ fn enqueueWorker(comptime ClientType: type, config: BenchConfig, worker_id: u16,
         idx += batch;
     }
 
-    return .{ .ops = total_enqueued, .errors = total_errors, .elapsed_ns = timer.read() };
+    result.* = .{ .ops = total_enqueued, .errors = total_errors, .elapsed_ns = timer.read() };
 }
 
-// ============================================================================
-// Lifecycle worker (fetch + ack)
-// ============================================================================
+fn runEnqueuePhase(alloc: std.mem.Allocator, port: u16, total_jobs: u32, thread_count: u16, queue: []const u8) !PhaseResult {
+    const jobs_per_worker = total_jobs / thread_count;
+    const threads = try alloc.alloc(std.Thread, thread_count);
+    defer alloc.free(threads);
+    const results = try alloc.alloc(WorkerResult, thread_count);
+    defer alloc.free(results);
 
-fn lifecycleWorker(comptime ClientType: type, config: BenchConfig, _: u16, jobs_per_worker: u32) WorkerResult {
-    if (ClientType == RpcClient) {
-        return rpcLifecycleWorker(config, jobs_per_worker);
-    } else {
-        return httpLifecycleWorker(config, jobs_per_worker);
+    g_stop.store(false, .monotonic);
+    var wall = std.time.Timer.start() catch unreachable;
+
+    for (0..thread_count) |i| {
+        threads[i] = try std.Thread.spawn(.{}, enqueueWorkerFn, .{
+            port, @as(u16, @intCast(i)), jobs_per_worker, queue, &results[i],
+        });
     }
+    for (0..thread_count) |i| threads[i].join();
+
+    const wall_ns = wall.read();
+    var total_ops: u64 = 0;
+    var total_errors: u64 = 0;
+    for (results) |r| {
+        total_ops += r.ops;
+        total_errors += r.errors;
+    }
+
+    const timed_out = wall_ns > PHASE_TIMEOUT_NS;
+    return .{ .ops = total_ops, .errors = total_errors, .wall_ns = wall_ns, .timed_out = timed_out, .target = total_jobs };
 }
 
-var g_lifecycle_done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
-var g_lifecycle_target: u32 = 0;
+// ============================================================================
+// Phase 2: Lifecycle throughput (fetch + ack)
+// ============================================================================
 
-fn rpcLifecycleWorker(config: BenchConfig, _: u32) WorkerResult {
-    var client = RpcClient.connect(config.host, config.port) catch return .{ .errors = 1 };
+fn lifecycleWorkerFn(port: u16, target_per_worker: u32, queue: []const u8, result: *WorkerResult) void {
+    var client = RpcClient.connect(port) catch {
+        result.* = .{ .errors = 1 };
+        return;
+    };
     defer client.close();
 
-    // 100ms recv timeout — fast enough for scale mode, long enough for push delivery.
+    // 100ms recv timeout for quick re-subscribe on idle.
     const timeval = std.posix.timeval{ .sec = 0, .usec = 100_000 };
     std.posix.setsockopt(client.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
 
     var total_ops: u64 = 0;
     var total_errors: u64 = 0;
-    var timer = std.time.Timer.start() catch return .{ .errors = 1 };
+    var timer = std.time.Timer.start() catch {
+        result.* = .{ .errors = 1 };
+        return;
+    };
+
     var fetched_buf: [512]FetchedId = undefined;
 
-    // Subscribe once — server pushes up to prefetch jobs, replenishes on ack.
-    const prefetch: u16 = @intCast(@min(config.batch_size, 512));
-    rpcSendSubscribe(&client, config.queue, prefetch) catch return .{ .errors = 1 };
+    // Subscribe — server pushes FETCH_BATCH_RESP when jobs are available.
+    // Acks automatically replenish prefetch (server-side), so we only
+    // re-subscribe on timeout (no jobs available).
+    sendSubscribe(&client, queue, BATCH_SIZE) catch {
+        result.* = .{ .errors = 1 };
+        return;
+    };
 
-    // Message loop: server pushes FETCH_BATCH_RESP and ACK_BATCH_RESP.
-    // Bail after 10s wall time to prevent scale mode from hanging.
-    const deadline_ns: u64 = timer.read() + 10_000_000_000;
-    while (g_lifecycle_done.load(.monotonic) < g_lifecycle_target) {
-        if (timer.read() > deadline_ns) break;
+    while (total_ops < target_per_worker) {
+        if (timer.read() > PHASE_TIMEOUT_NS) break;
+        if (g_stop.load(.monotonic)) break;
+
         const header = rpc.readHeader(client.stream) catch {
-            if (g_lifecycle_done.load(.monotonic) >= g_lifecycle_target) break;
-            rpcSendSubscribe(&client, config.queue, prefetch) catch break;
+            // Timeout — re-subscribe.
+            sendSubscribe(&client, queue, BATCH_SIZE) catch break;
             continue;
         };
 
@@ -428,40 +342,163 @@ fn rpcLifecycleWorker(config: BenchConfig, _: u32) WorkerResult {
             rpc.readExact(client.stream, client.recv_buf[0..header.payload_len]) catch break;
         }
 
-        switch (header.msg_type) {
-            rpc.MSG_FETCH_BATCH_RESP => {
-                const fetched = parseFetchPayload(client.recv_buf[0..header.payload_len], &fetched_buf);
-                if (fetched == 0) continue;
-
-                // Send ack (fire-and-forget — response handled by this loop).
-                rpcSendAck(&client, fetched_buf[0..fetched]) catch {
-                    total_errors += 1;
-                    break;
-                };
+        if (header.msg_type == rpc.MSG_FETCH_BATCH_RESP) {
+            const fetched = parseFetchPayload(client.recv_buf[0..header.payload_len], &fetched_buf);
+            if (fetched > 0) {
+                // Ack — server auto-replenishes prefetch and pushes more.
+                sendAck(&client, fetched_buf[0..fetched]) catch break;
                 total_ops += fetched;
-                _ = g_lifecycle_done.fetchAdd(@intCast(fetched), .monotonic);
-            },
-            rpc.MSG_ACK_BATCH_RESP => {},
-            rpc.MSG_ERROR => {
-                total_errors += 1;
-            },
-            else => {},
+            }
+        } else if (header.msg_type == rpc.MSG_ERROR) {
+            total_errors += 1;
+        }
+        // ACK_BATCH_RESP: ignore (fire-and-forget ack)
+    }
+
+    result.* = .{ .ops = total_ops, .errors = total_errors, .elapsed_ns = timer.read() };
+}
+
+fn runLifecyclePhase(alloc: std.mem.Allocator, port: u16, total_jobs: u32, thread_count: u16, queue: []const u8) !PhaseResult {
+    const jobs_per_worker = total_jobs / thread_count;
+    const threads = try alloc.alloc(std.Thread, thread_count);
+    defer alloc.free(threads);
+    const results = try alloc.alloc(WorkerResult, thread_count);
+    defer alloc.free(results);
+
+    g_stop.store(false, .monotonic);
+    var wall = std.time.Timer.start() catch unreachable;
+
+    for (0..thread_count) |i| {
+        threads[i] = try std.Thread.spawn(.{}, lifecycleWorkerFn, .{
+            port, jobs_per_worker, queue, &results[i],
+        });
+    }
+    for (0..thread_count) |i| threads[i].join();
+
+    const wall_ns = wall.read();
+    var total_ops: u64 = 0;
+    var total_errors: u64 = 0;
+    for (results) |r| {
+        total_ops += r.ops;
+        total_errors += r.errors;
+    }
+
+    const timed_out = wall_ns > PHASE_TIMEOUT_NS;
+    return .{ .ops = total_ops, .errors = total_errors, .wall_ns = wall_ns, .timed_out = timed_out, .target = total_jobs };
+}
+
+// ============================================================================
+// Phase 3: Combined throughput
+// ============================================================================
+
+fn combinedEnqueueWorkerFn(port: u16, worker_id: u16, queue: []const u8, result: *WorkerResult) void {
+    var client = RpcClient.connect(port) catch {
+        result.* = .{ .errors = 1 };
+        return;
+    };
+    defer client.close();
+
+    var prefix_buf: [32]u8 = undefined;
+    const ts: u32 = @truncate(@as(u64, @intCast(std.time.milliTimestamp())));
+    const prefix = std.fmt.bufPrint(&prefix_buf, "c{d}w{d}", .{ ts, worker_id }) catch "w";
+
+    var total_enqueued: u64 = 0;
+    var total_errors: u64 = 0;
+    var idx: u32 = 0;
+    var timer = std.time.Timer.start() catch {
+        result.* = .{ .errors = 1 };
+        return;
+    };
+
+    while (timer.read() < COMBINED_DURATION_NS) {
+        if (g_stop.load(.monotonic)) break;
+        const enqueued = client.enqueueBatch(queue, prefix, idx, BATCH_SIZE) catch {
+            total_errors += 1;
+            break;
+        };
+        total_enqueued += enqueued;
+        _ = g_enqueue_done.fetchAdd(enqueued, .monotonic);
+        idx += BATCH_SIZE;
+    }
+
+    result.* = .{ .ops = total_enqueued, .errors = total_errors, .elapsed_ns = timer.read() };
+}
+
+fn combinedLifecycleWorkerFn(port: u16, queue: []const u8, result: *WorkerResult) void {
+    var client = RpcClient.connect(port) catch {
+        result.* = .{ .errors = 1 };
+        return;
+    };
+    defer client.close();
+
+    // 100ms recv timeout.
+    const timeval = std.posix.timeval{ .sec = 0, .usec = 100_000 };
+    std.posix.setsockopt(client.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
+
+    var total_ops: u64 = 0;
+    var total_errors: u64 = 0;
+    var timer = std.time.Timer.start() catch {
+        result.* = .{ .errors = 1 };
+        return;
+    };
+    var fetched_buf: [512]FetchedId = undefined;
+
+    // Subscribe — acks auto-replenish prefetch on server side.
+    sendSubscribe(&client, queue, BATCH_SIZE) catch {
+        result.* = .{ .errors = 1 };
+        return;
+    };
+
+    while (timer.read() < COMBINED_DURATION_NS) {
+        if (g_stop.load(.monotonic)) break;
+
+        const header = rpc.readHeader(client.stream) catch {
+            // Timeout — re-subscribe.
+            sendSubscribe(&client, queue, BATCH_SIZE) catch break;
+            continue;
+        };
+
+        if (header.payload_len > 0) {
+            rpc.readExact(client.stream, client.recv_buf[0..header.payload_len]) catch break;
+        }
+
+        if (header.msg_type == rpc.MSG_FETCH_BATCH_RESP) {
+            const fetched = parseFetchPayload(client.recv_buf[0..header.payload_len], &fetched_buf);
+            if (fetched > 0) {
+                sendAck(&client, fetched_buf[0..fetched]) catch break;
+                total_ops += fetched;
+                _ = g_lifecycle_done.fetchAdd(fetched, .monotonic);
+            }
+        } else if (header.msg_type == rpc.MSG_ERROR) {
+            total_errors += 1;
         }
     }
 
-    return .{ .ops = total_ops, .errors = total_errors, .elapsed_ns = timer.read() };
+    result.* = .{ .ops = total_ops, .errors = total_errors, .elapsed_ns = timer.read() };
 }
 
-/// Send ack batch — fire-and-forget, response handled by message loop.
-fn rpcSendAck(client: *RpcClient, acks: []const FetchedId) !void {
+/// Send a fetch subscribe frame (fire-and-forget).
+fn sendSubscribe(client: *RpcClient, queue: []const u8, prefetch: u16) !void {
+    client.req_id +%= 1;
+    var w = rpc.BufWriter{ .buf = &client.send_buf };
+    w.writeU16(prefetch);
+    w.writeU32(30_000); // lease_ms
+    w.writePrefixed("bench-worker");
+    w.writeU8(1); // queue_count
+    w.writePrefixed(queue);
+    try writeFrame(client.stream, rpc.MSG_FETCH_BATCH, client.req_id, w.written());
+}
+
+/// Send ack batch (fire-and-forget).
+fn sendAck(client: *RpcClient, acks: []const FetchedId) !void {
     client.req_id +%= 1;
     var w = rpc.BufWriter{ .buf = &client.send_buf };
     w.writeU16(@intCast(acks.len));
     for (acks) |a| {
         w.writePrefixed(a.id_buf[0..a.id_len]);
         w.writePrefixed(a.queue_buf[0..a.queue_len]);
-        w.writeU8(0);
-        w.writeU8(0);
+        w.writeU8(0); // ack_status: done
+        w.writeU8(0); // flags
     }
     try writeFrame(client.stream, rpc.MSG_ACK_BATCH, client.req_id, w.written());
 }
@@ -478,109 +515,60 @@ fn parseFetchPayload(payload: []const u8, fetched_ids: []FetchedId) u16 {
         fetched_ids[i].id_len = @intCast(fid.len);
         @memcpy(fetched_ids[i].queue_buf[0..q.len], q);
         fetched_ids[i].queue_len = @intCast(q.len);
-        _ = r.readU16() catch break;
-        _ = r.readU16() catch break;
+        _ = r.readU16() catch break; // attempt
+        _ = r.readU16() catch break; // max_retries
         const ckpt_len = r.readU8() catch break;
         r.skip(ckpt_len) catch break;
         const tags_len = r.readU8() catch break;
         r.skip(tags_len) catch break;
         const pl = r.readU16() catch break;
         r.skip(pl) catch break;
+        _ = r.readU64() catch break; // lease_token
     }
     return n;
 }
 
-/// Send fetch subscribe frame — fire-and-forget, no response read.
-fn rpcSendSubscribe(client: *RpcClient, queue_name: []const u8, prefetch: u16) !void {
-    client.req_id +%= 1;
-    var w = rpc.BufWriter{ .buf = &client.send_buf };
-    w.writeU16(prefetch);
-    w.writeU32(30_000);
-    w.writePrefixed("bench-worker");
-    w.writeU8(1);
-    w.writePrefixed(queue_name);
-    try writeFrame(client.stream, rpc.MSG_FETCH_BATCH, client.req_id, w.written());
-}
-
-
-fn httpLifecycleWorker(config: BenchConfig, jobs_per_worker: u32) WorkerResult {
-    var client = HttpClient.connect(config.host, config.port) catch return .{ .errors = 1 };
-    defer client.close();
-
-    var total_ops: u64 = 0;
-    var total_errors: u64 = 0;
-    var remaining: u32 = jobs_per_worker;
-    var timer = std.time.Timer.start() catch return .{ .errors = 1 };
-    var fetched_buf: [512]FetchedId = undefined;
-
-    while (remaining > 0) {
-        const fetched = client.fetchBatch(config.queue, 1, &fetched_buf) catch {
-            total_errors += 1;
-            break;
-        };
-        if (fetched == 0) {
-            std.Thread.sleep(100_000);
-            continue;
-        }
-        const acked = client.ackBatch(fetched_buf[0..fetched]) catch {
-            total_errors += 1;
-            break;
-        };
-        total_ops += acked;
-        remaining -|= @intCast(acked);
-    }
-
-    return .{ .ops = total_ops, .errors = total_errors, .elapsed_ns = timer.read() };
-}
-
-// ============================================================================
-// Combined mode — producers + consumers simultaneously
-// ============================================================================
-
 const CombinedResult = struct {
     enqueue_ops: u64 = 0,
-    enqueue_errors: u64 = 0,
     lifecycle_ops: u64 = 0,
+    enqueue_errors: u64 = 0,
     lifecycle_errors: u64 = 0,
     wall_ns: u64 = 0,
 };
 
-fn runCombined(comptime ClientType: type, config: BenchConfig, alloc: std.mem.Allocator) !CombinedResult {
-    const jobs_per_producer = config.total_jobs / config.producers;
+fn runCombinedPhase(alloc: std.mem.Allocator, port: u16, queue: []const u8) !CombinedResult {
+    const enq_threads: u16 = 4;
+    const lc_threads: u16 = 4;
+    const total_threads = enq_threads + lc_threads;
 
-    // Set shared lifecycle target.
-    g_lifecycle_done.store(0, .monotonic);
-    g_lifecycle_target = config.total_jobs;
-
-    const total_threads = @as(usize, config.producers) + config.consumers;
     const threads = try alloc.alloc(std.Thread, total_threads);
     defer alloc.free(threads);
-    const producer_results = try alloc.alloc(WorkerResult, config.producers);
-    defer alloc.free(producer_results);
-    const consumer_results = try alloc.alloc(WorkerResult, config.consumers);
-    defer alloc.free(consumer_results);
+    const enq_results = try alloc.alloc(WorkerResult, enq_threads);
+    defer alloc.free(enq_results);
+    const lc_results = try alloc.alloc(WorkerResult, lc_threads);
+    defer alloc.free(lc_results);
+
+    g_stop.store(false, .monotonic);
+    g_enqueue_done.store(0, .monotonic);
+    g_lifecycle_done.store(0, .monotonic);
 
     var wall = std.time.Timer.start() catch unreachable;
 
-    // Spawn consumers FIRST — they subscribe and wait for jobs.
-    for (0..config.consumers) |i| {
-        threads[config.producers + i] = try std.Thread.spawn(.{}, struct {
-            fn run(cfg: BenchConfig, result: *WorkerResult) void {
-                result.* = rpcLifecycleWorker(cfg, 0);
-            }
-        }.run, .{ config, &consumer_results[i] });
+    // Spawn lifecycle workers first so they are ready.
+    for (0..lc_threads) |i| {
+        threads[enq_threads + i] = try std.Thread.spawn(.{}, combinedLifecycleWorkerFn, .{
+            port, queue, &lc_results[i],
+        });
     }
 
-    // Brief pause to let consumers connect and subscribe.
-    std.Thread.sleep(5_000_000); // 5ms
+    // Brief pause for consumers to connect.
+    std.Thread.sleep(2_000_000); // 2ms
 
-    // Spawn producers — their enqueues trigger fulfillSubscriptions on the server.
-    for (0..config.producers) |i| {
-        threads[i] = try std.Thread.spawn(.{}, struct {
-            fn run(cfg: BenchConfig, wid: u16, jpw: u32, result: *WorkerResult) void {
-                result.* = enqueueWorker(ClientType, cfg, wid, jpw);
-            }
-        }.run, .{ config, @as(u16, @intCast(i)), jobs_per_producer, &producer_results[i] });
+    // Spawn enqueue workers.
+    for (0..enq_threads) |i| {
+        threads[i] = try std.Thread.spawn(.{}, combinedEnqueueWorkerFn, .{
+            port, @as(u16, @intCast(i)), queue, &enq_results[i],
+        });
     }
 
     for (threads) |t| t.join();
@@ -588,358 +576,327 @@ fn runCombined(comptime ClientType: type, config: BenchConfig, alloc: std.mem.Al
 
     var enq_ops: u64 = 0;
     var enq_errors: u64 = 0;
-    for (producer_results) |r| {
+    for (enq_results) |r| {
         enq_ops += r.ops;
         enq_errors += r.errors;
     }
     var lc_ops: u64 = 0;
     var lc_errors: u64 = 0;
-    for (consumer_results) |r| {
+    for (lc_results) |r| {
         lc_ops += r.ops;
         lc_errors += r.errors;
     }
 
     return .{
         .enqueue_ops = enq_ops,
-        .enqueue_errors = enq_errors,
         .lifecycle_ops = lc_ops,
+        .enqueue_errors = enq_errors,
         .lifecycle_errors = lc_errors,
         .wall_ns = wall_ns,
     };
 }
 
-fn printCombinedResult(config: BenchConfig, result: CombinedResult, latency: ServerLatency) void {
-    const print = std.debug.print;
+// ============================================================================
+// Phase 4: Latency percentiles
+// ============================================================================
 
-    print("\nCorvo Bench — {s} combined, {d}k jobs, {d}+{d} threads, batch {d}\n\n", .{
-        @tagName(config.protocol), config.total_jobs / 1000, config.producers, config.consumers, config.batch_size,
-    });
+fn runLatencyPhase(port: u16, queue: []const u8) !LatencyResult {
+    // Single connection — enqueue one job, then immediately fetch on same conn.
+    // This ensures both operations are in the same or adjacent server ticks.
+    var client = RpcClient.connect(port) catch return .{};
+    defer client.close();
 
-    const enq_ops = if (result.wall_ns > 0) result.enqueue_ops * 1_000_000_000 / result.wall_ns else 0;
-    const lc_ops = if (result.wall_ns > 0) result.lifecycle_ops * 1_000_000_000 / result.wall_ns else 0;
+    var latencies: [LATENCY_SAMPLE_COUNT]u64 = undefined;
+    var sample_count: u32 = 0;
 
-    var wb: [16]u8 = undefined;
-    print("  {s:<12} {d:>9} ops/sec\n", .{ "enqueue", enq_ops });
-    print("  {s:<12} {d:>9} ops/sec\n", .{ "lifecycle", lc_ops });
-    print("  {s:<12} {s}\n", .{ "wall", fmtDuration(result.wall_ns, &wb) });
+    var timer = std.time.Timer.start() catch return .{};
+    var fetched_buf: [8]FetchedId = undefined;
 
-    var dp50: [16]u8 = undefined;
-    var dp99: [16]u8 = undefined;
-    var dp999: [16]u8 = undefined;
-    var ep50: [16]u8 = undefined;
-    var ep99: [16]u8 = undefined;
-    var ep999: [16]u8 = undefined;
-    print("\n  {s:<12} p50 {s:<8}  p99 {s:<8}  p999 {s}   (server)\n", .{
-        "delivery", fmtDuration(latency.delivery_p50, &dp50), fmtDuration(latency.delivery_p99, &dp99), fmtDuration(latency.delivery_p999, &dp999),
-    });
-    print("  {s:<12} p50 {s:<8}  p99 {s:<8}  p999 {s}   (server)\n", .{
-        "e2e", fmtDuration(latency.e2e_p50, &ep50), fmtDuration(latency.e2e_p99, &ep99), fmtDuration(latency.e2e_p999, &ep999),
-    });
+    // Warmup: enqueue+fetch a few jobs to prime the pipeline.
+    for (0..50) |wi| {
+        var warmup_id_buf: [128]u8 = undefined;
+        const warmup_id = std.fmt.bufPrint(&warmup_id_buf, "wl-{d}", .{wi}) catch continue;
+        _ = client.enqueueSingle(queue, warmup_id) catch continue;
+        const f = client.fetchBatch(queue, 1, &fetched_buf) catch continue;
+        if (f > 0) {
+            _ = client.ackBatch(fetched_buf[0..f]) catch {};
+        }
+    }
 
-    const total_errors = result.enqueue_errors + result.lifecycle_errors;
-    print("\n  total: {d} jobs   errors: {d}\n\n", .{ result.enqueue_ops, total_errors });
+    // Measure: enqueue one job at a time, immediately fetch, measure delta.
+    while (sample_count < LATENCY_SAMPLE_COUNT) {
+        if (timer.read() > PHASE_TIMEOUT_NS) break;
+
+        const enqueue_ns = @as(u64, @intCast(std.time.nanoTimestamp()));
+        var id_buf: [128]u8 = undefined;
+        const job_id = std.fmt.bufPrint(&id_buf, "l-{d}", .{sample_count}) catch continue;
+
+        const enqueued = client.enqueueSingle(queue, job_id) catch break;
+        if (enqueued == 0) continue;
+
+        // Fetch — on the same connection. The server processes enqueue first
+        // (from previous tick), then our fetch subscribe triggers fulfillSubscriptions
+        // which finds the pending job.
+        const fetched = client.fetchBatch(queue, 1, &fetched_buf) catch break;
+        if (fetched > 0) {
+            const fetch_ns = @as(u64, @intCast(std.time.nanoTimestamp()));
+            latencies[sample_count] = fetch_ns - enqueue_ns;
+            sample_count += 1;
+            _ = client.ackBatch(fetched_buf[0..fetched]) catch {};
+        }
+    }
+
+    if (sample_count == 0) return .{};
+
+    // Sort and compute percentiles.
+    std.mem.sort(u64, latencies[0..sample_count], {}, std.sort.asc(u64));
+
+    return .{
+        .p50 = latencies[sample_count * 50 / 100],
+        .p95 = latencies[sample_count * 95 / 100],
+        .p99 = latencies[sample_count * 99 / 100],
+        .p999 = latencies[@min(sample_count - 1, sample_count * 999 / 1000)],
+        .samples = sample_count,
+        .timed_out = timer.read() > PHASE_TIMEOUT_NS,
+    };
 }
 
+const LatencyResult = struct {
+    p50: u64 = 0,
+    p95: u64 = 0,
+    p99: u64 = 0,
+    p999: u64 = 0,
+    samples: u32 = 0,
+    timed_out: bool = false,
+};
+
 // ============================================================================
-// Run throughput benchmark (sequential phases)
+// Phase result
 // ============================================================================
 
 const PhaseResult = struct {
     ops: u64 = 0,
     errors: u64 = 0,
     wall_ns: u64 = 0,
+    timed_out: bool = false,
+    target: u32 = 0,
 };
 
-fn runPhase(comptime ClientType: type, comptime workerFn: anytype, config: BenchConfig, alloc: std.mem.Allocator) !PhaseResult {
-    const jobs_per_worker = config.total_jobs / config.concurrency;
-    const threads = try alloc.alloc(std.Thread, config.concurrency);
-    defer alloc.free(threads);
-    const results = try alloc.alloc(WorkerResult, config.concurrency);
-    defer alloc.free(results);
+// ============================================================================
+// Server management — start/stop child process
+// ============================================================================
 
-    var wall = std.time.Timer.start() catch unreachable;
+const ServerHandle = struct {
+    child: std.process.Child,
+    port: u16,
+    data_dir: [128]u8,
+    data_dir_len: usize,
 
-    for (0..config.concurrency) |i| {
-        threads[i] = try std.Thread.spawn(.{}, struct {
-            fn run(cfg: BenchConfig, wid: u16, jpw: u32, result: *WorkerResult) void {
-                result.* = workerFn(ClientType, cfg, wid, jpw);
+    fn stop(self: *ServerHandle) void {
+        // Send SIGTERM.
+        const pid = self.child.id;
+        std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+        // Wait for exit.
+        _ = self.child.wait() catch {};
+    }
+
+    fn cleanup(self: *ServerHandle) void {
+        self.stop();
+        // Remove temp dir.
+        const dir_path = self.data_dir[0..self.data_dir_len];
+        std.fs.cwd().deleteTree(dir_path) catch {};
+    }
+};
+
+fn startServer(alloc: std.mem.Allocator) !ServerHandle {
+    // Pick a random port in 20000-30000.
+    const seed = @as(u64, @intCast(std.time.nanoTimestamp()));
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    const port = 20000 + random.intRangeAtMost(u16, 0, 10000);
+
+    // Create temp dir.
+    var data_dir: [128]u8 = undefined;
+    const data_dir_slice = std.fmt.bufPrint(&data_dir, "/tmp/corvo-bench-{d}", .{port}) catch unreachable;
+    const data_dir_len = data_dir_slice.len;
+
+    // Ensure temp dir exists (delete if leftover from previous run).
+    std.fs.cwd().deleteTree(data_dir_slice) catch {};
+    std.fs.cwd().makePath(data_dir_slice) catch {};
+
+    // Format port as string.
+    var port_buf: [8]u8 = undefined;
+    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
+
+    // Use the ReleaseFast server binary built by the bench target.
+    const server_path = "zig-out/bin/corvo-bench-server";
+
+    var child = std.process.Child.init(
+        &.{ server_path, "--port", port_str, "--data-dir", data_dir_slice },
+        alloc,
+    );
+    child.stderr_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    try child.spawn();
+
+    // Wait for server to be ready by reading stderr for "listening on".
+    const stderr = child.stderr orelse return error.NoStderr;
+    var read_buf: [4096]u8 = undefined;
+    var filled: usize = 0;
+    const deadline = std.time.nanoTimestamp() + 10_000_000_000; // 10s
+    while (std.time.nanoTimestamp() < deadline) {
+        const n = stderr.read(read_buf[filled..]) catch |err| {
+            if (err == error.WouldBlock) {
+                std.Thread.sleep(10_000_000); // 10ms
+                continue;
             }
-        }.run, .{ config, @as(u16, @intCast(i)), jobs_per_worker, &results[i] });
+            return err;
+        };
+        if (n == 0) {
+            std.Thread.sleep(10_000_000);
+            continue;
+        }
+        filled += n;
+        if (std.mem.indexOf(u8, read_buf[0..filled], "listening on") != null) {
+            break;
+        }
+        if (filled >= read_buf.len) {
+            // Buffer full, server probably started but we missed the line.
+            break;
+        }
     }
-    for (threads) |t| t.join();
 
-    const wall_ns = wall.read();
-    var total_ops: u64 = 0;
-    var total_errors: u64 = 0;
-    for (results) |r| {
-        total_ops += r.ops;
-        total_errors += r.errors;
+    // Verify the server is actually reachable.
+    var attempts: u32 = 0;
+    while (attempts < 50) : (attempts += 1) {
+        if (net.tcpConnectToAddress(net.Address.parseIp("127.0.0.1", port) catch unreachable)) |stream| {
+            stream.close();
+            return .{
+                .child = child,
+                .port = port,
+                .data_dir = data_dir,
+                .data_dir_len = data_dir_len,
+            };
+        } else |_| {}
+        std.Thread.sleep(100_000_000); // 100ms
     }
 
-    return .{ .ops = total_ops, .errors = total_errors, .wall_ns = wall_ns };
+    return error.ServerDidNotStart;
 }
 
 // ============================================================================
-// Scrape /metrics from server
+// Warmup
 // ============================================================================
 
-const ServerLatency = struct {
-    delivery_p50: u64 = 0,
-    delivery_p99: u64 = 0,
-    delivery_p999: u64 = 0,
-    e2e_p50: u64 = 0,
-    e2e_p99: u64 = 0,
-    e2e_p999: u64 = 0,
-};
-
-fn scrapeMetrics(host: []const u8, port: u16) ServerLatency {
-    // Connect via HTTP and GET /metrics.
-    var client = HttpClient.connect(host, port) catch return .{};
+fn runWarmup(port: u16, queue: []const u8) void {
+    var client = RpcClient.connect(port) catch return;
     defer client.close();
 
-    // Set recv timeout to avoid blocking forever.
-    const timeval = std.posix.timeval{ .sec = 3, .usec = 0 };
-    std.posix.setsockopt(client.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
+    var prefix_buf: [32]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "warmup-{d}", .{std.time.milliTimestamp()}) catch "warmup";
 
-    var len: usize = 0;
-    len += (std.fmt.bufPrint(client.send_buf[len..], "GET /metrics HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{client.hostHeader()}) catch return .{}).len;
-    var sent: usize = 0;
-    while (sent < len) {
-        sent += client.stream.write(client.send_buf[sent..len]) catch return .{};
+    var idx: u32 = 0;
+    var fetched_buf: [512]FetchedId = undefined;
+
+    // Enqueue warmup jobs.
+    while (idx < WARMUP_OPS) {
+        const batch: u16 = @intCast(@min(BATCH_SIZE, WARMUP_OPS - idx));
+        _ = client.enqueueBatch(queue, prefix, idx, batch) catch break;
+        idx += batch;
     }
 
-    // Read response using Content-Length.
-    const resp = client.readResponse() catch return .{};
-    const body = resp.body;
-
-    // Parse the histogram percentiles from Prometheus text format.
-    // We use the bucket boundaries to approximate p50/p99/p999.
-    return .{
-        .delivery_p50 = parsePercentile(body, "corvo_delivery_latency_seconds", 0.50),
-        .delivery_p99 = parsePercentile(body, "corvo_delivery_latency_seconds", 0.99),
-        .delivery_p999 = parsePercentile(body, "corvo_delivery_latency_seconds", 0.999),
-        .e2e_p50 = parsePercentile(body, "corvo_e2e_latency_seconds", 0.50),
-        .e2e_p99 = parsePercentile(body, "corvo_e2e_latency_seconds", 0.99),
-        .e2e_p999 = parsePercentile(body, "corvo_e2e_latency_seconds", 0.999),
-    };
-}
-
-/// Parse an approximate percentile from Prometheus histogram buckets
-/// with linear interpolation. Returns nanoseconds.
-fn parsePercentile(body: []const u8, metric_name: []const u8, p: f64) u64 {
-    var count_needle_buf: [128]u8 = undefined;
-    const count_needle = std.fmt.bufPrint(&count_needle_buf, "{s}_count ", .{metric_name}) catch return 0;
-    const count_pos = std.mem.indexOf(u8, body, count_needle) orelse return 0;
-    const count_start = count_pos + count_needle.len;
-    const count_end = std.mem.indexOfScalar(u8, body[count_start..], '\n') orelse return 0;
-    const total_count = std.fmt.parseInt(u64, body[count_start..][0..count_end], 10) catch return 0;
-    if (total_count == 0) return 0;
-
-    const target: u64 = @intFromFloat(@as(f64, @floatFromInt(total_count)) * p);
-
-    // Must match metrics.zig boundaries.
-    const boundary_ns = [_]u64{
-        10_000, 50_000, 100_000, 500_000, 1_000_000,
-        5_000_000, 10_000_000, 50_000_000, 100_000_000,
-        200_000_000, 500_000_000, 1_000_000_000, 5_000_000_000, 10_000_000_000,
-    };
-    const boundary_str = [_][]const u8{
-        "0.00001", "0.00005", "0.0001", "0.0005", "0.001",
-        "0.005", "0.01", "0.05", "0.1", "0.2", "0.5", "1", "5", "10",
-    };
-
-    // Read all bucket counts.
-    var counts: [boundary_ns.len]u64 = undefined;
-    for (boundary_str, 0..) |le_str, i| {
-        var needle_buf: [192]u8 = undefined;
-        const needle = std.fmt.bufPrint(&needle_buf, "{s}_bucket{{le=\"{s}\"}} ", .{ metric_name, le_str }) catch {
-            counts[i] = 0;
+    // Fetch+ack them all (best effort, 3s timeout).
+    var acked: u32 = 0;
+    var timer = std.time.Timer.start() catch return;
+    while (acked < idx and timer.read() < 3_000_000_000) {
+        const want: u16 = @intCast(@min(BATCH_SIZE, idx - acked));
+        const fetched = client.fetchBatch(queue, want, &fetched_buf) catch break;
+        if (fetched == 0) {
+            std.Thread.sleep(1_000_000); // 1ms
             continue;
-        };
-        const pos = std.mem.indexOf(u8, body, needle) orelse {
-            counts[i] = 0;
-            continue;
-        };
-        const val_start = pos + needle.len;
-        const val_end = std.mem.indexOfScalar(u8, body[val_start..], '\n') orelse {
-            counts[i] = 0;
-            continue;
-        };
-        counts[i] = std.fmt.parseInt(u64, body[val_start..][0..val_end], 10) catch 0;
-    }
-
-    // Interpolate.
-    var prev_count: u64 = 0;
-    var prev_ns: u64 = 0;
-    for (counts, boundary_ns) |bucket_count, ns| {
-        if (bucket_count >= target) {
-            const range = bucket_count - prev_count;
-            if (range == 0) return ns;
-            const offset = target - prev_count;
-            const frac = @as(f64, @floatFromInt(offset)) / @as(f64, @floatFromInt(range));
-            return prev_ns + @as(u64, @intFromFloat(frac * @as(f64, @floatFromInt(ns - prev_ns))));
         }
-        prev_count = bucket_count;
-        prev_ns = ns;
+        _ = client.ackBatch(fetched_buf[0..fetched]) catch break;
+        acked += fetched;
     }
-
-    return boundary_ns[boundary_ns.len - 1];
 }
 
 // ============================================================================
 // Output formatting
 // ============================================================================
 
-fn fmtDuration(ns: u64, buf: []u8) []const u8 {
+fn formatNumber(value: u64, buf: []u8) []const u8 {
+    // Format with comma separators: 85412 -> "85,412"
+    var num_buf: [32]u8 = undefined;
+    const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{value}) catch return "?";
+
+    if (num_str.len <= 3) {
+        @memcpy(buf[0..num_str.len], num_str);
+        return buf[0..num_str.len];
+    }
+
+    var out_pos: usize = 0;
+    const first_group = num_str.len % 3;
+    if (first_group > 0) {
+        @memcpy(buf[out_pos..][0..first_group], num_str[0..first_group]);
+        out_pos += first_group;
+        buf[out_pos] = ',';
+        out_pos += 1;
+    }
+    var i: usize = first_group;
+    while (i < num_str.len) {
+        @memcpy(buf[out_pos..][0..3], num_str[i..][0..3]);
+        out_pos += 3;
+        i += 3;
+        if (i < num_str.len) {
+            buf[out_pos] = ',';
+            out_pos += 1;
+        }
+    }
+    return buf[0..out_pos];
+}
+
+fn formatDurationMs(ns: u64, buf: []u8) []const u8 {
     if (ns == 0) return "N/A";
     if (ns < 1_000) return std.fmt.bufPrint(buf, "{d}ns", .{ns}) catch "?";
-    if (ns < 1_000_000) return std.fmt.bufPrint(buf, "{d}us", .{ns / 1_000}) catch "?";
+    if (ns < 1_000_000) {
+        const us = ns / 1000;
+        const frac = (ns % 1000) / 100;
+        if (frac > 0) return std.fmt.bufPrint(buf, "{d}.{d}us", .{ us, frac }) catch "?";
+        return std.fmt.bufPrint(buf, "{d}us", .{us}) catch "?";
+    }
     if (ns < 1_000_000_000) {
         const ms = ns / 1_000_000;
-        const frac = (ns % 1_000_000) / 100_000;
-        if (frac > 0) return std.fmt.bufPrint(buf, "{d}.{d}ms", .{ ms, frac }) catch "?";
+        const frac = (ns % 1_000_000) / 10_000; // two decimal places
+        if (frac > 0) return std.fmt.bufPrint(buf, "{d}.{d:0>2}ms", .{ ms, frac }) catch "?";
         return std.fmt.bufPrint(buf, "{d}ms", .{ms}) catch "?";
     }
     const s = ns / 1_000_000_000;
-    const frac = (ns % 1_000_000_000) / 100_000_000;
-    if (frac > 0) return std.fmt.bufPrint(buf, "{d}.{d}s", .{ s, frac }) catch "?";
+    const frac = (ns % 1_000_000_000) / 10_000_000;
+    if (frac > 0) return std.fmt.bufPrint(buf, "{d}.{d:0>2}s", .{ s, frac }) catch "?";
     return std.fmt.bufPrint(buf, "{d}s", .{s}) catch "?";
 }
 
-fn printThroughputResult(config: BenchConfig, enq: PhaseResult, lc: PhaseResult, latency: ServerLatency) void {
+fn printPhaseResult(label: []const u8, detail: []const u8, result: PhaseResult) void {
     const print = std.debug.print;
-
-    print("\nCorvo Bench — {s} throughput, {d}k jobs, {d} threads, batch {d}\n\n", .{
-        @tagName(config.protocol), config.total_jobs / 1000, config.concurrency, config.batch_size,
-    });
-
-    const enq_ops = if (enq.wall_ns > 0) enq.ops * 1_000_000_000 / enq.wall_ns else 0;
-    const lc_ops = if (lc.wall_ns > 0) lc.ops * 1_000_000_000 / lc.wall_ns else 0;
-
-    var ew: [16]u8 = undefined;
-    var lw: [16]u8 = undefined;
-    print("  {s:<12} {d:>9} ops/sec    wall {s}\n", .{ "enqueue", enq_ops, fmtDuration(enq.wall_ns, &ew) });
-    print("  {s:<12} {d:>9} ops/sec    wall {s}\n", .{ "lifecycle", lc_ops, fmtDuration(lc.wall_ns, &lw) });
-
-    var dp50: [16]u8 = undefined;
-    var dp99: [16]u8 = undefined;
-    var dp999: [16]u8 = undefined;
-    var ep50: [16]u8 = undefined;
-    var ep99: [16]u8 = undefined;
-    var ep999: [16]u8 = undefined;
-    print("\n  {s:<12} p50 {s:<8}  p99 {s:<8}  p999 {s}   (server)\n", .{
-        "delivery", fmtDuration(latency.delivery_p50, &dp50), fmtDuration(latency.delivery_p99, &dp99), fmtDuration(latency.delivery_p999, &dp999),
-    });
-    print("  {s:<12} p50 {s:<8}  p99 {s:<8}  p999 {s}   (server)\n", .{
-        "e2e", fmtDuration(latency.e2e_p50, &ep50), fmtDuration(latency.e2e_p99, &ep99), fmtDuration(latency.e2e_p999, &ep999),
-    });
-
-    const total_errors = enq.errors + lc.errors;
-    print("\n  total: {d} jobs   errors: {d}\n\n", .{ enq.ops, total_errors });
-}
-
-// ============================================================================
-// Scale mode
-// ============================================================================
-
-fn runScale(comptime ClientType: type, config: BenchConfig, alloc: std.mem.Allocator) !void {
-    const print = std.debug.print;
-
-    print("\nCorvo Bench — {s} scale, burst {d}, {d} steps\n\n", .{
-        @tagName(config.protocol), config.burst, config.steps,
-    });
-    print("  {s:>6}  {s:>10}  {s:>10}  {s:>9}  {s:>9}  {s:>9}  {s}\n", .{
-        "CONNS", "ENQ ops/s", "LC ops/s", "DEL p50", "DEL p99", "E2E p99", "NOTES",
-    });
-
-    var first_del_p99: u64 = 0;
-
-    for (0..config.steps) |step| {
-        const conns: u16 = @intCast(@max(2, config.max_conns * (@as(u32, @intCast(step)) + 1) / config.steps));
-
-        // Use unique queue per step.
-        var queue_buf: [64]u8 = undefined;
-        const step_queue = std.fmt.bufPrint(&queue_buf, "{s}.s{d}", .{ config.queue, step }) catch config.queue;
-
-        // Half producers, half consumers, running simultaneously.
-        const producers = @max(1, conns / 2);
-        const consumers = @max(1, conns - producers);
-
-        var step_config = config;
-        step_config.total_jobs = config.burst;
-        step_config.producers = producers;
-        step_config.consumers = consumers;
-        step_config.queue = step_queue;
-        // Realistic prefetch: cap at 8, scale down with more consumers.
-        step_config.batch_size = @max(1, @min(8, config.burst / @as(u32, consumers)));
-
-        // Combined mode — producers and consumers run simultaneously.
-        const result = try runCombined(ClientType, step_config, alloc);
-
-        // Scrape server metrics.
-        const latency = scrapeMetrics(config.host, config.port);
-
-        if (step == 0) first_del_p99 = latency.delivery_p99;
-        const saturated = first_del_p99 > 0 and latency.delivery_p99 > first_del_p99 * 2;
-
-        const wall_s = if (result.wall_ns > 0) result.wall_ns else 1;
-        const enq_ops = result.enqueue_ops * 1_000_000_000 / wall_s;
-        const lc_ops = result.lifecycle_ops * 1_000_000_000 / wall_s;
-
-        var dp50: [16]u8 = undefined;
-        var dp99: [16]u8 = undefined;
-        var ep99: [16]u8 = undefined;
-
-        print("  {d:>6}  {d:>10}  {d:>10}  {s:>9}  {s:>9}  {s:>9}  {s}\n", .{
-            conns, enq_ops, lc_ops,
-            fmtDuration(latency.delivery_p50, &dp50),
-            fmtDuration(latency.delivery_p99, &dp99),
-            fmtDuration(latency.e2e_p99, &ep99),
-            if (saturated) "<- saturated" else "",
+    var nb: [32]u8 = undefined;
+    const ops_sec = if (result.wall_ns > 0) result.ops * 1_000_000_000 / result.wall_ns else 0;
+    if (result.timed_out) {
+        print("  {s:<24}{s:>9} ops/sec  TIMEOUT ({d}s -- {d} of {d})  {s}\n", .{
+            label,
+            formatNumber(ops_sec, &nb),
+            PHASE_TIMEOUT_NS / 1_000_000_000,
+            result.ops,
+            result.target,
+            detail,
+        });
+    } else {
+        print("  {s:<24}{s:>9} ops/sec  {s}\n", .{
+            label, formatNumber(ops_sec, &nb), detail,
         });
     }
-    print("\n", .{});
-}
-
-// ============================================================================
-// JSON output
-// ============================================================================
-
-fn writeJson(config: BenchConfig, enq: PhaseResult, lc: PhaseResult, latency: ServerLatency) void {
-    const path = config.json_path orelse return;
-    const file = std.fs.cwd().createFile(path, .{}) catch |err| {
-        std.debug.print("warning: could not write JSON to {s}: {}\n", .{ path, err });
-        return;
-    };
-    defer file.close();
-
-    const enq_ops = if (enq.wall_ns > 0) enq.ops * 1_000_000_000 / enq.wall_ns else 0;
-    const lc_ops = if (lc.wall_ns > 0) lc.ops * 1_000_000_000 / lc.wall_ns else 0;
-
-    var buf: [4096]u8 = undefined;
-    var pos: usize = 0;
-
-    pos += (std.fmt.bufPrint(buf[pos..], "{{\n  \"config\": {{\n    \"protocol\": \"{s}\",\n    \"total_jobs\": {d},\n    \"concurrency\": {d},\n    \"batch_size\": {d},\n    \"queue\": \"{s}\"\n  }},\n", .{
-        @tagName(config.protocol), config.total_jobs, config.concurrency, config.batch_size, config.queue,
-    }) catch return).len;
-
-    pos += (std.fmt.bufPrint(buf[pos..], "  \"enqueue\": {{ \"ops\": {d}, \"ops_per_sec\": {d}, \"wall_ns\": {d}, \"errors\": {d} }},\n", .{
-        enq.ops, enq_ops, enq.wall_ns, enq.errors,
-    }) catch return).len;
-
-    pos += (std.fmt.bufPrint(buf[pos..], "  \"lifecycle\": {{ \"ops\": {d}, \"ops_per_sec\": {d}, \"wall_ns\": {d}, \"errors\": {d} }},\n", .{
-        lc.ops, lc_ops, lc.wall_ns, lc.errors,
-    }) catch return).len;
-
-    pos += (std.fmt.bufPrint(buf[pos..], "  \"delivery\": {{ \"p50_ns\": {d}, \"p99_ns\": {d}, \"p999_ns\": {d} }},\n", .{
-        latency.delivery_p50, latency.delivery_p99, latency.delivery_p999,
-    }) catch return).len;
-
-    pos += (std.fmt.bufPrint(buf[pos..], "  \"e2e\": {{ \"p50_ns\": {d}, \"p99_ns\": {d}, \"p999_ns\": {d} }}\n}}\n", .{
-        latency.e2e_p50, latency.e2e_p99, latency.e2e_p999,
-    }) catch return).len;
-
-    file.writeAll(buf[0..pos]) catch {};
+    if (result.errors > 0) {
+        print("    ({d} errors)\n", .{result.errors});
+    }
 }
 
 // ============================================================================
@@ -947,85 +904,88 @@ fn writeJson(config: BenchConfig, enq: PhaseResult, lc: PhaseResult, latency: Se
 // ============================================================================
 
 pub fn main() !void {
-    var config = BenchConfig{};
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+    const print = std.debug.print;
 
-    var args = std.process.args();
-    _ = args.next();
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--server")) {
-            if (args.next()) |v| {
-                if (std.mem.indexOfScalar(u8, v, ':')) |colon| {
-                    config.host = v[0..colon];
-                    config.port = std.fmt.parseInt(u16, v[colon + 1 ..], 10) catch 9878;
-                } else {
-                    config.host = v;
-                }
-            }
-        } else if (std.mem.eql(u8, arg, "--mode")) {
-            if (args.next()) |v| {
-                if (std.mem.eql(u8, v, "combined")) config.mode = .combined
-                else if (std.mem.eql(u8, v, "throughput")) config.mode = .throughput
-                else if (std.mem.eql(u8, v, "scale")) config.mode = .scale;
-            }
-        } else if (std.mem.eql(u8, arg, "--protocol")) {
-            if (args.next()) |v| {
-                if (std.mem.eql(u8, v, "rpc")) config.protocol = .rpc
-                else if (std.mem.eql(u8, v, "http")) config.protocol = .http;
-            }
-        } else if (std.mem.eql(u8, arg, "--jobs")) {
-            if (args.next()) |v| config.total_jobs = std.fmt.parseInt(u32, v, 10) catch 100_000;
-        } else if (std.mem.eql(u8, arg, "--concurrency")) {
-            if (args.next()) |v| config.concurrency = std.fmt.parseInt(u16, v, 10) catch 8;
-        } else if (std.mem.eql(u8, arg, "--producers")) {
-            if (args.next()) |v| config.producers = std.fmt.parseInt(u16, v, 10) catch 4;
-        } else if (std.mem.eql(u8, arg, "--consumers")) {
-            if (args.next()) |v| config.consumers = std.fmt.parseInt(u16, v, 10) catch 4;
-        } else if (std.mem.eql(u8, arg, "--batch")) {
-            if (args.next()) |v| config.batch_size = std.fmt.parseInt(u16, v, 10) catch 64;
-        } else if (std.mem.eql(u8, arg, "--queue")) {
-            if (args.next()) |v| config.queue = v;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            if (args.next()) |v| config.json_path = v;
-        } else if (std.mem.eql(u8, arg, "--steps")) {
-            if (args.next()) |v| config.steps = std.fmt.parseInt(u16, v, 10) catch 8;
-        } else if (std.mem.eql(u8, arg, "--max-conns")) {
-            if (args.next()) |v| config.max_conns = std.fmt.parseInt(u16, v, 10) catch 256;
-        } else if (std.mem.eql(u8, arg, "--burst")) {
-            if (args.next()) |v| config.burst = std.fmt.parseInt(u32, v, 10) catch 5_000;
+    // Start server.
+    print("\nStarting Corvo server...\n", .{});
+    var server = startServer(alloc) catch |err| {
+        print("Failed to start server: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer server.cleanup();
+
+    print("Server running on port {d}\n\n", .{server.port});
+
+    // Warmup.
+    print("Warming up ({d} ops)...\n", .{WARMUP_OPS});
+    runWarmup(server.port, "bench.warmup");
+
+    print("\nCorvo Benchmark (single node, localhost)\n\n", .{});
+
+    // Phase 1: Enqueue throughput.
+    {
+        const result = try runEnqueuePhase(alloc, server.port, TOTAL_JOBS, THREAD_COUNT, "bench.enq");
+        var detail_buf: [128]u8 = undefined;
+        var nb: [32]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buf, "({s} jobs, batch={d}, {d} threads)", .{
+            formatNumber(TOTAL_JOBS, &nb), BATCH_SIZE, THREAD_COUNT,
+        }) catch "";
+        printPhaseResult("Enqueue throughput:", detail, result);
+    }
+
+    // Phase 2: Lifecycle throughput (fetch + ack on the jobs from phase 1).
+    {
+        const result = try runLifecyclePhase(alloc, server.port, TOTAL_JOBS, THREAD_COUNT, "bench.enq");
+        var detail_buf: [128]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buf, "(fetch+ack, batch={d}, {d} threads)", .{
+            BATCH_SIZE, THREAD_COUNT,
+        }) catch "";
+        printPhaseResult("Lifecycle throughput:", detail, result);
+    }
+
+    // Phase 3: Combined throughput.
+    {
+        const result = try runCombinedPhase(alloc, server.port, "bench.combined");
+        const wall_ns = result.wall_ns;
+        const enq_ops_sec = if (wall_ns > 0) result.enqueue_ops * 1_000_000_000 / wall_ns else 0;
+        const lc_ops_sec = if (wall_ns > 0) result.lifecycle_ops * 1_000_000_000 / wall_ns else 0;
+        var nb1: [32]u8 = undefined;
+        var nb2: [32]u8 = undefined;
+        print("  {s:<24}{s:>9} enq/sec + {s} lc/sec  (4+4 threads, {d}s sustained)\n", .{
+            "Combined throughput:", formatNumber(enq_ops_sec, &nb1), formatNumber(lc_ops_sec, &nb2),
+            COMBINED_DURATION_NS / 1_000_000_000,
+        });
+        if (result.enqueue_errors + result.lifecycle_errors > 0) {
+            print("    ({d} enqueue errors, {d} lifecycle errors)\n", .{
+                result.enqueue_errors, result.lifecycle_errors,
+            });
         }
     }
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
-
-    switch (config.mode) {
-        .combined => {
-            const result = switch (config.protocol) {
-                .rpc => try runCombined(RpcClient, config, alloc),
-                .http => try runCombined(HttpClient, config, alloc),
-            };
-            const latency = scrapeMetrics(config.host, config.port);
-            printCombinedResult(config, result, latency);
-        },
-        .scale => switch (config.protocol) {
-            .rpc => try runScale(RpcClient, config, alloc),
-            .http => try runScale(HttpClient, config, alloc),
-        },
-        .throughput => {
-            const enq = switch (config.protocol) {
-                .rpc => try runPhase(RpcClient, enqueueWorker, config, alloc),
-                .http => try runPhase(HttpClient, enqueueWorker, config, alloc),
-            };
-            g_lifecycle_done.store(0, .monotonic);
-            g_lifecycle_target = config.total_jobs;
-
-            const lc = switch (config.protocol) {
-                .rpc => try runPhase(RpcClient, lifecycleWorker, config, alloc),
-                .http => try runPhase(HttpClient, lifecycleWorker, config, alloc),
-            };
-            const latency = scrapeMetrics(config.host, config.port);
-            printThroughputResult(config, enq, lc, latency);
-            writeJson(config, enq, lc, latency);
-        },
+    // Phase 4: Latency percentiles.
+    {
+        const result = try runLatencyPhase(server.port, "bench.latency");
+        print("\n  Latency (enqueue-to-fetch):\n", .{});
+        if (result.samples == 0) {
+            print("    no samples collected\n", .{});
+        } else {
+            var b50: [32]u8 = undefined;
+            var b95: [32]u8 = undefined;
+            var b99: [32]u8 = undefined;
+            var b999: [32]u8 = undefined;
+            print("    p50:  {s}\n", .{formatDurationMs(result.p50, &b50)});
+            print("    p95:  {s}\n", .{formatDurationMs(result.p95, &b95)});
+            print("    p99:  {s}\n", .{formatDurationMs(result.p99, &b99)});
+            print("    p999: {s}\n", .{formatDurationMs(result.p999, &b999)});
+            if (result.timed_out) {
+                print("    (timed out after {d} samples)\n", .{result.samples});
+            } else {
+                print("    ({d} samples)\n", .{result.samples});
+            }
+        }
     }
+
+    print("\n", .{});
 }
