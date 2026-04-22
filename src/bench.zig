@@ -8,6 +8,9 @@
 //!   2. Lifecycle throughput   — fetch+ack jobs, measure ops/sec
 //!   3. Combined throughput    — enqueue + lifecycle simultaneously
 //!   4. Latency percentiles    — measure enqueue-to-fetch latency
+//!   5. Connection scaling     — ramp workers, measure throughput + latency
+//!
+//! After single-node results, starts a 3-node cluster and repeats all phases.
 //!
 //! Usage:
 //!   zig build bench          (builds + runs with ReleaseFast)
@@ -28,6 +31,8 @@ const WARMUP_OPS: u32 = 5_000;
 const PHASE_TIMEOUT_NS: u64 = 5_000_000_000; // 5 seconds
 const COMBINED_DURATION_NS: u64 = 10_000_000_000; // 10 seconds
 const LATENCY_SAMPLE_COUNT: u32 = 10_000;
+const SCALING_STEP_DURATION_NS: u64 = 3_000_000_000; // 3 seconds per step
+const SCALING_STEPS = [_]u16{ 8, 32, 128, 512 };
 
 // ============================================================================
 // FetchedId — stores job_id + queue from fetch response
@@ -671,6 +676,138 @@ const LatencyResult = struct {
 };
 
 // ============================================================================
+// Phase 5: Connection scaling
+// ============================================================================
+
+const ScalingStepResult = struct {
+    p50: u64 = 0,
+    p99: u64 = 0,
+    ops_sec: u64 = 0,
+    workers: u16 = 0,
+    ok: bool = false,
+};
+
+var g_scaling_stop = std.atomic.Value(bool).init(false);
+
+const ScalingWorkerResult = struct {
+    ops: u64 = 0,
+    latencies: [8192]u64 = undefined,
+    latency_count: u32 = 0,
+};
+
+fn scalingWorkerFn(port: u16, worker_id: u16, result: *ScalingWorkerResult) void {
+    _ = worker_id;
+    var client = RpcClient.connect(port) catch {
+        return;
+    };
+    defer client.close();
+
+    var timer = std.time.Timer.start() catch return;
+    var ops: u64 = 0;
+    var latency_count: u32 = 0;
+    var fetched_buf: [8]FetchedId = undefined;
+    var id_buf: [128]u8 = undefined;
+
+    while (!g_scaling_stop.load(.monotonic)) {
+        if (timer.read() > SCALING_STEP_DURATION_NS) break;
+
+        const start_ns = timer.read();
+
+        // Enqueue 1 job.
+        const job_id = std.fmt.bufPrint(&id_buf, "s-{d}-{d}", .{ @as(u64, @intCast(std.time.nanoTimestamp())), ops }) catch continue;
+        const enqueued = client.enqueueSingle("bench.scale", job_id) catch break;
+        if (enqueued == 0) continue;
+
+        // Fetch 1 job.
+        const fetched = client.fetchBatch("bench.scale", 1, &fetched_buf) catch break;
+        if (fetched == 0) continue;
+
+        // Ack 1 job.
+        _ = client.ackBatch(fetched_buf[0..fetched]) catch break;
+
+        ops += 1;
+        const elapsed = timer.read() - start_ns;
+        if (latency_count < result.latencies.len) {
+            result.latencies[latency_count] = elapsed;
+            latency_count += 1;
+        }
+    }
+
+    result.ops = ops;
+    result.latency_count = latency_count;
+}
+
+fn runScalingStep(alloc: std.mem.Allocator, port: u16, worker_count: u16) !ScalingStepResult {
+    const threads = try alloc.alloc(std.Thread, worker_count);
+    defer alloc.free(threads);
+    const results = try alloc.alloc(ScalingWorkerResult, worker_count);
+    defer alloc.free(results);
+
+    for (results) |*r| {
+        r.* = .{};
+    }
+
+    g_scaling_stop.store(false, .monotonic);
+    var wall = std.time.Timer.start() catch unreachable;
+
+    for (0..worker_count) |i| {
+        threads[i] = std.Thread.spawn(.{}, scalingWorkerFn, .{
+            port, @as(u16, @intCast(i)), &results[i],
+        }) catch {
+            // If we can't spawn all threads, stop and measure what we have.
+            g_scaling_stop.store(true, .monotonic);
+            for (0..i) |j| threads[j].join();
+            return .{ .workers = worker_count };
+        };
+    }
+
+    for (0..worker_count) |i| threads[i].join();
+    const wall_ns = wall.read();
+
+    // Aggregate ops.
+    var total_ops: u64 = 0;
+    var total_latency_count: u32 = 0;
+    for (results) |r| {
+        total_ops += r.ops;
+        total_latency_count += r.latency_count;
+    }
+
+    if (total_latency_count == 0) {
+        return .{ .workers = worker_count };
+    }
+
+    // Collect all latency samples into one sorted array.
+    const all_latencies = try alloc.alloc(u64, total_latency_count);
+    defer alloc.free(all_latencies);
+    var idx: u32 = 0;
+    for (results) |r| {
+        for (0..r.latency_count) |li| {
+            all_latencies[idx] = r.latencies[li];
+            idx += 1;
+        }
+    }
+    std.mem.sort(u64, all_latencies, {}, std.sort.asc(u64));
+
+    const ops_sec = if (wall_ns > 0) total_ops * 1_000_000_000 / wall_ns else 0;
+
+    return .{
+        .p50 = all_latencies[total_latency_count * 50 / 100],
+        .p99 = all_latencies[@min(total_latency_count - 1, total_latency_count * 99 / 100)],
+        .ops_sec = ops_sec,
+        .workers = worker_count,
+        .ok = true,
+    };
+}
+
+fn runScalingPhase(alloc: std.mem.Allocator, port: u16) ![SCALING_STEPS.len]ScalingStepResult {
+    var results: [SCALING_STEPS.len]ScalingStepResult = undefined;
+    for (SCALING_STEPS, 0..) |worker_count, i| {
+        results[i] = try runScalingStep(alloc, port, worker_count);
+    }
+    return results;
+}
+
+// ============================================================================
 // Phase result
 // ============================================================================
 
@@ -782,6 +919,141 @@ fn startServer(alloc: std.mem.Allocator) !ServerHandle {
     }
 
     return error.ServerDidNotStart;
+}
+
+// ============================================================================
+// Cluster management — 3-node cluster
+// ============================================================================
+
+const ClusterHandle = struct {
+    servers: [3]ServerHandle,
+    leader_port: u16,
+    count: u8,
+
+    fn cleanup(self: *ClusterHandle) void {
+        for (0..self.count) |i| {
+            self.servers[i].cleanup();
+        }
+    }
+};
+
+fn startCluster(alloc: std.mem.Allocator) !ClusterHandle {
+    const print = std.debug.print;
+
+    // Pick 3 random ports spaced 2000 apart so that each node's cluster port
+    // (auto-calculated as port + 1000) doesn't collide with any other node's main port.
+    const seed = @as(u64, @intCast(std.time.nanoTimestamp()));
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    const base_port = 20000 + random.intRangeAtMost(u16, 0, 3000);
+    const ports = [3]u16{ base_port, base_port + 2000, base_port + 4000 };
+    // Cluster ports are port + 1000 (server default).
+    const cluster_ports = [3]u16{ ports[0] + 1000, ports[1] + 1000, ports[2] + 1000 };
+    const node_ids = [3][]const u8{ "bench-n1", "bench-n2", "bench-n3" };
+
+    var handle = ClusterHandle{
+        .servers = undefined,
+        .leader_port = 0,
+        .count = 0,
+    };
+
+    // Build peers strings for each node (other two nodes' cluster ports).
+    var peers_bufs: [3][256]u8 = undefined;
+    var peers_slices: [3][]const u8 = undefined;
+    for (0..3) |i| {
+        var idx: usize = 0;
+        var first = true;
+        for (0..3) |j| {
+            if (j == i) continue;
+            if (!first) {
+                peers_bufs[i][idx] = ',';
+                idx += 1;
+            }
+            const written = std.fmt.bufPrint(peers_bufs[i][idx..], "{s}@127.0.0.1:{d}", .{ node_ids[j], cluster_ports[j] }) catch break;
+            idx += written.len;
+            first = false;
+        }
+        peers_slices[i] = peers_bufs[i][0..idx];
+    }
+
+    const server_path = "zig-out/bin/corvo-bench-server";
+
+    for (0..3) |i| {
+        // Create temp dir.
+        var data_dir: [128]u8 = undefined;
+        const data_dir_slice = std.fmt.bufPrint(&data_dir, "/tmp/corvo-bench-cluster-{d}", .{ports[i]}) catch unreachable;
+        const data_dir_len = data_dir_slice.len;
+
+        std.fs.cwd().deleteTree(data_dir_slice) catch {};
+        std.fs.cwd().makePath(data_dir_slice) catch {};
+
+        var port_buf: [8]u8 = undefined;
+        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{ports[i]}) catch unreachable;
+
+        var child = std.process.Child.init(
+            &.{ server_path, "--port", port_str, "--data-dir", data_dir_slice, "--node-id", node_ids[i], "--peers", peers_slices[i], "--no-mirror" },
+            alloc,
+        );
+        child.stderr_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        try child.spawn();
+
+        handle.servers[i] = .{
+            .child = child,
+            .port = ports[i],
+            .data_dir = data_dir,
+            .data_dir_len = data_dir_len,
+        };
+        handle.count += 1;
+    }
+
+    // Wait for all 3 nodes to be listening on their main ports.
+    print("  Waiting for cluster nodes...", .{});
+    const deadline = std.time.nanoTimestamp() + 15_000_000_000; // 15s
+    for (0..3) |i| {
+        while (std.time.nanoTimestamp() < deadline) {
+            if (net.tcpConnectToAddress(net.Address.parseIp("127.0.0.1", ports[i]) catch unreachable)) |stream| {
+                stream.close();
+                break;
+            } else |_| {}
+            std.Thread.sleep(100_000_000); // 100ms
+        }
+    }
+
+    // Wait for leader election. The election timeout is ~3s, so wait a bit
+    // then probe each node via RPC to find the leader (the one that accepts writes).
+    print(" waiting for leader election...", .{});
+    std.Thread.sleep(5_000_000_000); // 5s for election to complete
+
+    var leader_found = false;
+    const election_deadline = std.time.nanoTimestamp() + 25_000_000_000; // 25s more
+
+    while (std.time.nanoTimestamp() < election_deadline) {
+        for (0..3) |i| {
+            var client = RpcClient.connect(ports[i]) catch continue;
+            // Try a simple enqueue — the leader will accept, followers reject/error.
+            const enqueued = client.enqueueSingle("bench.probe", "probe-job") catch {
+                client.close();
+                continue;
+            };
+            client.close();
+            if (enqueued > 0) {
+                handle.leader_port = ports[i];
+                leader_found = true;
+                break;
+            }
+        }
+        if (leader_found) break;
+        std.Thread.sleep(1_000_000_000); // 1s
+    }
+
+    if (!leader_found) {
+        print(" FAILED\n", .{});
+        return error.LeaderElectionTimeout;
+    }
+
+    print(" ready (leader port {d})\n", .{handle.leader_port});
+    return handle;
 }
 
 // ============================================================================
@@ -900,33 +1172,15 @@ fn printPhaseResult(label: []const u8, detail: []const u8, result: PhaseResult) 
 }
 
 // ============================================================================
-// Main
+// Run all benchmark phases against a given port
 // ============================================================================
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
+fn runAllPhases(alloc: std.mem.Allocator, port: u16) !void {
     const print = std.debug.print;
-
-    // Start server.
-    print("\nStarting Corvo server...\n", .{});
-    var server = startServer(alloc) catch |err| {
-        print("Failed to start server: {s}\n", .{@errorName(err)});
-        return;
-    };
-    defer server.cleanup();
-
-    print("Server running on port {d}\n\n", .{server.port});
-
-    // Warmup.
-    print("Warming up ({d} ops)...\n", .{WARMUP_OPS});
-    runWarmup(server.port, "bench.warmup");
-
-    print("\nCorvo Benchmark (single node, localhost)\n\n", .{});
 
     // Phase 1: Enqueue throughput.
     {
-        const result = try runEnqueuePhase(alloc, server.port, TOTAL_JOBS, THREAD_COUNT, "bench.enq");
+        const result = try runEnqueuePhase(alloc, port, TOTAL_JOBS, THREAD_COUNT, "bench.enq");
         var detail_buf: [128]u8 = undefined;
         var nb: [32]u8 = undefined;
         const detail = std.fmt.bufPrint(&detail_buf, "({s} jobs, batch={d}, {d} threads)", .{
@@ -937,7 +1191,7 @@ pub fn main() !void {
 
     // Phase 2: Lifecycle throughput (fetch + ack on the jobs from phase 1).
     {
-        const result = try runLifecyclePhase(alloc, server.port, TOTAL_JOBS, THREAD_COUNT, "bench.enq");
+        const result = try runLifecyclePhase(alloc, port, TOTAL_JOBS, THREAD_COUNT, "bench.enq");
         var detail_buf: [128]u8 = undefined;
         const detail = std.fmt.bufPrint(&detail_buf, "(fetch+ack, batch={d}, {d} threads)", .{
             BATCH_SIZE, THREAD_COUNT,
@@ -947,7 +1201,7 @@ pub fn main() !void {
 
     // Phase 3: Combined throughput.
     {
-        const result = try runCombinedPhase(alloc, server.port, "bench.combined");
+        const result = try runCombinedPhase(alloc, port, "bench.combined");
         const wall_ns = result.wall_ns;
         const enq_ops_sec = if (wall_ns > 0) result.enqueue_ops * 1_000_000_000 / wall_ns else 0;
         const lc_ops_sec = if (wall_ns > 0) result.lifecycle_ops * 1_000_000_000 / wall_ns else 0;
@@ -966,7 +1220,7 @@ pub fn main() !void {
 
     // Phase 4: Latency percentiles.
     {
-        const result = try runLatencyPhase(server.port, "bench.latency");
+        const result = try runLatencyPhase(port, "bench.latency");
         print("\n  Latency (enqueue-to-fetch):\n", .{});
         if (result.samples == 0) {
             print("    no samples collected\n", .{});
@@ -986,6 +1240,89 @@ pub fn main() !void {
             }
         }
     }
+
+    // Phase 5: Connection scaling.
+    {
+        print("\n  Connection scaling (enqueue+fetch+ack per worker):\n", .{});
+        const scaling_results = try runScalingPhase(alloc, port);
+        for (scaling_results) |step| {
+            if (!step.ok) {
+                var wb: [8]u8 = undefined;
+                const wstr = std.fmt.bufPrint(&wb, "{d}", .{step.workers}) catch "?";
+                print("    {s} workers:{s}(no data)\n", .{ wstr, padding(14 - @min(wstr.len, 13)) });
+                continue;
+            }
+            var b50: [32]u8 = undefined;
+            var b99: [32]u8 = undefined;
+            var nb: [32]u8 = undefined;
+            var wb: [8]u8 = undefined;
+            const wstr = std.fmt.bufPrint(&wb, "{d}", .{step.workers}) catch "?";
+            // Pad worker count for alignment: "8 workers:     " vs "512 workers:   "
+            const label_len = wstr.len + " workers:".len;
+            const pad_len = if (label_len < 14) 14 - label_len else 1;
+            print("    {s} workers:{s}p50={s:<8} p99={s:<8} {s} ops/sec\n", .{
+                wstr,
+                padding(pad_len),
+                formatDurationMs(step.p50, &b50),
+                formatDurationMs(step.p99, &b99),
+                formatNumber(step.ops_sec, &nb),
+            });
+        }
+    }
+}
+
+fn padding(n: usize) []const u8 {
+    const spaces = "                    "; // 20 spaces
+    return spaces[0..@min(n, spaces.len)];
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+    const print = std.debug.print;
+
+    print("\nCorvo Benchmark\n", .{});
+
+    // ---- Single Node ----
+    {
+        print("\nStarting single-node server...\n", .{});
+        var server = startServer(alloc) catch |err| {
+            print("Failed to start server: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer server.cleanup();
+
+        print("Server running on port {d}\n", .{server.port});
+
+        // Warmup.
+        runWarmup(server.port, "bench.warmup");
+
+        print("\n=== Single Node ===\n\n", .{});
+        try runAllPhases(alloc, server.port);
+    }
+
+    // ---- 3-Node Cluster ----
+    print("\n\nStarting 3-node cluster...\n", .{});
+    var cluster = startCluster(alloc) catch |err| {
+        if (err == error.LeaderElectionTimeout) {
+            print("Cluster leader election timed out, skipping cluster benchmarks.\n", .{});
+        } else {
+            print("Failed to start cluster: {s}, skipping cluster benchmarks.\n", .{@errorName(err)});
+        }
+        print("\n", .{});
+        return;
+    };
+    defer cluster.cleanup();
+
+    // Warmup on cluster leader.
+    runWarmup(cluster.leader_port, "bench.cluster-warmup");
+
+    print("\n=== 3-Node Cluster ===\n\n", .{});
+    try runAllPhases(alloc, cluster.leader_port);
 
     print("\n", .{});
 }
