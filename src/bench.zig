@@ -629,25 +629,41 @@ fn runLatencyPhase(port: u16, queue: []const u8) !LatencyResult {
     }
 
     // Measure: enqueue one job at a time, immediately fetch, measure delta.
+    var consecutive_errors: u32 = 0;
+    var seq: u32 = 0;
     while (sample_count < LATENCY_SAMPLE_COUNT) {
         if (timer.read() > PHASE_TIMEOUT_NS) break;
+        if (consecutive_errors > 50) break;
 
         const enqueue_ns = @as(u64, @intCast(std.time.nanoTimestamp()));
         var id_buf: [128]u8 = undefined;
-        const job_id = std.fmt.bufPrint(&id_buf, "l-{d}", .{sample_count}) catch continue;
+        seq += 1;
+        const job_id = std.fmt.bufPrint(&id_buf, "l-{d}-{d}", .{ enqueue_ns, seq }) catch continue;
 
-        const enqueued = client.enqueueSingle(queue, job_id) catch break;
-        if (enqueued == 0) continue;
+        const enqueued = client.enqueueSingle(queue, job_id) catch {
+            consecutive_errors += 1;
+            continue;
+        };
+        if (enqueued == 0) {
+            consecutive_errors += 1;
+            continue;
+        }
 
-        // Fetch — on the same connection. The server processes enqueue first
-        // (from previous tick), then our fetch subscribe triggers fulfillSubscriptions
-        // which finds the pending job.
-        const fetched = client.fetchBatch(queue, 1, &fetched_buf) catch break;
+        // Fetch — retry a few times since cluster replication may delay commit.
+        var fetched: u16 = 0;
+        for (0..20) |_| {
+            fetched = client.fetchBatch(queue, 1, &fetched_buf) catch break;
+            if (fetched > 0) break;
+            std.Thread.sleep(100_000); // 100us
+        }
         if (fetched > 0) {
             const fetch_ns = @as(u64, @intCast(std.time.nanoTimestamp()));
             latencies[sample_count] = fetch_ns - enqueue_ns;
             sample_count += 1;
+            consecutive_errors = 0;
             _ = client.ackBatch(fetched_buf[0..fetched]) catch {};
+        } else {
+            consecutive_errors += 1;
         }
     }
 
@@ -718,8 +734,13 @@ fn scalingWorkerFn(port: u16, worker_id: u16, result: *ScalingWorkerResult) void
         const enqueued = client.enqueueSingle("bench.scale", job_id) catch break;
         if (enqueued == 0) continue;
 
-        // Fetch 1 job.
-        const fetched = client.fetchBatch("bench.scale", 1, &fetched_buf) catch break;
+        // Fetch 1 job — retry for cluster replication delay.
+        var fetched: u16 = 0;
+        for (0..20) |_| {
+            fetched = client.fetchBatch("bench.scale", 1, &fetched_buf) catch break;
+            if (fetched > 0) break;
+            std.Thread.sleep(100_000); // 100us
+        }
         if (fetched == 0) continue;
 
         // Ack 1 job.
@@ -830,10 +851,8 @@ const ServerHandle = struct {
     data_dir_len: usize,
 
     fn stop(self: *ServerHandle) void {
-        // Send SIGTERM.
         const pid = self.child.id;
-        std.posix.kill(pid, std.posix.SIG.TERM) catch {};
-        // Wait for exit.
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
         _ = self.child.wait() catch {};
     }
 
@@ -1152,7 +1171,7 @@ fn printPhaseResult(label: []const u8, detail: []const u8, result: PhaseResult) 
     const print = std.debug.print;
     var nb: [32]u8 = undefined;
     const ops_sec = if (result.wall_ns > 0) result.ops * 1_000_000_000 / result.wall_ns else 0;
-    if (result.timed_out) {
+    if (result.timed_out and result.ops < result.target) {
         print("  {s:<24}{s:>9} ops/sec  TIMEOUT ({d}s -- {d} of {d})  {s}\n", .{
             label,
             formatNumber(ops_sec, &nb),
