@@ -61,6 +61,12 @@ pub const SimClient = struct {
     // Queue pause state tracking.
     paused_queues: [8]bool = [_]bool{false} ** 8,
 
+    // Cron tracking: whether we have an active cron (binary RPC uses empty ID).
+    cron_count: usize = 0,
+
+    // Chain sequence counter for generating chain IDs.
+    chain_seq: u32 = 0,
+
     // Stats
     enqueued: u32 = 0,
     fetched: u32 = 0,
@@ -74,6 +80,9 @@ pub const SimClient = struct {
     double_acks: u32 = 0,
     stale_acks: u32 = 0,
     clear_queues: u32 = 0,
+    cron_ops: u32 = 0,
+    batch_creates: u32 = 0,
+    chain_enqueues: u32 = 0,
 
     // Fetch subscription: true when we sent a fetch that got no immediate response.
     // The pipeline will push MSG_FETCH_BATCH_RESP when jobs become available.
@@ -173,6 +182,20 @@ pub const SimClient = struct {
         threshold += self.config.queue_op_rate;
         if (r < threshold) {
             self.doQueueOp();
+            return;
+        }
+
+        // Cron operations
+        threshold += self.config.cron_rate;
+        if (r < threshold) {
+            self.doCronOp();
+            return;
+        }
+
+        // Batch lifecycle (create / seal)
+        threshold += self.config.batch_create_rate;
+        if (r < threshold) {
+            self.doBatchLifecycle();
             return;
         }
 
@@ -332,7 +355,31 @@ pub const SimClient = struct {
         else
             0;
         w.writeU32(expire_after_ms);
-        w.writeU16(0); // chain_step
+        // Chain job support
+        var chain_id_buf: [32]u8 = undefined;
+        var chain_id_len: usize = 0;
+        var chain_config_buf: [256]u8 = undefined;
+        var chain_config_len: usize = 0;
+        var chain_step: u16 = 0;
+
+        if (self.chance(self.config.chain_rate)) {
+            self.chain_seq += 1;
+            const cid = std.fmt.bufPrint(&chain_id_buf, "chain-{d}-{d}", .{ self.id, self.chain_seq }) catch unreachable;
+            chain_id_len = cid.len;
+            chain_step = 0;
+            flags |= rpc.FLAG_CHAIN_ID | rpc.FLAG_CHAIN_CONFIG;
+
+            // Build a 2-step chain config with on_exit handler.
+            const target_q = self.queues[self.rng.intRangeAtMost(usize, 0, self.queues.len - 1)];
+            const cc = std.fmt.bufPrint(&chain_config_buf,
+                "{{\"steps\":[{{\"queue\":\"{s}\"}},{{\"queue\":\"{s}\"}}],\"on_exit\":{{\"queue\":\"{s}\"}}}}",
+                .{ q, target_q, q },
+            ) catch unreachable;
+            chain_config_len = cc.len;
+            self.chain_enqueues += 1;
+        }
+
+        w.writeU16(chain_step);
         w.writeU16(flags);
 
         // Optional fields in flag order
@@ -343,7 +390,12 @@ pub const SimClient = struct {
         if (flags & rpc.FLAG_TAGS != 0) {
             w.writePrefixed(tag_buf[0..tag_len]);
         }
-        // BATCH_ID, CHAIN_ID, CHAIN_CONFIG not used by sim
+        if (flags & rpc.FLAG_CHAIN_ID != 0) {
+            w.writePrefixed(chain_id_buf[0..chain_id_len]);
+        }
+        if (flags & rpc.FLAG_CHAIN_CONFIG != 0) {
+            w.writeU16Prefixed(chain_config_buf[0..chain_config_len]);
+        }
         if (flags & rpc.FLAG_GROUP != 0) {
             w.writePrefixed(group_buf[0..group_len]);
         }
@@ -360,6 +412,93 @@ pub const SimClient = struct {
         if (err_byte == 0) {
             self.enqueued += 1;
         }
+    }
+
+    // ====================================================================
+    // Cron operations — MSG_CRON_CREATE / UPDATE / DELETE / TRIGGER
+    // ====================================================================
+
+    fn doCronOp(self: *SimClient) void {
+        const q = self.queues[self.rng.intRangeAtMost(usize, 0, self.queues.len - 1)];
+
+        // Binary RPC cron_create doesn't include cron_id (server generates it
+        // in the HTTP path). So binary creates produce crons with empty ID.
+        // We track cron names and use the empty-string ID for update/delete/trigger.
+        if (self.cron_count > 0 and self.chance(0.6)) {
+            // Operate on existing cron (empty ID from binary create).
+            const op = self.rng.intRangeAtMost(u8, 0, 2);
+            switch (op) {
+                0 => {
+                    // Trigger — fires the cron to enqueue a job
+                    var w = self.payloadWriter();
+                    w.writePrefixed(""); // cron_id (empty from binary create)
+                    self.sendFrame(rpc.MSG_CRON_TRIGGER, w.pos);
+                },
+                1 => {
+                    // Update: toggle enabled
+                    var w = self.payloadWriter();
+                    w.writePrefixed(""); // cron_id
+                    w.writeU16(0x0080); // CRON_UPD_ENABLED
+                    w.writeU8(if (self.chance(0.5)) 1 else 0);
+                    self.sendFrame(rpc.MSG_CRON_UPDATE, w.pos);
+                },
+                2 => {
+                    // Delete
+                    var w = self.payloadWriter();
+                    w.writePrefixed(""); // cron_id
+                    self.sendFrame(rpc.MSG_CRON_DELETE, w.pos);
+                    self.cron_count = 0;
+                },
+                else => unreachable,
+            }
+        } else {
+            // Create new cron (overwrites previous empty-ID cron).
+            self.job_seq += 1;
+            var name_buf: [32]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "cron-{d}-{d}", .{ self.id, self.job_seq }) catch unreachable;
+
+            var w = self.payloadWriter();
+            w.writePrefixed(name);
+            w.writePrefixed(q);
+            w.writePrefixed("*/5 * * * *"); // every 5 minutes
+            w.writePrefixed("UTC");
+            w.writeU16(3); // max_retries
+            w.writeU8(1); // enabled
+            w.writeU8(0x01); // CRON_FLAG_PAYLOAD
+            w.writeU16Prefixed("{\"cron\":true}");
+
+            self.sendFrame(rpc.MSG_CRON_CREATE, w.pos);
+            self.cron_count = 1; // Track that we have an active cron
+        }
+        self.cron_ops += 1;
+    }
+
+    // ====================================================================
+    // Batch lifecycle — MSG_BATCH_CREATE / MSG_BATCH_SEAL
+    // ====================================================================
+
+    fn doBatchLifecycle(self: *SimClient) void {
+        const q = self.queues[self.rng.intRangeAtMost(usize, 0, self.queues.len - 1)];
+
+        // Create batch — exercises handler_batch.applyBatchCreate.
+        // Binary RPC doesn't support client-supplied batch_id, so the handler
+        // creates batches with empty ID. We also send occasional seals.
+        if (self.chance(0.6)) {
+            var w = self.payloadWriter();
+            w.writePrefixed(q); // callback_queue
+            const use_payload = self.chance(0.3);
+            w.writeU8(if (use_payload) 0x01 else 0); // flags
+            if (use_payload) {
+                w.writeU16Prefixed("{\"batch_callback\":true}");
+            }
+            self.sendFrame(rpc.MSG_BATCH_CREATE, w.pos);
+        } else {
+            // Seal the empty-ID batch (may not exist — handler returns error, which is fine).
+            var w = self.payloadWriter();
+            w.writePrefixed(""); // batch_id
+            self.sendFrame(rpc.MSG_BATCH_SEAL, w.pos);
+        }
+        self.batch_creates += 1;
     }
 
     // ====================================================================
@@ -533,7 +672,30 @@ pub const SimClient = struct {
         w.writeU16(1); // count
         w.writePrefixed(entry.jobID());
         w.writePrefixed(entry.queue());
-        w.writeU8(0); // flags (no progress/checkpoint)
+
+        // Optionally include progress and/or checkpoint data.
+        var flags: u8 = 0;
+        const include_data = self.chance(self.config.checkpoint_rate);
+        if (include_data) {
+            if (self.chance(0.5)) flags |= rpc.HB_FLAG_PROGRESS;
+            if (self.chance(0.5)) flags |= rpc.HB_FLAG_CHECKPOINT;
+            // Ensure at least one flag is set when we decided to include data.
+            if (flags == 0) flags = rpc.HB_FLAG_PROGRESS;
+        }
+        w.writeU8(flags);
+
+        if (flags & rpc.HB_FLAG_PROGRESS != 0) {
+            var progress_buf: [32]u8 = undefined;
+            const pct = self.rng.intRangeAtMost(u8, 1, 100);
+            const progress = std.fmt.bufPrint(&progress_buf, "{{\"pct\":{d}}}", .{pct}) catch unreachable;
+            w.writePrefixed(progress);
+        }
+        if (flags & rpc.HB_FLAG_CHECKPOINT != 0) {
+            var ckpt_buf: [32]u8 = undefined;
+            const offset = self.rng.intRangeAtMost(u32, 0, 10000);
+            const ckpt = std.fmt.bufPrint(&ckpt_buf, "{{\"offset\":{d}}}", .{offset}) catch unreachable;
+            w.writePrefixed(ckpt);
+        }
 
         self.sendFrame(rpc.MSG_HEARTBEAT, w.pos);
         self.heartbeats += 1;
@@ -551,7 +713,7 @@ pub const SimClient = struct {
             self.completed_count,
         );
 
-        const actions = [_]ops.BulkAction{ .requeue, .delete, .cancel, .hold, .approve, .reject, .promote, .move };
+        const actions = [_]ops.BulkAction{ .requeue, .delete, .cancel, .hold, .approve, .reject, .promote, .move, .change_priority };
         const action = actions[self.rng.intRangeAtMost(usize, 0, actions.len - 1)];
 
         const now_ns: u64 = @intCast(clock_mod.globalClockNow());
@@ -566,11 +728,14 @@ pub const SimClient = struct {
             w.writePrefixed(self.completed_ids[ci].slice());
         }
 
-        // Flags: set move_to for .move action.
+        // Flags: set move_to for .move action, priority for .change_priority.
         if (action == .move) {
             w.writeU8(0x01); // BULK_FLAG_MOVE_TO
             const move_q = self.queues[self.rng.intRangeAtMost(usize, 0, self.queues.len - 1)];
             w.writePrefixed(move_q);
+        } else if (action == .change_priority) {
+            w.writeU8(0x02); // BULK_FLAG_PRIORITY
+            w.writeU8(self.rng.intRangeAtMost(u8, 1, 255)); // new priority
         } else {
             w.writeU8(0); // flags (no move_to, no priority)
         }
@@ -588,7 +753,7 @@ pub const SimClient = struct {
         const now_ns: u64 = @intCast(clock_mod.globalClockNow());
 
         const actions = [_]ops.MaintenanceAction{
-            .promote, .reclaim, .expire, .purge, .unique, .batches,
+            .promote, .reclaim, .expire, .purge, .unique, .batches, .rate_limit, .workers,
         };
         const action = actions[self.rng.intRangeAtMost(usize, 0, actions.len - 1)];
 

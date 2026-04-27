@@ -37,6 +37,18 @@ pub const Config = struct {
     // Stale acks (lease expiry testing)
     stale_rate: f64 = 0.03, // prob of "forgetting" a job instead of acking (lets lease expire)
 
+    // Chain jobs
+    chain_rate: f64 = 0.08, // fraction of enqueues that are chain jobs
+
+    // Cron operations
+    cron_rate: f64 = 0.03, // prob of cron operation per tick
+
+    // Batch lifecycle (create + seal)
+    batch_create_rate: f64 = 0.04, // prob of batch create per tick
+
+    // Heartbeat checkpoint/progress
+    checkpoint_rate: f64 = 0.3, // fraction of heartbeats that include checkpoint/progress
+
     // Time jumps
     time_jump_prob: f64 = 0.02, // prob of a large time jump per tick
     time_jump_max_ns: i64 = 120_000_000_000, // 120s max jump
