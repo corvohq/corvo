@@ -811,7 +811,7 @@ test "raft_net: 3-node TCP cluster — election + propose + commit + apply" {
     try testing.expectEqual(@as(usize, 1), counter.successes);
 
     var buf: [16]u8 = undefined;
-    const got = leader.?.db.getInto("rnet:1", &buf).?;
+    const got = (try leader.?.db.getInto("rnet:1", &buf)).?;
     try testing.expectEqualStrings("alpha", got);
 
     // ----- Phase 3: drive a bit longer; followers should also apply -----

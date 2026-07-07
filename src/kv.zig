@@ -45,7 +45,11 @@ pub const Store = struct {
     /// Returned slice is allocated by the DB's allocator — caller must
     /// free with `freeValue()` when done.
     pub fn get(self: *Store, key: []const u8) ?[]const u8 {
-        return self.db.get(key);
+        // A checksum failure on a committed page is corruption of durable
+        // state — fail-stop rather than return garbage or a false miss. On a
+        // clustered node this crash-and-resync is the correct recovery; on a
+        // single node it surfaces the problem loudly instead of hiding it.
+        return self.db.get(key) catch @panic("talon: page corruption on read (Store.get)");
     }
 
     /// Free a value returned by `get()`.
@@ -91,7 +95,8 @@ pub const WriteBatch = struct {
     /// Read from batch overlay first, then underlying store.
     /// Returned slice is valid until close().
     pub fn get(self: *WriteBatch, key: []const u8) ?[]const u8 {
-        const val = self.batch.get(key) orelse return null;
+        // Fail-stop on page corruption (see Store.get).
+        const val = (self.batch.get(key) catch @panic("talon: page corruption on read (batch.get)")) orelse return null;
         // Talon's batch.get() always allocates via db.allocator.dupe().
         // Track for bulk free on close().
         self.get_allocs.append(self.db.allocator, val) catch {};
@@ -101,7 +106,8 @@ pub const WriteBatch = struct {
     /// Zero-alloc read: copies value into caller-provided buffer.
     /// Returns slice of `out` on hit, null on miss. No heap allocation.
     pub fn getInto(self: *WriteBatch, key: []const u8, out: []u8) ?[]const u8 {
-        return self.batch.getInto(key, out);
+        // Fail-stop on page corruption (see Store.get).
+        return self.batch.getInto(key, out) catch @panic("talon: page corruption on read (batch.getInto)");
     }
 
     /// Buffer a key-value write.

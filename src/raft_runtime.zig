@@ -429,7 +429,7 @@ test "runtime: 3-node propose → commit → apply → completion" {
 
     // Leader's FSM has the data.
     var buf: [16]u8 = undefined;
-    const got = leader.?.db.getInto("job:1", &buf).?;
+    const got = (try leader.?.db.getInto("job:1", &buf)).?;
     try testing.expectEqualStrings("alpha", got);
     try testing.expect(leader.?.fsm.lastApplied() >= 1);
 
@@ -567,8 +567,8 @@ test "runtime: rolling restart — old leader stops, new leader elected, commits
     // Phase 5: verify both pre- and post-failover entries are visible
     // on the new leader's FSM.
     var buf: [16]u8 = undefined;
-    try testing.expect(new_leader.?.db.getInto("before:1", &buf) != null);
-    try testing.expect(new_leader.?.db.getInto("after:1", &buf) != null);
+    try testing.expect((try new_leader.?.db.getInto("before:1", &buf)) != null);
+    try testing.expect((try new_leader.?.db.getInto("after:1", &buf)) != null);
 }
 
 test "runtime: propose returns NotLeader when not leader" {

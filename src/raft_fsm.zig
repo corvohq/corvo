@@ -66,7 +66,7 @@ pub const OplogFsm = struct {
 
     fn loadAppliedCache(self: *OplogFsm) !void {
         var buf: [8]u8 = undefined;
-        const got = self.db.getInto(key_applied, &buf) orelse return;
+        const got = (self.db.getInto(key_applied, &buf) catch return FsmError.DecodeFailed) orelse return;
         if (got.len != 8) return FsmError.DecodeFailed;
         self.last_applied = std.mem.readInt(u64, buf[0..8], .big);
     }
@@ -259,7 +259,7 @@ test "fsm: apply set + delete idempotently" {
     try testing.expectEqual(@as(u64, 1), env.fsm.lastApplied());
 
     var buf: [16]u8 = undefined;
-    const got1 = env.db.getInto("job:1", &buf).?;
+    const got1 = (try env.db.getInto("job:1", &buf)).?;
     try testing.expectEqualStrings("alpha", got1);
 
     // Re-applying the same entry is a no-op.
@@ -272,7 +272,7 @@ test "fsm: apply set + delete idempotently" {
     defer freeEntry(testing.allocator, e2);
     try env.fsm.apply(e2);
     try testing.expectEqual(@as(u64, 2), env.fsm.lastApplied());
-    try testing.expect(env.db.getInto("job:1", &buf) == null);
+    try testing.expect((try env.db.getInto("job:1", &buf)) == null);
 }
 
 test "fsm: applyMany respects budget" {
@@ -315,7 +315,7 @@ test "fsm: persistence across reopen" {
         defer fsm.deinit();
         try testing.expectEqual(@as(u64, 1), fsm.lastApplied());
         var buf: [16]u8 = undefined;
-        const got = db.getInto("queue:default", &buf).?;
+        const got = (try db.getInto("queue:default", &buf)).?;
         try testing.expectEqualStrings("{}", got);
     }
 }
@@ -349,9 +349,9 @@ test "fsm: snapshot round-trip preserves FSM state" {
     try env.fsm.loadSnapshot(snap, 1);
     try testing.expectEqual(@as(u64, 1), env.fsm.lastApplied());
     var buf: [32]u8 = undefined;
-    const got1 = env.db.getInto("job:1", &buf).?;
+    const got1 = (try env.db.getInto("job:1", &buf)).?;
     try testing.expectEqualStrings("alpha", got1);
-    const got2 = env.db.getInto("job:2", &buf).?;
+    const got2 = (try env.db.getInto("job:2", &buf)).?;
     try testing.expectEqualStrings("beta", got2);
 }
 

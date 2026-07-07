@@ -198,7 +198,7 @@ test "migrate: fresh DB initialized with meta + bootstrap log entry" {
 
     // Existing FSM data is still there — migration did NOT touch it.
     var buf: [16]u8 = undefined;
-    const got = db.getInto("job:1", &buf).?;
+    const got = (try db.getInto("job:1", &buf)).?;
     try testing.expectEqualStrings("preexisting", got);
 }
 

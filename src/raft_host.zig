@@ -568,6 +568,6 @@ test "raft_host: 3-node TCP cluster — election + propose + commit + apply" {
     try testing.expectEqual(TokenState.committed, token.loadState());
 
     var buf: [16]u8 = undefined;
-    const got = leader.?.runtime.db.getInto("host3n:k1", &buf).?;
+    const got = (try leader.?.runtime.db.getInto("host3n:k1", &buf)).?;
     try testing.expectEqualStrings("v1", got);
 }

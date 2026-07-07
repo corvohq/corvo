@@ -117,14 +117,14 @@ pub const Storage = struct {
 
     fn loadMetaCache(self: *Storage) !void {
         var buf: [meta_max_size]u8 = undefined;
-        const got = self.db.getInto(key_meta, &buf) orelse return;
+        const got = (self.db.getInto(key_meta, &buf) catch return StorageError.IoError) orelse return;
         try self.decodeMetaInto(got);
     }
 
     fn loadSnapshotCache(self: *Storage) !void {
-        const meta_bytes = self.db.get(key_snap_meta) orelse return;
+        const meta_bytes = (self.db.get(key_snap_meta) catch return StorageError.IoError) orelse return;
         defer self.allocator.free(meta_bytes);
-        const data_bytes = self.db.get(key_snap_data) orelse return;
+        const data_bytes = (self.db.get(key_snap_data) catch return StorageError.IoError) orelse return;
         // data_bytes ownership transferred to self.snap_data_owned.
         const sm = decodeSnapshotMeta(meta_bytes) catch {
             self.allocator.free(data_bytes);
@@ -259,7 +259,7 @@ pub const Storage = struct {
         if (idx < self.first_idx or idx > self.last_idx) return StorageError.IndexOutOfRange;
         var key_buf: [log_key_size]u8 = undefined;
         encodeLogKey(&key_buf, idx);
-        const v = self.db.get(&key_buf) orelse return StorageError.IndexOutOfRange;
+        const v = (self.db.get(&key_buf) catch return StorageError.IoError) orelse return StorageError.IndexOutOfRange;
         defer self.allocator.free(v);
         const e = decodeEntry(v, self.allocator) catch return StorageError.IoError;
         // We only need the term — drop the data copy.
@@ -281,7 +281,7 @@ pub const Storage = struct {
         while (i < count) : (i += 1) {
             var key_buf: [log_key_size]u8 = undefined;
             encodeLogKey(&key_buf, lo + @as(u64, i));
-            const v = self.db.get(&key_buf) orelse return StorageError.IoError;
+            const v = (self.db.get(&key_buf) catch return StorageError.IoError) orelse return StorageError.IoError;
             defer self.allocator.free(v);
             out[i] = decodeEntry(v, arena_alloc) catch return StorageError.IoError;
         }
