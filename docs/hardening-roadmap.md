@@ -77,8 +77,13 @@ the COW work does not affect corvo's build until the re-pin below.
       back to previous snapshot, else `error.Corrupt` — never re-inits over a file.
 - [ ] **2-transaction freelist retention** — DEFERRED to Milestone 2. M1 leaks old
       pages (file grows, no regression vs today). Needed to reclaim space.
-- **Re-pin step (pending):** bump talon tag + corvo `build.zig.zon` hash; add `try`
-      at corvo call sites (`get`/`getInto` now return `!?[]u8`); re-run corvo suite.
+- [x] **Re-pin into corvo DONE + verified.** talon merged to master + tagged
+      `v0.4.0` locally; corvo call sites handle `error.PageCorrupt` (kv.zig wrapper
+      fail-stops → node crashes+resyncs; raft_storage maps to StorageError). Full
+      corvo suite green against the COW talon. build.zig.zon pins talon by local
+      path for now (like zig-raft). **FINALIZE before merge:** push talon
+      `master` + `v0.4.0`, then swap build.zig.zon to
+      `git+https://github.com/corvohq/talon.git#v0.4.0` + hash and re-verify.
 - [ ] Crash-injection sim: kill at random syscall points + torn-write injection,
       assert recovery yields a valid tree (sim does NO crash testing today).
 
