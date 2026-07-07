@@ -217,8 +217,12 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     }
                 }
 
-                if (job.max_retries > 0 and job.attempt >= job.max_retries) {
-                    // Dead — retries exhausted
+                if (job.attempt >= job.max_retries) {
+                    // Dead — retries exhausted. max_retries==0 means "no retries"
+                    // (dead on first failure), matching handler_fail's semantics.
+                    // The old `max_retries > 0` guard made reclaim treat 0 as
+                    // unlimited, so a lease-expired no-retry job looped forever
+                    // back to pending instead of dying (minor).
                     job.state = .dead;
                     job.completed_at_ns = now_ns;
                     job.failed_at_ns = now_ns;
@@ -238,6 +242,11 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     var dk_buf: keys.KeyBuf = undefined;
                     b.set(keys.deadKey(&dk_buf, now_ns, job_id), "");
                     self.dead_since_purge += 1;
+
+                    // Fire death webhook (reclaim dead was missing this — a job
+                    // that dies via lease expiry now notifies the same as one
+                    // that dies via an explicit fail).
+                    self.checkWebhooks(job_id, job.queue, .dead, now_ns);
 
                     // Batch failure tracking.
                     if (job.batch_id) |bid| {
@@ -309,10 +318,11 @@ fn applyExpire(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                 const key = iter.key();
                 const prefix_len = keys.prefix_expire.len;
                 const expires_at = keys.getU64BE(key[prefix_len .. prefix_len + 8]);
-                if (expires_at >= now_ns) {
-                    if (!iter.next()) break;
-                    continue;
-                }
+                // x| keys are globally sorted by expires_at (timestamp follows
+                // the prefix directly), so the first not-yet-expired key means
+                // every remaining key is also in the future — stop scanning
+                // instead of walking the whole index each tick (M12).
+                if (expires_at >= now_ns) break;
 
                 const job_id = key[prefix_len + 8 ..];
                 var jk_buf: keys.KeyBuf = undefined;
@@ -365,6 +375,8 @@ fn applyExpire(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                 var dk_buf: keys.KeyBuf = undefined;
                 b.set(keys.deadKey(&dk_buf, now_ns, job_id), "");
                 self.dead_since_purge += 1;
+                // Fire death webhook — expiry to dead was missing this.
+                self.checkWebhooks(job_id, job.queue, .dead, now_ns);
                 self.recordBulkResult(job_id, .update_state, "dead", "", now_ns);
 
                 affected += 1;

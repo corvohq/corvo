@@ -29,9 +29,20 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
     var last_queue_buf: [64]u8 = undefined;
     var last_queue_len: u8 = 0;
 
+    // Any early return below accounts the jobs already written this op into
+    // total_jobs first — otherwise a mid-batch error skips `total_jobs +=
+    // affected` and undercounts, drifting the max-jobs limit (M2). The jobs
+    // written before the error are real (they commit with the shared batch), so
+    // total_jobs must count them.
     for (op.jobs) |*enq| {
-        if (enq.queue.len == 0) return .{ .err = "missing queue" };
-        if (enq.job_id.len == 0) return .{ .err = "missing job_id" };
+        if (enq.queue.len == 0) {
+            self.total_jobs += affected;
+            return .{ .err = "missing queue" };
+        }
+        if (enq.job_id.len == 0) {
+            self.total_jobs += affected;
+            return .{ .err = "missing job_id" };
+        }
 
         assert.check(op.now_ns > 0, "enqueue op missing now_ns", .{});
         assert.check(enq.state == .pending or enq.state == .scheduled, "enqueue op has invalid state", .{});
@@ -42,9 +53,15 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
                 var bk_buf: keys.KeyBuf = undefined;
                 var batch_val_buf: [codec.max_batch_encoded_size]u8 = undefined;
                 const batch_bytes = b.getInto(keys.batchKey(&bk_buf, batch_id), &batch_val_buf);
-                if (batch_bytes == null) return .{ .err = "batch not found" };
+                if (batch_bytes == null) {
+                    self.total_jobs += affected;
+                    return .{ .err = "batch not found" };
+                }
                 const batch = codec.decodeBatch(batch_bytes.?);
-                if (!batch.open) return .{ .err = "batch sealed" };
+                if (!batch.open) {
+                    self.total_jobs += affected;
+                    return .{ .err = "batch sealed" };
+                }
             }
         }
 
@@ -63,6 +80,7 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
                     const id_len = @min(decoded.job_id.len, result.unique_job_id_buf.len);
                     @memcpy(result.unique_job_id_buf[0..id_len], decoded.job_id[0..id_len]);
                     result.unique_job_id_len = @intCast(id_len);
+                    self.total_jobs += affected;
                     return result;
                 }
                 unique_key_val = uk_key;
@@ -80,6 +98,7 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
             if (b.getInto(keys.queueConfigKey(&qc_buf, enq.queue), &qc_val_buf) == null) {
                 // New queue — enforce resource limit.
                 if (self.queue_configs.count() >= self.max_queues) {
+                    self.total_jobs += affected;
                     return .{ .err = "max queues exceeded" };
                 }
                 var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
@@ -104,6 +123,7 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
         var jk_buf: keys.KeyBuf = undefined;
         var existing_buf: [codec.max_job_encoded_size]u8 = undefined;
         if (b.getInto(keys.jobKey(&jk_buf, job.id), &existing_buf) != null) {
+            self.total_jobs += affected;
             return .{ .err = "job already exists" };
         }
 
@@ -127,7 +147,10 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
 
         // Write state index
         if (job.state == .scheduled) {
-            if (job.scheduled_at_ns == 0) return .{ .err = "invalid scheduled time" };
+            if (job.scheduled_at_ns == 0) {
+                self.total_jobs += affected;
+                return .{ .err = "invalid scheduled time" };
+            }
             var sk_buf: keys.KeyBuf = undefined;
             b.set(OpHandler.jobScheduledKey(&sk_buf, &job), "");
         } else {

@@ -26,7 +26,15 @@ pub const Indexer = struct {
     counter_delta_count: u32 = 0,
 
     const max_effects: u32 = 8192;
-    const max_counter_deltas: u32 = 128;
+    const max_counter_deltas: u32 = 1024;
+    /// Upper bound on effects / distinct-queue counter deltas a single op can
+    /// emit. A batch op carries at most rpc.MAX_BATCH_JOBS (256) jobs; each job
+    /// can, at most, drive one primary transition plus a chain enqueue plus a
+    /// batch-callback enqueue (≈3 distinct queues). 1024 is a comfortable cap
+    /// over that ~768 worst case. The pipeline flushes once fewer than this many
+    /// slots remain (nearFull), so a single op's records always fit and are
+    /// never silently dropped (M10).
+    const max_records_per_op: u32 = 1024;
 
     pub const IndexEffect = struct {
         kind: Kind,
@@ -73,12 +81,21 @@ pub const Indexer = struct {
         self.counter_delta_count = 0;
     }
 
+    /// True once either buffer has fewer than one op's worth of free slots.
+    /// The pipeline flushes on this signal *between* ops so the next op's
+    /// records always fit — addEffect/addCounterDelta never drop, so js|/jqs|
+    /// transitions and qc| counter deltas can never silently diverge (M10).
+    pub fn nearFull(self: *const Indexer) bool {
+        return self.effect_count + max_records_per_op > max_effects or
+            self.counter_delta_count + max_records_per_op > max_counter_deltas;
+    }
+
     // ====================================================================
     // Record methods — called by hot-path handlers
     // ====================================================================
 
     pub fn recordCreate(self: *Indexer, job_id: []const u8, queue: []const u8, state: types.JobState, created_at_ns: u64) void {
-        const e = self.addEffect() orelse return;
+        const e = self.addEffect();
         e.kind = .create;
         self.copyId(e, job_id, queue);
         e.new_state = state;
@@ -88,7 +105,7 @@ pub const Indexer = struct {
     }
 
     pub fn recordTransition(self: *Indexer, job_id: []const u8, queue: []const u8, old_state: types.JobState, new_state: types.JobState, created_at_ns: u64) void {
-        const e = self.addEffect() orelse return;
+        const e = self.addEffect();
         e.kind = .transition;
         self.copyId(e, job_id, queue);
         e.old_state = old_state;
@@ -100,7 +117,7 @@ pub const Indexer = struct {
     }
 
     pub fn recordDeleteAll(self: *Indexer, job_id: []const u8, queue: []const u8, old_state: types.JobState, created_at_ns: u64) void {
-        const e = self.addEffect() orelse return;
+        const e = self.addEffect();
         e.kind = .delete_all;
         self.copyId(e, job_id, queue);
         e.old_state = old_state;
@@ -288,8 +305,12 @@ pub const Indexer = struct {
     // Internal helpers
     // ====================================================================
 
-    fn addEffect(self: *Indexer) ?*IndexEffect {
-        if (self.effect_count >= max_effects) return null;
+    fn addEffect(self: *Indexer) *IndexEffect {
+        // Never silently drops: the pipeline flushes between ops when nearFull()
+        // so there is always room for the current op's effects (M10). Reaching
+        // this assert means a caller accumulated a full op's worth of effects
+        // without giving the pipeline a flush point.
+        assert.check(self.effect_count < max_effects, "indexer: effect buffer overflow ({d}) — pipeline must flush at nearFull()", .{self.effect_count});
         const e = &self.effects[self.effect_count];
         self.effect_count += 1;
         return e;
@@ -314,8 +335,9 @@ pub const Indexer = struct {
                 return;
             }
         }
-        // New queue — add entry.
-        if (self.counter_delta_count >= max_counter_deltas) return;
+        // New queue — add entry. Never silently drops (see addEffect): the
+        // pipeline flushes between ops when nearFull() so there is always room.
+        assert.check(self.counter_delta_count < max_counter_deltas, "indexer: counter-delta buffer overflow ({d}) — pipeline must flush at nearFull()", .{self.counter_delta_count});
         var cd = &self.counter_deltas[self.counter_delta_count];
         cd.* = .{};
         const q_len: u8 = @intCast(@min(queue.len, 64));
@@ -324,4 +346,71 @@ pub const Indexer = struct {
         cd.deltas[@intFromEnum(state)] = delta;
         self.counter_delta_count += 1;
     }
+
+    /// Discard this tick's accumulated counter deltas for `queue` in the given
+    /// states. clear-queue calls this after zeroing the qc| counters so the
+    /// pre-clear enqueue deltas (for jobs the clear just deleted) don't get
+    /// re-applied on top of the zeroed counter when flushed (M11). Post-clear
+    /// ops re-accumulate their own deltas normally.
+    pub fn resetQueueStateDeltas(self: *Indexer, queue: []const u8, states: []const types.JobState) void {
+        for (self.counter_deltas[0..self.counter_delta_count]) |*cd| {
+            if (cd.queue_len == queue.len and std.mem.eql(u8, cd.queueSlice(), queue)) {
+                for (states) |s| cd.deltas[@intFromEnum(s)] = 0;
+                return;
+            }
+        }
+    }
 };
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "nearFull flags one op's worth of headroom before overflow (M10)" {
+    const testing = std.testing;
+    const idx = try testing.allocator.create(Indexer);
+    defer testing.allocator.destroy(idx);
+    idx.* = .{};
+    idx.reset();
+
+    try testing.expect(!idx.nearFull());
+
+    // Effect buffer: false with exactly max_records_per_op slots free, true once
+    // fewer than that remain — so the next op always fits.
+    idx.effect_count = Indexer.max_effects - Indexer.max_records_per_op;
+    try testing.expect(!idx.nearFull());
+    idx.effect_count = Indexer.max_effects - Indexer.max_records_per_op + 1;
+    try testing.expect(idx.nearFull());
+
+    idx.effect_count = 0;
+    idx.counter_delta_count = Indexer.max_counter_deltas - Indexer.max_records_per_op;
+    try testing.expect(!idx.nearFull());
+    idx.counter_delta_count = Indexer.max_counter_deltas - Indexer.max_records_per_op + 1;
+    try testing.expect(idx.nearFull());
+}
+
+test "resetQueueStateDeltas clears only the given states (M11)" {
+    const testing = std.testing;
+    const idx = try testing.allocator.create(Indexer);
+    defer testing.allocator.destroy(idx);
+    idx.* = .{};
+    idx.reset();
+
+    // Simulate a tick that enqueued pending jobs and moved one to active.
+    idx.addCounterDelta("q", .pending, 3);
+    idx.addCounterDelta("q", .active, 1);
+    idx.addCounterDelta("other", .pending, 5);
+
+    // clear-queue on "q" discards the pending/scheduled/retrying deltas but must
+    // leave active (in-flight jobs survive the clear) and "other" untouched.
+    idx.resetQueueStateDeltas("q", &.{ .pending, .scheduled, .retrying });
+
+    const q = &idx.counter_deltas[0];
+    try testing.expectEqualStrings("q", q.queueSlice());
+    try testing.expectEqual(@as(i32, 0), q.deltas[@intFromEnum(types.JobState.pending)]);
+    try testing.expectEqual(@as(i32, 1), q.deltas[@intFromEnum(types.JobState.active)]);
+
+    const other = &idx.counter_deltas[1];
+    try testing.expectEqualStrings("other", other.queueSlice());
+    try testing.expectEqual(@as(i32, 5), other.deltas[@intFromEnum(types.JobState.pending)]);
+}

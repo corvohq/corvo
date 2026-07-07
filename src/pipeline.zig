@@ -190,7 +190,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
         /// can be disjoint, so the collection must hold both sets (each bounded by
         /// max_completions) to avoid a stack buffer overflow when merging them.
         const max_recv_conns: u32 = 2 * max_completions;
-        const max_waiting_conns: u32 = 4096;
+        /// Sized for the connection target (20k+). waiting_conns and the
+        /// PrepareSlot send buffers hold at most one entry per connection, so
+        /// this bounds them for the 20k-connection goal; the 4096 default made
+        /// the 4097th subscriber panic (M6). The Pipeline is heap-allocated in
+        /// production (initHeap) and inside the heap TestContext, so the larger
+        /// inline arrays are stack-safe. storeSubscription also rejects
+        /// gracefully rather than asserting if this is ever exceeded.
+        const max_waiting_conns: u32 = 20480;
         const max_notified_queues: u32 = 64;
         const max_prepare_slots: u32 = 4;
 
@@ -942,6 +949,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     for (queues) |q| self.recordNotifiedQueue(q);
                 }
 
+                // Drain the indexer between maintenance ops so a burst (e.g.
+                // cron firing many jobs) can never overflow the effect buffer
+                // (M10). The final flush below handles the remainder.
+                if (self.handler.indexer.nearFull()) self.handler.indexer.flush(&batch);
+
                 iv.last.* = now_ns;
                 // Reset the terminal-job accumulator only once the backlog is
                 // drained. Per-tick purge is capped; if this pass hit the cap
@@ -953,6 +965,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 self.maintenance_runs += 1;
                 self.applied_total += 1;
             }
+
+            // Flush deferred indexes (e.g. cron enqueues) into the maintenance
+            // batch. Without this, effects recorded during maintenance were
+            // dropped by the next resetEffects, leaving cron jobs missing their
+            // read indexes and qc| counter (KV/read drift).
+            self.handler.indexer.flush(&batch);
 
             batch.commit();
 
@@ -1116,6 +1134,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
             const t_apply = Timer.start(clock);
             for (self.frames[0..self.frame_count], 0..) |*frame, i| {
                 self.results[i] = self.decodeAndApply(&kv_batch, frame, @intCast(i));
+                // Bounded-pass index flush: drain the indexer between ops once
+                // it's within one op's worth of full so a later op's effects
+                // can never overflow and be silently dropped (M10). Flushing
+                // mid-loop writes into the same batch (committed below), so the
+                // result is identical to a single end-of-loop flush.
+                if (self.handler.indexer.nearFull()) self.handler.indexer.flush(&kv_batch);
             }
             addPhase(&self.exec_apply_ns, t_apply.elapsed(clock));
 
@@ -1746,11 +1770,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
             for (self.waiting_conns[0..self.waiting_conn_count]) |wc| {
                 if (wc == conn_id) return;
             }
-            assert.check(
-                self.waiting_conn_count < max_waiting_conns,
-                "pipeline: waiting_conns overflow",
-                .{},
-            );
+            // Reject the subscription gracefully if the waiting list is full
+            // rather than asserting (M6). Sized for the connection target, so
+            // this is only reachable past it — better to leave one worker
+            // unserved than to panic and drop every connection.
+            if (self.waiting_conn_count >= max_waiting_conns) return;
             self.waiting_conns[self.waiting_conn_count] = conn_id;
             self.waiting_conn_count += 1;
         }
@@ -1876,6 +1900,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
                 c.prefetch -= result.affected;
                 self.subscriptions_fulfilled += 1;
+
+                // Bounded-pass index flush (see executeBatch): drain the indexer
+                // between fetches so a later fetch's transitions can never
+                // overflow the effect buffer and be silently dropped (M10).
+                if (self.handler.indexer.nearFull()) self.handler.indexer.flush(&kv_batch);
 
                 // Swap served connection behind the boundary.
                 end -= 1;

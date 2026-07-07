@@ -102,6 +102,14 @@ pub fn applyClearQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Clear
         b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
     }
 
+    // Drop this tick's accumulated pending/scheduled/retrying deltas for the
+    // cleared queue. Otherwise the indexer's end-of-tick flush would re-apply
+    // deltas from enqueues that happened earlier this tick (whose jobs the
+    // clear just deleted) on top of the zeroed qc| counter — leaving KV
+    // non-zero while memory says zero (M11). Post-clear enqueues in the same
+    // tick re-accumulate their own deltas and flush correctly on top of zero.
+    self.indexer.resetQueueStateDeltas(op.queue, &.{ .pending, .scheduled, .retrying });
+
     return .{};
 }
 

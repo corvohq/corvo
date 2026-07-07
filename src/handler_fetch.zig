@@ -49,9 +49,11 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
         );
         defer gl_iter.close();
         var gl_count: u32 = 0;
+        // Stop counting once the limit is reached — the exact overage is
+        // irrelevant, only whether we're at/over the cap (M13 scan cost).
         if (gl_iter.first()) {
             gl_count += 1;
-            while (gl_iter.next()) gl_count += 1;
+            while (gl_count < self.global_rate_limit and gl_iter.next()) gl_count += 1;
         }
         if (gl_count >= self.global_rate_limit) return result;
     }
@@ -81,9 +83,10 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             );
             defer rl_iter.close();
             var rate_count: u32 = 0;
+            // Stop once the limit is reached (M13 scan cost).
             if (rl_iter.first()) {
                 rate_count += 1;
-                while (rl_iter.next()) rate_count += 1;
+                while (rate_count < queue.rate_limit and rl_iter.next()) rate_count += 1;
             }
             if (rate_count >= queue.rate_limit) continue;
         }
@@ -182,14 +185,19 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
                 self.incrFairnessServed(queue_name, g);
             }
 
-            // Write rate limit entries.
+            // Write rate limit entries. Disambiguate with lease_counter (the
+            // just-assigned lease token), which is monotonic and unique per
+            // claim across the whole process. The old `random_seed +% affected`
+            // collided when two fetch ops ran in one tick with equal seeds (e.g.
+            // fulfillSubscriptions, where random_seed is 0), causing the window
+            // to undercount claims and the rate limit to be bypassed (M13).
             if (has_rl) {
                 var rlk_buf: keys.KeyBuf = undefined;
-                b.set(keys.rateLimitKey(&rlk_buf, queue_name, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected))), "");
+                b.set(keys.rateLimitKey(&rlk_buf, queue_name, op.now_ns, self.lease_counter), "");
             }
             if (has_global_rl) {
                 var gl_rlk_buf: keys.KeyBuf = undefined;
-                b.set(keys.globalRateLimitKey(&gl_rlk_buf, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected)) +% 0x80000000), "");
+                b.set(keys.globalRateLimitKey(&gl_rlk_buf, op.now_ns, self.lease_counter), "");
             }
             self.indexer.recordTransition(job_id, queue_name, .pending, .active, job.created_at_ns);
             self.updateQueueCounterMem(queue_name, .pending, .active);
@@ -393,13 +401,16 @@ fn fetchWithFairness(
             self.incrFairnessServed(queue_name, g);
         }
 
+        // See non-fairness path: lease_counter is unique per claim, avoiding the
+        // random_seed collision that let two same-tick fetches undercount the
+        // rate-limit window (M13).
         if (has_rl) {
             var rlk_buf: keys.KeyBuf = undefined;
-            b.set(keys.rateLimitKey(&rlk_buf, queue_name, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected))), "");
+            b.set(keys.rateLimitKey(&rlk_buf, queue_name, op.now_ns, self.lease_counter), "");
         }
         if (has_global_rl) {
             var gl_rlk_buf: keys.KeyBuf = undefined;
-            b.set(keys.globalRateLimitKey(&gl_rlk_buf, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected)) +% 0x80000000), "");
+            b.set(keys.globalRateLimitKey(&gl_rlk_buf, op.now_ns, self.lease_counter), "");
         }
         self.indexer.recordTransition(sel_job_id, queue_name, .pending, .active, job.created_at_ns);
         self.updateQueueCounterMem(queue_name, .pending, .active);

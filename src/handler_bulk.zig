@@ -26,6 +26,18 @@ const BatchMod = struct {
 };
 
 pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkActionOp) ops.OpResult {
+    // Bulk move requires an existing destination queue. Moving jobs into a queue
+    // with no config/name key strands them: fetch's getQueueConfig returns null
+    // and skips the queue, so the jobs are never claimable. Validate once, up
+    // front (client-provided target → error, not silent stranding).
+    if (op.action == .move) {
+        const move_to = op.move_to_queue orelse return .{ .err = "missing target queue" };
+        var qn_buf: keys.KeyBuf = undefined;
+        if (b.get(keys.queueNameKey(&qn_buf, move_to)) == null) {
+            return .{ .err = "target queue not found" };
+        }
+    }
+
     var affected: u32 = 0;
 
     // Track batch counter adjustments for delete/cancel.
