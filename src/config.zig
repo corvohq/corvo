@@ -1,11 +1,10 @@
-//! Server configuration — config file parser + cluster config hash.
+//! Server configuration — config file parser.
 //!
 //! Config file: simple key = value format, # comments, blank lines.
 //! Load order: defaults → file (--config) → CLI args.
 //!
-//! Cluster consensus: clusterHash() computes FNV-1a over shared params
-//! that must match across all nodes. Exchanged during election; mismatch
-//! means nodes refuse to form a cluster.
+//! Cluster identity: an explicit `cluster-id` (u64, non-zero) shared by all
+//! voters; the raft layer drops cross-cluster traffic.
 
 const std = @import("std");
 const assert = @import("assert.zig");
@@ -25,11 +24,15 @@ pub const ServerConfig = struct {
     // Auth
     admin_password: []const u8 = "",
 
-    // Cluster identity (node-local)
+    // Cluster identity (node-local). node_id enables raft mode; peer specs
+    // are `id[:uuidhex]@host:port` with the peer's CLIENT address (the raft
+    // transport binds/dials on port + 1000, see resolvedClusterPort).
     node_id: []const u8 = "",
     peers: []const u8 = "",
     cluster_port: u16 = 0, // 0 = server port + 1000
-    discover_dns_name: []const u8 = "", // DNS name for peer auto-discovery
+    /// Cluster identifier shared by all voters; raft drops cross-cluster
+    /// traffic. Required (non-zero) in cluster mode.
+    cluster_id: u64 = 0,
     /// Shared secret authenticating peer connections (HMAC challenge-response
     /// on the cluster port). Empty = unauthenticated (single-node / trusted net).
     /// Set via --cluster-secret or the CORVO_CLUSTER_SECRET env var.
@@ -58,8 +61,6 @@ pub const ServerConfig = struct {
     worker_timeout_ns: u64 = 60_000_000_000, // 60s — workers with no heartbeat for this long are removed
     cron_interval_ns: u64 = 10_000_000_000, // 10s — scan cron schedules for due fires (minute resolution)
 
-    sync_replication: bool = false,
-
     // ================================================================
     // Accessors
     // ================================================================
@@ -71,29 +72,6 @@ pub const ServerConfig = struct {
     /// Resolved cluster port: explicit value or server port + 1000.
     pub fn resolvedClusterPort(self: *const ServerConfig) u16 {
         return if (self.cluster_port > 0) self.cluster_port else self.port +| 1000;
-    }
-
-    // ================================================================
-    // Cluster config hash
-    // ================================================================
-
-    /// FNV-1a hash of shared parameters. Nodes exchange this during
-    /// election; mismatch = reject proposal, refuse to form cluster.
-    pub fn clusterHash(self: *const ServerConfig) u64 {
-        var h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
-        h = fnvU32(h, self.max_payload_size);
-        h = fnvU32(h, self.max_queues);
-        h = fnvU32(h, self.max_jobs);
-        h = fnvU32(h, self.max_tags_per_queue);
-        h = fnvU64(h, self.promote_interval_ns);
-        h = fnvU64(h, self.reclaim_interval_ns);
-        h = fnvU64(h, self.unique_interval_ns);
-        h = fnvU64(h, self.rate_limit_interval_ns);
-        h = fnvU64(h, self.expire_interval_ns);
-        h = fnvU64(h, self.purge_interval_ns);
-        h = fnvU32(h, self.purge_threshold);
-        h = fnvByte(h, @intFromBool(self.sync_replication));
-        return h;
     }
 
     // ================================================================
@@ -112,6 +90,7 @@ pub const ServerConfig = struct {
         InvalidMaxConns,
         InvalidMaxQueues,
         ClusterMissingNodeId,
+        ClusterMissingClusterId,
     };
 
     /// Validate config invariants. Call after loading file + CLI args.
@@ -124,8 +103,8 @@ pub const ServerConfig = struct {
             return error.InvalidMaxQueues;
         if (self.node_id.len == 0 and self.peers.len > 0)
             return error.ClusterMissingNodeId;
-        if (self.discover_dns_name.len > 0 and self.node_id.len == 0)
-            return error.ClusterMissingNodeId;
+        if (self.clusterMode() and self.cluster_id == 0)
+            return error.ClusterMissingClusterId;
     }
 
     /// Parse config file content into this ServerConfig.
@@ -186,16 +165,14 @@ pub const ServerConfig = struct {
             self.purge_threshold = parseInt(u32, val) orelse return error.InvalidValue;
         } else if (eql(key, "purge-retention")) {
             self.purge_retention_ns = (parseInt(u64, val) orelse return error.InvalidValue) * 3_600_000_000_000;
-        } else if (eql(key, "sync-replication")) {
-            self.sync_replication = parseBool(val) orelse return error.InvalidValue;
         } else if (eql(key, "node-id")) {
             self.node_id = val;
         } else if (eql(key, "peers")) {
             self.peers = val;
         } else if (eql(key, "cluster-port")) {
             self.cluster_port = parseInt(u16, val) orelse return error.InvalidValue;
-        } else if (eql(key, "discover-dns-name")) {
-            self.discover_dns_name = val;
+        } else if (eql(key, "cluster-id")) {
+            self.cluster_id = parseInt(u64, val) orelse return error.InvalidValue;
         } else if (eql(key, "admin-password")) {
             self.admin_password = val;
         } else {
@@ -217,28 +194,6 @@ pub const ServerConfig = struct {
         return null;
     }
 };
-
-// ============================================================================
-// FNV-1a helpers
-// ============================================================================
-
-fn fnvByte(h: u64, b: u8) u64 {
-    return (h ^ b) *% 0x00000100000001B3;
-}
-
-fn fnvU32(h: u64, v: u32) u64 {
-    const bytes = std.mem.toBytes(v);
-    var r = h;
-    for (&bytes) |b| r = fnvByte(r, b);
-    return r;
-}
-
-fn fnvU64(h: u64, v: u64) u64 {
-    const bytes = std.mem.toBytes(v);
-    var r = h;
-    for (&bytes) |b| r = fnvByte(r, b);
-    return r;
-}
 
 // ============================================================================
 // Tests
@@ -264,7 +219,7 @@ test "config: parse file" {
         \\data-dir = /var/lib/corvo
         \\max-payload-size = 131072
         \\max-queues = 200
-        \\sync-replication = true
+        \\cluster-id = 42
         \\node-id = node-1
         \\peers = node-2@10.0.0.2:9878,node-3@10.0.0.3:9878
         \\
@@ -276,7 +231,7 @@ test "config: parse file" {
     try testing.expectEqualStrings("/var/lib/corvo", c.data_dir);
     try testing.expectEqual(@as(u32, 131072), c.max_payload_size);
     try testing.expectEqual(@as(u32, 200), c.max_queues);
-    try testing.expect(c.sync_replication);
+    try testing.expectEqual(@as(u64, 42), c.cluster_id);
     try testing.expect(c.clusterMode());
     try c.validate();
 }
@@ -312,56 +267,23 @@ test "config: invalid value errors" {
     try testing.expectError(error.InvalidValue, c.loadFile("port = abc\n"));
 }
 
-test "config: cluster hash deterministic" {
-    const c1 = ServerConfig{};
-    const c2 = ServerConfig{};
-    try testing.expectEqual(c1.clusterHash(), c2.clusterHash());
-    try testing.expect(c1.clusterHash() != 0);
-}
-
-test "config: cluster hash changes with shared params" {
-    const c1 = ServerConfig{};
-
-    var c2 = ServerConfig{};
-    c2.max_payload_size = 131072;
-    try testing.expect(c1.clusterHash() != c2.clusterHash());
-
-    var c3 = ServerConfig{};
-    c3.promote_interval_ns = 5_000_000_000;
-    try testing.expect(c1.clusterHash() != c3.clusterHash());
-
-    var c4 = ServerConfig{};
-    c4.sync_replication = true;
-    try testing.expect(c1.clusterHash() != c4.clusterHash());
-}
-
-test "config: cluster hash ignores node-local params" {
-    const c1 = ServerConfig{};
-
-    var c2 = ServerConfig{};
-    c2.bind = "192.168.1.1";
-    c2.port = 3000;
-    c2.data_dir = "/other/path";
-    c2.max_conns = 8192;
-    c2.node_id = "node-2";
-    try testing.expectEqual(c1.clusterHash(), c2.clusterHash());
-}
-
 test "config: validate catches bad config" {
     {
-        // node_id alone is valid (bootstrap mode).
+        // node_id + cluster_id is valid (single-node raft).
         var c = ServerConfig{};
         c.node_id = "node-1";
+        c.cluster_id = 7;
         try c.validate();
+    }
+    {
+        // Cluster mode without a cluster id is rejected.
+        var c = ServerConfig{};
+        c.node_id = "node-1";
+        try testing.expectError(error.ClusterMissingClusterId, c.validate());
     }
     {
         var c = ServerConfig{};
         c.peers = "node-2@10.0.0.2:9878";
-        try testing.expectError(error.ClusterMissingNodeId, c.validate());
-    }
-    {
-        var c = ServerConfig{};
-        c.discover_dns_name = "corvo.svc.cluster.local";
         try testing.expectError(error.ClusterMissingNodeId, c.validate());
     }
     {

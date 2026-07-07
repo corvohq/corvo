@@ -10,7 +10,12 @@
 //!   r:meta             encoded Meta (term, voted_for, instance_uuid, cluster_id)
 //!   r:log:<be-u64>     encoded Entry at that index
 //!   r:snap:meta        encoded SnapshotMeta
-//!   r:snap:data        raw FSM snapshot bytes
+//!   r:snap:manifest    chunk_count(4) | total_len(8) | xxhash64-of-blob(8)
+//!   r:snap:c:<be-u32>  FSM snapshot blob chunk (max snapshot_chunk_size)
+//!
+//! The snapshot blob is chunked because Talon's ValueLog caps a single
+//! value at 256 KiB — one key per chunk keeps every value comfortably
+//! under that cap regardless of FSM size.
 //!
 //! All multi-byte integers are big-endian on disk.
 
@@ -33,7 +38,20 @@ pub const max_voted_for_len: usize = 64;
 /// Talon key prefixes — kept narrow for fast prefix scans.
 const key_meta = "r:meta";
 const key_snap_meta = "r:snap:meta";
-const key_snap_data = "r:snap:data";
+const key_snap_manifest = "r:snap:manifest";
+/// Snapshot blob chunk keys: prefix + be-u32 chunk ordinal.
+const snap_chunk_prefix: []const u8 = "r:snap:c:";
+const snap_chunk_key_size: usize = snap_chunk_prefix.len + 4;
+/// Smallest key strictly greater than every chunk key (':' = 0x3A; ';' = 0x3B).
+const snap_chunk_upper: []const u8 = "r:snap:c;";
+/// Snapshot blob chunk payload size — half of Talon's 256 KiB single-value
+/// cap, so each chunk write is comfortably legal.
+pub const snapshot_chunk_size: usize = 128 * 1024;
+/// Bound on chunks per snapshot (max blob = 8 GiB). Keeps the reassembly
+/// loop explicitly bounded.
+pub const max_snapshot_chunks: u32 = 65_536;
+/// Manifest layout: chunk_count(4) | total_len(8) | xxhash64(8).
+const snap_manifest_size: usize = 4 + 8 + 8;
 const log_key_prefix: []const u8 = "r:log:";
 const log_key_size: usize = log_key_prefix.len + 8;
 /// Smallest key strictly greater than every "r:log:..." entry — used
@@ -124,12 +142,29 @@ pub const Storage = struct {
     fn loadSnapshotCache(self: *Storage) !void {
         const meta_bytes = (self.db.get(key_snap_meta) catch return StorageError.IoError) orelse return;
         defer self.allocator.free(meta_bytes);
-        const data_bytes = (self.db.get(key_snap_data) catch return StorageError.IoError) orelse return;
-        // data_bytes ownership transferred to self.snap_data_owned.
-        const sm = decodeSnapshotMeta(meta_bytes) catch {
-            self.allocator.free(data_bytes);
-            return StorageError.IoError;
-        };
+        // Meta and manifest are written in one batch — meta without a
+        // manifest means torn/corrupted state, not "no snapshot".
+        const manifest_bytes = (self.db.get(key_snap_manifest) catch return StorageError.IoError) orelse return StorageError.IoError;
+        defer self.allocator.free(manifest_bytes);
+        const manifest = decodeSnapManifest(manifest_bytes) catch return StorageError.IoError;
+        if (manifest.chunk_count > max_snapshot_chunks) return StorageError.IoError;
+        const expected_chunks: u64 = (manifest.total_len + snapshot_chunk_size - 1) / snapshot_chunk_size;
+        if (manifest.chunk_count != expected_chunks) return StorageError.IoError;
+        const data = try self.allocator.alloc(u8, @intCast(manifest.total_len));
+        errdefer self.allocator.free(data);
+        var i: u32 = 0;
+        while (i < manifest.chunk_count) : (i += 1) {
+            var key_buf: [snap_chunk_key_size]u8 = undefined;
+            encodeSnapChunkKey(&key_buf, i);
+            const chunk = (self.db.get(&key_buf) catch return StorageError.IoError) orelse return StorageError.IoError;
+            defer self.allocator.free(chunk);
+            const off = @as(usize, i) * snapshot_chunk_size;
+            const end = @min(off + snapshot_chunk_size, data.len);
+            if (chunk.len != end - off) return StorageError.IoError;
+            @memcpy(data[off..end], chunk);
+        }
+        if (std.hash.XxHash64.hash(0, data) != manifest.blob_hash) return StorageError.IoError;
+        const sm = decodeSnapshotMeta(meta_bytes) catch return StorageError.IoError;
         const cfg_owned = if (sm.config.len == 0) null else blk: {
             const c = try self.allocator.alloc(u8, sm.config.len);
             @memcpy(c, sm.config);
@@ -140,7 +175,7 @@ pub const Storage = struct {
             .last_included_term = sm.last_included_term,
             .config = if (cfg_owned) |c| c else &.{},
         };
-        self.snap_data_owned = data_bytes;
+        self.snap_data_owned = data;
         self.snap_config_owned = cfg_owned;
     }
 
@@ -359,12 +394,30 @@ pub const Storage = struct {
 
     fn saveSnapshotImpl(ptr: *anyopaque, meta: SnapshotMeta, data: []const u8) StorageError!void {
         const self: *Storage = @ptrCast(@alignCast(ptr));
+        const chunk_count: u32 = @intCast((data.len + snapshot_chunk_size - 1) / snapshot_chunk_size);
+        check(chunk_count <= max_snapshot_chunks, "snapshot blob too large: {d} bytes", .{data.len});
         var meta_buf: [256]u8 = undefined;
         const written = encodeSnapshotMeta(&meta_buf, meta) catch return StorageError.IoError;
+        var manifest_buf: [snap_manifest_size]u8 = undefined;
+        encodeSnapManifest(&manifest_buf, chunk_count, data.len, std.hash.XxHash64.hash(0, data));
         var batch = self.db.newBatch();
         defer self.db.closeBatch(batch);
         batch.set(key_snap_meta, meta_buf[0..written]);
-        batch.set(key_snap_data, data);
+        batch.set(key_snap_manifest, &manifest_buf);
+        // Drop stale chunks past the new count (a previous snapshot may have
+        // been larger); chunks [0, chunk_count) are overwritten below, so the
+        // deleted range never overlaps the new writes.
+        var stale_lo: [snap_chunk_key_size]u8 = undefined;
+        encodeSnapChunkKey(&stale_lo, chunk_count);
+        batch.deleteRange(&stale_lo, snap_chunk_upper);
+        var i: u32 = 0;
+        while (i < chunk_count) : (i += 1) {
+            const off = @as(usize, i) * snapshot_chunk_size;
+            const end = @min(off + snapshot_chunk_size, data.len);
+            var key_buf: [snap_chunk_key_size]u8 = undefined;
+            encodeSnapChunkKey(&key_buf, i);
+            batch.set(&key_buf, data[off..end]);
+        }
         batch.commit();
         // Refresh cache: free old, copy new.
         self.freeSnapshotCache();
@@ -450,6 +503,32 @@ fn decodeLogKey(key: []const u8) !u64 {
     if (key.len != log_key_size) return error.InvalidKey;
     if (!std.mem.eql(u8, key[0..log_key_prefix.len], log_key_prefix)) return error.InvalidKey;
     return std.mem.readInt(u64, key[log_key_prefix.len..][0..8], .big);
+}
+
+fn encodeSnapChunkKey(out: *[snap_chunk_key_size]u8, ordinal: u32) void {
+    @memcpy(out[0..snap_chunk_prefix.len], snap_chunk_prefix);
+    std.mem.writeInt(u32, out[snap_chunk_prefix.len..][0..4], ordinal, .big);
+}
+
+const SnapManifest = struct {
+    chunk_count: u32,
+    total_len: u64,
+    blob_hash: u64,
+};
+
+fn encodeSnapManifest(out: *[snap_manifest_size]u8, chunk_count: u32, total_len: usize, blob_hash: u64) void {
+    std.mem.writeInt(u32, out[0..4], chunk_count, .big);
+    std.mem.writeInt(u64, out[4..12], @intCast(total_len), .big);
+    std.mem.writeInt(u64, out[12..20], blob_hash, .big);
+}
+
+fn decodeSnapManifest(bytes: []const u8) !SnapManifest {
+    if (bytes.len != snap_manifest_size) return error.InvalidManifest;
+    return .{
+        .chunk_count = std.mem.readInt(u32, bytes[0..4], .big),
+        .total_len = std.mem.readInt(u64, bytes[4..12], .big),
+        .blob_hash = std.mem.readInt(u64, bytes[12..20], .big),
+    };
 }
 
 fn encodeMeta(buf: *[meta_max_size]u8, m: Meta) !usize {
@@ -652,6 +731,69 @@ test "raft_storage: snapshot round-trip" {
     try testing.expectEqual(@as(u64, 42), s.lastIndex());
     try testing.expectEqual(@as(u64, 7), try s.termAt(42));
     try testing.expectError(StorageError.IndexOutOfRange, s.termAt(41));
+}
+
+test "raft_storage: chunked snapshot > 256 KiB round-trips, survives reopen, stale chunks reclaimed" {
+    const path = "/tmp/corvo-snap-storage-chunked";
+    // 3 chunks: two full 128 KiB chunks + a 37,859-byte tail; total is
+    // well past Talon's 256 KiB single-value cap.
+    const big_len: usize = 300_003;
+    const big = try testing.allocator.alloc(u8, big_len);
+    defer testing.allocator.free(big);
+    var rng = std.Random.DefaultPrng.init(0xC0DEC0DE);
+    rng.random().bytes(big);
+
+    std.fs.cwd().deleteFile(path) catch {};
+    std.fs.cwd().deleteFile(path ++ ".vlog") catch {};
+    {
+        const db = try talon.DB.open(testing.allocator, path, .{});
+        defer db.close();
+        var s_obj = try Storage.init(testing.allocator, db);
+        defer s_obj.deinit();
+        const s = s_obj.storage();
+        try s.saveSnapshot(.{
+            .last_included_index = 100,
+            .last_included_term = 3,
+            .config = "n1,n2,n3",
+        }, big);
+        const snap = s.loadSnapshot().?;
+        try testing.expectEqualSlices(u8, big, snap.data);
+    }
+    {
+        const db = try talon.DB.open(testing.allocator, path, .{});
+        defer {
+            db.close();
+            std.fs.cwd().deleteFile(path) catch {};
+            std.fs.cwd().deleteFile(path ++ ".vlog") catch {};
+        }
+        var s_obj = try Storage.init(testing.allocator, db);
+        defer s_obj.deinit();
+        const s = s_obj.storage();
+        // Reopen reassembles the blob from chunks and verifies the hash.
+        const snap = s.loadSnapshot().?;
+        try testing.expectEqualSlices(u8, big, snap.data);
+        try testing.expectEqual(@as(u64, 100), snap.meta.last_included_index);
+
+        // A smaller follow-up snapshot must reclaim the stale chunk keys.
+        try s.saveSnapshot(.{
+            .last_included_index = 200,
+            .last_included_term = 4,
+            .config = "n1,n2,n3",
+        }, "tiny");
+        const snap2 = s.loadSnapshot().?;
+        try testing.expectEqualStrings("tiny", snap2.data);
+        var chunk1_key: [snap_chunk_key_size]u8 = undefined;
+        var chunk2_key: [snap_chunk_key_size]u8 = undefined;
+        encodeSnapChunkKey(&chunk1_key, 1);
+        encodeSnapChunkKey(&chunk2_key, 2);
+        var probe: [8]u8 = undefined;
+        try testing.expect((try db.getInto(&chunk1_key, &probe)) == null);
+        try testing.expect((try db.getInto(&chunk2_key, &probe)) == null);
+        var chunk0_key: [snap_chunk_key_size]u8 = undefined;
+        encodeSnapChunkKey(&chunk0_key, 0);
+        const got0 = (try db.getInto(&chunk0_key, &probe)).?;
+        try testing.expectEqualStrings("tiny", got0);
+    }
 }
 
 test "raft_storage: compactLog drops entries" {

@@ -127,24 +127,68 @@ root-caused, and fixed by making the Node own its peer-id bytes.
 
 ---
 
-## Phase 3 — wire raft into the binary
+## Phase 3 — wire raft into the binary — DONE (2026-07-07)
 
-Turn the tested scaffolding into live clustering.
+Raft is the live clustering stack; the legacy PBR stack (cluster.zig /
+election.zig / replicator.zig / tcp_transport.zig / follower.zig /
+cluster_sim.zig + the on-disk oplog Log) is REMOVED by maintainer decision.
+Design + decisions: docs/raft-wiring.md. Verified: full suite 247/247 +
+sim 3/3 green; live 3-node smoke (election, leader enqueue committed via
+raft ~20ms, follower 503 not_leader, replication to followers, leader kill →
+re-election → writes on new leader, old leader rejoin + catch-up).
 
-- [ ] `--raft` config path in main.zig (peer specs WITH uuids, cluster_id,
-      cluster-port → RaftHost.create/registerPeer/start).
-- [ ] pipeline integration: replace repl_hook/last_acked_seq with proposeAsync +
-      token polling; defer client responses until the token is final.
-- [ ] `raft_net` peer auth (async handshake — the live PBR transport is done; the
-      io_uring raft transport still accepts any peer).
-- [ ] migration: `raft_migrate` must move pre-existing KV data into the log or a
-      snapshot (today joining followers silently diverge).
-- [ ] snapshot/compaction trigger policy (log is never compacted → unbounded growth;
-      OplogFsm.snapshot() is currently dead code).
-- [ ] entry-size vs codec-frame cap (64×64KiB > 2MiB → replication livelock).
-- [ ] ProposeToken safe-abandon (UAF/leak on timeout/disconnect).
-- [ ] leadership-gated reads / ReadIndex use (raft_gate is codec-only today) +
-      MSG_NOT_LEADER emission + SDK redial.
+- [x] cluster config path in main.zig: `--node-id`/`--peers id[:uuidhex]@host:port`
+      (client addrs; raft transport = port+1000)/`--cluster-id` (required) →
+      RaftHost.create/registerPeer/start. uuids derived from node id by default
+      (deriveUuid), explicit hex override supported. `--sync-repl` and DNS
+      discovery removed (raft is always-sync; membership is static).
+- [x] pipeline integration: RaftIface vtable + proposeAsync token polling;
+      prepare slots hold tokens; responses defer until every token commits;
+      leader executes+commits locally, FSM skips self-proposed entries
+      (locally_applied flag through batcher), failed-token-after-local-commit =
+      divergence fail-stop; leadership state machine (follower → acquiring
+      [barrier proposal + rebuildState] → leading); maintenance leader-only,
+      through the same propose path; proposals split at frame boundaries
+      (client-op atomicity) / mutation granularity (maintenance).
+- [x] cross-thread DB safety: talon is single-threaded; a shared mutex
+      serializes the pipeline's post-drain span against the raft thread's
+      DB-touching tick span (docs/raft-wiring.md threading model).
+- [x] `raft_net` peer auth: mutual HMAC-SHA256 challenge-response
+      (--cluster-secret), constant-time verify, frames rejected until
+      authenticated, auth_rejects counter.
+- [~] migration: dropped by maintainer decision — pre-v1, no users, so no
+      migration path; `raft_migrate` deleted and fresh clusters bootstrap from
+      static `--peers` config (see docs/raft-wiring.md).
+- [x] snapshot/compaction: threshold trigger (snapshot_threshold_entries,
+      default 10k) → OplogFsm serialize → Node.compact → log prefix dropped;
+      snapshot blob chunked in talon (128KiB chunks + manifest w/ xxhash) under
+      the 256KiB vlog cap; restart recovery + follower InstallSnapshot catch-up
+      tested. Also fixed: talon-iterator empty-value bug corrupting snapshots;
+      dangling interior storage pointer in Runtime.
+- [x] entry-size vs codec-frame cap: entries_per_msg lowered to 4 (Runtime
+      forces it), per-entry byte cap derived from the frame cap (comptime
+      livelock guard), batcher rejects oversize proposals (ProposalTooLarge),
+      pipeline splits below the cap. Upstream (zig-raft) byte-aware
+      AppendEntries assembly reported as the eventual fix for the ~512KiB
+      per-op ceiling.
+- [x] ProposeToken safe-abandon: refcounted (2 owners), release() valid at any
+      time, host-side finish paths proven exactly-once.
+- [x] leadership-gated writes + MSG_NOT_LEADER (RPC) / 503 not_leader (HTTP);
+      barrier-on-acquisition = ReadIndex-equivalent for the rebuild; follower
+      reads stale-by-design (documented). FOLLOW-UP: leader id/addr hint in the
+      MSG_NOT_LEADER payload (empty today) + SDK redial in the 6 SDK repos.
+
+### Phase 3 follow-ups (performance/operability, not correctness)
+- [ ] event-driven raft-thread wakeup: commit latency is floored by the 5ms
+      tick sleep (~20ms end-to-end today vs PBR sync sub-ms); an eventfd/futex
+      wake on proposeAsync + pipelined drain would close most of the gap.
+- [ ] leader identity published cross-thread (for NOT_LEADER hints +
+      /cluster/status "leader" on followers + cluster events ring, which now
+      returns empty).
+- [ ] cluster metrics: term/commit-index gauges (epoch/lease gauges were
+      PBR-only and removed).
+- [ ] pipeline busy-drain while prepare slots pending (pre-existing
+      drainCoalescing spin, more visible at raft latencies).
 
 ---
 

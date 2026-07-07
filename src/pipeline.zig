@@ -19,7 +19,6 @@ const kv_read = @import("kv_read.zig");
 const ops_mod = @import("ops.zig");
 const kv = @import("kv.zig");
 const handler_mod = @import("handler.zig");
-const oplog_mod = @import("oplog.zig");
 const notify_mod = @import("notify.zig");
 const assert = @import("assert.zig");
 const keys = @import("keys.zig");
@@ -36,19 +35,36 @@ const BufReader = rpc.BufReader;
 const BufWriter = rpc.BufWriter;
 
 // ========================================================================
-// ReplHook — replication callback vtable (module-level, backend-agnostic)
+// RaftIface — consensus vtable (module-level, backend-agnostic)
 // ========================================================================
 
-/// Called after oplog append with encoded mutations. Cluster mode uses this
-/// to fan out mutations to followers via TCP.
-pub const ReplHook = struct {
-    ptr: *anyopaque,
-    replicate_fn: *const fn (ptr: *anyopaque, shard_id: u16, seq: u64, data: []const u8) void,
+const raft_host_mod = @import("raft_host.zig");
+const raft_gate = @import("raft_gate.zig");
 
-    pub fn replicate(self: ReplHook, shard_id: u16, seq: u64, data: []const u8) void {
-        self.replicate_fn(self.ptr, shard_id, seq, data);
+pub const ProposeToken = raft_host_mod.ProposeToken;
+pub const TokenState = raft_host_mod.TokenState;
+
+/// Cluster mode replicates each batch's recorded mutations through raft.
+/// The pipeline proposes after its local commit and defers the batch's
+/// client responses until the returned token commits (see docs/raft-wiring.md).
+/// Vtable (not a concrete *RaftHost) so tests can drive token state directly.
+pub const RaftIface = struct {
+    ptr: *anyopaque,
+    /// Deep-copies mutations; returns null on inbox back-pressure.
+    propose_fn: *const fn (ptr: *anyopaque, muts: []const kv.Mutation) ?*ProposeToken,
+    is_leader_fn: *const fn (ptr: *anyopaque) bool,
+
+    pub fn propose(self: RaftIface, muts: []const kv.Mutation) ?*ProposeToken {
+        return self.propose_fn(self.ptr, muts);
+    }
+    pub fn isLeader(self: RaftIface) bool {
+        return self.is_leader_fn(self.ptr);
     }
 };
+
+/// Sentinel err for write frames rejected at a non-leader. encodeResponses
+/// turns it into MSG_NOT_LEADER (RPC) or 503 (HTTP) instead of a generic error.
+pub const err_not_leader: []const u8 = "not_leader";
 
 pub fn Pipeline(comptime IoBackend: type) type {
     return struct {
@@ -57,7 +73,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
         io: *IoBackend,
         handler: *OpHandler,
         stores: []kv.Store,
-        oplog: *oplog_mod.Log,
         notify: *QueueNotifier,
         reader: ?*kv_read.Reader,
         config: Config,
@@ -75,6 +90,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
         // Results from execute stage
         results: [max_frames]ops_mod.OpResult = undefined,
+
+        // Mutation-list end offset per frame (raft mode): executeBatch
+        // records where each frame's mutations end so the proposal can be
+        // split at frame boundaries — one client op never spans two raft
+        // entries (its mutations must apply atomically on followers).
+        frame_mut_ends: [max_frames]u32 = undefined,
 
         // Recv compaction tracking: (conn_id, consumed_bytes) pairs
         recv_compactions: [max_completions]RecvCompaction = undefined,
@@ -115,13 +136,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
         last_cron_ns: u64 = 0,
         last_webhook_ns: u64 = 0,
 
-        // Sync replication — pipelined prepares.
+        // Raft replication — pipelined prepares.
         // Up to max_prepare_slots batches can be in-flight. Each slot holds
-        // deferred sends + recv requeues until replication ack arrives.
-        // last_acked_seq is written by the TCP receive thread (via onFollowerAck),
-        // read by the pipeline tick thread. Single atomic, single shared state.
-        last_acked_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-        last_recorded_seq: u64 = 0,
+        // deferred sends + recv requeues until every proposal token the slot
+        // carries commits. Tokens are written by the raft thread (atomic
+        // state), polled here — single shared state per proposal.
         prepare_slots: [max_prepare_slots]PrepareSlot = [_]PrepareSlot{.{}} ** max_prepare_slots,
         prepare_head: u32 = 0,
         prepare_tail: u32 = 0,
@@ -130,6 +149,24 @@ pub fn Pipeline(comptime IoBackend: type) type {
         // CQEs consumed but data is in recv_buf. Processed when a slot frees up.
         deferred_recv_conns: [max_completions]u16 = undefined,
         deferred_recv_conn_count: u32 = 0,
+
+        // Leadership state machine (raft mode only; see docs/raft-wiring.md).
+        // follower: write frames answered MSG_NOT_LEADER/503, no maintenance.
+        // acquiring: barrier proposal in flight; on commit the local FSM has
+        //   applied every prior term's entry, so the in-memory handler state
+        //   is rebuilt from KV before accepting writes.
+        // leading: normal write path.
+        raft_state: RaftState = .follower,
+        barrier_token: ?*ProposeToken = null,
+        // Proposal tokens produced this tick (frame batch + maintenance
+        // batches); attached to the batch's prepare slot at the end of tick.
+        tick_tokens: [max_tick_tokens]*ProposeToken = undefined,
+        tick_token_count: u32 = 0,
+        // Maintenance-only proposals from frameless ticks: nothing to defer,
+        // but every token must still be polled for divergence + released.
+        // Bounded: maintenance is interval-gated, commit latency is ms-scale.
+        maint_tokens: [max_maint_tokens]*ProposeToken = undefined,
+        maint_token_count: u32 = 0,
 
         // Stats
         ticks_total: u64 = 0,
@@ -200,15 +237,28 @@ pub fn Pipeline(comptime IoBackend: type) type {
         const max_waiting_conns: u32 = 20480;
         const max_notified_queues: u32 = 64;
         const max_prepare_slots: u32 = 4;
+        /// Worst-case proposals per tick: a full frame batch's mutations
+        /// split into ≤max_proposal_bytes chunks (256 frames × 256 KiB
+        /// payload cap ≈ 64 MiB ÷ ~512 KiB ≈ 125) plus every maintenance
+        /// kind committing its own batch.
+        const max_tick_tokens: u32 = 160;
+        const max_maint_tokens: u32 = 192;
+        /// Per-proposal byte budget — one raft entry's payload cap. The
+        /// batcher rejects anything larger (ProposalTooLarge → failed token
+        /// → false divergence panic), so the pipeline splits BELOW this.
+        const max_proposal_bytes: usize = @import("raft_batcher.zig").max_entry_bytes;
 
-        /// Pipelined prepare slot for sync replication. Holds deferred
-        /// sends and recv requeues until replication ack arrives.
+        const RaftState = enum { follower, acquiring, leading };
+
+        /// Pipelined prepare slot for raft replication. Holds deferred
+        /// sends and recv requeues until every carried token commits.
         const PrepareSlot = struct {
             send_conns: [max_frames + max_waiting_conns]u16 = undefined,
             send_conn_count: u32 = 0,
             recv_conns: [max_recv_conns]u16 = undefined,
             recv_conn_count: u32 = 0,
-            ack_seq: u64 = 0,
+            tokens: [max_tick_tokens]*ProposeToken = undefined,
+            token_count: u32 = 0,
         };
 
 
@@ -236,13 +286,21 @@ pub fn Pipeline(comptime IoBackend: type) type {
             cron_interval_ns: u64 = 0,
             webhook_interval_ns: u64 = 0,
             worker_timeout_ns: u64 = 60_000_000_000,
-            repl_hook: ?ReplHook = null,
-            sync_replication: bool = false,
-            /// Adaptive batch coalescing window for sync replication (nanoseconds).
-            /// When sync_replication is on and a drain yields fewer than max_frames,
-            /// the pipeline continues collecting frames via non-blocking drains until
-            /// the batch is full or this window elapses. Zero disables coalescing.
-            /// Only applies when sync_replication is true.
+            /// Raft consensus hook. Non-null = cluster mode: every batch with
+            /// mutations is proposed after its local commit and responses are
+            /// deferred until the token commits. Replication is always
+            /// synchronous — a raft commit IS quorum replication.
+            raft: ?RaftIface = null,
+            /// Serializes talon access between this thread and the raft
+            /// thread (talon's batch pool and root swap are single-threaded).
+            /// Held for the post-drain span of each tick — never across the
+            /// blocking io.drain. Null in single-node mode (no raft thread).
+            db_lock: ?*std.Thread.Mutex = null,
+            /// Adaptive batch coalescing window for raft replication
+            /// (nanoseconds). When a drain yields fewer than max_frames, the
+            /// pipeline continues collecting frames via non-blocking drains
+            /// until the batch is full or this window elapses. Zero disables
+            /// coalescing. Only applies in raft mode.
             coalesce_window_ns: u64 = 0, // set by main.zig for production
             admin_password: []const u8 = "",
         };
@@ -283,7 +341,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
             io_backend: *IoBackend,
             handler: *OpHandler,
             stores: []kv.Store,
-            oplog: *oplog_mod.Log,
             notify: *QueueNotifier,
             reader: ?*kv_read.Reader,
             config: Config,
@@ -292,11 +349,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 .io = io_backend,
                 .handler = handler,
                 .stores = stores,
-                .oplog = oplog,
                 .notify = notify,
                 .reader = reader,
                 .config = config,
                 .allocator = allocator,
+                // Single-node has no leadership to acquire — writes flow
+                // immediately. Raft mode starts as follower until the host
+                // reports leadership and the barrier commits.
+                .raft_state = if (config.raft == null) .leading else .follower,
             };
         }
 
@@ -307,17 +367,33 @@ pub fn Pipeline(comptime IoBackend: type) type {
             io_backend: *IoBackend,
             handler: *OpHandler,
             stores: []kv.Store,
-            oplog: *oplog_mod.Log,
             notify: *QueueNotifier,
             reader: ?*kv_read.Reader,
             config: Config,
         ) *Self {
             const self = allocator.create(Self) catch unreachable;
-            self.* = init(allocator, io_backend, handler, stores, oplog, notify, reader, config);
+            self.* = init(allocator, io_backend, handler, stores, notify, reader, config);
             return self;
         }
 
         pub fn deinit(self: *Self) void {
+            // Drop our reference on any in-flight proposal tokens (abandon is
+            // safe: the raft host's finish path frees the last reference).
+            var si = self.prepare_head;
+            var remaining = self.prepare_count;
+            while (remaining > 0) : (remaining -= 1) {
+                const slot = &self.prepare_slots[si];
+                for (slot.tokens[0..slot.token_count]) |token| token.release();
+                slot.token_count = 0;
+                si = (si + 1) % max_prepare_slots;
+            }
+            for (self.maint_tokens[0..self.maint_token_count]) |token| token.release();
+            self.maint_token_count = 0;
+            for (self.tick_tokens[0..self.tick_token_count]) |token| token.release();
+            self.tick_token_count = 0;
+            if (self.barrier_token) |token| token.release();
+            self.barrier_token = null;
+
             for (self.mut_list.items) |m| {
                 if (m.key.len > 0) self.allocator.free(@constCast(m.key));
                 if (m.value.len > 0 and m.op != .delete) self.allocator.free(@constCast(m.value));
@@ -367,38 +443,28 @@ pub fn Pipeline(comptime IoBackend: type) type {
             alloc.destroy(self);
         }
 
-        /// Called from TCP receive thread when a follower acks a sequence.
-        /// Thread-safe: single atomic write, no locks.
-        pub fn onFollowerAck(self: *Self, seq: u64) void {
-            const prev = self.last_acked_seq.load(.monotonic);
-            if (seq > prev) self.last_acked_seq.store(seq, .release);
-        }
-
-        /// Returns a pointer to the ack sequence atomic. Cluster mode wires this
-        /// into the TCP fast-path callback for direct atomic updates.
-        pub fn ackSeqPtr(self: *Self) *std.atomic.Value(u64) {
-            return &self.last_acked_seq;
-        }
-
         // ====================================================================
         // Tick — the entire event loop body
         // ====================================================================
 
         pub fn tick(self: *Self) void {
-            // ---- Phase 1: Flush acked prepare slots (FIFO order) ----
-            // Pipelined prepares: up to max_prepare_slots batches in-flight
-            // for sync replication. Each slot holds deferred sends + recv
-            // requeues until replication ack arrives.
+            // ---- Phase 0: Leadership + frameless maintenance tokens ----
+            self.tickRaftLeadership();
+            self.pollMaintTokens();
+
+            // ---- Phase 1: Flush committed prepare slots (FIFO order) ----
+            // Pipelined prepares: up to max_prepare_slots batches in-flight.
+            // Each slot holds deferred sends + recv requeues until every
+            // proposal token it carries commits. A failed token after a local
+            // commit is divergence → fail-stop (docs/raft-wiring.md).
             while (self.prepare_count > 0) {
                 const slot = &self.prepare_slots[self.prepare_head];
-                if (self.last_acked_seq.load(.acquire) >= slot.ack_seq) {
-                    self.flushPrepareSlot(slot);
-                    slot.ack_seq = 0;
-                    self.prepare_head = (self.prepare_head + 1) % max_prepare_slots;
-                    self.prepare_count -= 1;
-                } else {
-                    break;
-                }
+                if (!self.slotCommitted(slot)) break;
+                self.flushPrepareSlot(slot);
+                for (slot.tokens[0..slot.token_count]) |token| token.release();
+                slot.token_count = 0;
+                self.prepare_head = (self.prepare_head + 1) % max_prepare_slots;
+                self.prepare_count -= 1;
             }
 
             // ---- Phase 2: All slots full — back-pressure ----
@@ -442,8 +508,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
             // 1. Drain IO completions.
             const has_pending = self.prepare_count > 0;
-            const coalesce = !has_pending and self.config.sync_replication and
-                self.config.repl_hook != null and self.config.coalesce_window_ns > 0;
+            const coalesce = !has_pending and self.config.raft != null and
+                self.config.coalesce_window_ns > 0;
             const n = if (has_pending)
                 self.io.drainNonBlocking(&self.completions)
             else if (coalesce)
@@ -456,6 +522,13 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 self.io.drain(&self.completions);
 
             addPhase(&self.phase_drain_ns, t_drain.elapsed(clock));
+
+            // Everything below may touch talon (decode reads, batch commits,
+            // read endpoints); serialize against the raft thread's tick. The
+            // proposal inbox mutex nests inside this lock on our side only —
+            // the raft thread never holds both at once, so no deadlock.
+            if (self.config.db_lock) |l| l.lock();
+            defer if (self.config.db_lock) |l| l.unlock();
 
             // Reset per-tick state.
             self.frame_count = 0;
@@ -532,10 +605,15 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
             addPhase(&self.phase_extract_ns, t_extract.elapsed(clock));
 
-            // Run scheduled maintenance in its own batch, committed before client ops.
-            const t_maint = Timer.start(clock);
-            self.runMaintenance();
-            addPhase(&self.phase_maint_ns, t_maint.elapsed(clock));
+            // Run scheduled maintenance in its own batch, committed before
+            // client ops. Followers don't run maintenance — the leader's
+            // maintenance mutations arrive through the raft log.
+            self.tick_token_count = 0;
+            if (self.raft_state == .leading) {
+                const t_maint = Timer.start(clock);
+                self.runMaintenance();
+                addPhase(&self.phase_maint_ns, t_maint.elapsed(clock));
+            }
 
             if (self.frame_count == 0) {
                 if (self.notified_queue_count > 0) {
@@ -546,6 +624,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     self.flushSends();
                     addPhase(&self.phase_flush_ns, tfl.elapsed(clock));
                 }
+                // Maintenance/fulfill-only proposals: fetch pushes are
+                // at-least-once (a claim lost on failover expires via lease
+                // reclaim), so nothing is deferred; park the tokens for
+                // divergence polling + release.
+                self.parkTickTokens();
                 const tc = Timer.start(clock);
                 self.compactRecvBufs();
                 addPhase(&self.phase_compact_ns, tc.elapsed(clock));
@@ -566,39 +649,34 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
             // 3. Execute: decode + apply in single kv.Batch.
             const t_exec = Timer.start(clock);
-            const seq_before = self.last_recorded_seq;
             self.executeBatch();
-            const has_new_mutations = self.last_recorded_seq > seq_before;
             addPhase(&self.phase_execute_ns, t_exec.elapsed(clock));
 
-            // 4. Sync replication with mutations.
-            if (self.config.sync_replication and self.config.repl_hook != null and has_new_mutations) {
-                const batch_ack_seq = self.last_recorded_seq;
-
+            // 4. Raft replication: this tick produced proposals (frame batch
+            // and/or maintenance). Defer the batch's client responses until
+            // every token commits — a raft commit IS quorum replication.
+            if (self.tick_token_count > 0) {
                 self.encodeResponses();
                 self.pushCancelSignals();
                 self.writeWebhookDispatchRecords();
                 self.fulfillSubscriptions();
                 self.compactRecvBufs();
 
-                if (self.last_acked_seq.load(.acquire) >= batch_ack_seq) {
-                    self.flushSends();
-                    self.requeueRecvs(recv_conns[0..recv_conn_count]);
-                } else {
-                    assert.check(
-                        self.prepare_count < max_prepare_slots,
-                        "pipeline: prepare slot overflow",
-                        .{},
-                    );
-                    const slot = &self.prepare_slots[self.prepare_tail];
-                    slot.ack_seq = batch_ack_seq;
-                    @memcpy(slot.send_conns[0..self.send_conn_count], self.send_conns[0..self.send_conn_count]);
-                    slot.send_conn_count = self.send_conn_count;
-                    @memcpy(slot.recv_conns[0..recv_conn_count], recv_conns[0..recv_conn_count]);
-                    slot.recv_conn_count = recv_conn_count;
-                    self.prepare_tail = (self.prepare_tail + 1) % max_prepare_slots;
-                    self.prepare_count += 1;
-                }
+                assert.check(
+                    self.prepare_count < max_prepare_slots,
+                    "pipeline: prepare slot overflow",
+                    .{},
+                );
+                const slot = &self.prepare_slots[self.prepare_tail];
+                @memcpy(slot.tokens[0..self.tick_token_count], self.tick_tokens[0..self.tick_token_count]);
+                slot.token_count = self.tick_token_count;
+                self.tick_token_count = 0;
+                @memcpy(slot.send_conns[0..self.send_conn_count], self.send_conns[0..self.send_conn_count]);
+                slot.send_conn_count = self.send_conn_count;
+                @memcpy(slot.recv_conns[0..recv_conn_count], recv_conns[0..recv_conn_count]);
+                slot.recv_conn_count = recv_conn_count;
+                self.prepare_tail = (self.prepare_tail + 1) % max_prepare_slots;
+                self.prepare_count += 1;
             } else {
                 self.encodeResponses();
                 self.pushCancelSignals();
@@ -607,6 +685,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 self.flushSends();
                 self.compactRecvBufs();
                 self.requeueRecvs(recv_conns[0..recv_conn_count]);
+                // fulfillSubscriptions may have proposed claim mutations after
+                // the branch condition was evaluated: fetch pushes flush
+                // immediately (at-least-once), but the tokens still need
+                // divergence polling + release.
+                self.parkTickTokens();
             }
 
             self.io.submit();
@@ -616,6 +699,214 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
             self.ticks_total += 1;
             self.maybePrintPhaseStats();
+        }
+
+        // ====================================================================
+        // Raft — leadership state machine + proposal token plumbing
+        // ====================================================================
+
+        /// Drive follower → acquiring → leading transitions. Runs at the top
+        /// of every tick; no-op outside raft mode.
+        fn tickRaftLeadership(self: *Self) void {
+            const raft = self.config.raft orelse return;
+            switch (self.raft_state) {
+                .follower => if (raft.isLeader()) {
+                    // Barrier: an empty proposal in our term. When it commits,
+                    // every prior term's entry has been applied to the local
+                    // FSM, so the KV is complete and the in-memory handler
+                    // state can be rebuilt from it.
+                    const none: [0]kv.Mutation = .{};
+                    if (raft.propose(&none)) |token| {
+                        self.barrier_token = token;
+                        self.raft_state = .acquiring;
+                    } // Inbox back-pressure: retry next tick.
+                },
+                .acquiring => {
+                    const token = self.barrier_token.?;
+                    switch (token.loadState()) {
+                        .pending => {},
+                        .committed => {
+                            token.release();
+                            self.barrier_token = null;
+                            // Runs before the tick's main lock span — take
+                            // the DB lock for the rebuild reads.
+                            if (self.config.db_lock) |l| l.lock();
+                            defer if (self.config.db_lock) |l| l.unlock();
+                            self.handler.rebuildState(self.stores);
+                            self.warmupOnAcquire();
+                            self.raft_state = .leading;
+                        },
+                        .failed => {
+                            // Lost leadership before the barrier committed.
+                            // No local commits happened — clean fallback.
+                            token.release();
+                            self.barrier_token = null;
+                            self.raft_state = .follower;
+                        },
+                    }
+                },
+                .leading => if (!raft.isLeader() and self.prepare_count == 0 and
+                    self.maint_token_count == 0)
+                {
+                    // In-flight tokens either commit (slots flush) or fail
+                    // (divergence fail-stop); step down only once drained.
+                    self.raft_state = .follower;
+                },
+            }
+        }
+
+        /// Leadership-acquisition warmup: seed maintenance timestamps and
+        /// reload the webhook cache. Stale-worker cleanup is NOT run here —
+        /// it mutates, and the first interval-scheduled workers pass handles
+        /// it through the normal propose path.
+        fn warmupOnAcquire(self: *Self) void {
+            const now_ns = self.nowNs();
+            self.last_promote_ns = now_ns;
+            self.last_reclaim_ns = now_ns;
+            self.last_unique_ns = now_ns;
+            self.last_rate_limit_ns = now_ns;
+            self.last_expire_ns = now_ns;
+            self.last_purge_ns = now_ns;
+            self.last_workers_ns = now_ns;
+            self.last_cron_ns = now_ns;
+            self.last_webhook_ns = now_ns;
+            var batch = self.stores[0].newBatch();
+            defer batch.close();
+            self.handler.loadWebhookCache(&batch);
+        }
+
+        /// Encoded size a mutation contributes to a proposal payload
+        /// (oplog.encodeMutations layout: op u8 + keylen u16 + vallen u32).
+        fn mutationBytes(m: kv.Mutation) usize {
+            return 1 + 2 + 4 + m.key.len + m.value.len;
+        }
+
+        /// Propose one chunk of the recorded mutations and stash its token
+        /// for the tick's prepare slot.
+        fn proposeSlice(self: *Self, muts: []const kv.Mutation) void {
+            if (muts.len == 0) return;
+            const raft = self.config.raft.?;
+            // Inbox depth (4096) dwarfs the bounded in-flight window
+            // (max_prepare_slots × max_tick_tokens + max_maint_tokens), so
+            // back-pressure here is an invariant violation, not a condition.
+            const token = raft.propose(muts) orelse {
+                assert.check(false, "pipeline: raft inbox full with bounded in-flight window", .{});
+                unreachable;
+            };
+            assert.check(self.tick_token_count < max_tick_tokens, "pipeline: tick token overflow", .{});
+            self.tick_tokens[self.tick_token_count] = token;
+            self.tick_token_count += 1;
+        }
+
+        /// Propose a maintenance/fulfill batch's recorded mutations, split
+        /// into ≤max_proposal_bytes chunks at MUTATION granularity — these
+        /// batches are re-runnable scans (promote/reclaim/expire/purge) or
+        /// lease claims recovered by reclaim, so entry-level atomicity is
+        /// not required the way it is for client ops.
+        fn proposeRecorded(self: *Self) void {
+            if (self.config.raft == null) return;
+            const muts = self.mut_list.items;
+            var start: usize = 0;
+            var bytes: usize = 4; // encodeMutations count header
+            var i: usize = 0;
+            while (i < muts.len) : (i += 1) {
+                const sz = mutationBytes(muts[i]);
+                assert.check(4 + sz <= max_proposal_bytes, "pipeline: single mutation exceeds proposal cap", .{});
+                if (bytes + sz > max_proposal_bytes) {
+                    self.proposeSlice(muts[start..i]);
+                    start = i;
+                    bytes = 4;
+                }
+                bytes += sz;
+            }
+            self.proposeSlice(muts[start..]);
+        }
+
+        /// Propose the frame batch's recorded mutations, split into
+        /// ≤max_proposal_bytes chunks at FRAME boundaries: one client op's
+        /// mutations must land in one raft entry so followers apply them
+        /// atomically (a mid-op split would leave e.g. a job record without
+        /// its indexes after a failover).
+        fn proposeRecordedFrames(self: *Self) void {
+            if (self.config.raft == null) return;
+            const muts = self.mut_list.items;
+            if (muts.len == 0) return;
+            var start: usize = 0; // chunk start (mutation index)
+            var bytes: usize = 4; // encodeMutations count header
+            var prev_end: usize = 0;
+            for (self.frame_mut_ends[0..self.frame_count]) |end| {
+                var seg_bytes: usize = 0;
+                for (muts[prev_end..end]) |m| seg_bytes += mutationBytes(m);
+                assert.check(
+                    4 + seg_bytes <= max_proposal_bytes,
+                    "pipeline: one frame's mutations ({d}B) exceed the proposal cap {d}",
+                    .{ seg_bytes, max_proposal_bytes },
+                );
+                if (bytes + seg_bytes > max_proposal_bytes) {
+                    self.proposeSlice(muts[start..prev_end]);
+                    start = prev_end;
+                    bytes = 4;
+                }
+                bytes += seg_bytes;
+                prev_end = end;
+            }
+            assert.check(prev_end == muts.len, "pipeline: frame bounds don't cover mut_list ({d} vs {d})", .{ prev_end, muts.len });
+            self.proposeSlice(muts[start..]);
+        }
+
+        /// True when every token the slot carries has committed. A failed
+        /// token means our locally-committed batch was rejected by the
+        /// cluster (leadership lost mid-flight): the local KV now contains
+        /// writes the cluster never accepted, and there is no entry-wise
+        /// rollback for mutation replication — fail-stop.
+        fn slotCommitted(self: *Self, slot: *const PrepareSlot) bool {
+            _ = self;
+            var all_committed = true;
+            for (slot.tokens[0..slot.token_count]) |token| {
+                switch (token.loadState()) {
+                    .committed => {},
+                    .pending => all_committed = false,
+                    .failed => std.debug.panic(
+                        "corvo: raft proposal failed after local commit — " ++
+                            "state diverged from cluster; wipe the data dir and rejoin",
+                        .{},
+                    ),
+                }
+            }
+            return all_committed;
+        }
+
+        /// Move this tick's tokens to the maintenance ring (frameless tick:
+        /// nothing client-visible to defer, but divergence polling + release
+        /// must still happen).
+        fn parkTickTokens(self: *Self) void {
+            for (self.tick_tokens[0..self.tick_token_count]) |token| {
+                assert.check(self.maint_token_count < max_maint_tokens, "pipeline: maint token overflow", .{});
+                self.maint_tokens[self.maint_token_count] = token;
+                self.maint_token_count += 1;
+            }
+            self.tick_token_count = 0;
+        }
+
+        /// Poll parked maintenance tokens: release committed, fail-stop on
+        /// failed, keep pending (compacting in place).
+        fn pollMaintTokens(self: *Self) void {
+            var kept: u32 = 0;
+            for (self.maint_tokens[0..self.maint_token_count]) |token| {
+                switch (token.loadState()) {
+                    .committed => token.release(),
+                    .pending => {
+                        self.maint_tokens[kept] = token;
+                        kept += 1;
+                    },
+                    .failed => std.debug.panic(
+                        "corvo: raft proposal failed after local commit — " ++
+                            "state diverged from cluster; wipe the data dir and rejoin",
+                        .{},
+                    ),
+                }
+            }
+            self.maint_token_count = kept;
         }
 
         // ====================================================================
@@ -914,7 +1205,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             var batch = self.stores[0].newBatch();
             defer batch.close();
 
-            const record_mutations = self.config.repl_hook != null;
+            const record_mutations = self.config.raft != null;
             if (record_mutations) {
                 self.mut_list.clearRetainingCapacity();
                 batch.enableRecording(self.allocator, &self.mut_list);
@@ -973,10 +1264,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             self.handler.indexer.flush(&batch);
 
             batch.commit();
-
-            if (record_mutations and self.mut_list.items.len > 0) {
-                self.recordOplog();
-            }
+            self.proposeRecorded();
 
             // Webhook dispatch — separate from the main maintenance batch.
             // Scans whd| for pending deliveries and initiates outbound HTTP.
@@ -1124,7 +1412,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             var kv_batch = self.stores[0].newBatch();
             defer kv_batch.close();
 
-            const record_mutations = self.config.repl_hook != null;
+            const record_mutations = self.config.raft != null;
             if (record_mutations) {
                 self.mut_list.clearRetainingCapacity();
                 kv_batch.enableRecording(self.allocator, &self.mut_list);
@@ -1140,6 +1428,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 // mid-loop writes into the same batch (committed below), so the
                 // result is identical to a single end-of-loop flush.
                 if (self.handler.indexer.nearFull()) self.handler.indexer.flush(&kv_batch);
+                // Frame boundary for proposal splitting: mid-loop indexer
+                // flushes belong to already-decoded frames, so the running
+                // list length is a valid cut point.
+                if (record_mutations) self.frame_mut_ends[i] = @intCast(self.mut_list.items.len);
             }
             addPhase(&self.exec_apply_ns, t_apply.elapsed(clock));
 
@@ -1147,16 +1439,20 @@ pub fn Pipeline(comptime IoBackend: type) type {
             // Index writes don't pollute the overlay during handler.apply,
             // but they're captured by mutation recording for replication.
             self.handler.indexer.flush(&kv_batch);
+            // The final flush's mutations attach to the last frame's segment.
+            if (record_mutations and self.frame_count > 0) {
+                self.frame_mut_ends[self.frame_count - 1] = @intCast(self.mut_list.items.len);
+            }
 
             const t_commit = Timer.start(clock);
             kv_batch.commit();
             addPhase(&self.exec_commit_ns, t_commit.elapsed(clock));
             self.applied_total += self.frame_count;
 
-            if (record_mutations and self.mut_list.items.len > 0) {
-                const t_oplog = Timer.start(clock);
-                self.recordOplog();
-                addPhase(&self.exec_oplog_ns, t_oplog.elapsed(clock));
+            {
+                const t_propose = Timer.start(clock);
+                self.proposeRecordedFrames();
+                addPhase(&self.exec_oplog_ns, t_propose.elapsed(clock));
             }
 
             const t_notify = Timer.start(clock);
@@ -1203,14 +1499,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
         }
 
-        fn recordOplog(self: *Self) void {
-            const encoded = oplog_mod.encodeMutations(self.allocator, self.mut_list.items);
-            defer self.allocator.free(encoded);
-            const seq = self.oplog.append(0, encoded);
-            self.last_recorded_seq = seq;
-            if (self.config.repl_hook) |hook| hook.replicate(0, seq, encoded);
-        }
-
         fn decodeAndApply(self: *Self, batch: *kv.WriteBatch, frame: *FrameDesc, frame_idx: u32) ops_mod.OpResult {
             // HTTP writes use JSON decode; RPC uses binary decode.
             if (frame.protocol == .http)
@@ -1222,6 +1510,18 @@ pub fn Pipeline(comptime IoBackend: type) type {
             if (frame.msg_type == rpc.MSG_AUTH) {
                 self.applyRpcAuth(frame);
                 return .{};
+            }
+
+            // Leadership gate: every RPC op besides PING/AUTH mutates (fetch
+            // claims leases), so a non-leader answers MSG_NOT_LEADER and the
+            // SDK redials. isLeader() is re-checked live so the window where
+            // a deposed leader still executes writes is one atomic load wide.
+            if (self.config.raft) |raft| {
+                if (frame.msg_type != rpc.MSG_PING and
+                    (self.raft_state != .leading or !raft.isLeader()))
+                {
+                    return .{ .err = err_not_leader };
+                }
             }
 
             // Role enforcement. The extractRpcFrames gate already dropped
@@ -1419,6 +1719,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
         fn decodeAndApplyHttp(self: *Self, batch: *kv.WriteBatch, frame: *FrameDesc, frame_idx: u32) ops_mod.OpResult {
             const now_ns = self.nowNs();
 
+            // Leadership gate: HTTP frames reaching the pipeline are writes
+            // (reads are served by http_read). Non-leader → 503 not_leader.
+            if (self.config.raft) |raft| {
+                if (self.raft_state != .leading or !raft.isLeader()) {
+                    return .{ .err = err_not_leader };
+                }
+            }
+
             // Generate server-side IDs for operations that need them.
             switch (frame.msg_type) {
                 rpc.MSG_ENQUEUE_BATCH => {
@@ -1590,6 +1898,23 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     );
                     c.send_len += @intCast(aw.pos);
                     continue;
+                }
+
+                // Raft follower rejection: a dedicated frame type carrying a
+                // leader hint (empty until leader identity is plumbed) so
+                // SDKs can distinguish redial-and-replay from an op error.
+                if (self.results[i].err) |e| {
+                    if (e.ptr == err_not_leader.ptr) {
+                        self.trackSendConn(frame.conn_id);
+                        const c2 = self.io.conn(frame.conn_id);
+                        const n_written = raft_gate.encodeNotLeader(
+                            c2.send_buf[c2.send_len..],
+                            frame.req_id,
+                            .{},
+                        ) catch continue; // send_buf full: drop, client times out + redials
+                        c2.send_len += @intCast(n_written);
+                        continue;
+                    }
                 }
 
                 const resp_type = switch (frame.msg_type) {
@@ -1825,8 +2150,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
             defer kv_batch.close();
             var did_fulfill = false;
 
-            // Enable mutation recording for oplog + replication.
-            const record_mutations = self.config.repl_hook != null;
+            // Enable mutation recording for raft replication.
+            const record_mutations = self.config.raft != null;
             if (record_mutations) {
                 self.mut_list.clearRetainingCapacity();
                 kv_batch.enableRecording(self.allocator, &self.mut_list);
@@ -1917,9 +2242,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 // Flush deferred indexes (fetch transitions) into same batch.
                 self.handler.indexer.flush(&kv_batch);
                 kv_batch.commit();
-                if (record_mutations and self.mut_list.items.len > 0) {
-                    self.recordOplog();
-                }
+                self.proposeRecorded();
             }
         }
 
@@ -2298,14 +2621,57 @@ fn advanceTestClock(delta_ns: i64) void {
     _ = @atomicRmw(i64, &test_clock_ns, .Add, delta_ns, .monotonic);
 }
 
+/// Fake raft host for pipeline tests: hands out real ProposeTokens and lets
+/// the test play the raft thread's role (flip state + drop the host ref).
+const TestRaft = struct {
+    is_leader: bool = true,
+    spawned: [64]*ProposeToken = undefined,
+    spawned_count: u32 = 0,
+    /// Mutation count observed across all proposals (proves recording ran).
+    proposed_mutations: u32 = 0,
+
+    fn proposeFn(ptr: *anyopaque, muts: []const kv.Mutation) ?*ProposeToken {
+        const self: *TestRaft = @ptrCast(@alignCast(ptr));
+        const token = testing.allocator.create(ProposeToken) catch return null;
+        token.* = .{ .allocator = testing.allocator };
+        self.spawned[self.spawned_count] = token;
+        self.spawned_count += 1;
+        self.proposed_mutations += @intCast(muts.len);
+        return token;
+    }
+
+    fn isLeaderFn(ptr: *anyopaque) bool {
+        const self: *TestRaft = @ptrCast(@alignCast(ptr));
+        return self.is_leader;
+    }
+
+    fn iface(self: *TestRaft) RaftIface {
+        return .{
+            .ptr = @ptrCast(self),
+            .propose_fn = &proposeFn,
+            .is_leader_fn = &isLeaderFn,
+        };
+    }
+
+    /// Host-side finish for every unfinished token: store the final state,
+    /// then drop the host reference (release doubles as unref).
+    fn finishAll(self: *TestRaft, state: TokenState) void {
+        for (self.spawned[0..self.spawned_count]) |token| {
+            token.state.store(@intFromEnum(state), .release);
+            token.release();
+        }
+        self.spawned_count = 0;
+    }
+};
+
 const TestContext = struct {
     db: *talon.DB,
     stores: [1]kv.Store,
     handler: OpHandler,
-    oplog: oplog_mod.Log,
     notify: QueueNotifier,
     backend: SimBackend,
     pipeline: TestPipeline,
+    raft: TestRaft,
     db_path: [*:0]const u8,
 
     /// Heap-allocate and initialize a TestContext. Pipeline + SimBackend are ~7MB,
@@ -2313,18 +2679,11 @@ const TestContext = struct {
     fn create(db_path: [*:0]const u8) !*TestContext {
         const allocator = testing.allocator;
         const self = try allocator.create(TestContext);
-        self.initInPlace(allocator, db_path, null);
+        self.initInPlace(allocator, db_path);
         return self;
     }
 
-    fn createWithOplog(db_path: [*:0]const u8, oplog_path: [*:0]const u8) !*TestContext {
-        const allocator = testing.allocator;
-        const self = try allocator.create(TestContext);
-        self.initInPlace(allocator, db_path, oplog_path);
-        return self;
-    }
-
-    fn initInPlace(self: *TestContext, allocator: std.mem.Allocator, db_path: [*:0]const u8, oplog_path: ?[*:0]const u8) void {
+    fn initInPlace(self: *TestContext, allocator: std.mem.Allocator, db_path: [*:0]const u8) void {
         @atomicStore(i64, &test_clock_ns, 1_000_000_000_000, .monotonic);
 
         const path_slice = std.mem.span(db_path);
@@ -2335,7 +2694,6 @@ const TestContext = struct {
         self.stores = [1]kv.Store{kv.Store.init(db)};
         self.handler = OpHandler.init(allocator);
         self.handler.rebuildState(&self.stores);
-        self.oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &testClockFn }, oplog_path, 1024);
         self.notify = QueueNotifier.init(allocator);
         self.backend = SimBackend.init(allocator, .{
             .listen_fd = -1,
@@ -2343,6 +2701,7 @@ const TestContext = struct {
             .recv_buf_size = 65536,
             .send_buf_size = 65536,
         }) catch unreachable;
+        self.raft = .{};
         self.db_path = db_path;
 
         self.pipeline = TestPipeline.init(
@@ -2350,11 +2709,18 @@ const TestContext = struct {
             &self.backend,
             &self.handler,
             &self.stores,
-            &self.oplog,
             &self.notify,
             null,
             .{ .clock_fn = &testClockFn },
         );
+    }
+
+    /// Switch the pipeline into raft mode with this context's TestRaft as
+    /// the (already-elected) leader. Skips the acquisition barrier — tests
+    /// that exercise acquisition drive raft_state themselves.
+    fn enableRaftAsLeader(self: *TestContext) void {
+        self.pipeline.config.raft = self.raft.iface();
+        self.pipeline.raft_state = .leading;
     }
 
     fn destroy(self: *TestContext) void {
@@ -2363,7 +2729,6 @@ const TestContext = struct {
         self.backend.deinit(allocator);
         self.handler.deinit();
         self.notify.deinit();
-        self.oplog.deinit();
         self.db.close();
         const path_slice = std.mem.span(self.db_path);
         std.fs.cwd().deleteTree(path_slice) catch {};
@@ -3179,18 +3544,10 @@ test "maintenance promote wakes fetch subscription" {
     try testing.expectEqual(@as(u64, 1), ctx.pipeline.subscriptions_fulfilled);
 }
 
-fn testReplNoop(_: *anyopaque, _: u16, _: u64, _: []const u8) void {}
-
-test "sync-repl pipelined prepares — enqueue deferred, fetch fulfilled immediately" {
-    const ctx = try TestContext.create("/tmp/corvo-pv2-sync-repl-pipeline");
+test "raft pipelined prepares — enqueue deferred until token commits" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-raft-pipeline");
     defer ctx.destroy();
-
-    var repl_ctx: u8 = 0;
-    ctx.pipeline.config.sync_replication = true;
-    ctx.pipeline.config.repl_hook = .{
-        .ptr = @ptrCast(&repl_ctx),
-        .replicate_fn = &testReplNoop,
-    };
+    ctx.enableRaftAsLeader();
 
     const enq_conn = ctx.backend.connect().?;
     const fetch_conn = ctx.backend.connect().?;
@@ -3232,36 +3589,27 @@ test "sync-repl pipelined prepares — enqueue deferred, fetch fulfilled immedia
     ctx.injectFrame(fetch_conn, rpc.MSG_FETCH_BATCH, 5, fw.written());
     ctx.pipeline.tick();
 
-    // Fetch fulfilled immediately.
+    // Fetch fulfilled: the push is claimed + proposed. Enqueue still deferred.
     try testing.expectEqual(@as(u64, 1), ctx.pipeline.subscriptions_fulfilled);
-    // Enqueue still deferred.
-    try testing.expectEqual(@as(u32, 1), ctx.pipeline.prepare_count);
+    try testing.expect(ctx.pipeline.prepare_count >= 1);
 
-    // 3. Ack the enqueue — flush prepare slot.
-    ctx.pipeline.last_acked_seq.store(
-        ctx.pipeline.prepare_slots[ctx.pipeline.prepare_head].ack_seq,
-        .release,
-    );
+    // 3. Commit all proposals (host side) — flush prepare slots.
+    ctx.raft.finishAll(.committed);
     ctx.pipeline.tick();
 
     try testing.expectEqual(@as(u32, 0), ctx.pipeline.prepare_count);
+    try testing.expectEqual(@as(u32, 0), ctx.pipeline.maint_token_count);
 
-    // Enqueue response sent after ack.
+    // Enqueue response sent after commit.
     const enq_resp = ctx.readResponse(enq_conn).?;
     try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, enq_resp.header.msg_type);
     try testing.expectEqual(@as(u32, 1), enq_resp.header.req_id);
 }
 
-test "sync-repl pipelined prepares — multiple batches in flight" {
-    const ctx = try TestContext.create("/tmp/corvo-pv2-sync-repl-multi-slot");
+test "raft pipelined prepares — multiple batches in flight" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-raft-multi-slot");
     defer ctx.destroy();
-
-    var repl_ctx: u8 = 0;
-    ctx.pipeline.config.sync_replication = true;
-    ctx.pipeline.config.repl_hook = .{
-        .ptr = @ptrCast(&repl_ctx),
-        .replicate_fn = &testReplNoop,
-    };
+    ctx.enableRaftAsLeader();
 
     const conn1 = ctx.backend.connect().?;
     const conn2 = ctx.backend.connect().?;
@@ -3287,8 +3635,7 @@ test "sync-repl pipelined prepares — multiple batches in flight" {
     ctx.pipeline.tick();
 
     try testing.expectEqual(@as(u32, 1), ctx.pipeline.prepare_count);
-    const slot0_seq = ctx.pipeline.prepare_slots[0].ack_seq;
-    try testing.expect(slot0_seq > 0);
+    try testing.expectEqual(@as(u32, 1), ctx.pipeline.prepare_slots[0].token_count);
 
     // 2. Enqueue job-2 — deferred in slot 1.
     var enq2_buf: [512]u8 = undefined;
@@ -3311,11 +3658,10 @@ test "sync-repl pipelined prepares — multiple batches in flight" {
     ctx.pipeline.tick();
 
     try testing.expectEqual(@as(u32, 2), ctx.pipeline.prepare_count);
-    const slot1_seq = ctx.pipeline.prepare_slots[1].ack_seq;
-    try testing.expect(slot1_seq > slot0_seq);
+    try testing.expectEqual(@as(u32, 2), ctx.raft.spawned_count);
 
-    // 3. Ack all — both slots flushed in one tick.
-    ctx.pipeline.last_acked_seq.store(slot1_seq, .release);
+    // 3. Commit all — both slots flushed in one tick.
+    ctx.raft.finishAll(.committed);
     ctx.pipeline.tick();
 
     try testing.expectEqual(@as(u32, 0), ctx.pipeline.prepare_count);
@@ -3966,30 +4312,23 @@ test "reclaim transitions expired active job back to pending" {
 }
 
 // ============================================================================
-// Sync Replication Tests
+// Raft Replication Tests
 // ============================================================================
 
-test "sync-repl pipelined prepares — fast path when ack races ahead" {
-    const ctx = try TestContext.create("/tmp/corvo-pv2-sync-repl-fastpath");
+test "raft follower — write frames answered MSG_NOT_LEADER, nothing committed" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-raft-follower");
     defer ctx.destroy();
-
-    var repl_ctx: u8 = 0;
-    ctx.pipeline.config.sync_replication = true;
-    ctx.pipeline.config.repl_hook = .{
-        .ptr = @ptrCast(&repl_ctx),
-        .replicate_fn = &testReplNoop,
-    };
+    ctx.raft.is_leader = false;
+    ctx.pipeline.config.raft = ctx.raft.iface();
+    ctx.pipeline.raft_state = .follower;
 
     const conn_id = ctx.backend.connect().?;
-
-    // Pre-ack a high sequence — simulates follower being ahead.
-    ctx.pipeline.last_acked_seq.store(100, .release);
 
     var enq_buf: [512]u8 = undefined;
     var ew = BufWriter{ .buf = &enq_buf };
     ew.writeU16(1);
-    ew.writePrefixed("fast-queue");
-    ew.writePrefixed("fast-job-1");
+    ew.writePrefixed("fw-queue");
+    ew.writePrefixed("fw-job-1");
     ew.writeU8(128);
     ew.writeU16(3);
     ew.writeU8(0);
@@ -4001,13 +4340,66 @@ test "sync-repl pipelined prepares — fast path when ack races ahead" {
     ew.writeU16(0);
     ew.writeU16(0);
 
-    ctx.injectFrame(conn_id, rpc.MSG_ENQUEUE_BATCH, 1, ew.written());
+    ctx.injectFrame(conn_id, rpc.MSG_ENQUEUE_BATCH, 7, ew.written());
     ctx.pipeline.tick();
 
-    // Fast path: ack already high enough, no prepare slot used.
+    // Rejected immediately: no proposal, no prepare slot, NOT_LEADER frame.
+    try testing.expectEqual(@as(u32, 0), ctx.raft.spawned_count);
     try testing.expectEqual(@as(u32, 0), ctx.pipeline.prepare_count);
-
-    // Response sent immediately.
     const resp = ctx.readResponse(conn_id).?;
-    try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, resp.header.msg_type);
+    try testing.expectEqual(rpc.MSG_NOT_LEADER, resp.header.msg_type);
+    try testing.expectEqual(@as(u32, 7), resp.header.req_id);
+
+    // Nothing reached the KV.
+    var vb = ctx.stores[0].newBatch();
+    defer vb.close();
+    var key_buf: keys.KeyBuf = undefined;
+    var job_buf: [512]u8 = undefined;
+    try testing.expect(vb.getInto(keys.jobKey(&key_buf, "fw-job-1"), &job_buf) == null);
+}
+
+test "raft leadership acquisition — barrier commit rebuilds then leads" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-raft-acquire");
+    defer ctx.destroy();
+    ctx.raft.is_leader = false;
+    ctx.pipeline.config.raft = ctx.raft.iface();
+    ctx.pipeline.raft_state = .follower;
+
+    // Follower ticks: no barrier proposed while not leader.
+    ctx.pipeline.tick();
+    try testing.expectEqual(TestPipeline.RaftState.follower, ctx.pipeline.raft_state);
+    try testing.expectEqual(@as(u32, 0), ctx.raft.spawned_count);
+
+    // Host reports leadership → barrier proposed, state = acquiring.
+    ctx.raft.is_leader = true;
+    ctx.pipeline.tick();
+    try testing.expectEqual(TestPipeline.RaftState.acquiring, ctx.pipeline.raft_state);
+    try testing.expectEqual(@as(u32, 1), ctx.raft.spawned_count);
+
+    // Barrier still pending → stays acquiring.
+    ctx.pipeline.tick();
+    try testing.expectEqual(TestPipeline.RaftState.acquiring, ctx.pipeline.raft_state);
+
+    // Barrier commits → rebuild + leading.
+    ctx.raft.finishAll(.committed);
+    ctx.pipeline.tick();
+    try testing.expectEqual(TestPipeline.RaftState.leading, ctx.pipeline.raft_state);
+}
+
+test "raft leadership acquisition — barrier failure falls back to follower" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-raft-acquire-fail");
+    defer ctx.destroy();
+    ctx.raft.is_leader = true;
+    ctx.pipeline.config.raft = ctx.raft.iface();
+    ctx.pipeline.raft_state = .follower;
+
+    ctx.pipeline.tick();
+    try testing.expectEqual(TestPipeline.RaftState.acquiring, ctx.pipeline.raft_state);
+
+    // Leadership lost before the barrier committed — no local writes
+    // happened, so this is a clean fallback, not divergence.
+    ctx.raft.is_leader = false;
+    ctx.raft.finishAll(.failed);
+    ctx.pipeline.tick();
+    try testing.expectEqual(TestPipeline.RaftState.follower, ctx.pipeline.raft_state);
 }

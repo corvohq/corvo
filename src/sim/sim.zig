@@ -19,7 +19,6 @@ const corvo = @import("corvo");
 
 const kv = corvo.kv;
 const handler_mod = corvo.handler;
-const oplog_mod = corvo.oplog;
 const notify_mod = corvo.notify;
 const pipeline_mod = corvo.pipeline;
 const io_mod = corvo.io;
@@ -69,10 +68,6 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     defer handler.deinit();
     handler.rebuildState(&stores);
 
-    // --- Oplog ---
-    var oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &globalClockNow }, null, 1024);
-    defer oplog.deinit();
-
     // --- Notifier ---
     var notify_inst = notify_mod.QueueNotifier.init(allocator);
     defer notify_inst.deinit();
@@ -92,7 +87,6 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         &backend,
         &handler,
         &stores,
-        &oplog,
         &notify_inst,
         null,
         .{

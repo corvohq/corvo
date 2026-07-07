@@ -60,6 +60,11 @@ pub const InitParams = struct {
     /// Bootstrap behavior — write initial conf_change at index 1 if storage
     /// is fresh. Set true only on cluster bootstrap; false on rejoin.
     bootstrap_initial_config: bool = false,
+    /// Log-compaction trigger: once this many entries have been applied
+    /// beyond the last snapshot, serialize the FSM into a snapshot and
+    /// drop the covered log prefix. 0 disables compaction (tests that
+    /// inspect the raw log).
+    snapshot_threshold_entries: u64 = 10_000,
 };
 
 /// Reasonable defaults for production. Election timeout 300-600ms, heartbeat 50ms.
@@ -69,6 +74,9 @@ pub fn defaultConfig() Config {
         .election_timeout_max = 600_000_000,
         .heartbeat_interval = 50_000_000,
         .bootstrap_initial_config = false,
+        // Lowered from zig-raft's 64 so the batcher's per-entry byte budget
+        // fits any single client op (raft_batcher livelock guard).
+        .max_entries_per_msg = @import("raft_batcher.zig").entries_per_msg,
     };
 }
 
@@ -76,7 +84,11 @@ pub const Runtime = struct {
     allocator: std.mem.Allocator,
     db: *talon.DB,
 
-    storage: RaftStorage,
+    // Heap-pinned: the Node captures a pointer to the Storage adapter at
+    // init, and Runtime is returned (moved) by value — an inline field
+    // would leave the Node reading a dead stack copy while Runtime mutates
+    // a diverged one.
+    storage: *RaftStorage,
     transport: RaftTransport,
     fsm: OplogFsm,
     batcher: Batcher,
@@ -93,11 +105,22 @@ pub const Runtime = struct {
     cluster_id: u64,
     instance_uuid: u128,
 
+    // Compaction trigger — see maybeCompact. 0 disables.
+    snapshot_threshold_entries: u64,
+
     pub fn init(allocator: std.mem.Allocator, db: *talon.DB, params: InitParams) !Runtime {
         var raft_config = params.raft_config;
         raft_config.bootstrap_initial_config = params.bootstrap_initial_config;
+        // Livelock guard, runtime side: the batcher's per-entry byte cap
+        // assumes at most entries_per_msg entries per AppendEntries; packing
+        // more could assemble an untransmittable message. The Runtime owns
+        // the batcher, so it owns this knob — overridden unconditionally
+        // rather than trusting every Config constructor to remember it.
+        raft_config.max_entries_per_msg = @import("raft_batcher.zig").entries_per_msg;
 
-        var storage = try RaftStorage.init(allocator, db);
+        const storage = try allocator.create(RaftStorage);
+        errdefer allocator.destroy(storage);
+        storage.* = try RaftStorage.init(allocator, db);
         errdefer storage.deinit();
         var transport = try RaftTransport.init(allocator);
         errdefer transport.deinit();
@@ -118,6 +141,36 @@ pub const Runtime = struct {
         errdefer node.deinit();
         try node.recoverConfig();
 
+        // A snapshot can be durable while the FSM still lags behind it — a
+        // crash between InstallSnapshot persistence (inside node.step) and
+        // the FSM swap (applyReady) loses the volatile apply-pending flag,
+        // so ready() would never re-deliver it. The snapshot is committed
+        // state by definition; finish the swap now.
+        if (storage.snap_meta) |sm| {
+            if (sm.last_included_index > fsm.lastApplied()) {
+                const snap = storage.storage().loadSnapshot().?;
+                try fsm.loadSnapshot(snap.data, sm.last_included_index);
+            }
+        }
+
+        // Restart recovery: the raft library initializes commit_index and
+        // last_applied to 0 and re-delivers committed entries via ready().
+        // Once the log has been compacted, the prefix [1, snapshot_index]
+        // no longer exists, so that re-delivery window would reach into
+        // compacted history and ready() would fail on every tick. The FSM's
+        // durable last_applied counts exactly the entries this node already
+        // applied — and applyReady only ever applies committed entries — so
+        // resuming both counters from it is safe and also skips the
+        // redundant replay of the surviving log suffix.
+        const applied = fsm.lastApplied();
+        check(
+            applied <= storage.storage().lastIndex(),
+            "fsm applied {d} beyond log end {d}",
+            .{ applied, storage.storage().lastIndex() },
+        );
+        if (applied > node.commit_index) node.commit_index = applied;
+        if (applied > node.last_applied) node.last_applied = applied;
+
         return .{
             .allocator = allocator,
             .db = db,
@@ -129,6 +182,7 @@ pub const Runtime = struct {
             .last_role = node.role,
             .cluster_id = params.cluster_id,
             .instance_uuid = params.instance_uuid,
+            .snapshot_threshold_entries = params.snapshot_threshold_entries,
         };
     }
 
@@ -139,6 +193,7 @@ pub const Runtime = struct {
         self.fsm.deinit();
         self.transport.deinit();
         self.storage.deinit();
+        self.allocator.destroy(self.storage);
     }
 
     /// Convenience: install a send hook on the transport.
@@ -151,10 +206,12 @@ pub const Runtime = struct {
     }
 
     /// Enqueue a proposal for the next flush. Returns NotLeader if this
-    /// node is not currently the leader.
-    pub fn propose(self: *Runtime, mutations: []const Mutation, completion: Completion) RuntimeError!void {
+    /// node is not currently the leader. `locally_applied` = the caller has
+    /// already committed these mutations to talon (the pipeline's contract);
+    /// on commit the FSM records the entry applied without re-writing data.
+    pub fn propose(self: *Runtime, mutations: []const Mutation, completion: Completion, locally_applied: bool) RuntimeError!void {
         if (!self.node.isLeader()) return RuntimeError.NotLeader;
-        try self.batcher.enqueue(mutations, completion);
+        try self.batcher.enqueue(mutations, completion, locally_applied);
     }
 
     /// Drive one full tick. Caller passes the current monotonic timestamp
@@ -175,6 +232,7 @@ pub const Runtime = struct {
         try self.handleStepDown();
         try self.flushIfLeader(now);
         try self.applyReady();
+        try self.maybeCompact();
         // All entry-data slices returned by storage.getEntries during this
         // tick have been encoded onto the wire and applied to the FSM —
         // safe to reclaim arena memory.
@@ -258,14 +316,52 @@ pub const Runtime = struct {
         // initial config or performs a membership change.
         var max_committed: u64 = 0;
         for (r.committed) |entry| {
-            self.fsm.apply(entry) catch |err| {
-                // FSM apply failure on a committed entry is unrecoverable.
-                std.debug.panic("fsm apply failed for committed entry {d}: {s}", .{ entry.index, @errorName(err) });
-            };
+            // Leader fast-path (docs/raft-wiring.md): the pipeline commits
+            // its mutations to talon BEFORE proposing, so re-applying a
+            // self-proposed entry here would transiently roll back keys a
+            // newer in-flight batch has since written locally — only record
+            // it applied. Entries without an in-flight locally_applied
+            // record (prior-term catch-up, direct runtime.propose callers,
+            // post-step-down commits) take the full apply path, which is
+            // idempotent over any earlier local commit.
+            if (self.batcher.isLocallyApplied(entry.index)) {
+                self.fsm.markApplied(entry) catch |err| {
+                    std.debug.panic("fsm markApplied failed for committed entry {d}: {s}", .{ entry.index, @errorName(err) });
+                };
+            } else {
+                self.fsm.apply(entry) catch |err| {
+                    // FSM apply failure on a committed entry is unrecoverable.
+                    std.debug.panic("fsm apply failed for committed entry {d}: {s}", .{ entry.index, @errorName(err) });
+                };
+            }
             if (entry.index > max_committed) max_committed = entry.index;
         }
         self.node.advance(max_committed);
         self.batcher.onCommitted(max_committed);
+    }
+
+    /// Snapshot trigger policy: once `snapshot_threshold_entries` entries
+    /// have been applied beyond the last snapshot, serialize the FSM and
+    /// hand the blob to the raft node — `node.compact` persists it via
+    /// storage.saveSnapshot (chunked, see raft_storage.zig) and drops log
+    /// entries <= the applied index via storage.compactLog. Every node
+    /// compacts independently; a follower that falls behind a compacted
+    /// leader catches up via InstallSnapshot.
+    ///
+    /// LIMITATION: OplogFsm.snapshot() is O(db-size) and runs inline on the
+    /// raft thread — while it serializes, no messages are pumped, so a very
+    /// large DB stalls heartbeats for the duration and can trigger a
+    /// spurious election. Mitigation (incremental/off-thread snapshotting)
+    /// is future work.
+    fn maybeCompact(self: *Runtime) !void {
+        if (self.snapshot_threshold_entries == 0) return;
+        const applied = self.fsm.lastApplied();
+        const base = if (self.storage.snap_meta) |sm| sm.last_included_index else 0;
+        check(applied >= base, "fsm applied {d} behind snapshot {d}", .{ applied, base });
+        if (applied - base < self.snapshot_threshold_entries) return;
+        const blob = try self.fsm.snapshot();
+        defer self.allocator.free(blob);
+        try self.node.compact(applied, blob);
     }
 
     fn proposeBridge(ctx: *anyopaque, payload: []const u8) BatcherError!u64 {
@@ -415,7 +511,7 @@ test "runtime: 3-node propose → commit → apply → completion" {
         .{ .op = .set, .key = "job:1", .value = "alpha" },
         .{ .op = .set, .key = "job:2", .value = "beta" },
     };
-    try leader.?.propose(&muts, counter.completion());
+    try leader.?.propose(&muts, counter.completion(), false);
 
     // Drive ticks until commit + apply land on the leader.
     var j: usize = 0;
@@ -519,7 +615,7 @@ test "runtime: rolling restart — old leader stops, new leader elected, commits
     // Phase 2: propose + commit one entry.
     var c1 = TestCounter{};
     const muts1 = [_]Mutation{.{ .op = .set, .key = "before:1", .value = "OK" }};
-    try old_leader.propose(&muts1, c1.completion());
+    try old_leader.propose(&muts1, c1.completion(), false);
     var j: usize = 0;
     while (j < 80 and c1.successes == 0) : (j += 1) {
         now += 100;
@@ -554,7 +650,7 @@ test "runtime: rolling restart — old leader stops, new leader elected, commits
     // Phase 4: propose to NEW leader; verify it commits.
     var c2 = TestCounter{};
     const muts2 = [_]Mutation{.{ .op = .set, .key = "after:1", .value = "OK" }};
-    try new_leader.?.propose(&muts2, c2.completion());
+    try new_leader.?.propose(&muts2, c2.completion(), false);
     var m: usize = 0;
     while (m < 200 and c2.successes == 0) : (m += 1) {
         now += 100;
@@ -569,6 +665,270 @@ test "runtime: rolling restart — old leader stops, new leader elected, commits
     var buf: [16]u8 = undefined;
     try testing.expect((try new_leader.?.db.getInto("before:1", &buf)) != null);
     try testing.expect((try new_leader.?.db.getInto("after:1", &buf)) != null);
+}
+
+test "runtime: compaction — threshold crossing snapshots + truncates log, restart recovers" {
+    const paths = [3][]const u8{ "/tmp/corvo-snap-rt-thresh-1", "/tmp/corvo-snap-rt-thresh-2", "/tmp/corvo-snap-rt-thresh-3" };
+    var dbs: [3]*talon.DB = undefined;
+    for (paths, 0..) |p, i| dbs[i] = try openFreshDb(testing.allocator, p);
+    defer for (paths, 0..) |p, i| {
+        dbs[i].close();
+        deleteDbFiles(p);
+    };
+
+    const peers = buildClusterPeers3();
+    const cfg = Config{
+        .election_timeout_min = 200,
+        .election_timeout_max = 400,
+        .heartbeat_interval = 50,
+    };
+    const ids = [3][]const u8{ "n1", "n2", "n3" };
+    const peer_slices = [3][]const PeerSpec{ &peers.p1, &peers.p2, &peers.p3 };
+    var rts: [3]Runtime = undefined;
+    for (0..3) |i| {
+        rts[i] = try Runtime.init(testing.allocator, dbs[i], .{
+            .node_id = ids[i],
+            .instance_uuid = synthUuid(ids[i]),
+            .cluster_id = test_cluster_id,
+            .peers = peer_slices[i],
+            .raft_config = cfg,
+            .snapshot_threshold_entries = 4,
+        });
+    }
+
+    var router = InMemRouter.init();
+    for (0..3) |i| router.register(ids[i], &rts[i].transport);
+
+    var now: i64 = 0;
+    var leader_idx: ?usize = null;
+    var i: usize = 0;
+    while (i < 80 and leader_idx == null) : (i += 1) {
+        now += 100;
+        for (&rts) |*rt| try rt.tick(now);
+        for (0..3) |k| {
+            if (rts[k].node.isLeader()) leader_idx = k;
+        }
+    }
+    try testing.expect(leader_idx != null);
+    const li = leader_idx.?;
+
+    // Propose 6 entries one at a time — each commits before the next, so
+    // the applied index crosses the threshold (4) mid-run.
+    var key_buf: [8]u8 = undefined;
+    var n_committed: usize = 0;
+    while (n_committed < 6) : (n_committed += 1) {
+        var counter = TestCounter{};
+        const key = std.fmt.bufPrint(&key_buf, "job:{d}", .{n_committed}) catch unreachable;
+        const muts = [_]Mutation{.{ .op = .set, .key = key, .value = "V" }};
+        try rts[li].propose(&muts, counter.completion(), false);
+        var j: usize = 0;
+        while (j < 80 and counter.successes == 0) : (j += 1) {
+            now += 100;
+            for (&rts) |*rt| try rt.tick(now);
+        }
+        try testing.expectEqual(@as(usize, 1), counter.successes);
+    }
+
+    // Threshold crossed: leader snapshotted and truncated the log prefix.
+    const lsnap = rts[li].storage.snap_meta.?;
+    try testing.expect(lsnap.last_included_index >= 4);
+    const snap_idx = lsnap.last_included_index;
+    try testing.expectEqual(snap_idx + 1, rts[li].storage.storage().firstIndex());
+    try testing.expect(rts[li].fsm.lastApplied() >= snap_idx);
+
+    // Restart the leader on the same db. The other runtimes are torn down
+    // too; the restarted node is deliberately NOT registered with the
+    // router, so its messages drop — recovery must not need the cluster.
+    const leader_applied = rts[li].fsm.lastApplied();
+    for (&rts) |*rt| rt.deinit();
+    var restarted = try Runtime.init(testing.allocator, dbs[li], .{
+        .node_id = ids[li],
+        .instance_uuid = synthUuid(ids[li]),
+        .cluster_id = test_cluster_id,
+        .peers = peer_slices[li],
+        .raft_config = cfg,
+        .snapshot_threshold_entries = 4,
+    });
+    defer restarted.deinit();
+
+    // Storage bounds and applied state are consistent with the snapshot.
+    try testing.expectEqual(snap_idx + 1, restarted.storage.storage().firstIndex());
+    try testing.expectEqual(leader_applied, restarted.fsm.lastApplied());
+    try testing.expect(restarted.node.commit_index >= snap_idx);
+    var buf: [4]u8 = undefined;
+    for (0..6) |k| {
+        const key = std.fmt.bufPrint(&key_buf, "job:{d}", .{k}) catch unreachable;
+        try testing.expect((try dbs[li].getInto(key, &buf)) != null);
+    }
+    // Ticking with a compacted log prefix must not error (ready() must not
+    // reach into compacted history).
+    var t: usize = 0;
+    while (t < 20) : (t += 1) {
+        now += 100;
+        try restarted.tick(now);
+    }
+    try testing.expectEqual(leader_applied, restarted.fsm.lastApplied());
+}
+
+test "runtime: compaction — lagging follower catches up via InstallSnapshot" {
+    const paths = [3][]const u8{ "/tmp/corvo-snap-rt-lag-1", "/tmp/corvo-snap-rt-lag-2", "/tmp/corvo-snap-rt-lag-3" };
+    var dbs: [3]*talon.DB = undefined;
+    for (paths, 0..) |p, i| dbs[i] = try openFreshDb(testing.allocator, p);
+    defer for (paths, 0..) |p, i| {
+        dbs[i].close();
+        deleteDbFiles(p);
+    };
+
+    const peers = buildClusterPeers3();
+    const cfg = Config{
+        .election_timeout_min = 200,
+        .election_timeout_max = 400,
+        .heartbeat_interval = 50,
+    };
+    const ids = [3][]const u8{ "n1", "n2", "n3" };
+    const peer_slices = [3][]const PeerSpec{ &peers.p1, &peers.p2, &peers.p3 };
+    var rts: [3]Runtime = undefined;
+    for (0..3) |i| {
+        rts[i] = try Runtime.init(testing.allocator, dbs[i], .{
+            .node_id = ids[i],
+            .instance_uuid = synthUuid(ids[i]),
+            .cluster_id = test_cluster_id,
+            .peers = peer_slices[i],
+            .raft_config = cfg,
+            .snapshot_threshold_entries = 6,
+        });
+    }
+    defer for (&rts) |*rt| rt.deinit();
+
+    // n3 is the designated lagger: not registered with the router and not
+    // ticked, it is effectively offline while the other two make progress.
+    const lag: usize = 2;
+    var router = InMemRouter.init();
+    router.register(ids[0], &rts[0].transport);
+    router.register(ids[1], &rts[1].transport);
+
+    var now: i64 = 0;
+    var leader_idx: ?usize = null;
+    var i: usize = 0;
+    while (i < 80 and leader_idx == null) : (i += 1) {
+        now += 100;
+        try rts[0].tick(now);
+        try rts[1].tick(now);
+        for (0..2) |k| {
+            if (rts[k].node.isLeader()) leader_idx = k;
+        }
+    }
+    try testing.expect(leader_idx != null);
+    const li = leader_idx.?;
+
+    // Propose 7 entries with 48 KiB values — the FSM snapshot taken at the
+    // threshold (6 applied entries, ~288 KiB of values) exceeds Talon's
+    // 256 KiB single-value cap, so compaction exercises chunked storage and
+    // catch-up exercises multi-chunk InstallSnapshot end to end.
+    const value_len: usize = 48 * 1024;
+    const value = try testing.allocator.alloc(u8, value_len);
+    defer testing.allocator.free(value);
+    var key_buf: [8]u8 = undefined;
+    var n_committed: usize = 0;
+    while (n_committed < 7) : (n_committed += 1) {
+        var counter = TestCounter{};
+        const key = std.fmt.bufPrint(&key_buf, "job:{d}", .{n_committed}) catch unreachable;
+        @memset(value, @as(u8, @intCast(n_committed & 0xFF)));
+        const muts = [_]Mutation{.{ .op = .set, .key = key, .value = value }};
+        try rts[li].propose(&muts, counter.completion(), false);
+        var j: usize = 0;
+        while (j < 120 and counter.successes == 0) : (j += 1) {
+            now += 100;
+            try rts[0].tick(now);
+            try rts[1].tick(now);
+        }
+        try testing.expectEqual(@as(usize, 1), counter.successes);
+    }
+
+    // Leader compacted past what the lagger would need via AppendEntries.
+    const lsnap = rts[li].storage.snap_meta.?;
+    try testing.expect(lsnap.last_included_index >= 6);
+    try testing.expect(rts[li].storage.storage().firstIndex() > 1);
+    const leader_blob = rts[li].storage.storage().loadSnapshot().?;
+    try testing.expect(leader_blob.data.len > 256 * 1024);
+
+    // Wake the lagger: register + tick all three until it catches up.
+    router.register(ids[lag], &rts[lag].transport);
+    const leader_applied = rts[li].fsm.lastApplied();
+    var k: usize = 0;
+    while (k < 600 and rts[lag].fsm.lastApplied() < leader_applied) : (k += 1) {
+        now += 100;
+        for (&rts) |*rt| try rt.tick(now);
+    }
+    try testing.expectEqual(leader_applied, rts[lag].fsm.lastApplied());
+
+    // The lagger got there via InstallSnapshot: it holds a snapshot and its
+    // log starts after the snapshot index (never held the compacted prefix).
+    const fsnap = rts[lag].storage.snap_meta.?;
+    try testing.expectEqual(lsnap.last_included_index, fsnap.last_included_index);
+    try testing.expectEqual(fsnap.last_included_index + 1, rts[lag].storage.storage().firstIndex());
+
+    // KV state matches the leader byte for byte.
+    const got = try testing.allocator.alloc(u8, value_len);
+    defer testing.allocator.free(got);
+    for (0..7) |n| {
+        const key = std.fmt.bufPrint(&key_buf, "job:{d}", .{n}) catch unreachable;
+        @memset(value, @as(u8, @intCast(n & 0xFF)));
+        const got_slice = (try rts[lag].db.getInto(key, got)).?;
+        try testing.expectEqualSlices(u8, value, got_slice);
+    }
+}
+
+test "runtime: init completes a snapshot the FSM missed (install/apply crash window)" {
+    const path = "/tmp/corvo-snap-rt-heal";
+    const db = try openFreshDb(testing.allocator, path);
+    defer {
+        db.close();
+        deleteDbFiles(path);
+    }
+    // Simulate the crash window: InstallSnapshot persisted a snapshot (and
+    // truncated the log), but the process died before applyReady swapped
+    // the FSM.
+    {
+        var s_obj = try @import("raft_storage.zig").Storage.init(testing.allocator, db);
+        defer s_obj.deinit();
+        const blob = oplog.encodeMutations(testing.allocator, &.{
+            .{ .op = .set, .key = "job:s", .value = "SNAP" },
+        });
+        defer testing.allocator.free(blob);
+        try s_obj.storage().saveSnapshot(.{
+            .last_included_index = 5,
+            .last_included_term = 2,
+            .config = "",
+        }, blob);
+    }
+    const peers = [_]PeerSpec{.{ .id = "n2", .uuid = synthUuid("n2") }};
+    var rt = try Runtime.init(testing.allocator, db, .{
+        .node_id = "n1",
+        .instance_uuid = synthUuid("n1"),
+        .cluster_id = test_cluster_id,
+        .peers = &peers,
+        .raft_config = .{
+            .election_timeout_min = 200,
+            .election_timeout_max = 400,
+            .heartbeat_interval = 50,
+        },
+        .snapshot_threshold_entries = 0,
+    });
+    defer rt.deinit();
+    // Init finished the swap and resumed the applied/commit counters.
+    try testing.expectEqual(@as(u64, 5), rt.fsm.lastApplied());
+    try testing.expectEqual(@as(u64, 5), rt.node.commit_index);
+    var buf: [8]u8 = undefined;
+    const got = (try db.getInto("job:s", &buf)).?;
+    try testing.expectEqualStrings("SNAP", got);
+    // Ticking with the healed state must not error.
+    var now: i64 = 0;
+    var t: usize = 0;
+    while (t < 20) : (t += 1) {
+        now += 100;
+        try rt.tick(now);
+    }
 }
 
 test "runtime: propose returns NotLeader when not leader" {
@@ -593,5 +953,5 @@ test "runtime: propose returns NotLeader when not leader" {
     defer rt.deinit();
     var counter = TestCounter{};
     const muts = [_]Mutation{.{ .op = .set, .key = "k", .value = "v" }};
-    try testing.expectError(RuntimeError.NotLeader, rt.propose(&muts, counter.completion()));
+    try testing.expectError(RuntimeError.NotLeader, rt.propose(&muts, counter.completion(), false));
 }

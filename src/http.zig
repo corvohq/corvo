@@ -375,8 +375,6 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
                 return writeRoute(rpc.MSG_MODIFY_SETTING, "", "webhook_create");
             if (std.mem.eql(u8, api, "/auth/login"))
                 return .read;
-            if (std.mem.eql(u8, api, "/cluster/join"))
-                return .admin_read;
 
             if (std.mem.eql(u8, api, "/jobs/bulk-get"))
                 return .read;
@@ -1664,6 +1662,10 @@ pub fn encodeWriteResponse(
     request_body: []const u8,
 ) u32 {
     if (result.err) |err| {
+        if (std.mem.eql(u8, err, "not_leader")) {
+            // Raft follower: the client must retry against the leader.
+            return writeErrorResponse(send_buf, 503, "not_leader");
+        }
         if (std.mem.eql(u8, err, "unique_existing")) {
             const uid = result.unique_job_id_buf[0..result.unique_job_id_len];
             var body_buf: [256]u8 = undefined;
@@ -2262,7 +2264,6 @@ test "classifyRoute — backup/restore" {
 
     // Ordinary GET reads stay at read level.
     try std.testing.expect(classifyRoute(.GET, "/api/v1/cluster/status") == .read);
-    try std.testing.expect(classifyRoute(.POST, "/api/v1/cluster/join") == .admin_read);
 }
 
 test "decodeBulkAction — single job cancel" {

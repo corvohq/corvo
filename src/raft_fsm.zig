@@ -42,6 +42,7 @@ pub const FsmError = error{
     DecodeFailed,
     ApplyFailed,
     IndexRegression,
+    SnapshotFailed,
     OutOfMemory,
 };
 
@@ -91,6 +92,20 @@ pub const OplogFsm = struct {
         const muts = oplog.decodeMutations(self.allocator, entry.data) catch return FsmError.DecodeFailed;
         defer self.allocator.free(muts);
         try self.applyMutations(muts, entry.index);
+    }
+
+    /// Leader fast-path: record a committed entry as applied WITHOUT
+    /// re-writing its data. The pipeline already committed this entry's
+    /// mutations to talon at propose time (docs/raft-wiring.md); re-applying
+    /// here would transiently roll back keys that a newer in-flight batch
+    /// has since written. Crash between the pipeline's local commit and this
+    /// bump is safe: restart re-applies the entry over identical state
+    /// (set/delete are idempotent assignments).
+    pub fn markApplied(self: *OplogFsm, entry: Entry) FsmError!void {
+        check(entry.index > 0, "entry.index must be 1-based, got 0", .{});
+        if (entry.index <= self.last_applied) return; // already applied
+        check(entry.index == self.last_applied + 1, "entry.index gap: last_applied={d}, index={d}", .{ self.last_applied, entry.index });
+        try self.bumpApplied(entry.index);
     }
 
     /// Apply many committed entries in one Talon batch. Bounded by
@@ -160,20 +175,40 @@ pub const OplogFsm = struct {
     }
 
     fn collectRange(self: *OplogFsm, a: std.mem.Allocator, out: *std.ArrayList(Mutation), lower: ?[]const u8, upper: ?[]const u8) FsmError!void {
-        var batch = self.db.newBatch();
-        defer self.db.closeBatch(batch);
-        var iter = batch.newIterBounded(lower, upper);
-        defer iter.close();
-        if (!iter.first()) return;
-        while (true) {
-            const k = iter.key();
-            const v = iter.value();
-            const k_copy = a.alloc(u8, k.len) catch return FsmError.OutOfMemory;
-            @memcpy(k_copy, k);
-            const v_copy = a.alloc(u8, v.len) catch return FsmError.OutOfMemory;
-            @memcpy(v_copy, v);
-            out.append(a, .{ .op = .set, .key = k_copy, .value = v_copy }) catch return FsmError.OutOfMemory;
-            if (!iter.next()) break;
+        const start_len = out.items.len;
+        {
+            var batch = self.db.newBatch();
+            defer self.db.closeBatch(batch);
+            var iter = batch.newIterBounded(lower, upper);
+            defer iter.close();
+            if (!iter.first()) return;
+            while (true) {
+                const k = iter.key();
+                const v = iter.value();
+                const k_copy = a.alloc(u8, k.len) catch return FsmError.OutOfMemory;
+                @memcpy(k_copy, k);
+                const v_copy = a.alloc(u8, v.len) catch return FsmError.OutOfMemory;
+                @memcpy(v_copy, v);
+                out.append(a, .{ .op = .set, .key = k_copy, .value = v_copy }) catch return FsmError.OutOfMemory;
+                if (!iter.next()) break;
+            }
+        }
+        // Talon iterators return an EMPTY slice for ValueLog-stored values
+        // (anything above the inline threshold) — resolve those with point
+        // reads now that the iterator's shared lock is released. A
+        // legitimately empty value re-reads as empty, so the fixup is
+        // idempotent. Snapshot serialization runs on the raft thread, which
+        // is the only writer of this DB, so the scan and the point reads
+        // observe the same state.
+        for (out.items[start_len..]) |*m| {
+            if (m.value.len != 0) continue;
+            const got = (self.db.get(m.key) catch return FsmError.SnapshotFailed) orelse
+                assert_mod.fail("snapshot key vanished mid-scan: {s}", .{m.key});
+            defer self.allocator.free(got);
+            if (got.len == 0) continue;
+            const v_copy = a.alloc(u8, got.len) catch return FsmError.OutOfMemory;
+            @memcpy(v_copy, got);
+            m.value = v_copy;
         }
     }
 
@@ -353,6 +388,64 @@ test "fsm: snapshot round-trip preserves FSM state" {
     try testing.expectEqualStrings("alpha", got1);
     const got2 = (try env.db.getInto("job:2", &buf)).?;
     try testing.expectEqualStrings("beta", got2);
+}
+
+test "fsm: snapshot > 256 KiB round-trips through chunked raft storage" {
+    const RaftStorage = @import("raft_storage.zig").Storage;
+    var src = try TestEnv.init(testing.allocator, "/tmp/corvo-snap-fsm-big-src");
+    defer src.deinit();
+    var dst = try TestEnv.init(testing.allocator, "/tmp/corvo-snap-fsm-big-dst");
+    defer dst.deinit();
+
+    // Build a big value set: 80 keys x 4 KiB values makes the serialized
+    // blob far exceed Talon's 256 KiB single-value cap.
+    const key_count: usize = 80;
+    var value: [4096]u8 = undefined;
+    {
+        var batch = src.db.newBatch();
+        defer src.db.closeBatch(batch);
+        var i: usize = 0;
+        while (i < key_count) : (i += 1) {
+            var key_buf: [16]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "job:{d:0>4}", .{i}) catch unreachable;
+            @memset(&value, @intCast(i & 0xFF));
+            batch.set(key, &value);
+        }
+        batch.commit();
+    }
+
+    const snap = try src.fsm.snapshot();
+    defer testing.allocator.free(snap);
+    try testing.expect(snap.len > 256 * 1024);
+
+    // Persist via the chunked raft storage, then reopen a fresh Storage on
+    // the same db so the blob is reassembled from chunks (not the cache).
+    {
+        var s_obj = try RaftStorage.init(testing.allocator, src.db);
+        defer s_obj.deinit();
+        try s_obj.storage().saveSnapshot(.{
+            .last_included_index = 7,
+            .last_included_term = 2,
+            .config = "",
+        }, snap);
+    }
+    var s_obj = try RaftStorage.init(testing.allocator, src.db);
+    defer s_obj.deinit();
+    const loaded = s_obj.storage().loadSnapshot().?;
+    try testing.expectEqualSlices(u8, snap, loaded.data);
+
+    // Load into a second FSM and verify every key.
+    try dst.fsm.loadSnapshot(loaded.data, 7);
+    try testing.expectEqual(@as(u64, 7), dst.fsm.lastApplied());
+    var got_buf: [4096]u8 = undefined;
+    var i: usize = 0;
+    while (i < key_count) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "job:{d:0>4}", .{i}) catch unreachable;
+        const got = (try dst.db.getInto(key, &got_buf)).?;
+        @memset(&value, @intCast(i & 0xFF));
+        try testing.expectEqualSlices(u8, &value, got);
+    }
 }
 
 test "fsm: snapshot excludes raft state" {

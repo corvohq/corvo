@@ -1,7 +1,8 @@
 //! Corvo server — single-threaded pipeline over io_uring/kqueue.
 //!
 //! Single port handles both RPC (binary) and HTTP (JSON) via protocol detection.
-//! Supports single-node and cluster mode (PBR with leader election).
+//! Supports single-node and cluster mode (raft consensus; see
+//! docs/raft-wiring.md).
 //!
 //! Configuration: defaults → config file (--config) → CLI args.
 //!
@@ -10,9 +11,9 @@
 //!   --bind <addr>             Listen address (default: 0.0.0.0)
 //!   --port <port>             Listen port (default: 9878)
 //!   --data-dir <dir>          Data directory (default: /tmp/corvo-data)
-//!   --node-id <id>            Node ID for cluster mode (enables cluster)
-//!   --peers <spec>            Comma-separated peer list: id@host:port,...
-//!   --sync-repl               Enable sync replication
+//!   --node-id <id>            Node ID (enables cluster mode)
+//!   --peers <spec>            Peer list: id[:uuidhex]@host:port,... (client addrs)
+//!   --cluster-id <n>          Cluster identifier (u64, required in cluster mode)
 //!   --max-payload-size <n>    Max payload size in bytes (default: 65536)
 //!   --max-conns <n>           Max concurrent connections (default: 4096)
 //!   --max-queues <n>          Max number of queues (default: 100)
@@ -30,15 +31,27 @@ const io_mod = corvo.io;
 const kv = corvo.kv;
 const rpc = corvo.rpc;
 const handler_mod = corvo.handler;
-const oplog_mod = corvo.oplog;
 const notify_mod = corvo.notify;
 const kv_read = corvo.kv_read;
 const http_read = corvo.http_read;
 const pipeline_mod = corvo.pipeline;
-const cluster_mod = corvo.cluster;
+const raft_host_mod = corvo.raft_host;
+const raft_runtime_mod = corvo.raft_runtime;
 
 const RealPipeline = pipeline_mod.Pipeline(io_mod.Backend);
 const ServerConfig = config_mod.ServerConfig;
+const RaftHost = raft_host_mod.RaftHost;
+
+// RaftIface adapter — bridges the pipeline's consensus vtable to RaftHost.
+fn raftProposeFn(ptr: *anyopaque, muts: []const kv.Mutation) ?*pipeline_mod.ProposeToken {
+    const host: *RaftHost = @ptrCast(@alignCast(ptr));
+    return host.proposeAsync(muts) catch null;
+}
+
+fn raftIsLeaderFn(ptr: *anyopaque) bool {
+    const host: *RaftHost = @ptrCast(@alignCast(ptr));
+    return host.isLeader();
+}
 
 var running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true);
 
@@ -51,12 +64,20 @@ fn realClock() i64 {
 }
 
 // ============================================================================
-// Peer parsing: "id@host:port"
+// Peer parsing: "id[:uuidhex]@host:port" — host:port is the peer's CLIENT
+// address; the raft transport dials port + 1000 (resolvedClusterPort
+// convention). uuid defaults to deriveUuid(id) for static clusters.
 // ============================================================================
 
 const max_peers = 6;
 
-fn parsePeers(spec: []const u8, ids_out: *[max_peers][]const u8, addrs_out: *[max_peers]std.net.Address) !u8 {
+const ParsedPeer = struct {
+    spec: raft_host_mod.PeerSpec,
+    /// Raft transport address (client port + 1000).
+    raft_addr: std.net.Address,
+};
+
+fn parsePeers(spec: []const u8, out: *[max_peers]ParsedPeer) !u8 {
     var count: u8 = 0;
     var rest = spec;
 
@@ -66,144 +87,38 @@ fn parsePeers(spec: []const u8, ids_out: *[max_peers][]const u8, addrs_out: *[ma
         rest = if (end < rest.len) rest[end + 1 ..] else "";
 
         if (entry.len == 0) continue;
+        if (count >= max_peers) return error.TooManyPeers;
 
         const at_pos = std.mem.indexOfScalar(u8, entry, '@') orelse return error.InvalidPeerSpec;
-        const id = entry[0..at_pos];
+        var id = entry[0..at_pos];
         const host_port = entry[at_pos + 1 ..];
+
+        // Optional explicit uuid: "id:uuidhex".
+        var uuid: u128 = 0;
+        if (std.mem.indexOfScalar(u8, id, ':')) |colon| {
+            uuid = std.fmt.parseInt(u128, id[colon + 1 ..], 16) catch return error.InvalidPeerSpec;
+            if (uuid == 0) return error.InvalidPeerSpec;
+            id = id[0..colon];
+        }
+        if (id.len == 0) return error.InvalidPeerSpec;
+        if (uuid == 0) uuid = raft_host_mod.deriveUuid(id);
 
         const colon_pos = std.mem.lastIndexOfScalar(u8, host_port, ':') orelse return error.InvalidPeerSpec;
         const host = host_port[0..colon_pos];
         const port_str = host_port[colon_pos + 1 ..];
-        const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPeerSpec;
+        const client_port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPeerSpec;
 
-        // Peer spec port is the cluster transport port directly.
-        ids_out[count] = id;
-        addrs_out[count] = try std.net.Address.parseIp(host, port);
+        var addr = try std.net.Address.parseIp(host, client_port);
+        addr.setPort(client_port +| 1000);
+
+        out[count] = .{
+            .spec = .{ .id = id, .uuid = uuid },
+            .raft_addr = addr,
+        };
         count += 1;
     }
 
     return count;
-}
-
-/// Resolve a DNS name to discover cluster peers.
-/// Returns the total peer count (existing + discovered).
-fn discoverPeers(
-    allocator: std.mem.Allocator,
-    dns_name: []const u8,
-    cluster_port: u16,
-    bind_addr: []const u8,
-    http_port: u16,
-    ids_out: *[max_peers][]const u8,
-    addrs_out: *[max_peers]std.net.Address,
-    id_bufs: *[max_peers][64]u8,
-    existing_count: u8,
-) u8 {
-    // Resolve self address for filtering.
-    const self_addr = std.net.Address.parseIp(bind_addr, http_port) catch return existing_count;
-
-    // DNS name must be null-terminated for getaddrinfo.
-    var name_buf: [256]u8 = undefined;
-    if (dns_name.len >= name_buf.len) return existing_count;
-    @memcpy(name_buf[0..dns_name.len], dns_name);
-    name_buf[dns_name.len] = 0;
-
-    const list = std.net.getAddressList(allocator, name_buf[0..dns_name.len :0], cluster_port) catch |err| {
-        std.debug.print("corvo: DNS discovery failed for {s}: {}\n", .{ dns_name, err });
-        return existing_count;
-    };
-    defer list.deinit();
-
-    var count = existing_count;
-    for (list.addrs) |addr| {
-        if (count >= max_peers) break;
-
-        // Filter out self.
-        if (isSelfAddr(addr, self_addr)) continue;
-
-        // Check for duplicates against existing peers.
-        var dup = false;
-        for (addrs_out[0..count]) |existing| {
-            if (addr.eql(existing)) {
-                dup = true;
-                break;
-            }
-        }
-        if (dup) continue;
-
-        // Generate peer ID from address (e.g., "10.0.0.2:10878").
-        const id = std.fmt.bufPrint(&id_bufs[count], "{any}", .{addr}) catch continue;
-        ids_out[count] = id;
-        addrs_out[count] = addr;
-        count += 1;
-    }
-    return count;
-}
-
-fn isSelfAddr(addr: std.net.Address, self_addr: std.net.Address) bool {
-    // Compare IP bytes (ignore port since DNS may resolve to HTTP port).
-    switch (addr.any.family) {
-        std.posix.AF.INET => {
-            // Check against 0.0.0.0 (bind-all) — any resolved IP is "self".
-            if (self_addr.in.sa.addr == 0) return false; // Can't filter when binding to all.
-            return addr.in.sa.addr == self_addr.in.sa.addr;
-        },
-        std.posix.AF.INET6 => {
-            return std.mem.eql(u8, &addr.in6.sa.addr, &self_addr.in6.sa.addr);
-        },
-        else => return false,
-    }
-}
-
-/// Try to join an existing cluster by sending POST /api/v1/cluster/join
-/// to each discovered peer. Best-effort — failure is not fatal (we may
-/// be the first node bootstrapping).
-fn tryJoinCluster(
-    peer_addrs: []const std.net.Address,
-    node_id: []const u8,
-    self_cluster_addr: std.net.Address,
-) void {
-    var body_buf: [512]u8 = undefined;
-    var self_addr_buf: [64]u8 = undefined;
-    const self_addr_str = std.fmt.bufPrint(&self_addr_buf, "{any}", .{self_cluster_addr}) catch return;
-
-    const body = std.fmt.bufPrint(&body_buf,
-        \\{{"node_id":"{s}","addr":"{s}"}}
-    , .{ node_id, self_addr_str }) catch return;
-
-    for (peer_addrs) |addr| {
-        // Derive HTTP port from cluster port (cluster = http + 1000).
-        const peer_http_port = addr.getPort() -| 1000;
-        if (peer_http_port == 0) continue;
-
-        // Build HTTP address for the peer.
-        var peer_http_addr = addr;
-        peer_http_addr.setPort(peer_http_port);
-
-        // Simple TCP connection + HTTP POST.
-        const stream = std.net.tcpConnectToAddress(peer_http_addr) catch continue;
-        defer stream.close();
-
-        var req_buf: [1024]u8 = undefined;
-        const req = std.fmt.bufPrint(&req_buf,
-            "POST /api/v1/cluster/join HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-            .{ body.len, body },
-        ) catch continue;
-
-        _ = stream.write(req) catch continue;
-
-        var resp_buf: [1024]u8 = undefined;
-        const n = stream.read(&resp_buf) catch continue;
-        if (n > 0) {
-            const resp = resp_buf[0..n];
-            if (std.mem.indexOf(u8, resp, "200 OK") != null) {
-                std.debug.print("corvo: joined cluster via {any}\n", .{peer_http_addr});
-                return;
-            }
-            // Not leader — try next peer.
-        }
-    }
-
-    std.debug.print("corvo: no existing cluster found, bootstrapping as single node\n", .{});
 }
 
 // ============================================================================
@@ -229,9 +144,9 @@ fn printHelp() void {
         \\  --purge-threshold <n>     Early purge when terminal count exceeds n (default: 10000)
         \\  --persist-completed       Keep completed jobs until purge (default: off)
         \\  --node-id <id>            Node ID (enables cluster mode)
-        \\  --peers <spec>            Peers: id@host:port,id@host:port,...
-        \\  --discover-dns-name <n>   DNS name for peer auto-discovery
-        \\  --sync-repl               Enable sync replication
+        \\  --peers <spec>            Peers: id[:uuidhex]@host:port,... (client addrs;
+        \\                            raft transport uses port + 1000)
+        \\  --cluster-id <n>          Cluster identifier (u64, required in cluster mode)
         \\  --admin-password <pw>     Admin password (locks UI + API)
         \\  --cluster-secret <s>      Shared secret authenticating peer connections
         \\                            (or set CORVO_CLUSTER_SECRET)
@@ -348,13 +263,15 @@ pub fn main() !void {
                 std.debug.print("--peers requires an argument\n", .{});
                 return;
             };
-        } else if (std.mem.eql(u8, arg, "--discover-dns-name")) {
-            config.discover_dns_name = args.next() orelse {
-                std.debug.print("--discover-dns-name requires an argument\n", .{});
+        } else if (std.mem.eql(u8, arg, "--cluster-id")) {
+            const val = args.next() orelse {
+                std.debug.print("--cluster-id requires an argument\n", .{});
                 return;
             };
-        } else if (std.mem.eql(u8, arg, "--sync-repl")) {
-            config.sync_replication = true;
+            config.cluster_id = std.fmt.parseInt(u64, val, 10) catch {
+                std.debug.print("invalid cluster-id: {s}\n", .{val});
+                return;
+            };
         } else if (std.mem.eql(u8, arg, "--max-payload-size")) {
             const val = args.next() orelse {
                 std.debug.print("--max-payload-size requires an argument\n", .{});
@@ -458,7 +375,11 @@ pub fn main() !void {
     var stores = [1]kv.Store{kvstore};
 
     // --- OpHandler ---
-    std.debug.print("corvo: rebuilding state...\n", .{});
+    // In cluster mode the in-memory state is NOT rebuilt at boot: the raft
+    // thread may still be applying committed entries, and a follower's
+    // handler state is unused (writes are rejected with MSG_NOT_LEADER).
+    // The pipeline rebuilds it on leadership acquisition, after the barrier
+    // proposal commits (docs/raft-wiring.md).
     var handler = handler_mod.OpHandler.init(allocator);
     handler.max_queues = config.max_queues;
     handler.max_jobs = config.max_jobs;
@@ -466,17 +387,10 @@ pub fn main() !void {
     handler.persist_completed = config.persist_completed;
     handler.pending.max_queues = config.max_queues;
     defer handler.deinit();
-    handler.rebuildState(&stores);
-
-    // --- Oplog ---
-    var oplog_path_buf: [256]u8 = undefined;
-    const oplog_path_slice = std.fmt.bufPrint(&oplog_path_buf, "{s}/oplog", .{config.data_dir}) catch unreachable;
-    var oplog_path_z: [257]u8 = undefined;
-    @memcpy(oplog_path_z[0..oplog_path_slice.len], oplog_path_slice);
-    oplog_path_z[oplog_path_slice.len] = 0;
-
-    var oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &realClock }, oplog_path_z[0..oplog_path_slice.len :0], 8192);
-    defer oplog.deinit();
+    if (!cluster_mode) {
+        std.debug.print("corvo: rebuilding state...\n", .{});
+        handler.rebuildState(&stores);
+    }
 
     // --- QueueNotifier ---
     var notify = notify_mod.QueueNotifier.init(allocator);
@@ -486,83 +400,70 @@ pub fn main() !void {
     // --- KV reader (reads directly from Talon KV store) ---
     var kv_reader = kv_read.Reader.init(&stores[0]);
 
-    // --- Cluster setup (optional) ---
-    var cluster_node: ?cluster_mod.ClusterNode = null;
-    var repl_hook: ?pipeline_mod.ReplHook = null;
+    // --- Raft cluster setup (optional) ---
+    var raft_host: ?*RaftHost = null;
+    var raft_iface: ?pipeline_mod.RaftIface = null;
+    var cluster_peer_count: u8 = 0;
+    // Serializes talon access between the pipeline thread and the raft
+    // thread (talon is single-threaded; see docs/raft-wiring.md).
+    var db_lock: std.Thread.Mutex = .{};
 
     if (cluster_mode) {
-        var peer_ids: [max_peers][]const u8 = undefined;
-        var peer_addrs: [max_peers]std.net.Address = undefined;
+        var parsed_peers: [max_peers]ParsedPeer = undefined;
         var peer_count: u8 = 0;
-
-        // Static peers from --peers flag.
         if (config.peers.len > 0) {
-            peer_count = parsePeers(config.peers, &peer_ids, &peer_addrs) catch {
-                std.debug.print("invalid --peers format (expected: id@host:port,...)\n", .{});
+            peer_count = parsePeers(config.peers, &parsed_peers) catch {
+                std.debug.print("invalid --peers format (expected: id[:uuidhex]@host:port,...)\n", .{});
                 return;
             };
         }
+        cluster_peer_count = peer_count;
 
-        // Cluster transport binds on server port + 1000.
+        var peer_specs: [max_peers]raft_host_mod.PeerSpec = undefined;
+        for (parsed_peers[0..peer_count], 0..) |p, i| peer_specs[i] = p.spec;
+
+        // Raft transport binds on server port + 1000.
         const cluster_port = config.resolvedClusterPort();
         const cluster_bind_addr = try std.net.Address.parseIp(config.bind, cluster_port);
 
-        // DNS discovery — resolve DNS name to find peers.
-        // Peer IDs are generated from the address (host:cluster_port) since
-        // we don't know their node IDs until they join.
-        var dns_id_bufs: [max_peers][64]u8 = undefined;
-        if (config.discover_dns_name.len > 0) {
-            const discovered = discoverPeers(
-                allocator,
-                config.discover_dns_name,
-                cluster_port,
-                config.bind,
-                config.port,
-                &peer_ids,
-                &peer_addrs,
-                &dns_id_bufs,
-                peer_count,
-            );
-            if (discovered > peer_count) {
-                std.debug.print("corvo: discovered {d} peers via DNS ({s})\n", .{
-                    discovered - peer_count, config.discover_dns_name,
-                });
-                peer_count = discovered;
-            } else {
-                std.debug.print("corvo: no new peers discovered via DNS ({s})\n", .{
-                    config.discover_dns_name,
-                });
-            }
-        }
+        // Buffers must fit a full raft frame (entries carry whole batches
+        // of encoded mutations).
+        const raft_buf_size: u32 = 2 * 1024 * 1024;
 
-        cluster_node = cluster_mod.ClusterNode.init(allocator, &stores, .{
-            .node_id = config.node_id,
-            .peer_ids = peer_ids[0..peer_count],
-            .peer_addrs = peer_addrs[0..peer_count],
-            .bind_addr = cluster_bind_addr,
-            .config_hash = config.clusterHash(),
-            .cluster_secret = config.cluster_secret,
+        const host = try RaftHost.create(allocator, db, .{
+            .runtime = .{
+                .node_id = config.node_id,
+                .instance_uuid = raft_host_mod.deriveUuid(config.node_id),
+                .cluster_id = config.cluster_id,
+                .peers = peer_specs[0..peer_count],
+                .raft_config = raft_runtime_mod.defaultConfig(),
+            },
+            .peer_net = .{
+                .self_id = config.node_id,
+                .bind_addr = cluster_bind_addr,
+                .recv_buf_size = raft_buf_size,
+                .send_buf_size = raft_buf_size,
+                .cluster_secret = config.cluster_secret,
+            },
+            .db_lock = &db_lock,
         });
-
-        try cluster_node.?.start();
-        repl_hook = cluster_node.?.replHook();
-        http_read.g_cluster_node = &(cluster_node.?);
-
-        // If we discovered peers via DNS, try to join the cluster.
-        // The join request tells the leader about us so it adds us as a peer.
-        if (config.discover_dns_name.len > 0 and peer_count > 0) {
-            tryJoinCluster(
-                peer_addrs[0..peer_count],
-                config.node_id,
-                cluster_bind_addr,
-            );
+        for (parsed_peers[0..peer_count]) |p| {
+            try host.registerPeer(p.spec.id, p.raft_addr);
         }
+        try host.start();
+        raft_host = host;
+        raft_iface = .{
+            .ptr = @ptrCast(host),
+            .propose_fn = &raftProposeFn,
+            .is_leader_fn = &raftIsLeaderFn,
+        };
+        http_read.g_raft_host = host;
 
-        std.debug.print("corvo: cluster node={s}, peers={d}, transport=:{d}, config_hash={x}\n", .{
-            config.node_id, peer_count, cluster_port, config.clusterHash(),
+        std.debug.print("corvo: raft node={s}, cluster_id={d}, peers={d}, transport=:{d}\n", .{
+            config.node_id, config.cluster_id, peer_count, cluster_port,
         });
     }
-    defer if (cluster_node) |*cn| cn.deinit();
+    defer if (raft_host) |h| h.destroy();
 
     // --- Create listen socket ---
     const addr = try std.net.Address.parseIp(config.bind, config.port);
@@ -592,7 +493,6 @@ pub fn main() !void {
         &io_backend,
         &handler,
         &stores,
-        &oplog,
         &notify,
         &kv_reader,
         .{
@@ -610,22 +510,20 @@ pub fn main() !void {
             .cron_interval_ns = config.cron_interval_ns,
             .webhook_interval_ns = config.workers_interval_ns, // same as workers (1s default)
             .worker_timeout_ns = config.worker_timeout_ns,
-            .repl_hook = repl_hook,
-            .sync_replication = config.sync_replication,
-            .coalesce_window_ns = if (config.sync_replication) 200_000 else 0,
+            .raft = raft_iface,
+            .db_lock = if (cluster_mode) &db_lock else null,
+            .coalesce_window_ns = if (cluster_mode) 200_000 else 0,
             .admin_password = config.admin_password,
         },
     );
     defer pipeline.destroyHeap();
 
-    // Run initial maintenance before accepting connections.
-    std.debug.print("corvo: running startup maintenance...\n", .{});
-    pipeline.warmup();
-
-    // Wire cluster ack notification to pipeline's atomic + oplog for retry.
-    if (cluster_mode) {
-        cluster_mod.g_ack_seq_ptr = pipeline.ackSeqPtr();
-        cluster_node.?.oplog = &oplog;
+    // Run initial maintenance before accepting connections. Cluster mode
+    // skips this: warmup mutates the KV outside the raft log, and the
+    // pipeline runs the equivalent on leadership acquisition.
+    if (!cluster_mode) {
+        std.debug.print("corvo: running startup maintenance...\n", .{});
+        pipeline.warmup();
     }
 
     // --- Signal handling ---
@@ -637,24 +535,14 @@ pub fn main() !void {
     std.posix.sigaction(std.posix.SIG.INT, &sa, null);
     std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
 
-    // Wait for leader election if in cluster mode.
+    // Cluster mode serves immediately: writes get MSG_NOT_LEADER/503 until
+    // this node acquires leadership; reads are served from the local KV.
     var cluster_info: http_read.ClusterInfo = undefined;
-    if (cluster_node) |*cn| {
-        std.debug.print("corvo: waiting for leader election...\n", .{});
-        if (!cn.waitForLeader(30000)) {
-            std.debug.print("corvo: leader election timed out\n", .{});
-            return;
-        }
-        const state = cn.election.currentState();
-        std.debug.print("corvo: leader elected (epoch={d}, leader={s})\n", .{
-            state.epoch, if (state.leader_id.len > 0) state.leader_id else "(self)",
-        });
+    if (raft_host) |host| {
         cluster_info = .{
             .node_id = config.node_id,
-            .is_leader = &cn.is_leader_flag,
-            .election = &cn.election,
-            .events = &cn.events,
-            .peer_count = @intCast(cn.config.peer_ids.len),
+            .is_leader = &host.is_leader,
+            .peer_count = cluster_peer_count,
         };
         http_read.g_cluster_info = &cluster_info;
     }

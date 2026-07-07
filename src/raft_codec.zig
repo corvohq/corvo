@@ -45,6 +45,38 @@ pub const max_msg_bytes: usize = 2 * 1024 * 1024;
 /// Hard cap on a single ID (from / to). Matches existing tcp_transport.zig.
 pub const max_id_len: usize = 32;
 
+/// Per-entry wire overhead of an encoded entry: type(1) + term(8) + index(8) +
+/// data_len(4). See writeEntries / encodedSize.
+pub const entry_wire_overhead: usize = 1 + 8 + 8 + 4;
+
+/// Worst-case fixed (non-entry) bytes of an encoded message: every field in
+/// encodedSize() except the per-entry loop, with both ids at max_id_len and no
+/// snapshot payload (an AppendEntries carries none). This is the frame budget
+/// consumed before any entry data.
+pub const max_frame_overhead: usize =
+    (1 + 1 + 8 + 16 + 16 + 8) // version, type, term, from_uuid, to_uuid, cluster_id
++ (1 + max_id_len) + (1 + max_id_len) // from, to
++ (8 + 8) // last_log_index, last_log_term
++ (1 + 1) // granted, success
++ (8 + 8 + 8) // prev_log_index, prev_log_term, leader_commit
++ 4 // entries_count
++ (8 + 8 + 8) // hint_index, match_index, read_seq
++ (8 + 8 + 8 + 1) // snapshot_index, snapshot_term, snapshot_offset, snapshot_done
++ (4 + 4); // snapshot_data_len, snapshot_config_len (payloads empty)
+
+/// Largest single entry `data` payload such that `count` entries of this size
+/// still encode within max_msg_bytes. zig-raft packs up to
+/// Config.max_entries_per_msg entries into one AppendEntries by COUNT with no
+/// byte budget (zig-raft src/raft.zig `buildAppendEntriesFor`). If a single
+/// entry exceeds this, a full message can exceed the frame cap and become
+/// impossible to encode or transmit — the leader then re-assembles the same
+/// oversize message every retry: a per-follower replication livelock. Entry
+/// producers (raft_batcher) MUST bound each entry's payload to this.
+pub fn maxEntryDataBytes(count: usize) usize {
+    check(count > 0, "maxEntryDataBytes: count must be > 0", .{});
+    return (max_msg_bytes - max_frame_overhead) / count - entry_wire_overhead;
+}
+
 pub const CodecError = error{
     BufferTooSmall,
     MessageTooLarge,
@@ -466,4 +498,74 @@ test "codec: rejects oversized id" {
     const msg = Message{ .type_ = .append_entries, .from = long_id, .to = "n2", .term = 1 };
     var buf: [256]u8 = undefined;
     try testing.expectError(CodecError.InvalidMessage, encode(msg, &buf));
+}
+
+test "codec: worst-case max-entries message assembles within frame cap" {
+    // A leader packs up to raft.max_entries_per_msg entries per AppendEntries
+    // by count (zig-raft applies no byte budget). Prove the worst case — that
+    // many entries, each at maxEntryDataBytes, with max-length ids — encodes
+    // within max_msg_bytes and round-trips. If this ever regresses, a leader
+    // could assemble an untransmittable message and livelock replication.
+    const a = testing.allocator;
+    const count = raft.raft.max_entries_per_msg;
+    const data_len = maxEntryDataBytes(count);
+
+    // One shared data blob; every entry points at it (decode copies per entry).
+    const blob = try a.alloc(u8, data_len);
+    defer a.free(blob);
+    @memset(blob, 0xAB);
+
+    const ents = try a.alloc(Entry, count);
+    defer a.free(ents);
+    for (ents, 0..) |*e, i| e.* = .{ .term = 9, .index = @intCast(i + 1), .data = blob };
+
+    const id32 = "x" ** max_id_len; // worst-case 32-byte ids
+    const msg = Message{
+        .type_ = .append_entries,
+        .from = id32,
+        .to = id32,
+        .term = 9,
+        .prev_log_index = 100,
+        .prev_log_term = 8,
+        .leader_commit = 100,
+        .entries = ents,
+    };
+
+    const total = encodedSize(msg);
+    try testing.expect(total <= max_msg_bytes);
+
+    const buf = try a.alloc(u8, max_msg_bytes);
+    defer a.free(buf);
+    const n = try encode(msg, buf);
+    try testing.expectEqual(total, n);
+
+    var d = try decode(buf[0..n], a);
+    defer d.deinit();
+    try testing.expectEqual(count, d.msg.entries.len);
+    try testing.expectEqual(@as(usize, data_len), d.msg.entries[0].data.len);
+    try testing.expectEqual(@as(u8, 0xAB), d.msg.entries[count - 1].data[0]);
+}
+
+test "codec: one byte over per-entry budget overflows the frame" {
+    // maxEntryDataBytes is the exact ceiling: growing every entry by a single
+    // byte pushes a full-count message past max_msg_bytes. encode() rejects it
+    // (MessageTooLarge) before writing, so the buffer size is irrelevant.
+    const a = testing.allocator;
+    const count = raft.raft.max_entries_per_msg;
+    const data_len = maxEntryDataBytes(count) + 1;
+
+    const blob = try a.alloc(u8, data_len);
+    defer a.free(blob);
+    @memset(blob, 0xCD);
+
+    const ents = try a.alloc(Entry, count);
+    defer a.free(ents);
+    for (ents, 0..) |*e, i| e.* = .{ .term = 9, .index = @intCast(i + 1), .data = blob };
+
+    const id32 = "x" ** max_id_len;
+    const msg = Message{ .type_ = .append_entries, .from = id32, .to = id32, .term = 9, .entries = ents };
+    try testing.expect(encodedSize(msg) > max_msg_bytes);
+
+    var buf: [64]u8 = undefined;
+    try testing.expectError(CodecError.MessageTooLarge, encode(msg, &buf));
 }

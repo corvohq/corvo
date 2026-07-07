@@ -959,15 +959,13 @@ const ClusterHandle = struct {
 fn startCluster(alloc: std.mem.Allocator) !ClusterHandle {
     const print = std.debug.print;
 
-    // Pick 3 random ports spaced 2000 apart so that each node's cluster port
-    // (auto-calculated as port + 1000) doesn't collide with any other node's main port.
+    // Pick 3 random ports spaced 2000 apart so that each node's raft transport
+    // port (auto-calculated as port + 1000) doesn't collide with any other node's main port.
     const seed = @as(u64, @intCast(std.time.nanoTimestamp()));
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
     const base_port = 20000 + random.intRangeAtMost(u16, 0, 3000);
     const ports = [3]u16{ base_port, base_port + 2000, base_port + 4000 };
-    // Cluster ports are port + 1000 (server default).
-    const cluster_ports = [3]u16{ ports[0] + 1000, ports[1] + 1000, ports[2] + 1000 };
     const node_ids = [3][]const u8{ "bench-n1", "bench-n2", "bench-n3" };
 
     var handle = ClusterHandle{
@@ -976,7 +974,8 @@ fn startCluster(alloc: std.mem.Allocator) !ClusterHandle {
         .count = 0,
     };
 
-    // Build peers strings for each node (other two nodes' cluster ports).
+    // Build peers strings for each node (other two nodes' client ports; the
+    // raft transport dials each peer's client port + 1000).
     var peers_bufs: [3][256]u8 = undefined;
     var peers_slices: [3][]const u8 = undefined;
     for (0..3) |i| {
@@ -988,7 +987,7 @@ fn startCluster(alloc: std.mem.Allocator) !ClusterHandle {
                 peers_bufs[i][idx] = ',';
                 idx += 1;
             }
-            const written = std.fmt.bufPrint(peers_bufs[i][idx..], "{s}@127.0.0.1:{d}", .{ node_ids[j], cluster_ports[j] }) catch break;
+            const written = std.fmt.bufPrint(peers_bufs[i][idx..], "{s}@127.0.0.1:{d}", .{ node_ids[j], ports[j] }) catch break;
             idx += written.len;
             first = false;
         }
@@ -1010,7 +1009,7 @@ fn startCluster(alloc: std.mem.Allocator) !ClusterHandle {
         const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{ports[i]}) catch unreachable;
 
         var child = std.process.Child.init(
-            &.{ server_path, "--port", port_str, "--data-dir", data_dir_slice, "--node-id", node_ids[i], "--peers", peers_slices[i], "--no-mirror" },
+            &.{ server_path, "--port", port_str, "--data-dir", data_dir_slice, "--node-id", node_ids[i], "--peers", peers_slices[i], "--cluster-id", "1", "--no-mirror" },
             alloc,
         );
         child.stderr_behavior = .Pipe;
@@ -1039,8 +1038,9 @@ fn startCluster(alloc: std.mem.Allocator) !ClusterHandle {
         }
     }
 
-    // Wait for leader election. The election timeout is ~3s, so wait a bit
-    // then probe each node via RPC to find the leader (the one that accepts writes).
+    // Wait for leader election. Raft election settles in ~1s (300-600ms
+    // timeouts), so wait a bit then probe each node via RPC to find the leader
+    // (the leader accepts writes; followers answer not-leader).
     print(" waiting for leader election...", .{});
     std.Thread.sleep(5_000_000_000); // 5s for election to complete
 

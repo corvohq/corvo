@@ -61,6 +61,12 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{
         .root_module = test_mod,
     });
+    // Debug-mode tests materialize by-value temporaries of the ~5MB Pipeline
+    // struct in test-fn frames (a "maintenance scheduling"-sized test frame is
+    // ~38MB). The default limit sat within 64KB of that — any struct growth
+    // segfaulted at a function prologue with no trace. Make the bound explicit
+    // and generous.
+    tests.stack_size = 128 * 1024 * 1024;
     if (b.args) |a| tests.filters = a;
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
@@ -78,6 +84,7 @@ pub fn build(b: *std.Build) void {
     const sim_tests = b.addTest(.{
         .root_module = sim_mod,
     });
+    sim_tests.stack_size = 128 * 1024 * 1024; // same test-frame growth issue as unit tests
     const run_sim_tests = b.addRunArtifact(sim_tests);
     const sim_step = b.step("sim", "Run VOPR simulator");
     sim_step.dependOn(&run_sim_tests.step);

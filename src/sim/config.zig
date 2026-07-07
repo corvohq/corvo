@@ -55,7 +55,4 @@ pub const Config = struct {
 
     // Invariant check interval (every N ticks).
     check_interval: u32 = 10,
-
-    // Cluster: sync replication (pipeline defers until follower ack).
-    sync_replication: bool = false,
 };

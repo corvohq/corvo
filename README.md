@@ -130,9 +130,9 @@ Corvo is implemented in Zig around a single write pipeline and an embedded KV st
 | Pipeline | Classifies requests, batches work, applies state transitions |
 | Talon | Embedded durable KV store used for Corvo state |
 | KV read layer | Typed reads directly from Talon |
-| OpLog | Append-only mutation log used for replication |
-| TCP transport | Cluster replication and follower catch-up |
-| Election | Leader election and cluster membership checks |
+| Raft log | Replicated mutation log via zig-raft |
+| Raft transport | Peer replication and follower catch-up (raft_net) |
+| Raft elections | Leader election and cluster membership checks |
 | HTTP / RPC | Worker and client protocols |
 
 Talon is the storage engine. It uses a B+ tree plus value log layout, with job headers and indexes kept in the tree and larger payloads stored separately.
