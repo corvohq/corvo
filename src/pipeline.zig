@@ -112,6 +112,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
         last_expire_ns: u64 = 0,
         last_purge_ns: u64 = 0,
         last_workers_ns: u64 = 0,
+        last_cron_ns: u64 = 0,
         last_webhook_ns: u64 = 0,
 
         // Sync replication — pipelined prepares.
@@ -185,6 +186,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
         const max_batch_jobs = rpc.MAX_BATCH_JOBS;
         const max_frames: u32 = 256;
         const max_completions: u32 = 256;
+        /// recv conns for a tick = fresh completions ∪ deferred-recv conns, which
+        /// can be disjoint, so the collection must hold both sets (each bounded by
+        /// max_completions) to avoid a stack buffer overflow when merging them.
+        const max_recv_conns: u32 = 2 * max_completions;
         const max_waiting_conns: u32 = 4096;
         const max_notified_queues: u32 = 64;
         const max_prepare_slots: u32 = 4;
@@ -194,7 +199,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
         const PrepareSlot = struct {
             send_conns: [max_frames + max_waiting_conns]u16 = undefined,
             send_conn_count: u32 = 0,
-            recv_conns: [max_completions]u16 = undefined,
+            recv_conns: [max_recv_conns]u16 = undefined,
             recv_conn_count: u32 = 0,
             ack_seq: u64 = 0,
         };
@@ -215,7 +220,13 @@ pub fn Pipeline(comptime IoBackend: type) type {
             expire_interval_ns: u64 = 0,
             purge_interval_ns: u64 = 0,
             purge_retention_ns: u64 = 14 * 24 * 3_600_000_000_000,
+            /// Terminal-job count that triggers an early purge pass, independent
+            /// of purge_interval_ns. 0 = only the interval triggers purge.
+            purge_threshold: u32 = 0,
             workers_interval_ns: u64 = 0,
+            /// How often to scan cron schedules for due fires. Cron resolution is
+            /// one minute, so a 10s check fires within seconds of each boundary.
+            cron_interval_ns: u64 = 0,
             webhook_interval_ns: u64 = 0,
             worker_timeout_ns: u64 = 60_000_000_000,
             repl_hook: ?ReplHook = null,
@@ -321,6 +332,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             self.last_expire_ns = now_ns;
             self.last_purge_ns = now_ns;
             self.last_workers_ns = now_ns;
+            self.last_cron_ns = now_ns;
             self.last_webhook_ns = now_ns;
 
             // Clean stale workers so the UI doesn't show ghosts.
@@ -443,8 +455,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
             self.recv_compaction_count = 0;
             self.notified_queue_count = 0;
 
-            // 2. Process completions — collect unique recv conn_ids.
-            var recv_conns: [max_completions]u16 = undefined;
+            // 2. Process completions — collect unique recv conn_ids. Sized for
+            // the union of fresh completions and deferred-recv conns (see below).
+            var recv_conns: [max_recv_conns]u16 = undefined;
             var recv_conn_count: u32 = 0;
 
             for (self.completions[0..n]) |completion| {
@@ -499,6 +512,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     }
                 }
                 if (!dup) {
+                    assert.check(recv_conn_count < max_recv_conns, "pipeline: recv_conns overflow ({d})", .{recv_conn_count});
                     recv_conns[recv_conn_count] = dc;
                     recv_conn_count += 1;
                 }
@@ -637,6 +651,19 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
                 if (self.frame_count >= max_frames) break; // back-pressure
 
+                // RPC auth gate: when an admin password is configured, a
+                // connection must complete a MSG_AUTH handshake before any other
+                // frame is accepted. Otherwise a client speaking the binary
+                // protocol could bypass the HTTP-layer auth entirely and mutate
+                // state (delete jobs, drop queues). Unauthenticated non-AUTH
+                // frames close the connection.
+                if (self.config.admin_password.len > 0 and !c.rpc_authenticated and
+                    hdr.msg_type != rpc.MSG_AUTH)
+                {
+                    self.io.queueClose(conn_id);
+                    return;
+                }
+
                 self.frames[self.frame_count] = .{
                     .conn_id = conn_id,
                     .req_id = hdr.req_id,
@@ -645,6 +672,13 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 };
                 self.frame_count += 1;
                 pos = @intCast(frame_end);
+
+                // Stop after batching a MSG_AUTH from an unauthenticated conn:
+                // the client waits for MSG_AUTH_RESP before sending more, so any
+                // trailing bytes this pass would be processed with stale (still
+                // unauthenticated) state.
+                if (self.config.admin_password.len > 0 and !c.rpc_authenticated and
+                    hdr.msg_type == rpc.MSG_AUTH) break;
             }
 
             self.recordRecvCompaction(conn_id, pos);
@@ -704,10 +738,22 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     self.recordRecvCompaction(conn_id, req.total_len);
                     return;
                 }
+                // admin_read routes (backup/restore/cluster-join) additionally
+                // require the admin role — a scoped worker/producer key that is a
+                // valid identity must not dump or replace the whole database.
+                if (route == .admin_read and auth_result.ok.role != .admin) {
+                    const resp_len = http.writeAuthError(c.send_buf, .forbidden);
+                    if (resp_len > 0) {
+                        c.send_len = resp_len;
+                        self.io.queueSend(conn_id, resp_len);
+                    }
+                    self.recordRecvCompaction(conn_id, req.total_len);
+                    return;
+                }
             }
 
             switch (route) {
-                .read => {
+                .read, .admin_read => {
                     // Handle inline — write response directly, bypass batch.
                     const clean = if (std.mem.indexOfScalar(u8, req.path, '?')) |qi| req.path[0..qi] else req.path;
 
@@ -827,7 +873,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
         fn runMaintenance(self: *Self) void {
             const now_ns = self.nowNs();
 
-            const intervals = [7]struct { ns: u64, last: *u64, action: ops_mod.MaintenanceAction }{
+            const intervals = [8]struct { ns: u64, last: *u64, action: ops_mod.MaintenanceAction }{
                 .{ .ns = self.config.promote_interval_ns, .last = &self.last_promote_ns, .action = .promote },
                 .{ .ns = self.config.reclaim_interval_ns, .last = &self.last_reclaim_ns, .action = .reclaim },
                 .{ .ns = self.config.unique_interval_ns, .last = &self.last_unique_ns, .action = .unique },
@@ -835,11 +881,22 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 .{ .ns = self.config.expire_interval_ns, .last = &self.last_expire_ns, .action = .expire },
                 .{ .ns = self.config.purge_interval_ns, .last = &self.last_purge_ns, .action = .purge },
                 .{ .ns = self.config.workers_interval_ns, .last = &self.last_workers_ns, .action = .workers },
+                .{ .ns = self.config.cron_interval_ns, .last = &self.last_cron_ns, .action = .cron },
             };
+
+            // Purge also fires early once enough terminal jobs have accumulated,
+            // independent of the (hourly) interval, so terminal garbage doesn't
+            // build up for the full retention window under heavy churn.
+            const purge_count_due = self.config.purge_threshold > 0 and
+                self.handler.dead_since_purge >= self.config.purge_threshold;
 
             var any_due = false;
             for (intervals) |iv| {
                 if (iv.ns > 0 and now_ns - iv.last.* >= iv.ns) {
+                    any_due = true;
+                    break;
+                }
+                if (iv.action == .purge and purge_count_due) {
                     any_due = true;
                     break;
                 }
@@ -858,8 +915,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
             defer if (record_mutations) batch.freeMutations();
 
             for (intervals) |iv| {
-                if (iv.ns == 0) continue;
-                if (now_ns - iv.last.* < iv.ns) continue;
+                const interval_due = iv.ns > 0 and now_ns - iv.last.* >= iv.ns;
+                const count_due = iv.action == .purge and purge_count_due;
+                if (!interval_due and !count_due) continue;
 
                 const cutoff = if (iv.action == .rate_limit and self.handler.max_rate_window_ns > 0)
                     now_ns -| self.handler.max_rate_window_ns
@@ -885,6 +943,13 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 }
 
                 iv.last.* = now_ns;
+                // Reset the terminal-job accumulator only once the backlog is
+                // drained. Per-tick purge is capped; if this pass hit the cap
+                // there is more past-retention garbage to remove, so keep the
+                // counter high and let the count-trigger re-fire next tick until
+                // caught up. When it drains fewer than the cap, re-arm the trigger.
+                if (iv.action == .purge and result.affected < OpHandler.max_bulk_results)
+                    self.handler.dead_since_purge = 0;
                 self.maintenance_runs += 1;
                 self.applied_total += 1;
             }
@@ -1097,6 +1162,23 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
         }
 
+        /// Validate an RPC MSG_AUTH handshake and record the granted role on the
+        /// connection. Payload is a single length-prefixed credential (admin
+        /// password or API key). Reuses the same identity check as the HTTP layer.
+        fn applyRpcAuth(self: *Self, frame: *FrameDesc) void {
+            const c = self.io.conn(frame.conn_id);
+            var reader = BufReader{ .data = frame.payload };
+            const key = reader.readPrefixed() catch return; // stays unauthenticated
+            const auth = http.checkAuth(key, null, self.config.admin_password, self.reader);
+            switch (auth) {
+                .ok => |info| {
+                    c.rpc_authenticated = true;
+                    c.rpc_role = @intFromEnum(info.role);
+                },
+                .unauthorized, .forbidden => {}, // leave unauthenticated; resp reports failure
+            }
+        }
+
         fn recordOplog(self: *Self) void {
             const encoded = oplog_mod.encodeMutations(self.allocator, self.mut_list.items);
             defer self.allocator.free(encoded);
@@ -1109,6 +1191,24 @@ pub fn Pipeline(comptime IoBackend: type) type {
             // HTTP writes use JSON decode; RPC uses binary decode.
             if (frame.protocol == .http)
                 return self.decodeAndApplyHttp(batch, frame, frame_idx);
+
+            // RPC auth handshake — validate the key and record the granted role
+            // on the connection. The response (MSG_AUTH_RESP) is emitted from
+            // conn state in encodeResponses.
+            if (frame.msg_type == rpc.MSG_AUTH) {
+                self.applyRpcAuth(frame);
+                return .{};
+            }
+
+            // Role enforcement. The extractRpcFrames gate already dropped
+            // unauthenticated non-AUTH frames when auth is required; here we
+            // additionally enforce that the authenticated role may perform the op
+            // (e.g. a worker key can't delete queues).
+            if (self.config.admin_password.len > 0) {
+                const c = self.io.conn(frame.conn_id);
+                const role: http.AuthRole = @enumFromInt(c.rpc_role);
+                if (!http.rpcRoleAllows(role, frame.msg_type)) return .{ .err = "forbidden" };
+            }
 
             switch (frame.msg_type) {
                 rpc.MSG_PING => return .{},
@@ -1383,6 +1483,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
             var result = self.handler.apply(batch, op_type, &decoded.op_data);
             self.emitMirrorOp(op_type, &decoded.op_data, &result);
 
+            // Wake fetch waiters. The RPC path does this in notifyForFrame by
+            // re-parsing the binary payload, but an HTTP frame's payload is JSON
+            // and would fail that parse — leaving RPC-subscribed workers asleep
+            // when jobs arrive via the HTTP API. Capture the affected queues here
+            // where the decoded op is in hand. Names are copied into pipeline
+            // buffers and consumed post-commit by fulfillSubscriptions.
+            if (result.err == null) self.recordHttpNotify(op_type, &decoded.op_data, &result);
+
             // Audit: write entry in same batch for management ops.
             if (frame.actor_len > 0) {
                 self.handler.writeAuditEntry(batch, op_type, &decoded.op_data, &result, frame.actorSlice(), now_ns);
@@ -1437,6 +1545,26 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         self.trackSendConn(frame.conn_id);
                         c.send_len = resp_len;
                     }
+                    continue;
+                }
+
+                // RPC auth handshake response: [status:1 (0=ok,1=fail)][role:1].
+                // applyRpcAuth already set the connection state during apply.
+                if (frame.msg_type == rpc.MSG_AUTH) {
+                    self.trackSendConn(frame.conn_id);
+                    const write_start = c.send_len;
+                    var aw = BufWriter{ .buf = c.send_buf[write_start..] };
+                    aw.pos = rpc.FRAME_HEADER_SIZE;
+                    aw.writeU8(if (c.rpc_authenticated) 0 else 1);
+                    aw.writeU8(c.rpc_role);
+                    const alen: u32 = @intCast(aw.pos - rpc.FRAME_HEADER_SIZE);
+                    rpc.writeFrameHeader(
+                        c.send_buf[write_start..][0..rpc.FRAME_HEADER_SIZE],
+                        rpc.MSG_AUTH_RESP,
+                        frame.req_id,
+                        alen,
+                    );
+                    c.send_len += @intCast(aw.pos);
                     continue;
                 }
 
@@ -1546,17 +1674,19 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 writer.writeU8(0);
                 writer.writeU8(0);
 
-                // Payload: zero-copy lookup into caller buffer
-                var payload_buf: [32768]u8 = undefined;
+                // Payload: read via get() (returns a right-sized slice) rather
+                // than getInto() into a fixed scratch buffer, which overflowed
+                // on payloads larger than the scratch size. The fetch claim
+                // already bounded the total response to the send buffer, so the
+                // cumulative writes fit.
                 var jpk_buf: keys.KeyBuf = undefined;
                 const payload_key = keys.jobPayloadKey(&jpk_buf, job_id);
                 var store = &self.stores[0];
                 var batch = store.newBatch();
                 defer batch.close();
-                if (batch.getInto(payload_key, &payload_buf)) |payload_bytes| {
-                    const pl: u16 = @intCast(@min(payload_bytes.len, 32768));
-                    writer.writeU16(pl);
-                    writer.writeBytes(payload_bytes[0..pl]);
+                if (batch.get(payload_key)) |payload_bytes| {
+                    writer.writeU16(@intCast(payload_bytes.len));
+                    writer.writeBytes(payload_bytes);
                 } else {
                     writer.writeU16(0);
                 }
@@ -1601,6 +1731,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             c.worker_id_len = wlen;
 
             c.prefetch = sub.prefetch;
+            c.prefetch_window = sub.prefetch;
             c.lease_ms = sub.lease_ms;
             c.last_req_id = frame.req_id;
             c.waiting = true;
@@ -1699,12 +1830,21 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     queue_slices[qi] = c.queue_bufs[qi][0..c.queue_lens[qi]];
                 }
 
+                // Bound the fetch response to what fits in this connection's send
+                // buffer (minus any bytes already queued, the frame header, and
+                // the u16 job count). The claim stops before overflowing, leaving
+                // any remaining jobs pending for the next push.
+                const send_room: u32 = @intCast(c.send_buf.len - c.send_len);
+                const frame_overhead: u32 = @intCast(rpc.FRAME_HEADER_SIZE + 2);
+                const budget: u32 = if (send_room > frame_overhead) send_room - frame_overhead else 0;
+
                 const op_data = ops_mod.OpData{ .fetch = .{
                     .queues = queue_slices[0..c.queue_count],
                     .worker_id = c.worker_id_buf[0..c.worker_id_len],
                     .lease_duration_ms = c.lease_ms,
                     .count = c.prefetch,
                     .now_ns = self.nowNs(),
+                    .max_response_bytes = budget,
                 } };
 
                 const result = self.handler.apply(&kv_batch, .fetch, &op_data);
@@ -1886,7 +2026,43 @@ pub fn Pipeline(comptime IoBackend: type) type {
         // Notify — wake queue waiters post-commit
         // ====================================================================
 
+        /// Record fetch-wake notifications for an HTTP write op at decode time.
+        /// Mirrors the RPC notifyForFrame queue notifies (enqueue/ack/fail), but
+        /// reads the already-decoded op instead of re-parsing a binary payload.
+        /// Queue names are copied by recordNotifiedQueue; the QueueNotifier wake
+        /// is deferred to a later tick by the single-threaded event loop, so
+        /// recording here (pre-commit) is safe.
+        fn recordHttpNotify(self: *Self, op_type: ops_mod.OpType, data: *const ops_mod.OpData, result: *const ops_mod.OpResult) void {
+            switch (op_type) {
+                .enqueue => for (data.enqueue.jobs) |job| {
+                    if (job.queue.len == 0) continue;
+                    self.notify.notify(job.queue);
+                    self.recordNotifiedQueue(job.queue);
+                },
+                .ack => for (data.ack.acks) |ack| {
+                    if (ack.queue.len == 0) continue;
+                    self.notify.notify(ack.queue);
+                    self.recordNotifiedQueue(ack.queue);
+                },
+                .fail => for (data.fail.jobs) |job| {
+                    if (job.queue.len == 0) continue;
+                    self.notify.notify(job.queue);
+                    self.recordNotifiedQueue(job.queue);
+                },
+                // Bulk/other ops (e.g. requeue → pending) report affected queues
+                // via notify_queues; honor them the same way the RPC else-branch
+                // in notifyForFrame does.
+                else => if (result.notify_queues) |queues| {
+                    self.notify.notifyQueues(queues);
+                    for (queues) |q| self.recordNotifiedQueue(q);
+                },
+            }
+        }
+
         fn notifyForFrame(self: *Self, frame: *const FrameDesc, result: *const ops_mod.OpResult) void {
+            // HTTP frames carry JSON payloads that the binary re-parse below can't
+            // read; their wakes are recorded at decode time via recordHttpNotify.
+            if (frame.protocol == .http) return;
             switch (frame.msg_type) {
                 rpc.MSG_ENQUEUE_BATCH => {
                     // Enqueue can wake fetch waiters on affected queues.
@@ -1911,11 +2087,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
                             self.notify.notify(ack.queue);
                             self.recordNotifiedQueue(ack.queue);
                         }
-                        // Replenish prefetch — acked jobs free capacity for more pushes.
-                        const c = self.io.conn(frame.conn_id);
-                        if (c.waiting) {
-                            c.prefetch += result.affected;
-                        }
                     } else {
                         var reader = BufReader{ .data = frame.payload };
                         const parsed = rpc.parseFail(&reader, &self.fails_buf) catch return;
@@ -1924,6 +2095,18 @@ pub fn Pipeline(comptime IoBackend: type) type {
                             self.recordNotifiedQueue(job.queue);
                         }
                     }
+                    // Replenish the subscription window. A pushed job consumes one
+                    // slot; reporting it done (ack OR fail) frees that slot. Use the
+                    // count of jobs the worker reported (frame.count), NOT
+                    // result.affected — a skipped ack (job already cancelled/terminal/
+                    // auto-deleted) and every fail still occupied a window slot, so
+                    // counting only accepted transitions leaks the window down to 0
+                    // and the worker silently starves. Cap at the original window so
+                    // spurious completions can't inflate it.
+                    const c = self.io.conn(frame.conn_id);
+                    if (c.waiting) {
+                        c.prefetch = @min(c.prefetch_window, c.prefetch + frame.count);
+                    }
                 },
                 rpc.MSG_MAINTENANCE => {
                     // Promote/reclaim can make jobs available.
@@ -1931,7 +2114,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         var reader = BufReader{ .data = frame.payload };
                         const parsed = rpc.management.parseMaintenance(&reader) catch return;
                         switch (parsed.action) {
-                            .promote, .reclaim => {
+                            // cron fires jobs → wake workers, same as promote/reclaim.
+                            .promote, .reclaim, .cron => {
                                 if (result.notify_queues) |queues| {
                                     self.notify.notifyQueues(queues);
                                     for (queues) |q| {
@@ -2827,6 +3011,87 @@ test "maintenance scheduling" {
     const resp = ctx.readResponseHeader(conn_id).?;
     try testing.expectEqual(rpc.MSG_PONG, resp.msg_type);
     try testing.expect(ctx.pipeline.maintenance_runs > 8);
+}
+
+test "rpc auth: gate blocks unauthenticated, handshake accepts/rejects" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-rpc-auth");
+    defer ctx.destroy();
+    ctx.pipeline.config.admin_password = "s3cr3t";
+
+    // Unauthenticated PING is gated → connection closed, no PONG.
+    {
+        const conn = ctx.backend.connect().?;
+        ctx.injectFrame(conn, rpc.MSG_PING, 1, "");
+        ctx.pipeline.tick();
+        try testing.expect(ctx.readResponseHeader(conn) == null);
+    }
+
+    // Correct credential → MSG_AUTH_RESP with status ok (0) and admin role (0).
+    {
+        const conn = ctx.backend.connect().?;
+        var abuf: [64]u8 = undefined;
+        var aw = BufWriter{ .buf = &abuf };
+        aw.writePrefixed("s3cr3t");
+        ctx.injectFrame(conn, rpc.MSG_AUTH, 2, aw.written());
+        ctx.pipeline.tick();
+        const resp = ctx.readResponse(conn).?;
+        try testing.expectEqual(rpc.MSG_AUTH_RESP, resp.header.msg_type);
+        try testing.expectEqual(@as(u8, 0), resp.payload[0]); // status ok
+        try testing.expect(ctx.backend.conn(conn).rpc_authenticated);
+    }
+
+    // Wrong credential → MSG_AUTH_RESP status fail (1), connection stays unauthenticated.
+    {
+        const conn = ctx.backend.connect().?;
+        var abuf: [64]u8 = undefined;
+        var aw = BufWriter{ .buf = &abuf };
+        aw.writePrefixed("wrong-pass");
+        ctx.injectFrame(conn, rpc.MSG_AUTH, 3, aw.written());
+        ctx.pipeline.tick();
+        const resp = ctx.readResponse(conn).?;
+        try testing.expectEqual(rpc.MSG_AUTH_RESP, resp.header.msg_type);
+        try testing.expectEqual(@as(u8, 1), resp.payload[0]); // status fail
+        try testing.expect(!ctx.backend.conn(conn).rpc_authenticated);
+    }
+}
+
+test "cron scheduler fires a due cron and enqueues its job" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-cron-fire");
+    defer ctx.destroy();
+
+    const now: u64 = 1_700_000_000_000_000_000; // fixed base ns
+
+    // Create an every-minute cron with no client-supplied next_run_ns — the
+    // handler must compute it from the schedule.
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const op_data = ops_mod.OpData{ .cron_create = .{
+            .cron_id = "cron-1",
+            .name = "test-cron",
+            .queue = "cron-queue",
+            .schedule = "* * * * *",
+            .enabled = true,
+            .created_at_ns = now,
+        } };
+        const res = ctx.handler.apply(&b, .cron_create, &op_data);
+        try testing.expect(res.err == null);
+        b.commit();
+    }
+
+    // Scan two minutes later — the cron is due and should fire once.
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const later = now + 2 * 60 * 1_000_000_000;
+        const op_data = ops_mod.OpData{ .maintenance = .{ .action = .cron, .now_ns = later } };
+        const res = ctx.handler.apply(&b, .maintenance, &op_data);
+        b.commit();
+        try testing.expectEqual(@as(u32, 1), res.affected);
+    }
+
+    // The fired job is now pending in the cron's queue.
+    try testing.expect(ctx.handler.pending.queueCount("cron-queue") >= 1);
 }
 
 test "maintenance promote wakes fetch subscription" {

@@ -18,6 +18,16 @@ pub fn build(b: *std.Build) void {
     });
     const zigstache_mod = zigstache_dep.module("zigstache");
 
+    // --- zig-raft dependency ---
+    // Note: pass only `target` (not `optimize`). zig-raft's build.zig declares
+    // `standardOptimizeOption` per-step, so forwarding `optimize` produces a
+    // spurious "invalid option: -Doptimize" stderr line. Tests work either way,
+    // but skipping it keeps the build output clean.
+    const raft_dep = b.dependency("zig-raft", .{
+        .target = target,
+    });
+    const raft_mod = raft_dep.module("raft");
+
     // --- Corvo library module ---
     const corvo_mod = b.addModule("corvo", .{
         .root_source_file = b.path("src/root.zig"),
@@ -26,6 +36,7 @@ pub fn build(b: *std.Build) void {
     });
     corvo_mod.addImport("talon", talon_mod);
     corvo_mod.addImport("zigstache", zigstache_mod);
+    corvo_mod.addImport("raft", raft_mod);
     corvo_mod.addAnonymousImport("ui_embed", .{ .root_source_file = b.path("ui_embed.zig") });
     corvo_mod.link_libc = true; // required by talon (memory-mapped I/O)
 
@@ -44,6 +55,7 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addImport("talon", talon_mod);
     test_mod.addImport("zigstache", zigstache_mod);
+    test_mod.addImport("raft", raft_mod);
     test_mod.addAnonymousImport("ui_embed", .{ .root_source_file = b.path("ui_embed.zig") });
     test_mod.link_libc = true;
     const tests = b.addTest(.{
@@ -62,6 +74,7 @@ pub fn build(b: *std.Build) void {
     });
     sim_mod.addImport("talon", talon_mod);
     sim_mod.addImport("corvo", corvo_mod);
+    sim_mod.addImport("raft", raft_mod);
     const sim_tests = b.addTest(.{
         .root_module = sim_mod,
     });
@@ -78,6 +91,7 @@ pub fn build(b: *std.Build) void {
     });
     bench_corvo_mod.addImport("talon", talon_mod);
     bench_corvo_mod.addImport("zigstache", zigstache_mod);
+    bench_corvo_mod.addImport("raft", raft_mod);
     bench_corvo_mod.addAnonymousImport("ui_embed", .{ .root_source_file = b.path("ui_embed.zig") });
     bench_corvo_mod.link_libc = true;
 

@@ -316,6 +316,11 @@ pub fn extractQueryParam(path: []const u8, key: []const u8) ?[]const u8 {
 pub const RouteAction = union(enum) {
     /// Read route — handled inline by http_read, bypasses pipeline batch.
     read,
+    /// Like `read` (handled inline) but requires the admin role. Used for
+    /// operations that dump or replace the whole database or change cluster
+    /// membership — dangerous enough that a scoped worker/producer key must not
+    /// reach them even though they don't go through the pipeline write path.
+    admin_read,
     /// Write route — produces a frame for the pipeline batch.
     write: struct {
         msg_type: u8,
@@ -371,7 +376,7 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
             if (std.mem.eql(u8, api, "/auth/login"))
                 return .read;
             if (std.mem.eql(u8, api, "/cluster/join"))
-                return .read;
+                return .admin_read;
 
             if (std.mem.eql(u8, api, "/jobs/bulk-get"))
                 return .read;
@@ -415,15 +420,15 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
                 if (queue.len > 0) return writeRoute(rpc.MSG_ENQUEUE_BATCH, queue, "webhook");
             }
 
-            // Backup/restore (read-path — no KV mutation via pipeline)
-            if (std.mem.eql(u8, api, "/backup")) return .read;
-            if (std.mem.eql(u8, api, "/restore")) return .read;
-            if (std.mem.startsWith(u8, api, "/restore/")) return .read;
+            // Backup/restore dump or replace the entire database — admin only.
+            if (std.mem.eql(u8, api, "/backup")) return .admin_read;
+            if (std.mem.eql(u8, api, "/restore")) return .admin_read;
+            if (std.mem.startsWith(u8, api, "/restore/")) return .admin_read;
         },
 
         .PUT => {
-            // PUT /restore/{id} — upload chunk (read-path, writes to temp file)
-            if (std.mem.startsWith(u8, api, "/restore/")) return .read;
+            // PUT /restore/{id} — upload chunk of a full-DB restore — admin only.
+            if (std.mem.startsWith(u8, api, "/restore/")) return .admin_read;
             // PUT /cron-jobs/{id} or /crons/{id}
             if (std.mem.startsWith(u8, api, "/cron-jobs/")) {
                 const id = api["/cron-jobs/".len..];
@@ -486,11 +491,16 @@ pub fn classifyRoute(method: Method, path: []const u8) RouteAction {
             if (std.mem.eql(u8, api, "/audit-logs"))
                 return writeRoute(rpc.MSG_MODIFY_SETTING, "", "audit_clear");
 
-            // DELETE /backup/{id} — cleanup temp files (read-path, no KV mutation)
-            if (std.mem.startsWith(u8, api, "/backup/")) return .read;
+            // DELETE /backup/{id} — cleanup temp files for a backup — admin only.
+            if (std.mem.startsWith(u8, api, "/backup/")) return .admin_read;
         },
 
-        .GET => return .read,
+        // GET /backup/{id}?file=... streams the entire database (job payloads +
+        // API-key hashes) — admin only. All other GETs are ordinary reads.
+        .GET => {
+            if (std.mem.startsWith(u8, api, "/backup/")) return .admin_read;
+            return .read;
+        },
 
         .OPTIONS => return .read, // CORS preflight handled inline
 
@@ -630,7 +640,7 @@ pub fn checkAuth(
     // Layer 1: admin password (Bearer token or session cookie) → admin role.
     if (admin_password.len > 0) {
         if (api_key) |key| {
-            if (std.mem.eql(u8, key, admin_password)) return .{ .ok = AuthInfo.initAdmin() };
+            if (constantTimeEql(key, admin_password)) return .{ .ok = AuthInfo.initAdmin() };
         }
         if (session_cookie) |cookie| {
             if (validateSessionCookie(cookie, admin_password)) return .{ .ok = AuthInfo.initAdmin() };
@@ -713,6 +723,14 @@ fn roleAllowsWrite(role: AuthRole, msg_type: u8) bool {
     }
 }
 
+/// Whether an authenticated RPC role may perform a given RPC op. PING and the
+/// AUTH handshake are allowed for any authenticated connection; every other op
+/// follows the same role matrix as the HTTP write path.
+pub fn rpcRoleAllows(role: AuthRole, msg_type: u8) bool {
+    if (msg_type == rpc.MSG_PING or msg_type == rpc.MSG_AUTH) return true;
+    return roleAllowsWrite(role, msg_type);
+}
+
 // ============================================================================
 // Session Auth — stateless session tokens for admin password
 // ============================================================================
@@ -736,11 +754,22 @@ pub fn sessionHash(admin_password: []const u8, out: *[64]u8) []const u8 {
     return out[0..64];
 }
 
+/// Constant-time byte-slice equality. Used for secret comparisons (admin
+/// password, session token) so response timing can't leak how many leading
+/// bytes matched, which would let an attacker recover the secret byte by byte.
+/// Length is compared directly — it is not itself the secret.
+pub fn constantTimeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= (x ^ y);
+    return diff == 0;
+}
+
 fn validateSessionCookie(cookie: []const u8, admin_password: []const u8) bool {
     if (cookie.len != 64) return false;
     var expected: [64]u8 = undefined;
     const token = sessionHash(admin_password, &expected);
-    return std.mem.eql(u8, cookie, token);
+    return constantTimeEql(cookie, token);
 }
 
 /// Write 303 redirect with Set-Cookie (session token).
@@ -2221,15 +2250,19 @@ test "classifyRoute — queue throttle delete" {
 }
 
 test "classifyRoute — backup/restore" {
-    // Backup
-    try std.testing.expect(classifyRoute(.POST, "/api/v1/backup") == .read);
-    try std.testing.expect(classifyRoute(.GET, "/api/v1/backup/123") == .read);
-    try std.testing.expect(classifyRoute(.DELETE, "/api/v1/backup/123") == .read);
+    // Backup — dumps the whole DB, so admin-only.
+    try std.testing.expect(classifyRoute(.POST, "/api/v1/backup") == .admin_read);
+    try std.testing.expect(classifyRoute(.GET, "/api/v1/backup/123") == .admin_read);
+    try std.testing.expect(classifyRoute(.DELETE, "/api/v1/backup/123") == .admin_read);
 
-    // Restore
-    try std.testing.expect(classifyRoute(.POST, "/api/v1/restore") == .read);
-    try std.testing.expect(classifyRoute(.PUT, "/api/v1/restore/123") == .read);
-    try std.testing.expect(classifyRoute(.POST, "/api/v1/restore/123/apply") == .read);
+    // Restore — replaces the whole DB, so admin-only.
+    try std.testing.expect(classifyRoute(.POST, "/api/v1/restore") == .admin_read);
+    try std.testing.expect(classifyRoute(.PUT, "/api/v1/restore/123") == .admin_read);
+    try std.testing.expect(classifyRoute(.POST, "/api/v1/restore/123/apply") == .admin_read);
+
+    // Ordinary GET reads stay at read level.
+    try std.testing.expect(classifyRoute(.GET, "/api/v1/cluster/status") == .read);
+    try std.testing.expect(classifyRoute(.POST, "/api/v1/cluster/join") == .admin_read);
 }
 
 test "decodeBulkAction — single job cancel" {

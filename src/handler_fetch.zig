@@ -16,6 +16,13 @@ const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
 const pending_index_mod = @import("pending_index.zig");
 
+/// Wire size of one job in the RPC fetch response. MUST match the layout in
+/// pipeline.encodeFetchResult: 2+id, 2+queue, 2 attempt, 2 max_retries,
+/// 1 checkpoint-len, 1 tags-len, 2 payload-len, payload bytes, 8 lease_token.
+fn fetchedJobWireSize(id_len: usize, queue_len: usize, payload_len: usize) usize {
+    return 20 + id_len + queue_len + payload_len;
+}
+
 pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) ops.OpResult {
     if (op.count == 0) return .{ .err = "invalid fetch count: 0" };
 
@@ -24,6 +31,9 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
     const max_fetch: u32 = @min(op.count, ops.OpResult.max_inline_fetch);
 
     var result: ops.OpResult = .{};
+    // Running total of encoded response bytes, shared across queues so a
+    // multi-queue fetch also respects the caller's send-buffer budget.
+    var bytes_used: usize = 0;
     const has_global_rl = self.global_rate_limit > 0 and self.global_rate_window_ms > 0;
 
     // Global rate limit check — applies across all queues.
@@ -84,7 +94,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
         // Separate from the normal pop loop to avoid any overhead on non-fairness queues.
         if (queue.fairness) {
             var fairness_budget: u32 = @max((@min(op.count, ops.OpResult.max_inline_fetch) - result.affected) * 2, 64);
-            fetchWithFairness(self, b, &result, queue_name, &fairness_budget, max_fetch, lease_expires_ns, lease_duration_ms, op, has_rl, has_global_rl, queue.max_concurrency);
+            fetchWithFairness(self, b, &result, queue_name, &fairness_budget, max_fetch, lease_expires_ns, lease_duration_ms, op, has_rl, has_global_rl, queue.max_concurrency, &bytes_used);
             continue; // next queue
         }
 
@@ -105,6 +115,28 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
 
             var job = codec.decodeJob(job_bytes.?);
             if (job.state != .pending) continue; // No longer pending — stale.
+            // Bulk-move pushes the job into the destination queue's index but
+            // leaves a stale entry in the source queue's index. Validate the
+            // job still belongs to THIS queue, else claiming it here writes the
+            // active key + concurrency counter under mismatched queues (corrupts
+            // active counts, panics on ack). Drop the stale entry.
+            if (!std.mem.eql(u8, job.queue, queue_name)) continue;
+
+            // Read the payload once, here, for both the send-buffer budget check
+            // and the response (the pipeline reuses this slice, avoiding a second
+            // read). Stop before the encoded response would overflow the caller's
+            // send buffer, but always allow the first job so a lone large payload
+            // still ships (the buffer is sized for one max payload). Jobs left
+            // unclaimed stay pending for the next push — no loss.
+            var pk_buf: keys.KeyBuf = undefined;
+            const payload_slice: []const u8 = b.get(keys.jobPayloadKey(&pk_buf, job_id)) orelse "";
+            if (op.max_response_bytes > 0) {
+                const need = fetchedJobWireSize(job_id.len, queue_name.len, payload_slice.len);
+                if (bytes_used + need > op.max_response_bytes) {
+                    self.pending.push(queue_name, job.priority, job.created_at_ns, job_id);
+                    break;
+                }
+            }
 
             // Claim the job.
             self.lease_counter += 1;
@@ -176,6 +208,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             f.max_retries = job.max_retries;
             f.lease_duration_ms = lease_duration_ms;
             f.lease_token = job.lease_token;
+            bytes_used += fetchedJobWireSize(job_id.len, queue_name.len, payload_slice.len);
             result.affected += 1;
             if (conc_reached) break;
         }
@@ -230,6 +263,7 @@ fn fetchWithFairness(
     has_rl: bool,
     has_global_rl: bool,
     max_concurrency: u32,
+    bytes_used: *usize,
 ) void {
     const max_candidates: u32 = 16;
 
@@ -253,6 +287,8 @@ fn fetchWithFairness(
             if (job_bytes == null) continue;
             const job = codec.decodeJob(job_bytes.?);
             if (job.state != .pending) continue;
+            // Stale entry from a bulk-move into another queue (see non-fairness path).
+            if (!std.mem.eql(u8, job.queue, queue_name)) continue;
 
             assert.check(num_candidates < max_candidates, "fetch-fairness: num_candidates ({d}) >= max_candidates", .{num_candidates});
             candidates[num_candidates] = entry;
@@ -303,6 +339,19 @@ fn fetchWithFairness(
         const job_bytes = b.getInto(keys.jobKey(&jk_buf, sel_job_id), &job_val_buf);
         assert.check(job_bytes != null, "fairness: validated job disappeared", .{});
         var job = codec.decodeJob(job_bytes.?);
+
+        // Send-buffer budget (see non-fairness path). Read payload once for both
+        // the check and the response. If the selected job won't fit, re-push it
+        // and stop — it stays pending for the next push.
+        var pk_buf: keys.KeyBuf = undefined;
+        const payload_slice: []const u8 = b.get(keys.jobPayloadKey(&pk_buf, sel_job_id)) orelse "";
+        if (op.max_response_bytes > 0) {
+            const need = fetchedJobWireSize(sel_job_id.len, queue_name.len, payload_slice.len);
+            if (bytes_used.* + need > op.max_response_bytes) {
+                self.pending.push(queue_name, 255 - candidates[best_idx].inv_priority, candidates[best_idx].created_ns, sel_job_id);
+                break;
+            }
+        }
 
         self.lease_counter += 1;
         job.state = .active;
@@ -368,6 +417,7 @@ fn fetchWithFairness(
         f.max_retries = job.max_retries;
         f.lease_duration_ms = lease_duration_ms;
         f.lease_token = job.lease_token;
+        bytes_used.* += fetchedJobWireSize(sel_job_id.len, queue_name.len, payload_slice.len);
         result.affected += 1;
         if (conc_reached) break;
     }

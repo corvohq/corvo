@@ -233,6 +233,8 @@ fn printHelp() void {
         \\  --discover-dns-name <n>   DNS name for peer auto-discovery
         \\  --sync-repl               Enable sync replication
         \\  --admin-password <pw>     Admin password (locks UI + API)
+        \\  --cluster-secret <s>      Shared secret authenticating peer connections
+        \\                            (or set CORVO_CLUSTER_SECRET)
         \\  --help                    Show this help
         \\
         \\Config file format:
@@ -414,7 +416,20 @@ pub fn main() !void {
                 std.debug.print("--admin-password requires an argument\n", .{});
                 return;
             };
+        } else if (std.mem.eql(u8, arg, "--cluster-secret")) {
+            config.cluster_secret = args.next() orelse {
+                std.debug.print("--cluster-secret requires an argument\n", .{});
+                return;
+            };
         }
+    }
+
+    // Env fallback for the cluster secret (avoids the secret appearing in the
+    // process argv / command line). Explicit --cluster-secret takes precedence.
+    if (config.cluster_secret.len == 0) {
+        if (std.process.getEnvVarOwned(allocator, "CORVO_CLUSTER_SECRET")) |v| {
+            config.cluster_secret = v; // lives for the process lifetime
+        } else |_| {}
     }
 
     // --- Validate config ---
@@ -526,6 +541,7 @@ pub fn main() !void {
             .peer_addrs = peer_addrs[0..peer_count],
             .bind_addr = cluster_bind_addr,
             .config_hash = config.clusterHash(),
+            .cluster_secret = config.cluster_secret,
         });
 
         try cluster_node.?.start();
@@ -589,7 +605,9 @@ pub fn main() !void {
             .expire_interval_ns = config.expire_interval_ns,
             .purge_interval_ns = config.purge_interval_ns,
             .purge_retention_ns = config.purge_retention_ns,
+            .purge_threshold = config.purge_threshold,
             .workers_interval_ns = config.workers_interval_ns,
+            .cron_interval_ns = config.cron_interval_ns,
             .webhook_interval_ns = config.workers_interval_ns, // same as workers (1s default)
             .worker_timeout_ns = config.worker_timeout_ns,
             .repl_hook = repl_hook,

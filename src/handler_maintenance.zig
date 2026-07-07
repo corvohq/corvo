@@ -11,6 +11,7 @@ const kv = @import("kv.zig");
 const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
 const handler_fail = @import("handler_fail.zig");
+const handler_cron = @import("handler_cron.zig");
 
 // Chain step sentinel values (matching handler_ack.zig / handler_fail.zig).
 const chain_step_max: u16 = 0xFFFD;
@@ -25,6 +26,7 @@ pub fn applyMaintenance(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Main
         .rate_limit => applyCleanRateLimit(b, op.cutoff_ns),
         .workers => applyCleanWorkers(b, op.cutoff_ns),
         .batches => applyCleanBatches(b, op.cutoff_ns),
+        .cron => handler_cron.applyCronScan(self, b, op.now_ns),
     };
 }
 
@@ -47,6 +49,9 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
             if (iter.first()) {
                 while (true) {
+                    // Cap per-tick promote to avoid an unbounded scan stalling
+                    // the pipeline thread (and to bound work like reclaim/expire).
+                    if (self.bulk_result_count >= OpHandler.max_bulk_results - 1) break;
                     const key = iter.key();
                     const scheduled_ns = extractTimestampFromScheduledKey(key);
                     if (scheduled_ns > now_ns) {
@@ -98,6 +103,9 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
             if (iter.first()) {
                 while (true) {
+                    // Cap per-tick promote to avoid an unbounded scan stalling
+                    // the pipeline thread (and to bound work like reclaim/expire).
+                    if (self.bulk_result_count >= OpHandler.max_bulk_results - 1) break;
                     const key = iter.key();
                     const retry_ns = extractTimestampFromScheduledKey(key);
                     if (retry_ns > now_ns) {
@@ -385,6 +393,12 @@ fn applyPurge(self: *OpHandler, b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult 
 
         if (iter.first()) {
             while (true) {
+                // Cap per-tick purge. A large backlog (e.g. millions of terminal
+                // jobs crossing the retention cutoff at once) would otherwise
+                // delete everything in a single batch, stalling the pipeline
+                // thread for seconds and freezing all connections. The remainder
+                // is drained on subsequent ticks / count-triggered runs.
+                if (affected >= OpHandler.max_bulk_results) break;
                 const key = iter.key();
                 const prefix_len = keys.prefix_dead.len;
                 const completed_at = keys.getU64BE(key[prefix_len .. prefix_len + 8]);

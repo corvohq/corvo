@@ -31,6 +31,9 @@ pub const ClusterConfig = struct {
     /// Cluster config hash — exchanged during election. Nodes with
     /// different configs refuse to form a cluster.
     config_hash: u64 = 0,
+    /// Shared secret for peer-connection authentication (HMAC challenge-
+    /// response). Empty = no auth.
+    cluster_secret: []const u8 = "",
 };
 
 // ============================================================================
@@ -67,7 +70,7 @@ pub const ClusterNode = struct {
         shards: []kv.Store,
         config: ClusterConfig,
     ) ClusterNode {
-        var transport = tcp_mod.TcpTransport.init(allocator, config.node_id);
+        var transport = tcp_mod.TcpTransport.init(allocator, config.node_id, config.cluster_secret);
 
         // Register peers
         for (config.peer_ids, 0..) |pid, i| {

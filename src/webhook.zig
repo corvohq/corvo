@@ -72,14 +72,30 @@ pub fn buildEventPayload(buf: []u8, event: []const u8, job_id: []const u8, queue
     return result;
 }
 
+/// Reject webhook targets that would let a user-configured URL reach the host's
+/// own loopback or the cloud-metadata / link-local range (SSRF). RFC1918 private
+/// ranges are intentionally allowed — internal service webhooks are a normal use
+/// of a job system — so this blocks the clear-exfil cases without breaking that.
+pub fn isBlockedTarget(addr: std.net.Address) bool {
+    if (addr.any.family != std.posix.AF.INET) return false;
+    const octets = @as([4]u8, @bitCast(addr.in.sa.addr)); // network byte order
+    if (octets[0] == 127) return true; // 127.0.0.0/8 loopback
+    if (octets[0] == 0) return true; // 0.0.0.0/8 "this host"
+    if (octets[0] == 169 and octets[1] == 254) return true; // 169.254.0.0/16 link-local (incl. 169.254.169.254 IMDS)
+    return false;
+}
+
 /// Resolve a hostname to an IPv4 address. Blocking (one-time per webhook URL).
+/// Returns null for blocked (SSRF) targets so the delivery is dropped.
 pub fn resolveHost(host: []const u8, port: u16) ?std.net.Address {
     // Try parsing as IP first (no DNS needed).
     const addr = std.net.Address.parseIp4(host, port) catch {
         // Fall back to DNS resolution.
         const list = std.net.Address.resolveIp(host, port) catch return null;
+        if (isBlockedTarget(list)) return null;
         return list;
     };
+    if (isBlockedTarget(addr)) return null;
     return addr;
 }
 

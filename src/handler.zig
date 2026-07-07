@@ -46,9 +46,9 @@ pub const OpHandler = struct {
     requeue_counter: u64 = 0,
     // Effect buffers — accumulated during apply, drained by pipeline after commit.
     side_effect_count: u8 = 0, // kept for pipeline.resetEffects compat
-    fail_results: [max_fail_results]FailResult = undefined,
-    fail_result_count: u16 = 0,
-    bulk_results: [max_bulk_results]BulkResult = undefined,
+    /// Per-tick maintenance work units. Reclaim/expire/promote increment this
+    /// and stop once it reaches max_bulk_results so a single tick cannot stall
+    /// the pipeline thread with an unbounded scan. Saturating — never asserts.
     bulk_result_count: u16 = 0,
     cancel_signals: [max_cancel_signals]CancelSignal = undefined,
     cancel_signal_count: u16 = 0,
@@ -95,35 +95,11 @@ pub const OpHandler = struct {
     total_jobs: u32 = 0,
 
     const max_side_effects = 32;
-    const max_fail_results = 256;
     pub const max_bulk_results = 4096;
     const max_cancel_signals = 256;
     const max_webhook_events = 256;
     pub const max_webhooks = 64;
     const max_promote_queues = 32;
-
-    pub const FailResult = struct {
-        job_id: [128]u8 = undefined,
-        job_id_len: u8 = 0,
-        error_msg: [256]u8 = undefined,
-        error_msg_len: u16 = 0,
-        backtrace: [1024]u8 = undefined,
-        backtrace_len: u16 = 0,
-        new_state: types.JobState = .retrying,
-        attempt: u16 = 0,
-        retry_at_ns: u64 = 0,
-        now_ns: u64 = 0,
-
-        pub fn jobId(self: *const FailResult) []const u8 {
-            return self.job_id[0..self.job_id_len];
-        }
-        pub fn errorMsg(self: *const FailResult) []const u8 {
-            return self.error_msg[0..self.error_msg_len];
-        }
-        pub fn backtraceSlice(self: *const FailResult) []const u8 {
-            return self.backtrace[0..self.backtrace_len];
-        }
-    };
 
     pub const CancelSignal = struct {
         job_id: [64]u8 = undefined,
@@ -425,7 +401,6 @@ pub const OpHandler = struct {
 
     pub fn resetEffects(self: *OpHandler) void {
         self.side_effect_count = 0;
-        self.fail_result_count = 0;
         self.bulk_result_count = 0;
         self.cancel_signal_count = 0;
         self.webhook_event_count = 0;
@@ -459,43 +434,16 @@ pub const OpHandler = struct {
     /// No-op — mirror removed. Side effects were only consumed by mirror_events.
     pub fn recordSideEffect(_: *OpHandler, _: *const ops.EnqueueJob) void {}
 
-    pub fn recordFailResult(self: *OpHandler, job_id: []const u8, error_msg: []const u8, backtrace: ?[]const u8, new_state: types.JobState, attempt: u16, retry_at_ns: u64, now_ns: u64) void {
-        assert.check(self.fail_result_count < max_fail_results, "recordFailResult: overflow ({d})", .{self.fail_result_count});
-        var r = FailResult{
-            .new_state = new_state,
-            .attempt = attempt,
-            .retry_at_ns = retry_at_ns,
-            .now_ns = now_ns,
-        };
-        const il: u8 = @intCast(@min(job_id.len, r.job_id.len));
-        @memcpy(r.job_id[0..il], job_id[0..il]);
-        r.job_id_len = il;
-        const el: u16 = @intCast(@min(error_msg.len, r.error_msg.len));
-        @memcpy(r.error_msg[0..el], error_msg[0..el]);
-        r.error_msg_len = el;
-        if (backtrace) |bt| {
-            const bl: u16 = @intCast(@min(bt.len, r.backtrace.len));
-            @memcpy(r.backtrace[0..bl], bt[0..bl]);
-            r.backtrace_len = bl;
-        }
-        self.fail_results[self.fail_result_count] = r;
-        self.fail_result_count += 1;
-    }
+    /// No-op — mirror removed. Fail results were only consumed by mirror_events.
+    /// Kept as a call site so handler_fail stays readable; carries no state.
+    pub fn recordFailResult(_: *OpHandler, _: []const u8, _: []const u8, _: ?[]const u8, _: types.JobState, _: u16, _: u64, _: u64) void {}
 
-    pub fn recordBulkResult(self: *OpHandler, job_id: []const u8, action: BulkResult.ActionType, state: []const u8, queue: []const u8, now_ns: u64) void {
-        assert.check(self.bulk_result_count < max_bulk_results, "recordBulkResult: overflow ({d})", .{self.bulk_result_count});
-        var r = BulkResult{ .action = action, .now_ns = now_ns };
-        const il: u8 = @intCast(@min(job_id.len, r.job_id.len));
-        @memcpy(r.job_id[0..il], job_id[0..il]);
-        r.job_id_len = il;
-        const sl: u8 = @intCast(@min(state.len, r.new_state.len));
-        @memcpy(r.new_state[0..sl], state[0..sl]);
-        r.new_state_len = sl;
-        const ql: u8 = @intCast(@min(queue.len, r.new_queue.len));
-        @memcpy(r.new_queue[0..ql], queue[0..ql]);
-        r.new_queue_len = ql;
-        self.bulk_results[self.bulk_result_count] = r;
-        self.bulk_result_count += 1;
+    /// Count one unit of maintenance/bulk work this tick. The stored result set
+    /// was only consumed by the removed mirror; today this is purely the
+    /// per-tick work cap read by reclaim/expire/promote. Saturating so a burst
+    /// of client bulk ops in one tick can never overflow or panic.
+    pub fn recordBulkResult(self: *OpHandler, _: []const u8, _: BulkResult.ActionType, _: []const u8, _: []const u8, _: u64) void {
+        self.bulk_result_count +|= 1;
     }
 
     pub fn recordCancelSignal(self: *OpHandler, job_id: []const u8, worker_id: []const u8) void {
@@ -1163,18 +1111,26 @@ pub const OpHandler = struct {
 
 /// Calculate retry delay in nanoseconds.
 pub fn calculateBackoffNs(strategy: types.Backoff, attempt: u16, base_delay_ms: u32, max_delay_ms: u32) u64 {
+    // Saturating arithmetic throughout: with max_retries up to 65535, a naive
+    // exponential (base << exp) or the ms→ns multiply overflows u64 and panics
+    // in ReleaseSafe. Large delays saturate to the ceiling instead.
     const delay_ms: u64 = switch (strategy) {
         .none => 0,
         .fixed => base_delay_ms,
-        .linear => @as(u64, base_delay_ms) * @as(u64, attempt),
+        .linear => @as(u64, base_delay_ms) *| @as(u64, attempt),
         .exponential => blk: {
             const exp: u6 = if (attempt > 0) @intCast(@min(attempt - 1, 63)) else 0;
-            break :blk @as(u64, base_delay_ms) * (@as(u64, 1) << exp);
+            break :blk @as(u64, base_delay_ms) *| (@as(u64, 1) << exp);
         },
     };
 
-    const clamped = if (max_delay_ms > 0 and delay_ms > max_delay_ms) max_delay_ms else delay_ms;
-    return @as(u64, clamped) * 1_000_000; // ms → ns
+    // Clamp to max_delay_ms (when set), then to the largest value that still
+    // fits u64 after the ms→ns multiply.
+    const max_ms_before_ns: u64 = std.math.maxInt(u64) / 1_000_000;
+    var clamped = delay_ms;
+    if (max_delay_ms > 0 and clamped > max_delay_ms) clamped = max_delay_ms;
+    if (clamped > max_ms_before_ns) clamped = max_ms_before_ns;
+    return clamped * 1_000_000; // ms → ns
 }
 
 // ============================================================================

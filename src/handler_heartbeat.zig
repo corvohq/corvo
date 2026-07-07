@@ -29,6 +29,16 @@ pub fn applyHeartbeat(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Heartb
         var job = codec.decodeJob(job_bytes.?);
         if (job.state != .active) continue;
 
+        // Ownership guard: only the worker currently holding the lease may
+        // extend it or update progress/checkpoint. Without this, a worker
+        // whose lease expired and was reclaimed → refetched by another worker
+        // keeps refreshing the new holder's lease and overwriting its
+        // checkpoint with stale data (so a later retry resumes from the wrong
+        // point). Ack/fail enforce this via lease_token; the heartbeat wire
+        // format has no token, so match on worker_id, which catches the
+        // cross-worker case (the corruption risk).
+        if (op.worker_id.len > 0 and !std.mem.eql(u8, job.worker_id orelse "", op.worker_id)) continue;
+
         assert.check(job.lease_expires_at_ns > 0, "heartbeat: active job has no lease", .{});
 
         job.lease_expires_at_ns = lease_expires_ns;

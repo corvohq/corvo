@@ -30,6 +30,10 @@ pub const ServerConfig = struct {
     peers: []const u8 = "",
     cluster_port: u16 = 0, // 0 = server port + 1000
     discover_dns_name: []const u8 = "", // DNS name for peer auto-discovery
+    /// Shared secret authenticating peer connections (HMAC challenge-response
+    /// on the cluster port). Empty = unauthenticated (single-node / trusted net).
+    /// Set via --cluster-secret or the CORVO_CLUSTER_SECRET env var.
+    cluster_secret: []const u8 = "",
 
     // ================================================================
     // Shared settings (included in cluster hash — must match across nodes)
@@ -52,6 +56,7 @@ pub const ServerConfig = struct {
     purge_threshold: u32 = 10_000, // 0 = disabled; purge early when terminal job count exceeds this
     workers_interval_ns: u64 = 30_000_000_000, // 30s — clean up stale workers
     worker_timeout_ns: u64 = 60_000_000_000, // 60s — workers with no heartbeat for this long are removed
+    cron_interval_ns: u64 = 10_000_000_000, // 10s — scan cron schedules for due fires (minute resolution)
 
     sync_replication: bool = false,
 

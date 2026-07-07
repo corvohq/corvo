@@ -195,7 +195,7 @@ fn handleLogin(send_buf: []u8, body: []const u8) u32 {
     var decoded_buf: [256]u8 = undefined;
     const decoded = percentDecode(password, &decoded_buf);
 
-    if (!std.mem.eql(u8, decoded, g_admin_password))
+    if (!http.constantTimeEql(decoded, g_admin_password))
         return http.writeRedirect(send_buf, "/ui/login?error=1");
 
     // Valid — set session cookie and redirect to dashboard.

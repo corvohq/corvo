@@ -52,6 +52,11 @@ const MSG_REPL: u8 = 0x02;
 pub const TcpTransport = struct {
     node_id: []const u8,
     allocator: std.mem.Allocator,
+    /// Shared cluster secret. When non-empty, every peer connection must pass an
+    /// HMAC challenge-response before any frame is accepted, so an unauthenticated
+    /// party on the network can't inject replicated writes or forge election
+    /// messages. Empty = no auth (single-node or fully-trusted network).
+    cluster_secret: []const u8 = "",
 
     // Listening for incoming connections
     listener: ?net.Server = null,
@@ -85,12 +90,54 @@ pub const TcpTransport = struct {
         addr: net.Address,
     };
 
-    pub fn init(allocator: std.mem.Allocator, node_id: []const u8) TcpTransport {
+    pub fn init(allocator: std.mem.Allocator, node_id: []const u8, cluster_secret: []const u8) TcpTransport {
         return .{
             .node_id = node_id,
             .allocator = allocator,
+            .cluster_secret = cluster_secret,
             .peers = std.StringHashMap(PeerConn).init(allocator),
         };
+    }
+
+    // --- Cluster handshake auth (HMAC-SHA256 challenge-response) ---
+    const hs_nonce_len = 32;
+    const hs_tag_len = 32; // HMAC-SHA256 output length
+
+    fn computeAuthTag(secret: []const u8, nonce: []const u8) [hs_tag_len]u8 {
+        var tag: [hs_tag_len]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&tag, nonce, secret);
+        return tag;
+    }
+
+    fn verifyAuthTag(secret: []const u8, nonce: []const u8, tag: []const u8) bool {
+        if (tag.len != hs_tag_len) return false;
+        const expected = computeAuthTag(secret, nonce);
+        var diff: u8 = 0;
+        for (expected, tag[0..hs_tag_len]) |x, y| diff |= x ^ y; // constant-time
+        return diff == 0;
+    }
+
+    /// Acceptor side: challenge the connecting peer to prove it holds the shared
+    /// secret. Returns true if auth passes (or is disabled). Runs after the
+    /// node_id exchange, before any frame is read.
+    fn authAcceptor(self: *TcpTransport, stream: net.Stream) bool {
+        if (self.cluster_secret.len == 0) return true;
+        var nonce: [hs_nonce_len]u8 = undefined;
+        std.crypto.random.bytes(&nonce);
+        stream.writeAll(&nonce) catch return false;
+        var tag: [hs_tag_len]u8 = undefined;
+        readExact(stream, &tag) catch return false;
+        return verifyAuthTag(self.cluster_secret, &nonce, &tag);
+    }
+
+    /// Connector side: answer the acceptor's challenge with HMAC(secret, nonce).
+    fn authConnector(self: *TcpTransport, stream: net.Stream) bool {
+        if (self.cluster_secret.len == 0) return true;
+        var nonce: [hs_nonce_len]u8 = undefined;
+        readExact(stream, &nonce) catch return false;
+        const tag = computeAuthTag(self.cluster_secret, &nonce);
+        stream.writeAll(&tag) catch return false;
+        return true;
     }
 
     pub fn deinit(self: *TcpTransport) void {
@@ -181,6 +228,12 @@ pub const TcpTransport = struct {
                 new_stream.close();
                 return false;
             };
+
+            // Prove we hold the shared cluster secret before the peer accepts frames.
+            if (!self.authConnector(new_stream)) {
+                new_stream.close();
+                return false;
+            }
 
             // Store connection.
             self.peers_mu.lock();
@@ -289,6 +342,10 @@ pub const TcpTransport = struct {
         var id_buf: [64]u8 = undefined;
         readExact(stream, id_buf[0..id_len]) catch return;
         const from_id = id_buf[0..id_len];
+
+        // Authenticate the peer before accepting any replicated data or election
+        // messages. An unauthenticated connection is dropped here.
+        if (!self.authAcceptor(stream)) return;
 
         var stack_frame_buf: [256]u8 = undefined;
 
@@ -494,3 +551,31 @@ pub const TcpTransport = struct {
         }
     }
 };
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+test "cluster handshake HMAC: matching secret verifies, wrong rejected" {
+    var nonce: [TcpTransport.hs_nonce_len]u8 = undefined;
+    // Deterministic nonce for the test (real handshake uses crypto.random).
+    for (&nonce, 0..) |*b, i| b.* = @intCast(i);
+
+    // Connector computes the tag with the shared secret; acceptor verifies it.
+    const good_tag = TcpTransport.computeAuthTag("s3cr3t", &nonce);
+    try testing.expect(TcpTransport.verifyAuthTag("s3cr3t", &nonce, &good_tag));
+
+    // A tag computed with a different secret must NOT verify.
+    const bad_tag = TcpTransport.computeAuthTag("wrong", &nonce);
+    try testing.expect(!TcpTransport.verifyAuthTag("s3cr3t", &nonce, &bad_tag));
+
+    // A different nonce with the right secret must NOT verify (replay guard).
+    var nonce2: [TcpTransport.hs_nonce_len]u8 = undefined;
+    for (&nonce2, 0..) |*b, i| b.* = @intCast(i + 1);
+    try testing.expect(!TcpTransport.verifyAuthTag("s3cr3t", &nonce2, &good_tag));
+
+    // Truncated tag rejected.
+    try testing.expect(!TcpTransport.verifyAuthTag("s3cr3t", &nonce, good_tag[0..16]));
+}

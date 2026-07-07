@@ -55,9 +55,19 @@ pub const ConnState = struct {
     worker_id_buf: [128]u8 = undefined,
     worker_id_len: u8 = 0,
     prefetch: u32 = 0,
+    /// Original subscription window. Replenishment (ack/fail) is capped at this
+    /// so a worker reporting more completions than it was pushed cannot inflate
+    /// its window past what it subscribed with.
+    prefetch_window: u32 = 0,
     lease_ms: u32 = 30_000,
     waiting: bool = false,
     last_req_id: u32 = 0,
+
+    /// RPC auth state (only enforced when an admin password is configured). Set
+    /// once a valid MSG_AUTH handshake completes on this connection.
+    rpc_authenticated: bool = false,
+    /// AuthRole int value granted by the handshake (0=admin,1=worker,2=producer).
+    rpc_role: u8 = 0,
 
     pub const Phase = enum { free, recv_pending, ready, send_pending, connect_pending };
     pub const Protocol = enum { unknown, rpc, http, webhook };
@@ -73,8 +83,11 @@ pub const ConnState = struct {
         self.queue_count = 0;
         self.worker_id_len = 0;
         self.prefetch = 0;
+        self.prefetch_window = 0;
         self.waiting = false;
         self.last_req_id = 0;
+        self.rpc_authenticated = false;
+        self.rpc_role = 0;
     }
 };
 
