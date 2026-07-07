@@ -13,7 +13,8 @@
             .hash = "zigstache-0.1.0-rNuhg962AAAfQbLK7Jft7YfDRB0JOgjhvm2kbx0R3sUj",
         },
         .@"zig-raft" = .{
-            .path = "../zig-raft",
+            .url = "git+https://github.com/corvohq/zig-raft.git#v0.1.0",
+            .hash = "zig_raft-0.1.0-dNHn33T3BAAnUOj7oEJVNbUzgCl95PiaEusdMYNE3xml",
         },
     },
     .paths = .{
