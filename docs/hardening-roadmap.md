@@ -64,21 +64,21 @@ Full build + test suite + simulators green.
 
 ## Phase 1 — talon integrity (the durability floor)
 
-Needed so "a node can die and we keep the data" is actually true. Contained in
-`talon.zig`. **First step: repoint corvo's talon dep from the pinned GitHub tag
-to a local path (`.path = "../talon"`), or bump the tag — local talon edits do
-NOT reach corvo today.**
+Milestone 1 DONE + verified on talon branch `hardening/cow-integrity` (COW +
+checksums + recovery + crash-injection sim, ~900-line change, 2 commits).
+**NOT yet integrated into corvo** — corvo still pins talon@v0.3.0 from GitHub, so
+the COW work does not affect corvo's build until the re-pin below.
 
-- [ ] **Copy-on-write pages** — modified pages get new page ids (never overwrite
-      a page the committed meta references); the meta flip is the atomic commit.
-      talon already has dual-slot CRC meta + correct fsync ordering
-      (`syncDataAndVlog` → meta write → `syncMeta`); in-place overwrites are the
-      only thing defeating it. COW also fixes the dead freelist / unbounded growth.
-- [ ] **Per-page checksums** verified on read (only meta is CRC'd today).
-- [ ] **Dual-meta recovery**: on open, validate newest meta's pages via checksums;
-      fall back to the previous good meta if bad. Never silently re-init/wipe.
-- [ ] **2-transaction freelist retention** so the fallback snapshot's pages aren't
-      recycled (enables COW + reclaims space).
+- [x] **Copy-on-write pages** — modified pages COW to fresh append-only pages;
+      old root+pages stay intact for the previous meta. Fixed a no-op-commit bug
+      (found via crash sim) that kept consecutive metas' roots distinct.
+- [x] **Per-page checksums** (header 16→24, crc64) verified on read → `error.PageCorrupt`.
+- [x] **Dual-meta recovery** (`recoverMeta`): validate newest root checksum, fall
+      back to previous snapshot, else `error.Corrupt` — never re-inits over a file.
+- [ ] **2-transaction freelist retention** — DEFERRED to Milestone 2. M1 leaks old
+      pages (file grows, no regression vs today). Needed to reclaim space.
+- **Re-pin step (pending):** bump talon tag + corvo `build.zig.zon` hash; add `try`
+      at corvo call sites (`get`/`getInto` now return `!?[]u8`); re-run corvo suite.
 - [ ] Crash-injection sim: kill at random syscall points + torn-write injection,
       assert recovery yields a valid tree (sim does NO crash testing today).
 
@@ -96,26 +96,29 @@ NOT reach corvo today.**
 
 ---
 
-## Phase 2 — zig-raft consensus safety
+## Phase 2 — zig-raft consensus safety — DONE + verified
 
-Latent because raft isn't wired in, but must be fixed before it is. **Add the
-missing VOPR invariants first** so the fixes are provable.
+Done on zig-raft branch `hardening/consensus-safety` (2 commits: safety fixes +
+VOPR strengthening `7dd6111`, then a by-value-move regression fix `b086e6d`).
+Verified: zig-raft `zig build test` + full VOPR green; the fixes provably caught
+by the strengthened VOPR (temp reverts → I11 NoProgress / LogTooShort / C1 test
+fail). A regression (broke corvo 3-node election via dangling `peer_storage`
+slices after a by-value Node move) was caught in integration verification,
+root-caused, and fixed by making the Node own its peer-id bytes.
 
-- [ ] **VOPR gaps** (do first): no liveness/progress invariant; no committed-entry
-      durability ledger; DoubleVote (I7) declared but unchecked; no commit-index
-      monotonicity or Leader Completeness check; fault classes are siloed
-      (snapshots never combined with dup/partition).
-- [ ] **C1 (critical)** derivePeers doesn't remap match/next_index on peer slot
-      shift → commit without quorum → acked-write loss on membership change.
-- [ ] **C2 (critical)** follower commit uses min(leaderCommit, lastIndex) instead
-      of last-new-entry; next_index rewind unclamped → stale divergent commit.
-- [ ] M1 ReadIndex has no current-term-committed barrier + no no-op on becomeLeader
-      → stale linearizable read after leader change.
-- [ ] M2 single-node cluster never advances commit_index.
-- [ ] M3 RequestVote from a non-member → assert(stable.len>0) panic.
-- [ ] M4 truncating the only conf_change entry leaves a stale config + stuck
-      conf_change_pending.
-- [ ] M5 stale AE overlapping a compacted log → step() returns a hard error.
+- [x] **VOPR gaps**: added I10 durability ledger (Leader Completeness /
+      commit-monotonicity), I11 progress/liveness, I7 DoubleVote; combined-fault
+      seed groups (snapshot + dup/partition/delay); per-node snapshotting.
+- [x] **C1** per-peer state now follows peer identity (snapshot-by-id-copy before
+      config overwrite + restore-by-id). Node made relocatable (owns peer-id bytes).
+- [x] **C2** follower commit clamps to prev_log_index+entries.len; next_index
+      rewind clamps to match_index+1.
+- [x] M1 ReadIndex current-term barrier (lazy no-op on read). M2 peerless commit.
+      M3 non-member vote rejected. M4 config revert on truncate. M5 compacted-AE
+      replies instead of erroring.
+- Note: C1/M1/M3/M4 proven by unit tests (VOPR models neither membership changes
+  nor client reads); C2 by unit tests (no random seed triggered the divergence).
+  Adding membership/read modeling to the VOPR is future work.
 
 ---
 
@@ -142,22 +145,27 @@ Turn the tested scaffolding into live clustering.
 
 ## Phase 4 — core-engine majors (live server)
 
-- [ ] M3 io_uring user_data carries no generation → stale CQE hits a reused slot
-      (cross-connection frame injection at high churn).
-- [ ] M4 second queueSend while a send is in flight resends from offset 0.
-- [ ] M2 batch enqueue partial-commit on error + total_jobs drift.
-- [ ] M6 max_waiting_conns=4096 vs 20k target → 4097th subscriber panics
-      (Pipeline is heap-allocated, so growing the arrays is stack-safe — verify).
-- [ ] M5 frame backpressure permanently starves a pipelining connection.
-- [ ] M8 sync-repl fetch released on the previous batch's ack.
-- [ ] M10 indexer silently drops effects past 8192/tick (counter + read-index drift).
-- [ ] M11 clear-queue + enqueue same tick re-applies stale counter deltas.
-- [ ] M12 maintenance scans O(total) every second on the pipeline thread
-      (promote/expire should break not continue; reclaim walks all active).
-- [ ] M13 rate-limited fetch does an O(rate_limit) scan per fetch op.
-- [ ] minors: reclaim/expire death fire no webhook; max_retries==0 semantics;
-      duplicate batch id panic; unique-lock expiry lag; bulk move to nonexistent
-      queue strands jobs; hot-path per-op heap allocs; drainCoalescing busy-spin.
+Mostly DONE + verified on corvo `hardening/review-fixes` (`d375bd6`); corruption
+fixes (M3/M4/M10/M11) read-verified, backed by the sim counter invariants across
+40+ seeds; full suite 274/274 green.
+
+- [x] M3 io_uring user_data now carries the ConnState generation; stale CQEs for a
+      reused slot are dropped.
+- [x] M4 queueSend extends send_len instead of resetting send_pos=0 while a send is
+      in flight (no duplicate bytes).
+- [x] M10 indexer flushes between ops at nearFull() + asserts (never silently drops);
+      also fixed maintenance never flushing (dropped cron-enqueue indexes).
+- [x] M11 clear-queue resets the cleared queue's pending/scheduled/retrying deltas.
+- [x] M6 max_waiting_conns 4096→20480 + graceful subscription reject (stack-safe: heap).
+- [x] M12 expire uses break (time-sorted keys); M13 rate-limit key collision fixed
+      (monotonic lease_counter; count scans early-break).
+- [~] M2 total_jobs drift fixed; the poison-batch partial-commit residual is NOT
+      closed (needs a validation pre-pass rejected on hot-path perf grounds).
+- [x] minors: reclaim/expire death fire the dead webhook; max_retries==0 → dead;
+      duplicate batch id → error; bulk move validates the destination queue.
+- [ ] NOT done (were out of the agent's scope): M5 frame-backpressure starvation,
+      M8 sync-repl fetch released on previous batch's ack, unique-lock expiry lag,
+      hot-path per-op heap allocs, drainCoalescing busy-spin.
 
 ---
 
