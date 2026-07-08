@@ -113,6 +113,28 @@ cluster port).
 - Removed: `--sync-repl`, `--discover-dns-name` (DNS discovery + join was a
   PBR feature; raft membership change is future work).
 
+**Shared-config hash check.** `--cluster-id` only separates clusters; it does
+not guarantee two voters agree on the *behavioral* params that drive replicated
+state. `config.zig`'s `clusterHash()` folds those shared params — payload/queue/
+job/tag limits, `persist-completed`, and every maintenance interval (promote,
+reclaim, unique, rate-limit, expire, purge interval/retention/threshold, workers
+interval/timeout, cron) — into one FNV-1a value. Each node carries its hash into
+the raft_net peer handshake, where it rides *inside* the HMAC'd material
+(`nonce ++ config_hash`), so it authenticates the peer AND can't be rewritten by
+a man-in-the-middle. A peer whose hash differs is refused (`config_hash_rejects`,
+logged once as "config hash mismatch — shared cluster params differ") and stays
+refused on every reconnect, so it can never replicate or win an election. This
+matters because maintenance runs only on the leader and ships through the log: a
+node misconfigured with, say, `purge-retention=1h` that won a failover election
+would delete terminal jobs cluster-wide through the raft log — unrecoverable
+replicated data loss. The handshake — and with it the config check — runs on
+every peer connection, secret or not: the misconfiguration it catches is an
+operator typo, which needs no attacker. With an empty secret the HMAC provides
+no authentication but still transports and binds the config hash; setting
+`--cluster-secret` upgrades the same tags to peer authentication. Node-local
+settings (bind, ports, data dir, conn caps, node id, peers, the secret itself)
+are excluded — they legitimately differ per node.
+
 ## Known limitations (accepted for Phase 3)
 
 - Commit latency is bounded below by the raft thread's 5ms tick interval;

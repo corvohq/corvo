@@ -23,9 +23,11 @@
 //! payload is the raft_codec-encoded Message; from-id is decoded out of
 //! the payload header for transport.pushInboundBytes routing.
 //!
-//! When a cluster secret is configured, every connection runs an
-//! HMAC-SHA256 challenge-response handshake before any frame flows in
-//! either direction (see "Cluster handshake auth" below).
+//! Every connection runs an HMAC-SHA256 challenge-response handshake
+//! before any frame flows in either direction (see "Cluster handshake
+//! auth" below). The handshake always exchanges and enforces the
+//! shared-config hash; a configured cluster secret additionally
+//! authenticates the peers.
 //!
 //! TigerStyle: static peer / conn-info tables, bounded outbox per peer,
 //! short functions, exhaustive switches, drops are explicit (Raft retries).
@@ -70,12 +72,19 @@ pub const Config = struct {
     bind_addr: net.Address,
     recv_buf_size: u32 = default_buf_size,
     send_buf_size: u32 = default_buf_size,
-    /// Shared cluster secret. When non-empty, every peer connection must pass
-    /// the HMAC challenge-response handshake before any frame is accepted or
-    /// sent, so an unauthenticated party on the network can't inject raft
-    /// messages or receive log data. Empty = no auth (tests, fully-trusted
-    /// networks — matches the PBR transport's behavior).
+    /// Shared cluster secret keying the handshake HMAC. Every peer connection
+    /// runs the challenge-response handshake before any frame is accepted or
+    /// sent; when the secret is non-empty the tags also prove the peer knows
+    /// it, so an unauthenticated party on the network can't inject raft
+    /// messages or receive log data. Empty = handshake still runs (it carries
+    /// the config-hash check) but provides no authentication — tests,
+    /// fully-trusted networks.
     cluster_secret: []const u8 = "",
+    /// config.zig clusterHash() — the shared cluster params every voter must
+    /// agree on. Exchanged inside the handshake on every connection,
+    /// secret or not; a peer whose hash differs is refused (it would diverge
+    /// on replicated maintenance).
+    config_hash: u64 = 0,
 };
 
 pub const NetError = error{
@@ -93,36 +102,69 @@ pub const NetError = error{
 //
 // Mirrors the PBR transport's handshake, adapted to the async state machine
 // and made mutual — raft frames carry log data, so the connector must also
-// verify the acceptor before shipping anything:
+// verify the acceptor before shipping anything. The exchange also carries each
+// side's config hash (config.zig clusterHash() over the shared cluster params)
+// so a misconfigured node is turned away before it can replicate or vote:
 //
 //   acceptor  → connector : nonce_a (32 B challenge)
-//   connector → acceptor  : nonce_c (32 B) ++ HMAC(secret, nonce_a) (32 B)
-//   acceptor  → connector : HMAC(secret, nonce_c) (32 B ack)
+//   connector → acceptor  : nonce_c (32 B) ++ cfg_c (8 B) ++ HMAC(secret, nonce_a ++ cfg_c) (32 B)
+//   acceptor  → connector : cfg_a (8 B) ++ HMAC(secret, nonce_c ++ cfg_a) (32 B ack)
 //
-// Each side verifies the tag over its own nonce with a constant-time compare.
+// Each side verifies the tag over (its own nonce ++ the peer's config hash)
+// with a constant-time compare — proving the peer knows the secret AND binding
+// the config hash to the HMAC'd material so a man-in-the-middle can't rewrite
+// it to force a match. It then checks the peer's config hash equals its own; a
+// mismatch means the two nodes would diverge on replicated maintenance (e.g. a
+// shorter purge retention that, on failover, deletes terminal jobs through the
+// raft log), so the connection is refused (`config_hash_rejects`) and stays
+// refused on every 100 ms reconnect. The handshake runs on EVERY connection,
+// secret or not: the misconfiguration it catches is an operator typo, which
+// needs no attacker. With an empty secret the HMAC (empty key) provides no
+// authentication, but it still transports and binds the config hash — all the
+// benign-misconfig case needs. Production clusters set --cluster-secret, which
+// upgrades the same tags to peer authentication.
+//
 // Handshake bytes come from an unauthenticated peer (trust boundary): any
 // mismatch or protocol violation closes the connection and bumps
-// `auth_rejects` — never an assert.
+// `auth_rejects` (or `config_hash_rejects`) — never an assert.
 
 /// Cap on the shared secret copied into PeerNet at init.
 pub const max_secret_len: usize = 128;
 
 const hs_nonce_len: u32 = 32;
+const hs_cfg_len: u32 = 8; // config hash: u64 big-endian
 const hs_tag_len: u32 = 32; // HMAC-SHA256 output length
-const hs_response_len: u32 = hs_nonce_len + hs_tag_len;
+/// connector → acceptor: nonce_c ++ cfg_c ++ tag.
+const hs_response_len: u32 = hs_nonce_len + hs_cfg_len + hs_tag_len;
+/// acceptor → connector: cfg_a ++ tag.
+const hs_ack_len: u32 = hs_cfg_len + hs_tag_len;
 
-fn computeAuthTag(secret: []const u8, nonce: []const u8) [hs_tag_len]u8 {
+/// HMAC-SHA256 over (nonce ++ config_hash_be). Binding the config hash to the
+/// tag is what stops a man-in-the-middle from rewriting it to force a match:
+/// the tag only verifies if the hash the peer committed to is unchanged.
+fn computeAuthTag(secret: []const u8, nonce: []const u8, config_hash: u64) [hs_tag_len]u8 {
+    check(nonce.len == hs_nonce_len, "auth nonce len {d}", .{nonce.len});
+    var material: [hs_nonce_len + hs_cfg_len]u8 = undefined;
+    @memcpy(material[0..hs_nonce_len], nonce[0..hs_nonce_len]);
+    std.mem.writeInt(u64, material[hs_nonce_len..][0..hs_cfg_len], config_hash, .big);
     var tag: [hs_tag_len]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&tag, nonce, secret);
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&tag, &material, secret);
     return tag;
 }
 
-fn verifyAuthTag(secret: []const u8, nonce: []const u8, tag: []const u8) bool {
+fn verifyAuthTag(secret: []const u8, nonce: []const u8, config_hash: u64, tag: []const u8) bool {
     if (tag.len != hs_tag_len) return false;
-    const expected = computeAuthTag(secret, nonce);
+    const expected = computeAuthTag(secret, nonce, config_hash);
     var diff: u8 = 0;
     for (expected, tag[0..hs_tag_len]) |x, y| diff |= x ^ y; // constant-time
     return diff == 0;
+}
+
+/// Serialize the acceptor's ack (cfg_a ++ tag) into `send_buf`. Shared by the
+/// immediate and parked (send_done) ack paths so the wire layout is defined once.
+fn writeAck(send_buf: []u8, config_hash: u64, tag: [hs_tag_len]u8) void {
+    std.mem.writeInt(u64, send_buf[0..hs_cfg_len], config_hash, .big);
+    @memcpy(send_buf[hs_cfg_len..hs_ack_len], &tag);
 }
 
 // ============================================================================
@@ -135,13 +177,13 @@ const ConnRole = enum { unused, outbound, inbound };
 /// Per-connection handshake progress. Sends are strictly sequenced through
 /// send_done completions — the io backend allows one in-flight send per conn.
 const AuthState = enum {
-    /// Handshake complete (or auth disabled) — frames may flow.
+    /// Handshake complete — frames may flow.
     authenticated,
     /// Outbound: connected, waiting for the acceptor's 32-byte challenge.
     awaiting_challenge,
-    /// Outbound: nonce+tag response queued/sent, waiting for the 32-byte ack.
+    /// Outbound: nonce+cfg+tag response queued/sent, waiting for the 40-byte ack.
     awaiting_ack,
-    /// Inbound: challenge queued/sent, waiting for the 64-byte nonce+tag response.
+    /// Inbound: challenge queued/sent, waiting for the 72-byte nonce+cfg+tag response.
     awaiting_response,
     /// Inbound: response verified while the challenge send was still in
     /// flight; the ack tag is parked in `hs_buf` until send_done.
@@ -179,8 +221,8 @@ const ConnInfo = struct {
     /// For outbound conns, the peer index. Inbound conns are unattributed
     /// at the conn level — each frame's `from` field routes per-message.
     peer_idx: ?u8 = null,
-    /// Handshake progress. Accept/connect paths set `.authenticated` directly
-    /// when no secret is configured; the default never grants access.
+    /// Handshake progress. Every connection handshakes (empty secret
+    /// included); the default never grants access.
     auth: AuthState = .awaiting_challenge,
     /// Own challenge nonce while awaiting the peer's tag. On the acceptor it
     /// is reused to park the outgoing ack tag in the `.ack_pending` state
@@ -209,15 +251,29 @@ pub const PeerNet = struct {
 
     conn_info: [max_conns]ConnInfo = [_]ConnInfo{.{}} ** max_conns,
 
-    /// Shared cluster secret copied at init. Zero length = auth disabled.
+    /// Shared cluster secret copied at init. Keys the handshake HMAC; zero
+    /// length = no authentication (the handshake still runs and enforces the
+    /// config hash).
     secret_buf: [max_secret_len]u8 = undefined,
     secret_len: u8 = 0,
+
+    /// This node's shared-config hash (config.zig clusterHash()). Sent in the
+    /// handshake and compared against each peer's; a mismatch refuses the peer.
+    config_hash: u64 = 0,
 
     drops_unknown_peer: u64 = 0,
     drops_outbox_full: u64 = 0,
     drops_bad_frame: u64 = 0,
     /// Connections torn down for failing (or violating) the auth handshake.
     auth_rejects: u64 = 0,
+    /// Connections torn down because the peer's config hash differs from ours
+    /// (shared cluster params diverge). Grows on every reconnect while the
+    /// misconfiguration persists.
+    config_hash_rejects: u64 = 0,
+    /// One-shot guard so the config-mismatch log fires once, not on every
+    /// 100 ms reconnect attempt (the handshake is not a hot path, but a stuck
+    /// misconfiguration would otherwise flood the log forever).
+    config_mismatch_logged: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) !PeerNet {
         check(cfg.self_id.len > 0 and cfg.self_id.len <= codec.max_id_len, "self_id len {d}", .{cfg.self_id.len});
@@ -246,6 +302,7 @@ pub const PeerNet = struct {
         pn.self_id_len = @intCast(cfg.self_id.len);
         @memcpy(pn.secret_buf[0..cfg.cluster_secret.len], cfg.cluster_secret);
         pn.secret_len = @intCast(cfg.cluster_secret.len);
+        pn.config_hash = cfg.config_hash;
 
         pn.io.queueAccept();
         pn.io.submit();
@@ -428,14 +485,10 @@ pub const PeerNet = struct {
 
     fn onAccept(self: *PeerNet, conn_id: u16) void {
         check(conn_id < max_conns, "conn_id {d} >= max_conns {d}", .{ conn_id, max_conns });
-        if (self.secret_len == 0) {
-            self.conn_info[conn_id] = .{ .role = .inbound, .peer_idx = null, .auth = .authenticated };
-            // io backend already queued the recv on accept.
-            return;
-        }
         // Challenge the connector: send our nonce and keep a copy for
-        // verifying the response tag. The recv (for the 64-byte response)
-        // was already queued by the io backend on accept.
+        // verifying the response tag. The recv (for the 72-byte response)
+        // was already queued by the io backend on accept. Runs even with an
+        // empty secret — the handshake carries the config-hash check.
         var info = ConnInfo{ .role = .inbound, .peer_idx = null, .auth = .awaiting_response };
         std.crypto.random.bytes(&info.hs_buf);
         self.conn_info[conn_id] = info;
@@ -450,14 +503,8 @@ pub const PeerNet = struct {
         if (info.role != .outbound) return;
         const peer_idx = info.peer_idx orelse return;
         const p = &self.peers[peer_idx];
-        if (self.secret_len == 0) {
-            info.auth = .authenticated;
-            p.out_phase = .connected;
-            // Outbound is send-only: no queueRecv. Peer's reciprocal outbound is our inbound.
-            self.tryDispatch(p);
-            return;
-        }
-        // Handshake first: no frame leaves until the acceptor is verified.
+        // Handshake first: no frame leaves until the acceptor's config hash
+        // (and, with a secret, its identity) is verified.
         info.auth = .awaiting_challenge;
         p.out_phase = .authenticating;
         self.io.queueRecv(conn_id);
@@ -554,28 +601,38 @@ pub const PeerNet = struct {
             self.io.queueRecv(conn_id);
             return;
         }
-        const tag = computeAuthTag(self.secret(), c.recv_buf[0..hs_nonce_len]);
+        // Reply nonce_c ++ cfg_c ++ tag, where the tag binds our config hash to
+        // proof-of-secret over the acceptor's nonce.
+        const tag = computeAuthTag(self.secret(), c.recv_buf[0..hs_nonce_len], self.config_hash);
         std.crypto.random.bytes(&info.hs_buf);
         @memcpy(c.send_buf[0..hs_nonce_len], &info.hs_buf);
-        @memcpy(c.send_buf[hs_nonce_len..hs_response_len], &tag);
+        std.mem.writeInt(u64, c.send_buf[hs_nonce_len..][0..hs_cfg_len], self.config_hash, .big);
+        @memcpy(c.send_buf[hs_nonce_len + hs_cfg_len ..][0..hs_tag_len], &tag);
         c.recv_pos = 0;
         info.auth = .awaiting_ack;
         self.io.queueSend(conn_id, hs_response_len);
     }
 
-    /// Outbound: the acceptor's 32-byte ack tag over our nonce. Verify → the
-    /// connection is authenticated and the outbox may flow.
+    /// Outbound: the acceptor's 40-byte ack (cfg_a ++ tag over our nonce).
+    /// Verify + config match → the connection is up and the outbox may flow.
     fn onAckRecv(self: *PeerNet, conn_id: u16, info: *ConnInfo, c: *io_mod.ConnState) void {
-        if (c.recv_pos > hs_tag_len) {
+        if (c.recv_pos > hs_ack_len) {
             self.rejectConn(conn_id);
             return;
         }
-        if (c.recv_pos < hs_tag_len) {
+        if (c.recv_pos < hs_ack_len) {
             self.io.queueRecv(conn_id);
             return;
         }
-        if (!verifyAuthTag(self.secret(), &info.hs_buf, c.recv_buf[0..hs_tag_len])) {
+        // Verify first (proof-of-secret + authenticity of the peer's config
+        // hash over our nonce), then require the config hash to match ours.
+        const peer_hash = std.mem.readInt(u64, c.recv_buf[0..hs_cfg_len], .big);
+        if (!verifyAuthTag(self.secret(), &info.hs_buf, peer_hash, c.recv_buf[hs_cfg_len..hs_ack_len])) {
             self.rejectConn(conn_id);
+            return;
+        }
+        if (peer_hash != self.config_hash) {
+            self.rejectConfigMismatch(conn_id, peer_hash);
             return;
         }
         c.recv_pos = 0;
@@ -583,14 +640,14 @@ pub const PeerNet = struct {
         const peer_idx = info.peer_idx orelse return;
         const p = &self.peers[peer_idx];
         p.out_phase = .connected;
-        // Outbound is send-only from here: no further queueRecv (steady state
-        // matches the no-auth path).
+        // Outbound is send-only from here: no further queueRecv. Peer's
+        // reciprocal outbound is our inbound.
         self.tryDispatch(p);
     }
 
-    /// Inbound: the connector's 64-byte nonce+tag response. Verify their tag
-    /// over our challenge, then ack with a tag over their nonce — parked in
-    /// `hs_buf` if the challenge send is still in flight (one send at a time).
+    /// Inbound: the connector's 72-byte nonce+cfg+tag response. Verify their
+    /// tag over our challenge, then ack with a tag over their nonce — parked
+    /// in `hs_buf` if the challenge send is still in flight (one send at a time).
     fn onResponseRecv(self: *PeerNet, conn_id: u16, info: *ConnInfo, c: *io_mod.ConnState) void {
         if (c.recv_pos > hs_response_len) {
             self.rejectConn(conn_id);
@@ -600,16 +657,24 @@ pub const PeerNet = struct {
             self.io.queueRecv(conn_id);
             return;
         }
-        if (!verifyAuthTag(self.secret(), &info.hs_buf, c.recv_buf[hs_nonce_len..hs_response_len])) {
+        // Verify the connector's tag over (our nonce ++ its config hash), then
+        // require its config hash to match ours before we ack.
+        const peer_hash = std.mem.readInt(u64, c.recv_buf[hs_nonce_len..][0..hs_cfg_len], .big);
+        if (!verifyAuthTag(self.secret(), &info.hs_buf, peer_hash, c.recv_buf[hs_nonce_len + hs_cfg_len ..][0..hs_tag_len])) {
             self.rejectConn(conn_id);
             return;
         }
-        const ack = computeAuthTag(self.secret(), c.recv_buf[0..hs_nonce_len]);
+        if (peer_hash != self.config_hash) {
+            self.rejectConfigMismatch(conn_id, peer_hash);
+            return;
+        }
+        // ack tag proves our secret + binds our config hash over the connector's nonce.
+        const ack = computeAuthTag(self.secret(), c.recv_buf[0..hs_nonce_len], self.config_hash);
         c.recv_pos = 0;
         if (info.challenge_sent) {
-            @memcpy(c.send_buf[0..hs_tag_len], &ack);
+            writeAck(c.send_buf, self.config_hash, ack);
             info.auth = .authenticated;
-            self.io.queueSend(conn_id, hs_tag_len);
+            self.io.queueSend(conn_id, hs_ack_len);
         } else {
             info.hs_buf = ack;
             info.auth = .ack_pending;
@@ -622,6 +687,31 @@ pub const PeerNet = struct {
     /// so peer bookkeeping is reset inline (mirrors onClosed).
     fn rejectConn(self: *PeerNet, conn_id: u16) void {
         self.auth_rejects += 1;
+        self.teardownConn(conn_id);
+    }
+
+    /// Tear down a peer whose config hash differs from ours. The secret checked
+    /// out (the tag verified), but the shared cluster params diverge — letting
+    /// the node replicate or win an election risks unrecoverable data loss
+    /// (e.g. a shorter purge retention purging terminal jobs through the log).
+    /// Logged once (the 100 ms reconnect loop would otherwise flood the log);
+    /// the reject counter keeps climbing so the mismatch stays observable.
+    fn rejectConfigMismatch(self: *PeerNet, conn_id: u16, peer_hash: u64) void {
+        self.config_hash_rejects += 1;
+        if (!self.config_mismatch_logged) {
+            self.config_mismatch_logged = true;
+            std.debug.print(
+                "raft_net: config hash mismatch — shared cluster params differ " ++
+                    "(local=0x{x:0>16}, peer=0x{x:0>16}); refusing peer connection\n",
+                .{ self.config_hash, peer_hash },
+            );
+        }
+        self.teardownConn(conn_id);
+    }
+
+    /// Shared teardown for a rejected connection (auth failure or config
+    /// mismatch): reset outbound peer bookkeeping and close the slot.
+    fn teardownConn(self: *PeerNet, conn_id: u16) void {
         const info = self.conn_info[conn_id];
         if (info.role == .outbound) {
             if (info.peer_idx) |idx| {
@@ -645,12 +735,12 @@ pub const PeerNet = struct {
                 .awaiting_response => info.challenge_sent = true,
                 .ack_pending => {
                     // Response was verified while the challenge was still in
-                    // flight; ship the parked ack tag now.
+                    // flight; ship the parked ack (cfg_a ++ tag) now.
                     const c = self.io.conn(conn_id);
-                    @memcpy(c.send_buf[0..hs_tag_len], &info.hs_buf);
+                    writeAck(c.send_buf, self.config_hash, info.hs_buf);
                     info.auth = .authenticated;
                     info.challenge_sent = true;
-                    self.io.queueSend(conn_id, hs_tag_len);
+                    self.io.queueSend(conn_id, hs_ack_len);
                 },
                 .authenticated => {}, // ack tag drained; nothing else is sent inbound
                 .awaiting_challenge, .awaiting_ack => unreachable, // outbound-only states
@@ -876,36 +966,51 @@ test "raft_net: two-peer loopback delivers a frame" {
 test "raft_net: auth tag compute + constant-time verify" {
     var nonce: [hs_nonce_len]u8 = undefined;
     std.crypto.random.bytes(&nonce);
-    const good = computeAuthTag("s3cr3t", &nonce);
-    try testing.expect(verifyAuthTag("s3cr3t", &nonce, &good));
+    const cfg: u64 = 0xABCD_1234_5678_9ABC;
+    const good = computeAuthTag("s3cr3t", &nonce, cfg);
+    try testing.expect(verifyAuthTag("s3cr3t", &nonce, cfg, &good));
 
     // Wrong secret produces a different tag.
-    const bad = computeAuthTag("wrong", &nonce);
-    try testing.expect(!verifyAuthTag("s3cr3t", &nonce, &bad));
+    const bad = computeAuthTag("wrong", &nonce, cfg);
+    try testing.expect(!verifyAuthTag("s3cr3t", &nonce, cfg, &bad));
+
+    // A different config hash produces a different tag: the hash is bound into
+    // the HMAC'd material, so a man-in-the-middle can't rewrite it on the wire
+    // to force a match without also invalidating the tag.
+    try testing.expect(!verifyAuthTag("s3cr3t", &nonce, cfg +% 1, &good));
 
     // Wrong nonce fails, and so does a truncated tag.
     var nonce2: [hs_nonce_len]u8 = undefined;
     std.crypto.random.bytes(&nonce2);
-    try testing.expect(!verifyAuthTag("s3cr3t", &nonce2, &good));
-    try testing.expect(!verifyAuthTag("s3cr3t", &nonce, good[0..16]));
+    try testing.expect(!verifyAuthTag("s3cr3t", &nonce2, cfg, &good));
+    try testing.expect(!verifyAuthTag("s3cr3t", &nonce, cfg, good[0..16]));
 }
 
 const AuthLoopbackOutcome = struct {
     delivered: bool,
     rejects_a: u64,
     rejects_b: u64,
+    config_rejects_a: u64,
+    config_rejects_b: u64,
 };
 
-/// Two PeerNets with independent secrets; n1 sends one heartbeat to n2.
-/// Drives both ticks for up to `budget_ns` (early exit on delivery) and
-/// reports delivery plus each side's auth reject count.
-fn runAuthedLoopback(secret_a: []const u8, secret_b: []const u8, budget_ns: i128) !AuthLoopbackOutcome {
+/// Two PeerNets with independent secrets + config hashes; n1 sends one
+/// heartbeat to n2. Drives both ticks for up to `budget_ns` (early exit on
+/// delivery) and reports delivery plus each side's auth + config reject counts.
+fn runAuthedLoopback(
+    secret_a: []const u8,
+    secret_b: []const u8,
+    hash_a: u64,
+    hash_b: u64,
+    budget_ns: i128,
+) !AuthLoopbackOutcome {
     var pn1 = try PeerNet.init(testing.allocator, .{
         .self_id = "n1",
         .bind_addr = loopback(0),
         .recv_buf_size = test_buf_size,
         .send_buf_size = test_buf_size,
         .cluster_secret = secret_a,
+        .config_hash = hash_a,
     });
     defer pn1.deinit();
     var pn2 = try PeerNet.init(testing.allocator, .{
@@ -914,6 +1019,7 @@ fn runAuthedLoopback(secret_a: []const u8, secret_b: []const u8, budget_ns: i128
         .recv_buf_size = test_buf_size,
         .send_buf_size = test_buf_size,
         .cluster_secret = secret_b,
+        .config_hash = hash_b,
     });
     defer pn2.deinit();
 
@@ -950,35 +1056,94 @@ fn runAuthedLoopback(secret_a: []const u8, secret_b: []const u8, budget_ns: i128
         }
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
-    return .{ .delivered = delivered, .rejects_a = pn1.auth_rejects, .rejects_b = pn2.auth_rejects };
+    return .{
+        .delivered = delivered,
+        .rejects_a = pn1.auth_rejects,
+        .rejects_b = pn2.auth_rejects,
+        .config_rejects_a = pn1.config_hash_rejects,
+        .config_rejects_b = pn2.config_hash_rejects,
+    };
 }
 
-test "raft_net: handshake success with shared secret" {
+test "raft_net: handshake success with shared secret and matching config" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const out = try runAuthedLoopback("hunter2-cluster-secret", "hunter2-cluster-secret", 5 * std.time.ns_per_s);
+    const cfg: u64 = 0xC0FFEE_1234_5678;
+    const out = try runAuthedLoopback("hunter2-cluster-secret", "hunter2-cluster-secret", cfg, cfg, 5 * std.time.ns_per_s);
     try testing.expect(out.delivered);
     try testing.expectEqual(@as(u64, 0), out.rejects_a);
     try testing.expectEqual(@as(u64, 0), out.rejects_b);
+    try testing.expectEqual(@as(u64, 0), out.config_rejects_a);
+    try testing.expectEqual(@as(u64, 0), out.config_rejects_b);
 }
 
 test "raft_net: wrong secret is rejected" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     // 1.5 s budget: connect + handshake round-trips take milliseconds on
     // loopback; the loop runs the full budget since nothing is delivered.
-    const out = try runAuthedLoopback("secret-alpha", "secret-bravo", 1_500 * std.time.ns_per_ms);
+    const out = try runAuthedLoopback("secret-alpha", "secret-bravo", 0, 0, 1_500 * std.time.ns_per_ms);
     try testing.expect(!out.delivered);
     // Each side accepted the other's outbound conn, challenged it, and the
     // response tag failed to verify (reconnects retry, so counts only grow).
     try testing.expect(out.rejects_a >= 1);
     try testing.expect(out.rejects_b >= 1);
+    // The tag failed before any config comparison, so nothing is charged to
+    // the config-mismatch counter.
+    try testing.expectEqual(@as(u64, 0), out.config_rejects_a);
+    try testing.expectEqual(@as(u64, 0), out.config_rejects_b);
 }
 
-test "raft_net: empty secret bypasses handshake" {
+test "raft_net: matching config hashes connect" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const out = try runAuthedLoopback("", "", 5 * std.time.ns_per_s);
+    // Same secret, same config hash (a non-default value) — the added config
+    // exchange must not disturb the happy path.
+    const cfg: u64 = 0xDEAD_BEEF_F00D_BABE;
+    const out = try runAuthedLoopback("shared-secret", "shared-secret", cfg, cfg, 5 * std.time.ns_per_s);
     try testing.expect(out.delivered);
+    try testing.expectEqual(@as(u64, 0), out.config_rejects_a);
+    try testing.expectEqual(@as(u64, 0), out.config_rejects_b);
+}
+
+test "raft_net: mismatched config hashes are refused both directions" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // Same secret (so the HMAC verifies) but divergent shared-config hashes.
+    // Each node is the acceptor for the other's outbound conn, so BOTH detect
+    // the mismatch and refuse — no frame is ever delivered. 1.5 s budget: the
+    // handshake resolves in milliseconds and nothing is delivered, so the loop
+    // runs the full budget accumulating rejects across reconnects.
+    const out = try runAuthedLoopback("shared-secret", "shared-secret", 0x1111_1111, 0x2222_2222, 1_500 * std.time.ns_per_ms);
+    try testing.expect(!out.delivered);
+    // Refused on both sides (both directions), and it's a config reject, not an
+    // auth reject: the secret was correct.
+    try testing.expect(out.config_rejects_a >= 1);
+    try testing.expect(out.config_rejects_b >= 1);
     try testing.expectEqual(@as(u64, 0), out.rejects_a);
     try testing.expectEqual(@as(u64, 0), out.rejects_b);
+}
+
+test "raft_net: empty secret still handshakes and enforces config hash" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // The handshake runs unconditionally: an operator typo needs no attacker,
+    // so the config-hash check must not depend on --cluster-secret. With an
+    // empty secret the HMAC provides no authentication, but it still
+    // transports + binds the config hash.
+    {
+        // Mismatched hashes are refused even without a secret.
+        const out = try runAuthedLoopback("", "", 0x1111_1111, 0x2222_2222, 1_500 * std.time.ns_per_ms);
+        try testing.expect(!out.delivered);
+        try testing.expect(out.config_rejects_a >= 1);
+        try testing.expect(out.config_rejects_b >= 1);
+        try testing.expectEqual(@as(u64, 0), out.rejects_a);
+        try testing.expectEqual(@as(u64, 0), out.rejects_b);
+    }
+    {
+        // Matching hashes connect without a secret (single-node dev / tests).
+        const out = try runAuthedLoopback("", "", 0x3333_3333, 0x3333_3333, 5 * std.time.ns_per_s);
+        try testing.expect(out.delivered);
+        try testing.expectEqual(@as(u64, 0), out.rejects_a);
+        try testing.expectEqual(@as(u64, 0), out.rejects_b);
+        try testing.expectEqual(@as(u64, 0), out.config_rejects_a);
+        try testing.expectEqual(@as(u64, 0), out.config_rejects_b);
+    }
 }
 
 test "raft_net: frames before auth are rejected" {
@@ -1005,7 +1170,7 @@ test "raft_net: frames before auth are rejected" {
     var framed: [4 + 256]u8 = undefined;
     std.mem.writeInt(u32, framed[0..4], @intCast(n), .big);
     @memcpy(framed[4..][0..n], payload[0..n]);
-    // Two frames back-to-back guarantees the bytes exceed the 64-byte
+    // Two frames back-to-back guarantees the bytes exceed the 72-byte
     // handshake response the acceptor is waiting for → reject + close.
     try stream.writeAll(framed[0 .. 4 + n]);
     try stream.writeAll(framed[0 .. 4 + n]);

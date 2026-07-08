@@ -19,6 +19,7 @@ const kv_read = @import("kv_read.zig");
 const ops_mod = @import("ops.zig");
 const kv = @import("kv.zig");
 const handler_mod = @import("handler.zig");
+const handler_fetch = @import("handler_fetch.zig");
 const notify_mod = @import("notify.zig");
 const assert = @import("assert.zig");
 const keys = @import("keys.zig");
@@ -65,6 +66,14 @@ pub const RaftIface = struct {
 /// Sentinel err for write frames rejected at a non-leader. encodeResponses
 /// turns it into MSG_NOT_LEADER (RPC) or 503 (HTTP) instead of a generic error.
 pub const err_not_leader: []const u8 = "not_leader";
+
+/// Sentinel err for an enqueue frame whose recorded mutations would exceed one
+/// raft entry's payload cap (cluster mode only). Rejected at the boundary —
+/// before handler.apply — so a legal-but-amplifying batch (job records inline
+/// tags; each tag repeats queue+id in a tq| index key) can never drive the
+/// per-frame proposal-cap assert in proposeRecordedFrames. Client input is a
+/// boundary → error, never an assert. http.encodeWriteResponse maps it to 413.
+pub const err_too_large: []const u8 = "batch too large for replication";
 
 pub fn Pipeline(comptime IoBackend: type) type {
     return struct {
@@ -237,12 +246,27 @@ pub fn Pipeline(comptime IoBackend: type) type {
         const max_waiting_conns: u32 = 20480;
         const max_notified_queues: u32 = 64;
         const max_prepare_slots: u32 = 4;
-        /// Worst-case proposals per tick: a full frame batch's mutations
-        /// split into ≤max_proposal_bytes chunks (256 frames × 256 KiB
-        /// payload cap ≈ 64 MiB ÷ ~512 KiB ≈ 125) plus every maintenance
-        /// kind committing its own batch.
-        const max_tick_tokens: u32 = 160;
+        /// Upper bound on parked non-frame (maintenance + fulfill-claim)
+        /// proposal tokens in flight at once. Both come from proposeRecorded's
+        /// byte-split batches; this is the same cap parkTickTokens enforces on
+        /// the maint_tokens ring.
         const max_maint_tokens: u32 = 192;
+        /// Worst-case proposal tokens accumulated in `tick_tokens` within one
+        /// tick, before they are copied into a PrepareSlot. In a frame-carrying
+        /// tick three sources feed the same array, in order:
+        ///   1. runMaintenance      → proposeRecorded (byte-split maint batch)
+        ///   2. executeBatch        → proposeRecordedFrames
+        ///   3. fulfillSubscriptions → proposeRecorded (byte-split fetch claims)
+        /// proposeRecordedFrames splits at FRAME granularity, so (2) alone can
+        /// emit one token per frame — up to max_frames. The old estimate (~125)
+        /// assumed perfect byte packing, which frame splitting does not give,
+        /// and undersized this so the 161st proposeSlice panicked under legal
+        /// heavy load. (1)+(3) are byte-split and together bounded by
+        /// max_maint_tokens (the same in-flight cap parkTickTokens enforces).
+        /// Sum bounds the array; PrepareSlot.tokens is sized identically. Each
+        /// element is a *ProposeToken (one pointer), so the larger array costs
+        /// only (max_tick_tokens × 8) bytes per Pipeline plus per PrepareSlot.
+        const max_tick_tokens: u32 = max_frames + max_maint_tokens;
         /// Per-proposal byte budget — one raft entry's payload cap. The
         /// batcher rejects anything larger (ProposalTooLarge → failed token
         /// → false divergence panic), so the pipeline splits BELOW this.
@@ -560,6 +584,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     .connected => self.handleWebhookConnected(completion.conn_id),
                     .send_done => {
                         const c = self.io.conn(completion.conn_id);
+                        // Re-arm subscription delivery: this connection's send
+                        // buffer just drained (send_len reset to 0 by the IO
+                        // backend), so a job skipped for lack of room or a
+                        // re-pushed job can be retried now. notified_queue_count
+                        // was reset above this loop, so recording here feeds THIS
+                        // tick's fulfillSubscriptions — nothing else re-triggers a
+                        // stranded push until unrelated queue activity (Bug C).
+                        if (c.waiting) self.recordConnNotified(c);
                         if (c.protocol == .webhook) {
                             self.io.queueRecv(completion.conn_id);
                         } else if (c.recv_pos > 0) {
@@ -732,6 +764,16 @@ pub fn Pipeline(comptime IoBackend: type) type {
                             // the DB lock for the rebuild reads.
                             if (self.config.db_lock) |l| l.lock();
                             defer if (self.config.db_lock) |l| l.unlock();
+                            // Clear before rebuild: while we were a follower the
+                            // FSM applied the new leader's log straight to KV
+                            // without touching our in-memory PendingIndex/queue
+                            // caches, so they are stale. Rebuilding onto stale
+                            // state would duplicate pending entries (a re-acquire
+                            // loop leaks the index). clearState + rebuildState
+                            // gives a slate that exactly matches KV, closing the
+                            // hole where a deposed node's stale pending index
+                            // could later feed a fulfillment.
+                            self.handler.clearState();
                             self.handler.rebuildState(self.stores);
                             self.warmupOnAcquire();
                             self.raft_state = .leading;
@@ -750,6 +792,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 {
                     // In-flight tokens either commit (slots flush) or fail
                     // (divergence fail-stop); step down only once drained.
+                    // A fetch claim is a local write, forbidden on a follower,
+                    // so subscribed workers must be told to redial the leader
+                    // rather than wait forever on a node that can no longer
+                    // serve them.
+                    self.evictWaitingSubscribers();
                     self.raft_state = .follower;
                 },
             }
@@ -773,6 +820,37 @@ pub fn Pipeline(comptime IoBackend: type) type {
             var batch = self.stores[0].newBatch();
             defer batch.close();
             self.handler.loadWebhookCache(&batch);
+        }
+
+        /// True when the node may commit writes to its LOCAL KV: single-node
+        /// (no raft) always may; in raft mode only a confirmed leader may. Uses
+        /// the SAME source of truth the write path (decodeAndApply) gates on —
+        /// raft_state == .leading AND a live isLeader() — so a follower, an
+        /// acquiring node (barrier not yet committed), or a deposed leader
+        /// mid-stepdown can never claim jobs and propose a doomed write.
+        fn canWriteLocally(self: *Self) bool {
+            const raft = self.config.raft orelse return true;
+            return self.raft_state == .leading and raft.isLeader();
+        }
+
+        /// On step-down, tell every subscribed worker to redial the leader. A
+        /// fetch subscription is a standing claim (a local write on fulfillment),
+        /// which a follower may not serve. We emit MSG_NOT_LEADER on each waiting
+        /// connection and clear its subscription state, preserving the invariant
+        /// "a connection marked waiting is in waiting_conns" (none is left
+        /// waiting after the list is cleared). Reuses the same not-leader frame
+        /// the per-frame write rejection path emits.
+        fn evictWaitingSubscribers(self: *Self) void {
+            for (self.waiting_conns[0..self.waiting_conn_count]) |conn_id| {
+                const c = self.io.conn(conn_id);
+                if (c.phase == .free) continue;
+                c.waiting = false;
+                c.prefetch = 0;
+                const n = raft_gate.encodeNotLeader(c.send_buf[c.send_len..], c.last_req_id, .{}) catch continue;
+                c.send_len += @intCast(n);
+                self.io.queueSend(conn_id, c.send_len);
+            }
+            self.waiting_conn_count = 0;
         }
 
         /// Encoded size a mutation contributes to a proposal payload
@@ -827,6 +905,11 @@ pub fn Pipeline(comptime IoBackend: type) type {
         /// mutations must land in one raft entry so followers apply them
         /// atomically (a mid-op split would leave e.g. a job record without
         /// its indexes after a failover).
+        ///
+        /// The per-frame cap assert below is a BACKSTOP only: enqueueRecordedBound
+        /// already rejects an oversize enqueue frame at decode (Bug B), and
+        /// maintenance uses proposeRecorded (mutation-granularity split), so no
+        /// client input reaches this assert.
         fn proposeRecordedFrames(self: *Self) void {
             if (self.config.raft == null) return;
             const muts = self.mut_list.items;
@@ -852,6 +935,95 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
             assert.check(prev_end == muts.len, "pipeline: frame bounds don't cover mut_list ({d} vs {d})", .{ prev_end, muts.len });
             self.proposeSlice(muts[start..]);
+        }
+
+        /// Provable UPPER BOUND on the recorded-mutation bytes ONE enqueue frame
+        /// contributes to its raft proposal segment. proposeRecordedFrames cannot
+        /// split a frame across raft entries, so a frame whose recorded mutations
+        /// exceed one entry's cap (max_proposal_bytes) fires the per-frame assert
+        /// AFTER the local commit — a panic on legal client input. A 256 KiB
+        /// enqueue amplifies far past its wire size: the job record inlines its
+        /// tags AND every tag repeats queue+id in a tq| index key. decodeAndApply*
+        /// rejects a frame at the boundary (before handler.apply) when this bound
+        /// exceeds the cap, so the assert becomes a pure backstop.
+        ///
+        /// Every mutation the enqueue path records (handler_enqueue.applyEnqueue +
+        /// indexer.flushCreate + flushCounterDeltas) is over-estimated as oplog
+        /// framing (1 op + 2 keylen + 4 vallen = 7, see mutationBytes) + key bytes
+        /// + value bytes, from the job's ACTUAL field sizes:
+        ///   j|{id}   record : encodeJob = 91 fixed + 15 var-field 2-byte prefixes
+        ///                     + inlined field CONTENT (id, queue, unique, batch,
+        ///                     parent, chain, chain_config, group, tags, checkpoint)
+        ///   jp|{id}  payload: value = payload bytes                    (if present)
+        ///   jt|/jq|/js|/jqs|: empty-value read indexes (flushCreate)
+        ///   tq| per tag     : the tag string parses into ≥5-byte pairs, so the
+        ///                     pair count ≤ tags/5; all key/value CONTENT across
+        ///                     pairs is a subset of the tag string (≤ tags total);
+        ///                     each key's fixed part + framing is q + id + 13 bytes
+        ///   qc|{queue}      : new-queue default write AND per-tick counter
+        ///                     re-encode, each value = encodeQueue = 54 fixed + 2 +
+        ///                     name; charged twice per job (worst case: every job a
+        ///                     fresh queue)
+        ///   qn|{queue}      : empty new-queue marker
+        ///   x|/s|/u|/b|     : optional expire / scheduled / unique-lock / batch
+        ///                     counter mutations, charged only when the field is set
+        ///                     (b|'s re-encode is the batch record's ACTUAL current
+        ///                     size, read from the batch — its counters change but
+        ///                     its length does not).
+        /// Plus the 4-byte encodeMutations count header, matching
+        /// proposeRecordedFrames' per-chunk accounting.
+        fn enqueueRecordedBound(batch: *kv.WriteBatch, op: *const ops_mod.EnqueueOp) usize {
+            const fr: usize = 7; // oplog framing per mutation (see mutationBytes)
+            var total: usize = 4; // encodeMutations count header
+            for (op.jobs) |*j| {
+                const q = j.queue.len;
+                const id = j.job_id.len;
+                const tags_len = if (j.tags) |t| t.len else 0;
+
+                // j|{id} job record — value inlines every variable field present.
+                var job_val: usize = 91 + 15 * 2 + id + q + tags_len;
+                if (j.unique_key) |u| job_val += u.len;
+                if (j.batch_id) |b| job_val += b.len;
+                if (j.parent_id) |p| job_val += p.len;
+                if (j.chain_id) |c| job_val += c.len;
+                if (j.chain_config) |c| job_val += c.len;
+                if (j.group) |g| job_val += g.len;
+                if (j.checkpoint) |c| job_val += c.len;
+                total += fr + (2 + id) + job_val;
+
+                // Deferred read indexes (empty values).
+                total += fr + (3 + 8 + id); // jt|{inv:8}{id}
+                total += fr + (3 + q + 1 + 8 + id); // jq|{queue}\0{inv:8}{id}
+                total += fr + (3 + 1 + 8 + id); // js|{state:1}{inv:8}{id}
+                total += fr + (4 + q + 1 + 1 + 8 + id); // jqs|{queue}\0{state:1}{inv:8}{id}
+
+                // Queue config (default write + counter re-encode) and marker.
+                total += 2 * (fr + (3 + q) + (54 + 2 + q));
+                total += fr + (3 + q);
+
+                // Tag index keys: pair count ≤ tags/5, content ≤ tags total.
+                total += tags_len + (tags_len / 5) * (q + id + 13);
+
+                // Optional per-feature mutations.
+                if (j.payload) |p| {
+                    if (p.len > 0) total += fr + (3 + id) + p.len; // jp|{id}
+                }
+                if (j.expire_after_ms > 0) total += fr + (2 + 8 + id); // x|{expire:8}{id}
+                if (j.scheduled_at_ns > 0) total += fr + (2 + q + 1 + 8 + id); // s|{queue}\0{sched:8}{id}
+                if (j.unique_key) |u| {
+                    if (u.len > 0) total += fr + (2 + q + 1 + u.len) + (id + 1 + 8); // u| lock (value = id|expires)
+                }
+                if (j.batch_id) |b| {
+                    if (b.len > 0) {
+                        // Re-encode of the existing batch record (same length).
+                        var bk: keys.KeyBuf = undefined;
+                        const bv = batch.get(keys.batchKey(&bk, b));
+                        const bsz = if (bv) |v| v.len else codec.max_batch_encoded_size;
+                        total += fr + (2 + b.len) + bsz; // b|{batch_id}
+                    }
+                }
+            }
+            return total;
         }
 
         /// True when every token the slot carries has committed. A failed
@@ -1422,27 +1594,34 @@ pub fn Pipeline(comptime IoBackend: type) type {
             const t_apply = Timer.start(clock);
             for (self.frames[0..self.frame_count], 0..) |*frame, i| {
                 self.results[i] = self.decodeAndApply(&kv_batch, frame, @intCast(i));
-                // Bounded-pass index flush: drain the indexer between ops once
-                // it's within one op's worth of full so a later op's effects
-                // can never overflow and be silently dropped (M10). Flushing
-                // mid-loop writes into the same batch (committed below), so the
-                // result is identical to a single end-of-loop flush.
-                if (self.handler.indexer.nearFull()) self.handler.indexer.flush(&kv_batch);
-                // Frame boundary for proposal splitting: mid-loop indexer
-                // flushes belong to already-decoded frames, so the running
-                // list length is a valid cut point.
-                if (record_mutations) self.frame_mut_ends[i] = @intCast(self.mut_list.items.len);
+                if (record_mutations) {
+                    // Raft: flush THIS frame's deferred index effects now so its
+                    // recorded-mutation segment is self-contained. Two reasons:
+                    // (1) a follower must apply one client op's mutations — the
+                    // job record AND its read/tag indexes — in a single raft
+                    // entry (docs/raft-wiring.md atomicity). The old end-of-loop
+                    // flush attributed every frame's indexes to the LAST frame's
+                    // segment, so an earlier frame's entry carried a job record
+                    // without its indexes. (2) It makes each frame_mut_ends[i]
+                    // cover exactly frame i, so enqueueRecordedBound provably
+                    // bounds every frame's whole segment (Bug B). Flushing into
+                    // the same committed batch is result-identical to one
+                    // end-of-loop flush, and write-path handlers never read the
+                    // read indexes, so an earlier frame's flushed indexes can't
+                    // perturb a later frame's apply.
+                    self.handler.indexer.flush(&kv_batch);
+                    self.frame_mut_ends[i] = @intCast(self.mut_list.items.len);
+                } else if (self.handler.indexer.nearFull()) {
+                    // Non-raft: bounded-pass mid-loop flush so a burst of effects
+                    // can never overflow and be silently dropped (M10).
+                    self.handler.indexer.flush(&kv_batch);
+                }
             }
             addPhase(&self.exec_apply_ns, t_apply.elapsed(clock));
 
-            // Flush deferred indexes into the same batch AFTER all reads.
-            // Index writes don't pollute the overlay during handler.apply,
-            // but they're captured by mutation recording for replication.
-            self.handler.indexer.flush(&kv_batch);
-            // The final flush's mutations attach to the last frame's segment.
-            if (record_mutations and self.frame_count > 0) {
-                self.frame_mut_ends[self.frame_count - 1] = @intCast(self.mut_list.items.len);
-            }
+            // Non-raft: flush the remaining deferred indexes once, after all
+            // reads. (Raft flushed per-frame above — nothing left to attribute.)
+            if (!record_mutations) self.handler.indexer.flush(&kv_batch);
 
             const t_commit = Timer.start(clock);
             kv_batch.commit();
@@ -1543,6 +1722,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     const parsed = rpc.parseEnqueue(&reader, &self.jobs_buf, now_ns) catch
                         return .{ .err = "parse error" };
                     frame.count = parsed.count;
+                    // Bug B: reject at the boundary if this frame's recorded
+                    // mutations could exceed one raft entry's cap (cluster mode
+                    // only — single node has no entry cap and never rejects).
+                    if (self.config.raft != null and
+                        enqueueRecordedBound(batch, &parsed.op) > max_proposal_bytes)
+                        return .{ .err = err_too_large };
                     const op_data = ops_mod.OpData{ .enqueue = parsed.op };
                     const result = self.handler.apply(batch, .enqueue, &op_data);
                     self.emitMirrorOp(.enqueue, &op_data, &result);
@@ -1812,6 +1997,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 else => return .{ .err = "unsupported http write" },
             };
 
+            // Bug B: same per-frame proposal-cap boundary check as the RPC path.
+            // An HTTP enqueue amplifies identically (tags inline + tq| indexes);
+            // reject before apply in cluster mode so the cap assert stays a
+            // backstop. http.encodeWriteResponse maps err_too_large to 413.
+            if (op_type == .enqueue and self.config.raft != null and
+                enqueueRecordedBound(batch, &decoded.op_data.enqueue) > max_proposal_bytes)
+                return .{ .err = err_too_large };
+
             var result = self.handler.apply(batch, op_type, &decoded.op_data);
             self.emitMirrorOp(op_type, &decoded.op_data, &result);
 
@@ -1859,7 +2052,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 if (frame.msg_type == rpc.MSG_FETCH_BATCH and frame.protocol == .rpc and
                     self.results[i].err == null)
                 {
-                    self.storeSubscription(frame.conn_id, &frame);
+                    if (!self.storeSubscription(frame.conn_id, &frame)) {
+                        // waiting_conns at capacity: reject with an explicit
+                        // error so the worker backs off and reconnects, rather
+                        // than hanging forever on a subscription that was never
+                        // registered (M6 — the old bare return silently dropped
+                        // it after the conn was already marked waiting).
+                        self.encodeErrorFrame(frame.conn_id, frame.req_id, "subscription rejected: server at connection capacity");
+                    }
                     continue;
                 }
 
@@ -1941,6 +2141,29 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
                 c.send_len += @intCast(writer.pos);
             }
+        }
+
+        /// Encode a standalone MSG_ERROR frame into a connection's send buffer
+        /// and mark it for flushing. Used to reject an operation (e.g. a fetch
+        /// subscribe when waiting_conns is full) so the client sees an explicit
+        /// error instead of silence. The message is a short static string and
+        /// the send buffer is sized for a full payload, so it always fits.
+        fn encodeErrorFrame(self: *Self, conn_id: u16, req_id: u32, msg: []const u8) void {
+            const c = self.io.conn(conn_id);
+            if (c.phase == .free) return;
+            const write_start = c.send_len;
+            var w = BufWriter{ .buf = c.send_buf[write_start..] };
+            w.pos = rpc.FRAME_HEADER_SIZE; // reserve header space
+            rpc.encodeError(&w, msg);
+            const payload_len: u32 = @intCast(w.pos - rpc.FRAME_HEADER_SIZE);
+            rpc.writeFrameHeader(
+                c.send_buf[write_start..][0..rpc.FRAME_HEADER_SIZE],
+                rpc.MSG_ERROR,
+                req_id,
+                payload_len,
+            );
+            c.send_len += @intCast(w.pos);
+            self.trackSendConn(conn_id);
         }
 
         /// Record a connection that needs a send flushed (dedup).
@@ -2033,11 +2256,15 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 var store = &self.stores[0];
                 var batch = store.newBatch();
                 defer batch.close();
+                // Payload length is a u32: rpc.MAX_PAYLOAD_SIZE is 256 KiB and
+                // the default max_payload_size is 64 KiB, both of which exceed
+                // u16's 65535 cap — a u16 field @intCast-panicked on a legal
+                // 64 KiB payload and truncated anything larger.
                 if (batch.get(payload_key)) |payload_bytes| {
-                    writer.writeU16(@intCast(payload_bytes.len));
+                    writer.writeU32(@intCast(payload_bytes.len));
                     writer.writeBytes(payload_bytes);
                 } else {
-                    writer.writeU16(0);
+                    writer.writeU32(0);
                 }
 
                 writer.writeU64(fetched.lease_token);
@@ -2050,20 +2277,46 @@ pub fn Pipeline(comptime IoBackend: type) type {
         // Fetch subscriptions — store and fulfill
         // ====================================================================
 
-        /// Store a fetch subscription in ConnState. Subscribe-only: RPC fetch
-        /// always subscribes — fulfillSubscriptions serves pending jobs.
-        /// Re-parses the subscription from the frame payload (still valid before compaction).
-        fn storeSubscription(self: *Self, conn_id: u16, frame: *const FrameDesc) void {
+        /// Store a fetch subscription in ConnState and register the connection
+        /// in waiting_conns. Subscribe-only: RPC fetch always subscribes —
+        /// fulfillSubscriptions serves pending jobs. Re-parses the subscription
+        /// from the frame payload (still valid before compaction).
+        ///
+        /// Returns false only when waiting_conns is at capacity and this
+        /// connection is not already tracked; the caller must then reject the
+        /// subscribe with an error. The capacity gate runs BEFORE any ConnState
+        /// mutation, so a rejected connection is never left with c.waiting=true
+        /// (which previously hung the worker forever — it believed it was
+        /// subscribed while never appearing in waiting_conns, M6).
+        fn storeSubscription(self: *Self, conn_id: u16, frame: *const FrameDesc) bool {
             const c = self.io.conn(conn_id);
-            if (c.phase == .free) return;
+            if (c.phase == .free) return true; // conn closed; nothing to register or report
 
-            // HTTP: don't subscribe. HTTP is request-response — return empty result immediately.
-            // The client will retry (long-poll behavior is handled at a higher level).
-            if (frame.protocol == .http) return;
+            // The caller only reaches here for RPC frames; HTTP is
+            // request-response and never subscribes.
+            assert.check(frame.protocol == .rpc, "pipeline: storeSubscription on non-RPC frame", .{});
 
-            // Re-parse subscription from frame payload.
+            // Re-parse subscription from frame payload. Already validated at
+            // decode time (results[i].err == null), so a boundary re-parse
+            // failure just skips registration without an error.
             var reader = BufReader{ .data = frame.payload };
-            const sub = rpc.parseFetchSubscribe(&reader) catch return;
+            const sub = rpc.parseFetchSubscribe(&reader) catch return true;
+
+            // Locate any existing waiting_conns entry: a re-subscribe updates
+            // ConnState in place without consuming another slot.
+            var tracked_idx: ?u32 = null;
+            for (self.waiting_conns[0..self.waiting_conn_count], 0..) |wc, idx| {
+                if (wc == conn_id) {
+                    tracked_idx = @intCast(idx);
+                    break;
+                }
+            }
+            // Capacity gate — BEFORE touching ConnState. Sized for the
+            // connection target, so this is only reachable past it. Reject
+            // (caller sends an error) rather than silently dropping: the worker
+            // must learn it is not subscribed. No state has been mutated yet, so
+            // the connection stays clean and non-waiting.
+            if (tracked_idx == null and self.waiting_conn_count >= max_waiting_conns) return false;
 
             // Copy queue names into ConnState fixed buffers.
             c.queue_count = sub.queue_count;
@@ -2091,17 +2344,18 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 self.recordNotifiedQueue(sub.queues[qi]);
             }
 
-            // Add to waiting list (skip if already present).
-            for (self.waiting_conns[0..self.waiting_conn_count]) |wc| {
-                if (wc == conn_id) return;
+            if (tracked_idx == null) {
+                tracked_idx = self.waiting_conn_count;
+                self.waiting_conns[self.waiting_conn_count] = conn_id;
+                self.waiting_conn_count += 1;
             }
-            // Reject the subscription gracefully if the waiting list is full
-            // rather than asserting (M6). Sized for the connection target, so
-            // this is only reachable past it — better to leave one worker
-            // unserved than to panic and drop every connection.
-            if (self.waiting_conn_count >= max_waiting_conns) return;
-            self.waiting_conns[self.waiting_conn_count] = conn_id;
-            self.waiting_conn_count += 1;
+            // Invariant: a connection marked waiting is always in waiting_conns.
+            assert.check(
+                self.waiting_conns[tracked_idx.?] == conn_id,
+                "pipeline: waiting conn not tracked in waiting_conns",
+                .{},
+            );
+            return true;
         }
 
         /// Save a recv conn_id for processing when a prepare slot frees up.
@@ -2143,6 +2397,13 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
         /// After commit+encode, scan waiting connections and push jobs if notified queues match.
         fn fulfillSubscriptions(self: *Self) void {
+            // A fetch claim writes to the LOCAL KV (lease + active key) and is
+            // then proposed. Only fulfill when the node may write locally:
+            // single-node, or a confirmed raft leader. On a follower / acquiring
+            // / mid-stepdown node the local write would commit then fail the
+            // proposal → false divergence panic (Bug A). Waiting workers on a
+            // deposed node are drained via evictWaitingSubscribers on step-down.
+            if (!self.canWriteLocally()) return;
             if (self.notified_queue_count == 0) return;
             if (self.waiting_conn_count == 0) return;
 
@@ -2174,18 +2435,37 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     continue;
                 }
 
+                // Budget guarantee: only fulfill a connection whose free send
+                // buffer already holds at least one max-size job (max payload +
+                // per-job wire + frame overhead). A partially-drained buffer that
+                // can't fit one max job is SKIPPED here — not fulfilled with a
+                // starvation-prone shrunken budget. Skipping is safe for liveness
+                // only because .send_done re-notifies this connection's queues
+                // once its buffer drains (notified_queue_count resets each tick,
+                // so a bare skip would strand the job).
+                const send_room: u32 = @intCast(c.send_buf.len - c.send_len);
+                const frame_overhead: u32 = @intCast(rpc.FRAME_HEADER_SIZE + 2);
+                // One max-size job: FetchedJob id/queue buffers are 64 bytes each
+                // and a payload can reach the configured cap. fetchedJobWireSize
+                // is exact, so this is the true worst-case single-job wire size.
+                const one_max_job: u32 = frame_overhead +
+                    @as(u32, @intCast(handler_fetch.fetchedJobWireSize(64, 64, self.config.max_payload_size)));
+                if (send_room < one_max_job) {
+                    i += 1;
+                    continue;
+                }
+
                 var queue_slices: [16][]const u8 = undefined;
                 for (0..c.queue_count) |qi| {
                     queue_slices[qi] = c.queue_bufs[qi][0..c.queue_lens[qi]];
                 }
 
-                // Bound the fetch response to what fits in this connection's send
-                // buffer (minus any bytes already queued, the frame header, and
-                // the u16 job count). The claim stops before overflowing, leaving
-                // any remaining jobs pending for the next push.
-                const send_room: u32 = @intCast(c.send_buf.len - c.send_len);
-                const frame_overhead: u32 = @intCast(rpc.FRAME_HEADER_SIZE + 2);
-                const budget: u32 = if (send_room > frame_overhead) send_room - frame_overhead else 0;
+                // fetchedJobWireSize is exact (no slack needed): the claim stops
+                // before the encoded response would exceed this budget, leaving
+                // any remaining jobs pending for the next push. Since send_room ≥
+                // one_max_job, the budget covers at least one max job, so the
+                // first-job admission in applyFetch can never overflow.
+                const budget: u32 = send_room - frame_overhead;
 
                 const op_data = ops_mod.OpData{ .fetch = .{
                     .queues = queue_slices[0..c.queue_count],
@@ -2221,6 +2501,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 );
 
                 c.send_len += @intCast(writer.pos);
+                // Invariant: the encoded push fit the connection's send buffer.
+                // Guaranteed by the one_max_job room check + the exact budget
+                // handed to applyFetch; assert it since the cost is one compare.
+                assert.check(c.send_len <= c.send_buf.len, "fulfill: encoded fetch push overflowed send_buf ({d} > {d})", .{ c.send_len, c.send_buf.len });
                 self.trackSendConn(conn_id);
 
                 c.prefetch -= result.affected;
@@ -2256,6 +2540,15 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 }
             }
             return false;
+        }
+
+        /// Record all of a subscribed connection's queues as notified this tick,
+        /// so fulfillSubscriptions re-checks it. Used to re-arm delivery when a
+        /// connection's send buffer drains (see the .send_done handler).
+        fn recordConnNotified(self: *Self, c: *const ConnState) void {
+            for (0..c.queue_count) |qi| {
+                self.recordNotifiedQueue(c.queue_bufs[qi][0..c.queue_lens[qi]]);
+            }
         }
 
         /// Record a queue name as notified this tick (deduped).
@@ -2412,6 +2705,13 @@ pub fn Pipeline(comptime IoBackend: type) type {
         }
 
         fn notifyForFrame(self: *Self, frame: *const FrameDesc, result: *const ops_mod.OpResult) void {
+            // A rejected op changed no state, so it wakes no waiters. Critically,
+            // a frame rejected with err_not_leader (deposed/follower node) must
+            // NOT record its queues as notified: doing so let a follower with
+            // stale waiting_conns run fulfillSubscriptions, claim jobs into the
+            // LOCAL KV, and then fail the proposal — a false divergence panic
+            // (Bug A). This mirrors the HTTP path's `if err == null` notify gate.
+            if (result.err != null) return;
             // HTTP frames carry JSON payloads that the binary re-parse below can't
             // read; their wakes are recorded at decode time via recordHttpNotify.
             if (frame.protocol == .http) return;
@@ -2695,11 +2995,16 @@ const TestContext = struct {
         self.handler = OpHandler.init(allocator);
         self.handler.rebuildState(&self.stores);
         self.notify = QueueNotifier.init(allocator);
+        // Mirror main.zig's buffer sizing (max_payload_size + frame header +
+        // 1024) so the send buffer can hold one max-size job plus framing — the
+        // invariant fulfillSubscriptions' one_max_job room check relies on. The
+        // TestPipeline uses the default max_payload_size (64 KiB).
+        const test_buf_size: u32 = 64 * 1024 + @as(u32, rpc.FRAME_HEADER_SIZE) + 1024;
         self.backend = SimBackend.init(allocator, .{
             .listen_fd = -1,
             .max_conns = 16,
-            .recv_buf_size = 65536,
-            .send_buf_size = 65536,
+            .recv_buf_size = test_buf_size,
+            .send_buf_size = test_buf_size,
         }) catch unreachable;
         self.raft = .{};
         self.db_path = db_path;
@@ -2931,6 +3236,68 @@ test "enqueue then fetch round-trip" {
 
     const job_id = try r.readPrefixed();
     try testing.expectEqualStrings("fetch-job-1", job_id);
+}
+
+test "fetch-result payload length is u32 (round-trips 64 KiB and 256 KiB)" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fetch-u32-payload");
+    defer ctx.destroy();
+
+    const allocator = testing.allocator;
+
+    // 65536 is what a u16 length silently zeroed (65536 & 0xFFFF == 0) and
+    // 256 KiB is what @intCast to u16 panicked on — both must now round-trip.
+    const sizes = [_]usize{ 65536, 256 * 1024 };
+    inline for (sizes) |plen| {
+        const job_id = "u32-payload-job";
+        const queue = "u32-payload-queue";
+
+        // Store the payload under the job's payload key so encodeFetchResult
+        // reads it back through the KV exactly like the real push path.
+        const payload = try allocator.alloc(u8, plen);
+        defer allocator.free(payload);
+        for (payload, 0..) |*byte, idx| byte.* = @truncate(idx);
+        {
+            var jpk_buf: keys.KeyBuf = undefined;
+            var b = ctx.stores[0].newBatch();
+            b.set(keys.jobPayloadKey(&jpk_buf, job_id), payload);
+            b.commit();
+            b.close();
+        }
+
+        // One-job fetch result feeding the encoder.
+        var result: ops_mod.OpResult = .{};
+        result.affected = 1;
+        const fetched = &result.fetched[0];
+        @memcpy(fetched.id_buf[0..job_id.len], job_id);
+        fetched.id_len = @intCast(job_id.len);
+        @memcpy(fetched.queue_buf[0..queue.len], queue);
+        fetched.queue_len = @intCast(queue.len);
+        fetched.attempt = 2;
+        fetched.max_retries = 5;
+        fetched.lease_token = 0x00AB_CD12_3456_789A;
+
+        // Encode on the heap (256 KiB overflows the test thread stack).
+        const enc_buf = try allocator.alloc(u8, plen + 128);
+        defer allocator.free(enc_buf);
+        var w = BufWriter{ .buf = enc_buf };
+        ctx.pipeline.encodeFetchResult(&w, &result);
+
+        // Decode exactly as the bench/sim/SDK decoders do and verify.
+        var r = BufReader{ .data = w.written() };
+        try testing.expectEqual(@as(u16, 1), try r.readU16()); // count
+        try testing.expectEqualStrings(job_id, try r.readPrefixed());
+        try testing.expectEqualStrings(queue, try r.readPrefixed());
+        try testing.expectEqual(@as(u16, 2), try r.readU16()); // attempt
+        try testing.expectEqual(@as(u16, 5), try r.readU16()); // max_retries
+        try testing.expectEqual(@as(u8, 0), try r.readU8()); // checkpoint len
+        try testing.expectEqual(@as(u8, 0), try r.readU8()); // tags len
+        const got_len = try r.readU32(); // payload length (now u32)
+        try testing.expectEqual(@as(u32, @intCast(plen)), got_len);
+        const got_payload = r.data[r.pos..][0..got_len];
+        try r.skip(got_len);
+        try testing.expect(std.mem.eql(u8, payload, got_payload));
+        try testing.expectEqual(@as(u64, 0x00AB_CD12_3456_789A), try r.readU64());
+    }
 }
 
 test "partial frame waits for more data" {
@@ -3676,6 +4043,97 @@ test "raft pipelined prepares — multiple batches in flight" {
     try testing.expectEqual(@as(u32, 2), resp2.header.req_id);
 }
 
+test "raft rejects an over-cap amplifying enqueue; single-node accepts it (Bug B)" {
+    const allocator = testing.allocator;
+
+    // One enqueue frame whose RECORDED mutations amplify far past its ~48 KiB
+    // wire size: many jobs, each with a 64-byte queue, a distinct id, and a
+    // 255-byte tag string. Every tag repeats queue+id in a tq| index key, so
+    // the mutations blow past a raft entry's cap while the wire frame stays
+    // under max_payload_size. proposeRecordedFrames cannot split a frame across
+    // entries, so without the boundary check this would panic the leader on
+    // commit (the old confirmed bug). The SAME frame must apply fine on a
+    // single node, where there is no entry cap.
+    const job_count: u16 = 130;
+    const queue = "q" ** 64;
+    const tags = "t" ** 255;
+
+    const payload = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(payload);
+    var w = BufWriter{ .buf = payload };
+    w.writeU16(job_count);
+    var idx: u16 = 0;
+    while (idx < job_count) : (idx += 1) {
+        var id_buf: [32]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buf, "amp-job-{d:0>5}", .{idx}) catch unreachable;
+        w.writePrefixed(queue);
+        w.writePrefixed(id);
+        w.writeU8(128); // priority
+        w.writeU16(0); // max_retries
+        w.writeU8(0); // backoff = none
+        w.writeU32(0); // base_delay_ms
+        w.writeU32(0); // max_delay_ms
+        w.writeU32(0); // unique_period_s
+        w.writeU64(0); // scheduled_at_ns
+        w.writeU32(0); // expire_after_ms
+        w.writeU16(0); // chain_step
+        w.writeU16(rpc.FLAG_TAGS);
+        w.writePrefixed(tags);
+    }
+    const frame_payload = w.written();
+    // Sanity: the wire frame is legal (under the default 64 KiB payload cap),
+    // so the rejection is purely about the amplified replication size.
+    try testing.expect(frame_payload.len < 64 * 1024);
+
+    // --- Cluster mode: rejected at the boundary, nothing proposed or written. ---
+    {
+        const ctx = try TestContext.create("/tmp/corvo-pv2-bugb-cluster");
+        defer ctx.destroy();
+        ctx.enableRaftAsLeader();
+
+        const conn = ctx.backend.connect().?;
+        ctx.injectFrame(conn, rpc.MSG_ENQUEUE_BATCH, 1, frame_payload);
+        ctx.pipeline.tick();
+
+        // Rejected before handler.apply: no mutations recorded → no proposal,
+        // no prepare slot, no panic.
+        try testing.expectEqual(@as(u32, 0), ctx.raft.spawned_count);
+        try testing.expectEqual(@as(u32, 0), ctx.pipeline.prepare_count);
+
+        // Response carries the enqueue error flag: [count:u16][err:u8].
+        const resp = ctx.readResponse(conn).?;
+        try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, resp.header.msg_type);
+        try testing.expectEqual(@as(u8, 1), resp.payload[2]);
+
+        // Nothing reached the KV.
+        var vb = ctx.stores[0].newBatch();
+        defer vb.close();
+        var key_buf: keys.KeyBuf = undefined;
+        var job_buf: [4096]u8 = undefined;
+        try testing.expect(vb.getInto(keys.jobKey(&key_buf, "amp-job-00000"), &job_buf) == null);
+    }
+
+    // --- Single-node mode: the SAME batch is accepted (no entry cap). ---
+    {
+        const ctx = try TestContext.create("/tmp/corvo-pv2-bugb-single");
+        defer ctx.destroy();
+
+        const conn = ctx.backend.connect().?;
+        ctx.injectFrame(conn, rpc.MSG_ENQUEUE_BATCH, 1, frame_payload);
+        ctx.pipeline.tick();
+
+        const resp = ctx.readResponse(conn).?;
+        try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, resp.header.msg_type);
+        try testing.expectEqual(@as(u8, 0), resp.payload[2]); // no error
+
+        var vb = ctx.stores[0].newBatch();
+        defer vb.close();
+        var key_buf: keys.KeyBuf = undefined;
+        var job_buf: [4096]u8 = undefined;
+        try testing.expect(vb.getInto(keys.jobKey(&key_buf, "amp-job-00000"), &job_buf) != null);
+    }
+}
+
 // ============================================================================
 // Handler Guard Condition Tests
 // ============================================================================
@@ -4314,6 +4772,39 @@ test "reclaim transitions expired active job back to pending" {
 // ============================================================================
 // Raft Replication Tests
 // ============================================================================
+
+test "raft step-down evicts fetch subscribers with MSG_NOT_LEADER (Bug A)" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-raft-stepdown-evict");
+    defer ctx.destroy();
+    ctx.enableRaftAsLeader();
+
+    // Subscribe a worker to an empty queue — it stays waiting (no jobs).
+    const conn = ctx.backend.connect().?;
+    var fetch_buf: [256]u8 = undefined;
+    var fw = BufWriter{ .buf = &fetch_buf };
+    fw.writeU16(1);
+    fw.writeU32(30000);
+    fw.writePrefixed("worker-1");
+    fw.writeU8(1);
+    fw.writePrefixed("evict-queue");
+    ctx.injectFrame(conn, rpc.MSG_FETCH_BATCH, 9, fw.written());
+    ctx.pipeline.tick();
+    try testing.expect(ctx.backend.conn(conn).waiting);
+    try testing.expectEqual(@as(u32, 1), ctx.pipeline.waiting_conn_count);
+
+    // Leadership lost. No in-flight proposals, so the next tick steps down and
+    // must drain the subscriber: a fetch claim is a local write a follower may
+    // not serve, so the worker is told to redial the leader rather than hang.
+    ctx.raft.is_leader = false;
+    ctx.pipeline.tick();
+
+    try testing.expectEqual(TestPipeline.RaftState.follower, ctx.pipeline.raft_state);
+    try testing.expectEqual(@as(u32, 0), ctx.pipeline.waiting_conn_count);
+    try testing.expect(!ctx.backend.conn(conn).waiting);
+
+    const resp = ctx.readResponse(conn).?;
+    try testing.expectEqual(rpc.MSG_NOT_LEADER, resp.header.msg_type);
+}
 
 test "raft follower — write frames answered MSG_NOT_LEADER, nothing committed" {
     const ctx = try TestContext.create("/tmp/corvo-pv2-raft-follower");

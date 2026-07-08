@@ -1666,6 +1666,11 @@ pub fn encodeWriteResponse(
             // Raft follower: the client must retry against the leader.
             return writeErrorResponse(send_buf, 503, "not_leader");
         }
+        if (std.mem.eql(u8, err, "batch too large for replication")) {
+            // Cluster mode: the batch's recorded mutations would exceed one
+            // raft entry's cap (pipeline.err_too_large). Payload Too Large.
+            return writeErrorResponse(send_buf, 413, err);
+        }
         if (std.mem.eql(u8, err, "unique_existing")) {
             const uid = result.unique_job_id_buf[0..result.unique_job_id_len];
             var body_buf: [256]u8 = undefined;

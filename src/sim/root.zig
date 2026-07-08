@@ -7,6 +7,7 @@ pub const config = @import("config.zig");
 pub const invariants = @import("invariants.zig");
 pub const client = @import("client.zig");
 pub const sim = @import("sim.zig");
+pub const cluster = @import("cluster.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

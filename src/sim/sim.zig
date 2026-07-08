@@ -73,11 +73,16 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     defer notify_inst.deinit();
 
     // --- SimBackend ---
+    // Buffer sizing mirrors main.zig's invariant: a FRESH send buffer must
+    // hold one max-size fetched job plus framing, or fulfillSubscriptions'
+    // one-max-job room check never admits a subscriber and the sim silently
+    // stops exercising the fetch/ack lifecycle (fetch=0 at any traffic level).
+    const buf_size = 64 * 1024 + corvo.rpc.FRAME_HEADER_SIZE + 1024;
     var backend = try SimBackend.init(allocator, .{
         .listen_fd = -1,
         .max_conns = max_clients + 4,
-        .recv_buf_size = 65536,
-        .send_buf_size = 65536,
+        .recv_buf_size = buf_size,
+        .send_buf_size = buf_size,
     });
     defer backend.deinit(allocator);
 

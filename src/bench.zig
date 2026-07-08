@@ -182,7 +182,7 @@ const RpcClient = struct {
             r.skip(ckpt_len) catch break;
             const tags_len = r.readU8() catch break;
             r.skip(tags_len) catch break;
-            const pl = r.readU16() catch break;
+            const pl = r.readU32() catch break; // payload length (u32)
             r.skip(pl) catch break;
             fetched_ids[i].lease_token = r.readU64() catch break; // lease_token
         }
@@ -526,7 +526,7 @@ fn parseFetchPayload(payload: []const u8, fetched_ids: []FetchedId) u16 {
         r.skip(ckpt_len) catch break;
         const tags_len = r.readU8() catch break;
         r.skip(tags_len) catch break;
-        const pl = r.readU16() catch break;
+        const pl = r.readU32() catch break; // payload length (u32)
         r.skip(pl) catch break;
         _ = r.readU64() catch break; // lease_token
     }

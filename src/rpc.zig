@@ -284,7 +284,7 @@ pub const BufReader = struct {
         return data;
     }
 
-    pub fn skip(self: *BufReader, n: u16) ParseError!void {
+    pub fn skip(self: *BufReader, n: usize) ParseError!void {
         if (self.pos + n > self.data.len) return error.ShortRead;
         self.pos += n;
     }

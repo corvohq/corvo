@@ -15,6 +15,7 @@ const keys = @import("keys.zig");
 const kv = @import("kv.zig");
 const codec = @import("codec.zig");
 const assert = @import("assert.zig");
+const rpc = @import("rpc.zig");
 
 pub const Indexer = struct {
     effects: [max_effects]IndexEffect = undefined,
@@ -27,14 +28,42 @@ pub const Indexer = struct {
 
     const max_effects: u32 = 8192;
     const max_counter_deltas: u32 = 1024;
-    /// Upper bound on effects / distinct-queue counter deltas a single op can
-    /// emit. A batch op carries at most rpc.MAX_BATCH_JOBS (256) jobs; each job
-    /// can, at most, drive one primary transition plus a chain enqueue plus a
-    /// batch-callback enqueue (≈3 distinct queues). 1024 is a comfortable cap
-    /// over that ~768 worst case. The pipeline flushes once fewer than this many
-    /// slots remain (nearFull), so a single op's records always fit and are
-    /// never silently dropped (M10).
-    const max_records_per_op: u32 = 1024;
+
+    /// Worst-case record* calls a single job can drive. The largest op is a
+    /// batch ack/fail (rpc.MAX_BATCH_JOBS jobs); per job the record* calls are:
+    /// (1) its own primary transition/delete
+    /// (recordTransition/recordDeleteAll), (2) a chain-advance enqueue
+    /// (handler_ack.advanceChain / handler_fail.fireChainOnFailure →
+    /// applyEnqueue → recordCreate), and (3) a batch-completion callback
+    /// enqueue (handler.handleBatchJobComplete → applyEnqueue → recordCreate).
+    /// The callback job carries no batch_id and no active state, so it never
+    /// recurses. Three is the ceiling.
+    const records_per_job: u32 = 3;
+
+    /// Max effects a single op (one pipeline frame / maintenance action /
+    /// fetch) can buffer before the pipeline's next nearFull() check. Every
+    /// record* call emits exactly one effect, so the batch ack/fail worst case
+    /// bounds it. The other flush contexts are smaller: cron enqueues ≤64 jobs
+    /// per maintenance action (handler_cron.max_fire_per_scan) and a fetch
+    /// transitions ≤ops.OpResult.max_inline_fetch (128) jobs per fulfillment.
+    const max_effects_per_op: u32 = rpc.MAX_BATCH_JOBS * records_per_job;
+
+    /// Max distinct-queue counter-delta slots a single op can consume. Each
+    /// record* call touches exactly one queue and a new slot is used only for a
+    /// queue not yet seen this tick, so the distinct queues one op introduces
+    /// can never exceed its effect count — same worst case, independent of
+    /// max_queues (the effect count, not the queue population, is the binding
+    /// bound because both chain and callback enqueues route through record*).
+    const max_counter_deltas_per_op: u32 = max_effects_per_op;
+
+    comptime {
+        // The pipeline flushes at nearFull() *between* ops, so one op's records
+        // must fit in the free tail of each buffer or addEffect/addCounterDelta
+        // would assert-overflow (M10). These caps are the headroom nearFull()
+        // reserves; they must not exceed the buffers themselves.
+        std.debug.assert(max_effects_per_op <= max_effects);
+        std.debug.assert(max_counter_deltas_per_op <= max_counter_deltas);
+    }
 
     pub const IndexEffect = struct {
         kind: Kind,
@@ -86,8 +115,8 @@ pub const Indexer = struct {
     /// records always fit — addEffect/addCounterDelta never drop, so js|/jqs|
     /// transitions and qc| counter deltas can never silently diverge (M10).
     pub fn nearFull(self: *const Indexer) bool {
-        return self.effect_count + max_records_per_op > max_effects or
-            self.counter_delta_count + max_records_per_op > max_counter_deltas;
+        return self.effect_count + max_effects_per_op > max_effects or
+            self.counter_delta_count + max_counter_deltas_per_op > max_counter_deltas;
     }
 
     // ====================================================================
@@ -366,7 +395,7 @@ pub const Indexer = struct {
 // Tests
 // ============================================================================
 
-test "nearFull flags one op's worth of headroom before overflow (M10)" {
+test "nearFull reserves exactly one op's headroom, not the whole buffer (M10)" {
     const testing = std.testing;
     const idx = try testing.allocator.create(Indexer);
     defer testing.allocator.destroy(idx);
@@ -375,17 +404,31 @@ test "nearFull flags one op's worth of headroom before overflow (M10)" {
 
     try testing.expect(!idx.nearFull());
 
-    // Effect buffer: false with exactly max_records_per_op slots free, true once
-    // fewer than that remain — so the next op always fits.
-    idx.effect_count = Indexer.max_effects - Indexer.max_records_per_op;
+    // Dozens of ops' worth of buffered effects and deltas must NOT trip
+    // nearFull — batching only pays off if a tick accumulates far more than one
+    // op before flushing. The prior bug reserved the entire 1024-slot counter
+    // buffer as headroom, so a single buffered delta (every write op emits at
+    // least one) tripped nearFull and flushed after essentially every op. These
+    // concrete moderate loads must stay below the threshold regardless of the
+    // named caps, so they fail against that buggy nearFull.
+    idx.effect_count = 4 * Indexer.max_effects_per_op; // 3072 ≪ effect cap
+    idx.counter_delta_count = 50; // dozens of single-queue ops
     try testing.expect(!idx.nearFull());
-    idx.effect_count = Indexer.max_effects - Indexer.max_records_per_op + 1;
+
+    // Effect buffer: false with exactly one op's headroom free, true once fewer
+    // than one op's worth of slots remain — so the next op always fits.
+    idx.counter_delta_count = 0;
+    idx.effect_count = Indexer.max_effects - Indexer.max_effects_per_op;
+    try testing.expect(!idx.nearFull());
+    idx.effect_count = Indexer.max_effects - Indexer.max_effects_per_op + 1;
     try testing.expect(idx.nearFull());
 
+    // Counter-delta buffer: same one-op headroom. The honest cap puts the
+    // threshold a full op below the buffer (256 free slots), not at 1 delta.
     idx.effect_count = 0;
-    idx.counter_delta_count = Indexer.max_counter_deltas - Indexer.max_records_per_op;
+    idx.counter_delta_count = Indexer.max_counter_deltas - Indexer.max_counter_deltas_per_op;
     try testing.expect(!idx.nearFull());
-    idx.counter_delta_count = Indexer.max_counter_deltas - Indexer.max_records_per_op + 1;
+    idx.counter_delta_count = Indexer.max_counter_deltas - Indexer.max_counter_deltas_per_op + 1;
     try testing.expect(idx.nearFull());
 }
 

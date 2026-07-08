@@ -1,10 +1,25 @@
-//! Server configuration — config file parser.
+//! Server configuration — config file parser + cluster config hash.
 //!
 //! Config file: simple key = value format, # comments, blank lines.
 //! Load order: defaults → file (--config) → CLI args.
 //!
 //! Cluster identity: an explicit `cluster-id` (u64, non-zero) shared by all
 //! voters; the raft layer drops cross-cluster traffic.
+//!
+//! Cluster config hash: `clusterHash()` folds the *shared* parameters — the
+//! ones that govern replicated state-machine and maintenance behavior (payload
+//! bounds, queue/job/tag limits, completion persistence, and every maintenance
+//! interval that runs on the leader and replicates through the raft log). All
+//! voters must agree on these: a node whose replicated maintenance behaves
+//! differently (e.g. a shorter purge retention) can, once it wins an election,
+//! delete or mutate terminal jobs cluster-wide THROUGH the raft log —
+//! unrecoverable replicated data loss. Nodes exchange the hash inside the
+//! HMAC-bound peer handshake (raft_net.zig), which runs on every connection
+//! whether or not a cluster secret is set; a mismatch refuses the peer
+//! connection, so a misconfigured node cannot join, replicate, or win an
+//! election. Node-local settings (bind, ports, data dir, conn caps, identity,
+//! the secret itself) are deliberately excluded — they legitimately differ
+//! per node.
 
 const std = @import("std");
 const assert = @import("assert.zig");
@@ -72,6 +87,86 @@ pub const ServerConfig = struct {
     /// Resolved cluster port: explicit value or server port + 1000.
     pub fn resolvedClusterPort(self: *const ServerConfig) u16 {
         return if (self.cluster_port > 0) self.cluster_port else self.port +| 1000;
+    }
+
+    // ================================================================
+    // Cluster config hash
+    // ================================================================
+
+    /// FNV-1a hash of the shared parameters every voter must agree on.
+    /// Exchanged inside the authenticated raft peer handshake
+    /// (raft_net.zig); a mismatch refuses the connection so a node whose
+    /// replicated behavior would diverge cannot join, replicate, or win an
+    /// election. The order below is part of the wire contract — never
+    /// reorder or drop a field without bumping all nodes together.
+    ///
+    /// Per-field audit — a field is INCLUDED iff two nodes disagreeing on it
+    /// produces divergent *replicated* state or maintenance (which runs only
+    /// on the leader and ships through the raft log, so a failover to a
+    /// differently-configured node corrupts or destroys committed data):
+    ///
+    ///   INCLUDED (shared, replicated):
+    ///     max_payload_size    — boundary bound on accepted job payloads; a
+    ///                           new leader with a smaller cap rejects writes
+    ///                           its predecessor accepted and replicated.
+    ///     max_queues          — replicated queue-count limit.
+    ///     max_jobs            — global cap over all KV jobs; a lower cap on a
+    ///                           new leader rejects/evicts replicated jobs.
+    ///     max_tags_per_queue  — replicated per-queue tag limit.
+    ///     persist_completed   — decides auto-delete of completed jobs on ack;
+    ///                           divergence means a new leader deletes (through
+    ///                           the log) jobs a peer expects retained. (Master
+    ///                           omitted this — a latent hole; added here.)
+    ///     promote/reclaim/unique/rate_limit/expire interval_ns — maintenance
+    ///                           loops that mutate jobs on the leader and
+    ///                           replicate; divergent cadence => divergent
+    ///                           replicated effects across failover.
+    ///     purge_interval_ns / purge_retention_ns / purge_threshold — the
+    ///                           purge pass deletes terminal jobs THROUGH the
+    ///                           log; a node with a short retention that wins an
+    ///                           election wipes terminal jobs cluster-wide. This
+    ///                           is the exact data-loss the check exists for.
+    ///                           (Master hashed purge_threshold but NOT the
+    ///                           retention — the most dangerous omission.)
+    ///     workers_interval_ns / worker_timeout_ns — stale-worker cleanup (and,
+    ///                           reusing workers_interval, webhook dispatch)
+    ///                           runs on the leader and replicates worker/record
+    ///                           deletes; divergence removes records a peer keeps.
+    ///     cron_interval_ns    — cron scanning fires jobs (enqueue mutations)
+    ///                           through the log on the leader; kept in lockstep
+    ///                           with the other maintenance cadences so failover
+    ///                           behavior is identical.
+    ///
+    ///   EXCLUDED (node-local, legitimately per-node):
+    ///     bind, port, data_dir, cluster_port — network/disk placement.
+    ///     mirror, max_conns                  — local resource knobs.
+    ///     admin_password                     — local auth; must never be hashed
+    ///                                          or leaked onto the wire.
+    ///     node_id, peers                     — per-node identity/topology view.
+    ///     cluster_id                         — cluster identity, already
+    ///                                          enforced in every frame header
+    ///                                          (raft drops cross-cluster traffic).
+    ///     cluster_secret                     — the HMAC key itself; a mismatch
+    ///                                          already fails the handshake.
+    pub fn clusterHash(self: *const ServerConfig) u64 {
+        var h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+        h = fnvU32(h, self.max_payload_size);
+        h = fnvU32(h, self.max_queues);
+        h = fnvU32(h, self.max_jobs);
+        h = fnvU32(h, self.max_tags_per_queue);
+        h = fnvByte(h, @intFromBool(self.persist_completed));
+        h = fnvU64(h, self.promote_interval_ns);
+        h = fnvU64(h, self.reclaim_interval_ns);
+        h = fnvU64(h, self.unique_interval_ns);
+        h = fnvU64(h, self.rate_limit_interval_ns);
+        h = fnvU64(h, self.expire_interval_ns);
+        h = fnvU64(h, self.purge_interval_ns);
+        h = fnvU64(h, self.purge_retention_ns);
+        h = fnvU32(h, self.purge_threshold);
+        h = fnvU64(h, self.workers_interval_ns);
+        h = fnvU64(h, self.worker_timeout_ns);
+        h = fnvU64(h, self.cron_interval_ns);
+        return h;
     }
 
     // ================================================================
@@ -196,6 +291,28 @@ pub const ServerConfig = struct {
 };
 
 // ============================================================================
+// FNV-1a helpers for clusterHash (little-endian byte folding, order-sensitive)
+// ============================================================================
+
+fn fnvByte(h: u64, b: u8) u64 {
+    return (h ^ b) *% 0x00000100000001B3;
+}
+
+fn fnvU32(h: u64, v: u32) u64 {
+    const bytes = std.mem.toBytes(v);
+    var r = h;
+    for (&bytes) |b| r = fnvByte(r, b);
+    return r;
+}
+
+fn fnvU64(h: u64, v: u64) u64 {
+    const bytes = std.mem.toBytes(v);
+    var r = h;
+    for (&bytes) |b| r = fnvByte(r, b);
+    return r;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -265,6 +382,54 @@ test "config: missing separator errors" {
 test "config: invalid value errors" {
     var c = ServerConfig{};
     try testing.expectError(error.InvalidValue, c.loadFile("port = abc\n"));
+}
+
+test "config: cluster hash deterministic and non-zero" {
+    const c1 = ServerConfig{};
+    const c2 = ServerConfig{};
+    try testing.expectEqual(c1.clusterHash(), c2.clusterHash());
+    try testing.expect(c1.clusterHash() != 0);
+}
+
+test "config: cluster hash changes with each shared param" {
+    const base = ServerConfig{};
+    // Every field folded into clusterHash must move the hash when it changes.
+    const cases = [_]ServerConfig{
+        blk: { var c = base; c.max_payload_size = 131072; break :blk c; },
+        blk: { var c = base; c.max_queues = 200; break :blk c; },
+        blk: { var c = base; c.max_jobs = 5; break :blk c; },
+        blk: { var c = base; c.max_tags_per_queue = 42; break :blk c; },
+        blk: { var c = base; c.persist_completed = true; break :blk c; },
+        blk: { var c = base; c.promote_interval_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.reclaim_interval_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.unique_interval_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.rate_limit_interval_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.expire_interval_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.purge_interval_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.purge_retention_ns = 3_600_000_000_000; break :blk c; },
+        blk: { var c = base; c.purge_threshold = 5; break :blk c; },
+        blk: { var c = base; c.workers_interval_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.worker_timeout_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.cron_interval_ns = 5_000_000_000; break :blk c; },
+    };
+    for (cases) |c| try testing.expect(base.clusterHash() != c.clusterHash());
+}
+
+test "config: cluster hash ignores node-local params" {
+    const c1 = ServerConfig{};
+    var c2 = ServerConfig{};
+    c2.bind = "192.168.1.1";
+    c2.port = 3000;
+    c2.data_dir = "/other/path";
+    c2.mirror = false;
+    c2.max_conns = 8192;
+    c2.admin_password = "hunter2";
+    c2.node_id = "node-2";
+    c2.peers = "node-1@10.0.0.1:9878";
+    c2.cluster_port = 12345;
+    c2.cluster_id = 999;
+    c2.cluster_secret = "shared-secret";
+    try testing.expectEqual(c1.clusterHash(), c2.clusterHash());
 }
 
 test "config: validate catches bad config" {

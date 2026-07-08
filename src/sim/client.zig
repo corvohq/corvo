@@ -534,7 +534,7 @@ pub const SimClient = struct {
         _ = r.readU16() catch return; // max_retries
         _ = r.readPrefixed() catch return; // checkpoint (empty)
         _ = r.readPrefixed() catch return; // tags (empty)
-        const plen = r.readU16() catch return;
+        const plen = r.readU32() catch return; // payload length (u32)
         r.skip(plen) catch return; // payload bytes
         const lease_token = r.readU64() catch return;
 

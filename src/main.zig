@@ -444,6 +444,12 @@ pub fn main() !void {
                 .recv_buf_size = raft_buf_size,
                 .send_buf_size = raft_buf_size,
                 .cluster_secret = config.cluster_secret,
+                // Shared-config hash: peers exchange this in the handshake on
+                // every connection (secret or not) and refuse a node whose
+                // shared cluster params differ (would diverge on replicated
+                // maintenance). See config.zig clusterHash() and
+                // docs/raft-wiring.md.
+                .config_hash = config.clusterHash(),
             },
             .db_lock = &db_lock,
         });
