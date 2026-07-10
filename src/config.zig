@@ -3,9 +3,23 @@
 //! Config file: simple key = value format, # comments, blank lines.
 //! Load order: defaults → file (--config) → CLI args.
 //!
-//! Cluster consensus: clusterHash() computes FNV-1a over shared params
-//! that must match across all nodes. Exchanged during election; mismatch
-//! means nodes refuse to form a cluster.
+//! Cluster identity: an explicit `cluster-id` (u64, non-zero) shared by all
+//! voters; the raft layer drops cross-cluster traffic.
+//!
+//! Cluster config hash: `clusterHash()` folds the *shared* parameters — the
+//! ones that govern replicated state-machine and maintenance behavior (payload
+//! bounds, queue/job/tag limits, completion persistence, and every maintenance
+//! interval that runs on the leader and replicates through the raft log). All
+//! voters must agree on these: a node whose replicated maintenance behaves
+//! differently (e.g. a shorter purge retention) can, once it wins an election,
+//! delete or mutate terminal jobs cluster-wide THROUGH the raft log —
+//! unrecoverable replicated data loss. Nodes exchange the hash inside the
+//! HMAC-bound peer handshake (raft_net.zig), which runs on every connection
+//! whether or not a cluster secret is set; a mismatch refuses the peer
+//! connection, so a misconfigured node cannot join, replicate, or win an
+//! election. Node-local settings (bind, ports, data dir, conn caps, identity,
+//! the secret itself) are deliberately excluded — they legitimately differ
+//! per node.
 
 const std = @import("std");
 const assert = @import("assert.zig");
@@ -25,11 +39,19 @@ pub const ServerConfig = struct {
     // Auth
     admin_password: []const u8 = "",
 
-    // Cluster identity (node-local)
+    // Cluster identity (node-local). node_id enables raft mode; peer specs
+    // are `id[:uuidhex]@host:port` with the peer's CLIENT address (the raft
+    // transport binds/dials on port + 1000, see resolvedClusterPort).
     node_id: []const u8 = "",
     peers: []const u8 = "",
     cluster_port: u16 = 0, // 0 = server port + 1000
-    discover_dns_name: []const u8 = "", // DNS name for peer auto-discovery
+    /// Cluster identifier shared by all voters; raft drops cross-cluster
+    /// traffic. Required (non-zero) in cluster mode.
+    cluster_id: u64 = 0,
+    /// Shared secret authenticating peer connections (HMAC challenge-response
+    /// on the cluster port). Empty = unauthenticated (single-node / trusted net).
+    /// Set via --cluster-secret or the CORVO_CLUSTER_SECRET env var.
+    cluster_secret: []const u8 = "",
 
     // ================================================================
     // Shared settings (included in cluster hash — must match across nodes)
@@ -52,8 +74,7 @@ pub const ServerConfig = struct {
     purge_threshold: u32 = 10_000, // 0 = disabled; purge early when terminal job count exceeds this
     workers_interval_ns: u64 = 30_000_000_000, // 30s — clean up stale workers
     worker_timeout_ns: u64 = 60_000_000_000, // 60s — workers with no heartbeat for this long are removed
-
-    sync_replication: bool = false,
+    cron_interval_ns: u64 = 10_000_000_000, // 10s — scan cron schedules for due fires (minute resolution)
 
     // ================================================================
     // Accessors
@@ -72,22 +93,79 @@ pub const ServerConfig = struct {
     // Cluster config hash
     // ================================================================
 
-    /// FNV-1a hash of shared parameters. Nodes exchange this during
-    /// election; mismatch = reject proposal, refuse to form cluster.
+    /// FNV-1a hash of the shared parameters every voter must agree on.
+    /// Exchanged inside the authenticated raft peer handshake
+    /// (raft_net.zig); a mismatch refuses the connection so a node whose
+    /// replicated behavior would diverge cannot join, replicate, or win an
+    /// election. The order below is part of the wire contract — never
+    /// reorder or drop a field without bumping all nodes together.
+    ///
+    /// Per-field audit — a field is INCLUDED iff two nodes disagreeing on it
+    /// produces divergent *replicated* state or maintenance (which runs only
+    /// on the leader and ships through the raft log, so a failover to a
+    /// differently-configured node corrupts or destroys committed data):
+    ///
+    ///   INCLUDED (shared, replicated):
+    ///     max_payload_size    — boundary bound on accepted job payloads; a
+    ///                           new leader with a smaller cap rejects writes
+    ///                           its predecessor accepted and replicated.
+    ///     max_queues          — replicated queue-count limit.
+    ///     max_jobs            — global cap over all KV jobs; a lower cap on a
+    ///                           new leader rejects/evicts replicated jobs.
+    ///     max_tags_per_queue  — replicated per-queue tag limit.
+    ///     persist_completed   — decides auto-delete of completed jobs on ack;
+    ///                           divergence means a new leader deletes (through
+    ///                           the log) jobs a peer expects retained. (Master
+    ///                           omitted this — a latent hole; added here.)
+    ///     promote/reclaim/unique/rate_limit/expire interval_ns — maintenance
+    ///                           loops that mutate jobs on the leader and
+    ///                           replicate; divergent cadence => divergent
+    ///                           replicated effects across failover.
+    ///     purge_interval_ns / purge_retention_ns / purge_threshold — the
+    ///                           purge pass deletes terminal jobs THROUGH the
+    ///                           log; a node with a short retention that wins an
+    ///                           election wipes terminal jobs cluster-wide. This
+    ///                           is the exact data-loss the check exists for.
+    ///                           (Master hashed purge_threshold but NOT the
+    ///                           retention — the most dangerous omission.)
+    ///     workers_interval_ns / worker_timeout_ns — stale-worker cleanup (and,
+    ///                           reusing workers_interval, webhook dispatch)
+    ///                           runs on the leader and replicates worker/record
+    ///                           deletes; divergence removes records a peer keeps.
+    ///     cron_interval_ns    — cron scanning fires jobs (enqueue mutations)
+    ///                           through the log on the leader; kept in lockstep
+    ///                           with the other maintenance cadences so failover
+    ///                           behavior is identical.
+    ///
+    ///   EXCLUDED (node-local, legitimately per-node):
+    ///     bind, port, data_dir, cluster_port — network/disk placement.
+    ///     mirror, max_conns                  — local resource knobs.
+    ///     admin_password                     — local auth; must never be hashed
+    ///                                          or leaked onto the wire.
+    ///     node_id, peers                     — per-node identity/topology view.
+    ///     cluster_id                         — cluster identity, already
+    ///                                          enforced in every frame header
+    ///                                          (raft drops cross-cluster traffic).
+    ///     cluster_secret                     — the HMAC key itself; a mismatch
+    ///                                          already fails the handshake.
     pub fn clusterHash(self: *const ServerConfig) u64 {
         var h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
         h = fnvU32(h, self.max_payload_size);
         h = fnvU32(h, self.max_queues);
         h = fnvU32(h, self.max_jobs);
         h = fnvU32(h, self.max_tags_per_queue);
+        h = fnvByte(h, @intFromBool(self.persist_completed));
         h = fnvU64(h, self.promote_interval_ns);
         h = fnvU64(h, self.reclaim_interval_ns);
         h = fnvU64(h, self.unique_interval_ns);
         h = fnvU64(h, self.rate_limit_interval_ns);
         h = fnvU64(h, self.expire_interval_ns);
         h = fnvU64(h, self.purge_interval_ns);
+        h = fnvU64(h, self.purge_retention_ns);
         h = fnvU32(h, self.purge_threshold);
-        h = fnvByte(h, @intFromBool(self.sync_replication));
+        h = fnvU64(h, self.workers_interval_ns);
+        h = fnvU64(h, self.worker_timeout_ns);
+        h = fnvU64(h, self.cron_interval_ns);
         return h;
     }
 
@@ -107,6 +185,7 @@ pub const ServerConfig = struct {
         InvalidMaxConns,
         InvalidMaxQueues,
         ClusterMissingNodeId,
+        ClusterMissingClusterId,
     };
 
     /// Validate config invariants. Call after loading file + CLI args.
@@ -119,8 +198,8 @@ pub const ServerConfig = struct {
             return error.InvalidMaxQueues;
         if (self.node_id.len == 0 and self.peers.len > 0)
             return error.ClusterMissingNodeId;
-        if (self.discover_dns_name.len > 0 and self.node_id.len == 0)
-            return error.ClusterMissingNodeId;
+        if (self.clusterMode() and self.cluster_id == 0)
+            return error.ClusterMissingClusterId;
     }
 
     /// Parse config file content into this ServerConfig.
@@ -181,16 +260,14 @@ pub const ServerConfig = struct {
             self.purge_threshold = parseInt(u32, val) orelse return error.InvalidValue;
         } else if (eql(key, "purge-retention")) {
             self.purge_retention_ns = (parseInt(u64, val) orelse return error.InvalidValue) * 3_600_000_000_000;
-        } else if (eql(key, "sync-replication")) {
-            self.sync_replication = parseBool(val) orelse return error.InvalidValue;
         } else if (eql(key, "node-id")) {
             self.node_id = val;
         } else if (eql(key, "peers")) {
             self.peers = val;
         } else if (eql(key, "cluster-port")) {
             self.cluster_port = parseInt(u16, val) orelse return error.InvalidValue;
-        } else if (eql(key, "discover-dns-name")) {
-            self.discover_dns_name = val;
+        } else if (eql(key, "cluster-id")) {
+            self.cluster_id = parseInt(u64, val) orelse return error.InvalidValue;
         } else if (eql(key, "admin-password")) {
             self.admin_password = val;
         } else {
@@ -214,7 +291,7 @@ pub const ServerConfig = struct {
 };
 
 // ============================================================================
-// FNV-1a helpers
+// FNV-1a helpers for clusterHash (little-endian byte folding, order-sensitive)
 // ============================================================================
 
 fn fnvByte(h: u64, b: u8) u64 {
@@ -259,7 +336,7 @@ test "config: parse file" {
         \\data-dir = /var/lib/corvo
         \\max-payload-size = 131072
         \\max-queues = 200
-        \\sync-replication = true
+        \\cluster-id = 42
         \\node-id = node-1
         \\peers = node-2@10.0.0.2:9878,node-3@10.0.0.3:9878
         \\
@@ -271,7 +348,7 @@ test "config: parse file" {
     try testing.expectEqualStrings("/var/lib/corvo", c.data_dir);
     try testing.expectEqual(@as(u32, 131072), c.max_payload_size);
     try testing.expectEqual(@as(u32, 200), c.max_queues);
-    try testing.expect(c.sync_replication);
+    try testing.expectEqual(@as(u64, 42), c.cluster_id);
     try testing.expect(c.clusterMode());
     try c.validate();
 }
@@ -307,56 +384,71 @@ test "config: invalid value errors" {
     try testing.expectError(error.InvalidValue, c.loadFile("port = abc\n"));
 }
 
-test "config: cluster hash deterministic" {
+test "config: cluster hash deterministic and non-zero" {
     const c1 = ServerConfig{};
     const c2 = ServerConfig{};
     try testing.expectEqual(c1.clusterHash(), c2.clusterHash());
     try testing.expect(c1.clusterHash() != 0);
 }
 
-test "config: cluster hash changes with shared params" {
-    const c1 = ServerConfig{};
-
-    var c2 = ServerConfig{};
-    c2.max_payload_size = 131072;
-    try testing.expect(c1.clusterHash() != c2.clusterHash());
-
-    var c3 = ServerConfig{};
-    c3.promote_interval_ns = 5_000_000_000;
-    try testing.expect(c1.clusterHash() != c3.clusterHash());
-
-    var c4 = ServerConfig{};
-    c4.sync_replication = true;
-    try testing.expect(c1.clusterHash() != c4.clusterHash());
+test "config: cluster hash changes with each shared param" {
+    const base = ServerConfig{};
+    // Every field folded into clusterHash must move the hash when it changes.
+    const cases = [_]ServerConfig{
+        blk: { var c = base; c.max_payload_size = 131072; break :blk c; },
+        blk: { var c = base; c.max_queues = 200; break :blk c; },
+        blk: { var c = base; c.max_jobs = 5; break :blk c; },
+        blk: { var c = base; c.max_tags_per_queue = 42; break :blk c; },
+        blk: { var c = base; c.persist_completed = true; break :blk c; },
+        blk: { var c = base; c.promote_interval_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.reclaim_interval_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.unique_interval_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.rate_limit_interval_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.expire_interval_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.purge_interval_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.purge_retention_ns = 3_600_000_000_000; break :blk c; },
+        blk: { var c = base; c.purge_threshold = 5; break :blk c; },
+        blk: { var c = base; c.workers_interval_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.worker_timeout_ns = 5_000_000_000; break :blk c; },
+        blk: { var c = base; c.cron_interval_ns = 5_000_000_000; break :blk c; },
+    };
+    for (cases) |c| try testing.expect(base.clusterHash() != c.clusterHash());
 }
 
 test "config: cluster hash ignores node-local params" {
     const c1 = ServerConfig{};
-
     var c2 = ServerConfig{};
     c2.bind = "192.168.1.1";
     c2.port = 3000;
     c2.data_dir = "/other/path";
+    c2.mirror = false;
     c2.max_conns = 8192;
+    c2.admin_password = "hunter2";
     c2.node_id = "node-2";
+    c2.peers = "node-1@10.0.0.1:9878";
+    c2.cluster_port = 12345;
+    c2.cluster_id = 999;
+    c2.cluster_secret = "shared-secret";
     try testing.expectEqual(c1.clusterHash(), c2.clusterHash());
 }
 
 test "config: validate catches bad config" {
     {
-        // node_id alone is valid (bootstrap mode).
+        // node_id + cluster_id is valid (single-node raft).
         var c = ServerConfig{};
         c.node_id = "node-1";
+        c.cluster_id = 7;
         try c.validate();
+    }
+    {
+        // Cluster mode without a cluster id is rejected.
+        var c = ServerConfig{};
+        c.node_id = "node-1";
+        try testing.expectError(error.ClusterMissingClusterId, c.validate());
     }
     {
         var c = ServerConfig{};
         c.peers = "node-2@10.0.0.2:9878";
-        try testing.expectError(error.ClusterMissingNodeId, c.validate());
-    }
-    {
-        var c = ServerConfig{};
-        c.discover_dns_name = "corvo.svc.cluster.local";
         try testing.expectError(error.ClusterMissingNodeId, c.validate());
     }
     {

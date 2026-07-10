@@ -46,9 +46,9 @@ pub const OpHandler = struct {
     requeue_counter: u64 = 0,
     // Effect buffers — accumulated during apply, drained by pipeline after commit.
     side_effect_count: u8 = 0, // kept for pipeline.resetEffects compat
-    fail_results: [max_fail_results]FailResult = undefined,
-    fail_result_count: u16 = 0,
-    bulk_results: [max_bulk_results]BulkResult = undefined,
+    /// Per-tick maintenance work units. Reclaim/expire/promote increment this
+    /// and stop once it reaches max_bulk_results so a single tick cannot stall
+    /// the pipeline thread with an unbounded scan. Saturating — never asserts.
     bulk_result_count: u16 = 0,
     cancel_signals: [max_cancel_signals]CancelSignal = undefined,
     cancel_signal_count: u16 = 0,
@@ -95,35 +95,11 @@ pub const OpHandler = struct {
     total_jobs: u32 = 0,
 
     const max_side_effects = 32;
-    const max_fail_results = 256;
     pub const max_bulk_results = 4096;
     const max_cancel_signals = 256;
     const max_webhook_events = 256;
     pub const max_webhooks = 64;
     const max_promote_queues = 32;
-
-    pub const FailResult = struct {
-        job_id: [128]u8 = undefined,
-        job_id_len: u8 = 0,
-        error_msg: [256]u8 = undefined,
-        error_msg_len: u16 = 0,
-        backtrace: [1024]u8 = undefined,
-        backtrace_len: u16 = 0,
-        new_state: types.JobState = .retrying,
-        attempt: u16 = 0,
-        retry_at_ns: u64 = 0,
-        now_ns: u64 = 0,
-
-        pub fn jobId(self: *const FailResult) []const u8 {
-            return self.job_id[0..self.job_id_len];
-        }
-        pub fn errorMsg(self: *const FailResult) []const u8 {
-            return self.error_msg[0..self.error_msg_len];
-        }
-        pub fn backtraceSlice(self: *const FailResult) []const u8 {
-            return self.backtrace[0..self.backtrace_len];
-        }
-    };
 
     pub const CancelSignal = struct {
         job_id: [64]u8 = undefined,
@@ -304,10 +280,13 @@ pub const OpHandler = struct {
         // Clear pending index.
         self.pending.clear();
 
-        // Clear fairness maps (nested hashmaps — free inner maps).
+        // Clear fairness maps (nested hashmaps — free outer keys + inner maps).
         {
             var it = self.fairness_active.iterator();
             while (it.next()) |entry| {
+                self.allocator.free(@constCast(entry.key_ptr.*));
+                var inner_it = entry.value_ptr.iterator();
+                while (inner_it.next()) |ie| self.allocator.free(@constCast(ie.key_ptr.*));
                 entry.value_ptr.deinit();
             }
             self.fairness_active.clearRetainingCapacity();
@@ -315,6 +294,9 @@ pub const OpHandler = struct {
         {
             var it = self.fairness_served.iterator();
             while (it.next()) |entry| {
+                self.allocator.free(@constCast(entry.key_ptr.*));
+                var inner_it = entry.value_ptr.iterator();
+                while (inner_it.next()) |ie| self.allocator.free(@constCast(ie.key_ptr.*));
                 entry.value_ptr.deinit();
             }
             self.fairness_served.clearRetainingCapacity();
@@ -419,7 +401,6 @@ pub const OpHandler = struct {
 
     pub fn resetEffects(self: *OpHandler) void {
         self.side_effect_count = 0;
-        self.fail_result_count = 0;
         self.bulk_result_count = 0;
         self.cancel_signal_count = 0;
         self.webhook_event_count = 0;
@@ -453,43 +434,16 @@ pub const OpHandler = struct {
     /// No-op — mirror removed. Side effects were only consumed by mirror_events.
     pub fn recordSideEffect(_: *OpHandler, _: *const ops.EnqueueJob) void {}
 
-    pub fn recordFailResult(self: *OpHandler, job_id: []const u8, error_msg: []const u8, backtrace: ?[]const u8, new_state: types.JobState, attempt: u16, retry_at_ns: u64, now_ns: u64) void {
-        assert.check(self.fail_result_count < max_fail_results, "recordFailResult: overflow ({d})", .{self.fail_result_count});
-        var r = FailResult{
-            .new_state = new_state,
-            .attempt = attempt,
-            .retry_at_ns = retry_at_ns,
-            .now_ns = now_ns,
-        };
-        const il: u8 = @intCast(@min(job_id.len, r.job_id.len));
-        @memcpy(r.job_id[0..il], job_id[0..il]);
-        r.job_id_len = il;
-        const el: u16 = @intCast(@min(error_msg.len, r.error_msg.len));
-        @memcpy(r.error_msg[0..el], error_msg[0..el]);
-        r.error_msg_len = el;
-        if (backtrace) |bt| {
-            const bl: u16 = @intCast(@min(bt.len, r.backtrace.len));
-            @memcpy(r.backtrace[0..bl], bt[0..bl]);
-            r.backtrace_len = bl;
-        }
-        self.fail_results[self.fail_result_count] = r;
-        self.fail_result_count += 1;
-    }
+    /// No-op — mirror removed. Fail results were only consumed by mirror_events.
+    /// Kept as a call site so handler_fail stays readable; carries no state.
+    pub fn recordFailResult(_: *OpHandler, _: []const u8, _: []const u8, _: ?[]const u8, _: types.JobState, _: u16, _: u64, _: u64) void {}
 
-    pub fn recordBulkResult(self: *OpHandler, job_id: []const u8, action: BulkResult.ActionType, state: []const u8, queue: []const u8, now_ns: u64) void {
-        assert.check(self.bulk_result_count < max_bulk_results, "recordBulkResult: overflow ({d})", .{self.bulk_result_count});
-        var r = BulkResult{ .action = action, .now_ns = now_ns };
-        const il: u8 = @intCast(@min(job_id.len, r.job_id.len));
-        @memcpy(r.job_id[0..il], job_id[0..il]);
-        r.job_id_len = il;
-        const sl: u8 = @intCast(@min(state.len, r.new_state.len));
-        @memcpy(r.new_state[0..sl], state[0..sl]);
-        r.new_state_len = sl;
-        const ql: u8 = @intCast(@min(queue.len, r.new_queue.len));
-        @memcpy(r.new_queue[0..ql], queue[0..ql]);
-        r.new_queue_len = ql;
-        self.bulk_results[self.bulk_result_count] = r;
-        self.bulk_result_count += 1;
+    /// Count one unit of maintenance/bulk work this tick. The stored result set
+    /// was only consumed by the removed mirror; today this is purely the
+    /// per-tick work cap read by reclaim/expire/promote. Saturating so a burst
+    /// of client bulk ops in one tick can never overflow or panic.
+    pub fn recordBulkResult(self: *OpHandler, _: []const u8, _: BulkResult.ActionType, _: []const u8, _: []const u8, _: u64) void {
+        self.bulk_result_count +|= 1;
     }
 
     pub fn recordCancelSignal(self: *OpHandler, job_id: []const u8, worker_id: []const u8) void {
@@ -732,7 +686,10 @@ pub const OpHandler = struct {
 
         const queue = codec.decodeQueue(qc_bytes.?);
         _ = self.putQueueConfig(queue_name, queue);
-        return queue;
+        // Return from cache — putQueueConfig fixes up the name slice to
+        // point at the owned HashMap key. The local `queue` has name
+        // pointing into qc_val_buf which dies when this function returns.
+        return self.queue_configs.get(queue_name);
     }
 
     /// Update cache after a queue config change.
@@ -747,6 +704,11 @@ pub const OpHandler = struct {
             entry.key_ptr.* = self.allocator.dupe(u8, queue_name) catch return false;
         }
         entry.value_ptr.* = queue;
+        // Fix up name to point at the owned HashMap key — the original
+        // queue.name slice points into transient memory (frame payload,
+        // stack decode buffer, KV iterator) that becomes dangling after
+        // the calling function returns.
+        entry.value_ptr.*.name = entry.key_ptr.*;
         return true;
     }
 
@@ -824,6 +786,26 @@ pub const OpHandler = struct {
         b.delete(keys.jobQueueStateKey(&jqs_buf, job.queue, state_byte, job.created_at_ns, job.id));
     }
 
+    /// Delete queue-specific read indexes for a job under a given queue.
+    /// Used by bulk move to clean up old queue's indexes before writing new ones.
+    pub fn deleteQueueReadIndexes(b: *kv.WriteBatch, queue: []const u8, job: *const types.Job) void {
+        var jq_buf: keys.KeyBuf = undefined;
+        var jqs_buf: keys.KeyBuf = undefined;
+        const state_byte = @intFromEnum(job.state);
+        b.delete(keys.jobQueueKey(&jq_buf, queue, job.created_at_ns, job.id));
+        b.delete(keys.jobQueueStateKey(&jqs_buf, queue, state_byte, job.created_at_ns, job.id));
+    }
+
+    /// Write queue-specific read indexes for a job (using job.queue).
+    /// Used by bulk move to write new queue's indexes after updating job.queue.
+    pub fn writeQueueReadIndexes(b: *kv.WriteBatch, job: *const types.Job) void {
+        var jq_buf: keys.KeyBuf = undefined;
+        var jqs_buf: keys.KeyBuf = undefined;
+        const state_byte = @intFromEnum(job.state);
+        b.set(keys.jobQueueKey(&jq_buf, job.queue, job.created_at_ns, job.id), "");
+        b.set(keys.jobQueueStateKey(&jqs_buf, job.queue, state_byte, job.created_at_ns, job.id), "");
+    }
+
     /// Update read indexes when a job transitions state.
     /// Deletes old state entries, writes new state entries, updates queue counters.
     pub fn transitionReadIndexes(self: *OpHandler, b: *kv.WriteBatch, job: *const types.Job, old_state: types.JobState, new_state: types.JobState) void {
@@ -899,6 +881,10 @@ pub const OpHandler = struct {
     }
 
     /// Increment counter for new_state, decrement for old_state on a queue.
+    /// Updates KV from the batch overlay and in-memory cache independently.
+    /// The KV path reads from the batch (which may lag behind the cache when
+    /// indexer deltas are still deferred), so we must NOT putQueueConfig here —
+    /// that would overwrite in-memory deltas from the same batch.
     fn updateQueueCounter(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, old_state: types.JobState, new_state: types.JobState) void {
         var qc_buf: keys.KeyBuf = undefined;
         var qc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
@@ -907,10 +893,9 @@ pub const OpHandler = struct {
         var q = codec.decodeQueue(qc_bytes);
         q.decrState(old_state);
         q.incrState(new_state);
-        // Re-encode with updated name pointer (decodeQueue returns slice into qc_val_buf)
         var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
         b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
-        _ = self.putQueueConfig(queue, q);
+        self.updateQueueCounterMem(queue, old_state, new_state);
     }
 
     /// Increment a single state counter on a queue (for enqueue).
@@ -923,7 +908,7 @@ pub const OpHandler = struct {
         q.incrState(state);
         var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
         b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
-        _ = self.putQueueConfig(queue, q);
+        self.incrQueueCounterMem(queue, state);
     }
 
     /// Decrement a single state counter on a queue (for purge).
@@ -936,7 +921,7 @@ pub const OpHandler = struct {
         q.decrState(state);
         var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
         b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
-        _ = self.putQueueConfig(queue, q);
+        self.decrQueueCounterMem(queue, state);
     }
 
     /// In-memory-only counter increment. KV write deferred to indexer.
@@ -1126,18 +1111,26 @@ pub const OpHandler = struct {
 
 /// Calculate retry delay in nanoseconds.
 pub fn calculateBackoffNs(strategy: types.Backoff, attempt: u16, base_delay_ms: u32, max_delay_ms: u32) u64 {
+    // Saturating arithmetic throughout: with max_retries up to 65535, a naive
+    // exponential (base << exp) or the ms→ns multiply overflows u64 and panics
+    // in ReleaseSafe. Large delays saturate to the ceiling instead.
     const delay_ms: u64 = switch (strategy) {
         .none => 0,
         .fixed => base_delay_ms,
-        .linear => @as(u64, base_delay_ms) * @as(u64, attempt),
+        .linear => @as(u64, base_delay_ms) *| @as(u64, attempt),
         .exponential => blk: {
             const exp: u6 = if (attempt > 0) @intCast(@min(attempt - 1, 63)) else 0;
-            break :blk @as(u64, base_delay_ms) * (@as(u64, 1) << exp);
+            break :blk @as(u64, base_delay_ms) *| (@as(u64, 1) << exp);
         },
     };
 
-    const clamped = if (max_delay_ms > 0 and delay_ms > max_delay_ms) max_delay_ms else delay_ms;
-    return @as(u64, clamped) * 1_000_000; // ms → ns
+    // Clamp to max_delay_ms (when set), then to the largest value that still
+    // fits u64 after the ms→ns multiply.
+    const max_ms_before_ns: u64 = std.math.maxInt(u64) / 1_000_000;
+    var clamped = delay_ms;
+    if (max_delay_ms > 0 and clamped > max_delay_ms) clamped = max_delay_ms;
+    if (clamped > max_ms_before_ns) clamped = max_ms_before_ns;
+    return clamped * 1_000_000; // ms → ns
 }
 
 // ============================================================================

@@ -85,6 +85,11 @@ pub const FetchOp = struct {
     count: u32 = 1,
     now_ns: u64 = 0,
     random_seed: u64 = 0,
+    /// Max total encoded response bytes the caller's send buffer can hold.
+    /// The claim stops before exceeding this so a batch of large payloads can
+    /// never overflow the connection send buffer. 0 = unbounded (callers that
+    /// don't inline payloads into a fixed buffer).
+    max_response_bytes: u32 = 0,
 };
 
 // ============================================================================
@@ -243,6 +248,7 @@ pub const MaintenanceAction = enum(u8) {
     rate_limit = 6,
     workers = 7,
     batches = 8,
+    cron = 9,
 
     pub fn toString(self: MaintenanceAction) []const u8 {
         return switch (self) {
@@ -254,6 +260,7 @@ pub const MaintenanceAction = enum(u8) {
             .rate_limit => "rate_limit",
             .workers => "workers",
             .batches => "batches",
+            .cron => "cron",
         };
     }
 };

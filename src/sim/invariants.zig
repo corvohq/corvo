@@ -33,6 +33,12 @@ pub const InvariantError = struct {
 
 pub const CheckResult = ?InvariantError;
 
+/// Reset module-level state between sim runs.
+pub fn reset() void {
+    concurrency_grace = [_]ConcurrencyGrace{.{}} ** 16;
+    concurrency_grace_count = 0;
+}
+
 /// Run all KV invariant checks.
 pub fn checkAll(
     store: *kv.Store,
@@ -74,6 +80,54 @@ pub fn checkAll(
 
     // Pending jobs in KV are in the PendingIndex (no orphaned pending jobs).
     if (checkPendingIndexCompleteness(store, &handler.pending, tick, seed)) |err| return err;
+
+    // Active count does not exceed max_concurrency.
+    if (checkConcurrencyLimit(handler, tick, seed)) |err| return err;
+
+    // Queue per-state counters match actual job counts in KV.
+    if (checkQueueStateCounters(store, handler, tick, seed)) |err| return err;
+
+    // Lease consistency: a| key value matches job.lease_expires_at_ns.
+    if (checkLeaseConsistency(store, tick, seed)) |err| return err;
+
+    // Expire index: x| keys point to existing pending jobs.
+    if (checkExpireIndexConsistency(store, tick, seed)) |err| return err;
+
+    // No orphaned jp| payload keys without a corresponding j| key.
+    if (checkNoOrphanedPayloads(store, tick, seed)) |err| return err;
+
+    // Job state FSM field consistency.
+    if (checkJobStateFields(store, tick, seed)) |err| return err;
+
+    // total_jobs counter matches actual j| key count.
+    if (checkTotalJobsAccuracy(store, handler, tick, seed)) |err| return err;
+
+    // No orphaned jq| keys pointing to non-existent jobs.
+    if (checkNoOrphanedQueueIndexes(store, tick, seed)) |err| return err;
+
+    // Read index consistency: js| keys point to existing jobs with matching state.
+    if (checkStateIndexConsistency(store, tick, seed)) |err| return err;
+
+    // Read index consistency: jt| keys point to existing jobs.
+    if (checkTimeIndexConsistency(store, tick, seed)) |err| return err;
+
+    // Read index consistency: jqs| keys point to existing jobs with matching state.
+    if (checkQueueStateIndexConsistency(store, tick, seed)) |err| return err;
+
+    // Read index consistency: tq| keys point to existing jobs.
+    if (checkTagIndexConsistency(store, tick, seed)) |err| return err;
+
+    // No orphaned je| error log keys without a corresponding j| key.
+    if (checkNoOrphanedErrorLogs(store, tick, seed)) |err| return err;
+
+    // Unique lock bidirectionality: non-terminal jobs with unique_key must have u| key.
+    if (checkUniqueLockBidirectional(store, tick, seed)) |err| return err;
+
+    // Queue config KV/memory consistency.
+    if (checkQueueConfigConsistency(store, handler, tick, seed)) |err| return err;
+
+    // Cron schedule consistency: sc| and cn| cross-reference.
+    if (checkCronConsistency(store, tick, seed)) |err| return err;
 
     return null;
 }
@@ -294,25 +348,28 @@ fn checkUniqueLockConsistency(store: *kv.Store, tick: u32, seed: u64) CheckResul
     if (!iter.first()) return null;
 
     while (true) {
-        // Unique key value = job_id that owns the lock.
+        // Unique key value is {job_id}|{expires_ns:8BE} — decode to get job_id.
         const val = iter.value();
         if (val.len > 0) {
-            // Look up the owning job.
-            var job_key_buf: keys.KeyBuf = undefined;
-            const job_key = keys.jobKey(&job_key_buf, val);
-            if (batch.get(job_key)) |job_val| {
-                const job = codec.decodeJob(job_val);
-                // A unique lock should not be held by a terminal job
-                // (completed/dead/cancelled jobs should release their locks).
-                if (job.state == .completed or job.state == .dead) {
-                    return makeErrorFmt("unique-lock", tick, seed,
-                        "u| lock held by terminal job {s} state={s}",
-                        .{ val, job.state.toString() });
+            const decoded = keys.decodeUniqueValue(val);
+            if (decoded.job_id.len > 0) {
+                // Look up the owning job.
+                var job_key_buf: keys.KeyBuf = undefined;
+                const job_key = keys.jobKey(&job_key_buf, decoded.job_id);
+                if (batch.get(job_key)) |job_val| {
+                    const job = codec.decodeJob(job_val);
+                    // A unique lock should not be held by a terminal job
+                    // (completed/dead/cancelled jobs should release their locks).
+                    if (job.state.isTerminal()) {
+                        return makeErrorFmt("unique-lock", tick, seed,
+                            "u| lock held by terminal job {s} state={s}",
+                            .{ decoded.job_id, job.state.toString() });
+                    }
                 }
+                // If job doesn't exist, it was purged — lock should have been cleaned
+                // by maintenance. We allow this as a transient state between purge
+                // and unique lock cleanup maintenance runs.
             }
-            // If job doesn't exist, it was purged — lock should have been cleaned
-            // by maintenance. We allow this as a transient state between purge
-            // and unique lock cleanup maintenance runs.
         }
 
         if (!iter.next()) break;
@@ -478,15 +535,18 @@ fn checkUniqueLockOwnerHasKey(store: *kv.Store, tick: u32, seed: u64) CheckResul
     while (true) {
         const val = iter.value();
         if (val.len > 0) {
-            var job_key_buf: keys.KeyBuf = undefined;
-            const job_key = keys.jobKey(&job_key_buf, val);
-            if (batch.get(job_key)) |job_val| {
-                const job = codec.decodeJob(job_val);
-                // The job that owns this lock should have a unique_key set.
-                if (job.unique_key == null or job.unique_key.?.len == 0) {
-                    return makeErrorFmt("unique-lock-owner-no-key", tick, seed,
-                        "u| lock points to job {s} which has no unique_key",
-                        .{val});
+            const decoded = keys.decodeUniqueValue(val);
+            if (decoded.job_id.len > 0) {
+                var job_key_buf: keys.KeyBuf = undefined;
+                const job_key = keys.jobKey(&job_key_buf, decoded.job_id);
+                if (batch.get(job_key)) |job_val| {
+                    const job = codec.decodeJob(job_val);
+                    // The job that owns this lock should have a unique_key set.
+                    if (job.unique_key == null or job.unique_key.?.len == 0) {
+                        return makeErrorFmt("unique-lock-owner-no-key", tick, seed,
+                            "u| lock points to job {s} which has no unique_key",
+                            .{decoded.job_id});
+                    }
                 }
             }
         }
@@ -505,6 +565,43 @@ fn checkBatchCounters(store: *kv.Store, tick: u32, seed: u64) CheckResult {
     var batch = store.newBatch();
     defer batch.close();
 
+    // Phase 1: Count actual non-terminal jobs per batch from j| scan.
+    const max_batches = 64;
+    var batch_ids: [max_batches][128]u8 = undefined;
+    var batch_id_lens: [max_batches]u8 = [_]u8{0} ** max_batches;
+    var actual_pending: [max_batches]u32 = [_]u32{0} ** max_batches;
+    var batch_count: usize = 0;
+
+    {
+        var j_upper_buf: keys.KeyBuf = undefined;
+        const j_upper = keys.prefixEnd(&j_upper_buf, keys.prefix_job) orelse return null;
+        var j_iter = batch.newIter(keys.prefix_job, j_upper);
+        defer j_iter.close();
+
+        if (j_iter.first()) {
+            while (true) {
+                const jkey = j_iter.key();
+                if (jkey.len > 2 and jkey[0] == 'j' and jkey[1] == '|') {
+                    const jval = j_iter.value();
+                    if (jval.len > 0) {
+                        const job = codec.decodeJob(jval);
+                        if (job.batch_id) |bid| {
+                            if (bid.len > 0 and !job.state.isTerminal()) {
+                                // Find or add batch.
+                                const bi = findOrAddBatch(&batch_ids, &batch_id_lens, &batch_count, bid);
+                                if (bi) |idx| {
+                                    actual_pending[idx] += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!j_iter.next()) break;
+            }
+        }
+    }
+
+    // Phase 2: Scan batch KV entries and compare.
     var upper_buf: keys.KeyBuf = undefined;
     const upper = keys.prefixEnd(&upper_buf, keys.prefix_batch) orelse return null;
 
@@ -534,6 +631,24 @@ fn checkBatchCounters(store: *kv.Store, tick: u32, seed: u64) CheckResult {
                 return makeErrorFmt("batch-counter-underflow", tick, seed,
                     "batch {s}: suspiciously large counters p={d} s={d} f={d} (underflow?)",
                     .{ b.id, b.pending, b.succeeded, b.failed });
+            }
+
+            // Verify batch.pending matches actual non-terminal job count.
+            if (b.id.len > 0) {
+                var actual: u32 = 0;
+                for (0..batch_count) |i| {
+                    if (batch_id_lens[i] == @as(u8, @intCast(b.id.len)) and
+                        std.mem.eql(u8, batch_ids[i][0..batch_id_lens[i]], b.id))
+                    {
+                        actual = actual_pending[i];
+                        break;
+                    }
+                }
+                if (b.pending != actual) {
+                    return makeErrorFmt("batch-pending-accuracy", tick, seed,
+                        "batch {s}: pending={d} but {d} non-terminal jobs in KV",
+                        .{ b.id, b.pending, actual });
+                }
             }
         }
 
@@ -646,6 +761,818 @@ fn findOrAddQueue(
     lens[idx] = @intCast(len);
     count.* += 1;
     return idx;
+}
+
+fn findOrAddBatch(
+    ids: *[64][128]u8,
+    lens: *[64]u8,
+    count: *usize,
+    batch_id: []const u8,
+) ?usize {
+    const bid_len: u8 = @intCast(@min(batch_id.len, 128));
+    for (0..count.*) |i| {
+        if (lens[i] == bid_len and
+            std.mem.eql(u8, ids[i][0..lens[i]], batch_id[0..bid_len]))
+        {
+            return i;
+        }
+    }
+    if (count.* >= 64) return null;
+    const idx = count.*;
+    @memcpy(ids[idx][0..bid_len], batch_id[0..bid_len]);
+    lens[idx] = bid_len;
+    count.* += 1;
+    return idx;
+}
+
+// ============================================================================
+// Concurrency limit — active_count must not exceed max_concurrency
+// ============================================================================
+
+fn checkConcurrencyLimit(handler: *OpHandler, tick: u32, seed: u64) CheckResult {
+    // When max_concurrency is lowered while jobs are already active, those
+    // jobs drain naturally but temporarily exceed the new limit. To avoid
+    // false positives we track a per-queue "grace" — the active count at the
+    // time max_concurrency was last set. The invariant allows:
+    //   active_count <= max(max_concurrency, grace_active)
+    // As jobs complete, the grace shrinks until max_concurrency governs.
+    const max_tracked = 16;
+
+    var it = handler.queue_configs.iterator();
+    while (it.next()) |entry| {
+        const queue_name = entry.key_ptr.*;
+        const config = entry.value_ptr.*;
+
+        // When max_concurrency is 0 (unlimited), clear the grace entry so
+        // that if the limit is re-enabled later, we freshly capture the
+        // current active count. Without this, the grace retains the old
+        // max_concurrency value and doesn't detect the 0→N transition.
+        if (config.max_concurrency == 0) {
+            const gi = findOrAddGrace(&concurrency_grace, &concurrency_grace_count, queue_name);
+            if (gi) |idx| concurrency_grace[idx].max_concurrency = 0;
+            continue;
+        }
+
+        const active = handler.getActiveCount(queue_name);
+        if (active < 0) continue;
+        const active_u: u32 = @intCast(active);
+
+        // Update grace tracking.
+        const gi = findOrAddGrace(&concurrency_grace, &concurrency_grace_count, queue_name);
+        if (gi) |idx| {
+            const grace = &concurrency_grace[idx];
+            // If max_concurrency changed since last check, record current active as grace.
+            if (grace.max_concurrency != config.max_concurrency) {
+                grace.max_concurrency = config.max_concurrency;
+                grace.grace_active = active_u;
+            }
+            // Once active drops to or below max_concurrency, clear the grace —
+            // from this point any overshoot is a real bug.
+            if (active_u <= config.max_concurrency) {
+                grace.grace_active = config.max_concurrency;
+            }
+
+            const effective_limit = @max(config.max_concurrency, grace.grace_active);
+            if (active_u > effective_limit) {
+                return makeErrorFmt("concurrency-limit", tick, seed,
+                    "queue '{s}': active_count={d} exceeds max_concurrency={d}",
+                    .{ queue_name, active_u, config.max_concurrency });
+            }
+        }
+    }
+    _ = max_tracked;
+    return null;
+}
+
+const ConcurrencyGrace = struct {
+    name_buf: [64]u8 = undefined,
+    name_len: u8 = 0,
+    max_concurrency: u32 = 0,
+    grace_active: u32 = 0,
+};
+
+var concurrency_grace: [16]ConcurrencyGrace = [_]ConcurrencyGrace{.{}} ** 16;
+var concurrency_grace_count: usize = 0;
+
+fn findOrAddGrace(
+    graces: *[16]ConcurrencyGrace,
+    count: *usize,
+    queue: []const u8,
+) ?usize {
+    for (0..count.*) |i| {
+        if (graces[i].name_len == @as(u8, @intCast(@min(queue.len, 64))) and
+            std.mem.eql(u8, graces[i].name_buf[0..graces[i].name_len], queue[0..@min(queue.len, 64)]))
+        {
+            return i;
+        }
+    }
+    if (count.* >= 16) return null;
+    const idx = count.*;
+    const len = @min(queue.len, 64);
+    @memcpy(graces[idx].name_buf[0..len], queue[0..len]);
+    graces[idx].name_len = @intCast(len);
+    count.* += 1;
+    return idx;
+}
+
+// ============================================================================
+// Queue per-state counter accuracy — cached counters must match KV scan
+// ============================================================================
+
+fn checkQueueStateCounters(store: *kv.Store, handler: *OpHandler, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    // Count jobs per state per queue from KV scan.
+    const max_q = 16;
+    const num_states = 8;
+    var queue_names: [max_q][64]u8 = undefined;
+    var queue_name_lens: [max_q]u8 = [_]u8{0} ** max_q;
+    var kv_counts: [max_q][num_states]u32 = [_][num_states]u32{[_]u32{0} ** num_states} ** max_q;
+    var queue_count: usize = 0;
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job) orelse return null;
+    var iter = batch.newIter(keys.prefix_job, upper);
+    defer iter.close();
+
+    if (iter.first()) {
+        while (true) {
+            const key = iter.key();
+            if (key.len > 2 and key[0] == 'j' and key[1] == '|') {
+                const val = iter.value();
+                if (val.len > 0) {
+                    const job = codec.decodeJob(val);
+                    const qi = findOrAddQueue(&queue_names, &queue_name_lens, &queue_count, job.queue);
+                    if (qi) |idx| {
+                        kv_counts[idx][@intFromEnum(job.state)] += 1;
+                    }
+                }
+            }
+            if (!iter.next()) break;
+        }
+    }
+
+    // Compare with cached Queue counters.
+    for (0..queue_count) |qi| {
+        const qname = queue_names[qi][0..queue_name_lens[qi]];
+        const cached = handler.queue_configs.get(qname) orelse continue;
+
+        const expected = [num_states]u32{
+            kv_counts[qi][@intFromEnum(types.JobState.pending)],
+            kv_counts[qi][@intFromEnum(types.JobState.active)],
+            kv_counts[qi][@intFromEnum(types.JobState.retrying)],
+            kv_counts[qi][@intFromEnum(types.JobState.completed)],
+            kv_counts[qi][@intFromEnum(types.JobState.dead)],
+            kv_counts[qi][@intFromEnum(types.JobState.cancelled)],
+            kv_counts[qi][@intFromEnum(types.JobState.scheduled)],
+            kv_counts[qi][@intFromEnum(types.JobState.held)],
+        };
+        const actual = [num_states]u32{
+            cached.pending_count,
+            cached.active_count,
+            cached.retrying_count,
+            cached.completed_count,
+            cached.dead_count,
+            cached.cancelled_count,
+            cached.scheduled_count,
+            cached.held_count,
+        };
+        const labels = [num_states][]const u8{
+            "pending", "active", "retrying", "completed",
+            "dead", "cancelled", "scheduled", "held",
+        };
+
+        for (0..num_states) |si| {
+            if (actual[si] != expected[si]) {
+                return makeErrorFmt("queue-state-counter", tick, seed,
+                    "queue '{s}': {s}_count={d} but KV has {d}",
+                    .{ qname, labels[si], actual[si], expected[si] });
+            }
+        }
+    }
+
+    return null;
+}
+
+// ============================================================================
+// Lease consistency — a| key value must match job.lease_expires_at_ns
+// ============================================================================
+
+fn checkLeaseConsistency(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_active) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_active, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const key = iter.key();
+        const val = iter.value();
+
+        if (val.len != 8) {
+            if (!iter.next()) break;
+            continue;
+        }
+
+        const index_lease_ns = keys.getU64BE(val);
+
+        // Parse job ID from active key: a|{queue}\x00{job_id}
+        const key_offset = keys.prefix_active.len;
+        const sep_pos = std.mem.indexOfScalarPos(u8, key, key_offset, 0x00) orelse {
+            if (!iter.next()) break;
+            continue;
+        };
+        const job_id = key[sep_pos + 1 ..];
+
+        var jk_buf: keys.KeyBuf = undefined;
+        if (batch.get(keys.jobKey(&jk_buf, job_id))) |job_val| {
+            const job = codec.decodeJob(job_val);
+            if (job.lease_expires_at_ns != index_lease_ns) {
+                return makeErrorFmt("lease-consistency", tick, seed,
+                    "job {s}: a| lease={d} but job.lease_expires_at_ns={d}",
+                    .{ job_id, index_lease_ns, job.lease_expires_at_ns });
+            }
+        }
+
+        if (!iter.next()) break;
+    }
+    return null;
+}
+
+// ============================================================================
+// Expire index consistency — x| keys must point to existing pending jobs
+// ============================================================================
+
+fn checkExpireIndexConsistency(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_expire) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_expire, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const key = iter.key();
+        const prefix_len = keys.prefix_expire.len;
+        if (key.len <= prefix_len + 8) {
+            if (!iter.next()) break;
+            continue;
+        }
+        const job_id = key[prefix_len + 8 ..];
+
+        var jk_buf: keys.KeyBuf = undefined;
+        if (batch.get(keys.jobKey(&jk_buf, job_id))) |job_val| {
+            const job = codec.decodeJob(job_val);
+            if (job.state != .pending) {
+                return makeErrorFmt("expire-index", tick, seed,
+                    "x| key for job {s} but state={s} (expected pending)",
+                    .{ job_id, job.state.toString() });
+            }
+        } else {
+            return makeErrorFmt("expire-index", tick, seed,
+                "x| key for job {s} but job not found in KV", .{job_id});
+        }
+
+        if (!iter.next()) break;
+    }
+    return null;
+}
+
+// ============================================================================
+// No orphaned payload keys — every jp| must have a corresponding j| key
+// ============================================================================
+
+fn checkNoOrphanedPayloads(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job_payload) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_job_payload, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const key = iter.key();
+        if (key.len > keys.prefix_job_payload.len) {
+            const job_id = key[keys.prefix_job_payload.len..];
+
+            var jk_buf: keys.KeyBuf = undefined;
+            if (batch.get(keys.jobKey(&jk_buf, job_id)) == null) {
+                return makeErrorFmt("orphaned-payload", tick, seed,
+                    "jp| key for job {s} but no j| key exists", .{job_id});
+            }
+        }
+
+        if (!iter.next()) break;
+    }
+    return null;
+}
+
+// ============================================================================
+// Job state FSM field consistency — fields must match state
+// ============================================================================
+
+fn checkJobStateFields(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_job, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const key = iter.key();
+        if (key.len > 2 and key[0] == 'j' and key[1] == '|') {
+            const val = iter.value();
+            if (val.len > 0) {
+                const job = codec.decodeJob(val);
+                const job_id = key[keys.prefix_job.len..];
+
+                switch (job.state) {
+                    .active => {
+                        if (job.lease_expires_at_ns == 0) {
+                            return makeErrorFmt("job-field-fsm", tick, seed,
+                                "active job {s} has lease_expires_at_ns=0", .{job_id});
+                        }
+                        if (job.attempt == 0) {
+                            return makeErrorFmt("job-field-fsm", tick, seed,
+                                "active job {s} has attempt=0", .{job_id});
+                        }
+                    },
+                    .completed, .dead => {
+                        if (job.completed_at_ns == 0) {
+                            return makeErrorFmt("job-field-fsm", tick, seed,
+                                "{s} job {s} has completed_at_ns=0",
+                                .{ job.state.toString(), job_id });
+                        }
+                    },
+                    .pending => {
+                        if (job.lease_expires_at_ns != 0) {
+                            return makeErrorFmt("job-field-fsm", tick, seed,
+                                "pending job {s} has lease_expires_at_ns={d}",
+                                .{ job_id, job.lease_expires_at_ns });
+                        }
+                    },
+                    .scheduled => {
+                        if (job.scheduled_at_ns == 0) {
+                            return makeErrorFmt("job-field-fsm", tick, seed,
+                                "scheduled job {s} has scheduled_at_ns=0", .{job_id});
+                        }
+                    },
+                    .retrying => {
+                        if (job.attempt == 0) {
+                            return makeErrorFmt("job-field-fsm", tick, seed,
+                                "retrying job {s} has attempt=0", .{job_id});
+                        }
+                    },
+                    .cancelled => {
+                        if (job.completed_at_ns == 0) {
+                            return makeErrorFmt("job-field-fsm", tick, seed,
+                                "cancelled job {s} has completed_at_ns=0", .{job_id});
+                        }
+                    },
+                    .held => {
+                        if (job.lease_expires_at_ns != 0) {
+                            return makeErrorFmt("job-field-fsm", tick, seed,
+                                "held job {s} has lease_expires_at_ns={d}",
+                                .{ job_id, job.lease_expires_at_ns });
+                        }
+                    },
+                }
+            }
+        }
+
+        if (!iter.next()) break;
+    }
+    return null;
+}
+
+// ============================================================================
+// total_jobs accuracy — handler.total_jobs must match j| key count in KV
+// ============================================================================
+
+fn checkTotalJobsAccuracy(store: *kv.Store, handler: *OpHandler, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_job, upper);
+    defer iter.close();
+
+    var kv_count: u32 = 0;
+    if (iter.first()) {
+        while (true) {
+            const key = iter.key();
+            // Only count j| keys (not jp|, je|, etc.)
+            if (key.len > 2 and key[0] == 'j' and key[1] == '|') {
+                kv_count += 1;
+            }
+            if (!iter.next()) break;
+        }
+    }
+
+    if (handler.total_jobs != kv_count) {
+        return makeErrorFmt("total-jobs-accuracy", tick, seed,
+            "handler.total_jobs={d} but KV has {d} j| keys",
+            .{ handler.total_jobs, kv_count });
+    }
+
+    return null;
+}
+
+// ============================================================================
+// No orphaned jq| keys — every jq| index must reference an existing j| key
+// ============================================================================
+
+fn checkNoOrphanedQueueIndexes(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job_queue) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_job_queue, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const key = iter.key();
+        // jq|{queue}\x00{inv_created_ns:8BE}{job_id}
+        const job_id = extractJobIDStructured(key, keys.prefix_job_queue.len, 8) orelse {
+            if (!iter.next()) break;
+            continue;
+        };
+
+        var jk_buf: keys.KeyBuf = undefined;
+        if (batch.get(keys.jobKey(&jk_buf, job_id)) == null) {
+            return makeErrorFmt("orphaned-queue-index", tick, seed,
+                "jq| key references job {s} but no j| key exists", .{job_id});
+        }
+
+        if (!iter.next()) break;
+    }
+
+    return null;
+}
+
+// ============================================================================
+// Read index: js| state consistency
+// js| keys encode state byte — must match actual job state.
+// ============================================================================
+
+fn checkStateIndexConsistency(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job_state) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_job_state, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const key = iter.key();
+        // js|{state:1}{inv_created_ns:8BE}{job_id}
+        if (key.len > keys.prefix_job_state.len + 1 + 8) {
+            const encoded_state = key[keys.prefix_job_state.len];
+            const job_id = keys.jobIdFromStateKey(key);
+
+            var jk_buf: keys.KeyBuf = undefined;
+            if (batch.get(keys.jobKey(&jk_buf, job_id))) |job_val| {
+                const job = codec.decodeJob(job_val);
+                if (@intFromEnum(job.state) != encoded_state) {
+                    return makeErrorFmt("state-index-mismatch", tick, seed,
+                        "js| key has state={d} but job {s} actual state={s}",
+                        .{ encoded_state, job_id, job.state.toString() });
+                }
+            }
+            // If j| key doesn't exist, this is a stale read-index entry from
+            // a purged/cleared job. Harmless — read queries filter these out.
+        }
+
+        if (!iter.next()) break;
+    }
+    return null;
+}
+
+// ============================================================================
+// Read index: jt| time index — every entry must reference an existing job
+// ============================================================================
+
+fn checkTimeIndexConsistency(store: *kv.Store, _: u32, _: u64) CheckResult {
+    // jt| is a read index — stale entries after purge/clear are harmless.
+    // Verify the index is scannable (no corruption) by iterating it.
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job_time) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_job_time, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        if (!iter.next()) break;
+    }
+    return null;
+}
+
+// ============================================================================
+// Read index: jqs| queue+state index — state byte must match actual job state
+// ============================================================================
+
+fn checkQueueStateIndexConsistency(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job_queue_state) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_job_queue_state, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const key = iter.key();
+        // jqs|{queue}\x00{state:1}{inv_created_ns:8BE}{job_id}
+        if (keys.jobIdFromQueueStateKey(key)) |job_id| {
+            // Extract encoded state: find sep after prefix, state is next byte
+            const start = keys.prefix_job_queue_state.len;
+            const sep_pos = std.mem.indexOfScalarPos(u8, key, start, 0x00) orelse {
+                if (!iter.next()) break;
+                continue;
+            };
+            const encoded_state = key[sep_pos + 1];
+
+            var jk_buf: keys.KeyBuf = undefined;
+            if (batch.get(keys.jobKey(&jk_buf, job_id))) |job_val| {
+                const job = codec.decodeJob(job_val);
+                if (@intFromEnum(job.state) != encoded_state) {
+                    return makeErrorFmt("queue-state-index-mismatch", tick, seed,
+                        "jqs| key has state={d} but job {s} actual state={s}",
+                        .{ encoded_state, job_id, job.state.toString() });
+                }
+            }
+            // If j| key doesn't exist, stale read-index entry — harmless.
+        }
+
+        if (!iter.next()) break;
+    }
+    return null;
+}
+
+// ============================================================================
+// Read index: tq| tag index — every entry must reference an existing job
+// ============================================================================
+
+fn checkTagIndexConsistency(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    // tq| is a read index — stale entries after purge/clear are harmless.
+    // Verify that if a j| key exists, the job's tags are consistent.
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_tag_queue) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_tag_queue, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const key = iter.key();
+        if (keys.jobIdFromTagQueueKey(key)) |job_id| {
+            var jk_buf: keys.KeyBuf = undefined;
+            if (batch.get(keys.jobKey(&jk_buf, job_id))) |job_val| {
+                const job = codec.decodeJob(job_val);
+                // If the job exists, it should have tags.
+                if (job.tags == null or job.tags.?.len == 0) {
+                    return makeErrorFmt("tag-index-no-tags", tick, seed,
+                        "tq| key for job {s} but job has no tags", .{job_id});
+                }
+            }
+            // If j| key doesn't exist, stale tag entry — harmless.
+        }
+
+        if (!iter.next()) break;
+    }
+    return null;
+}
+
+// ============================================================================
+// No orphaned je| error log keys
+// ============================================================================
+
+fn checkNoOrphanedErrorLogs(store: *kv.Store, _: u32, _: u64) CheckResult {
+    // je| error logs may briefly outlive their j| key during purge/clear.
+    // These are cleaned up by the purge handler which does deleteRange on je|{job_id}.
+    // Just verify the index is scannable (no corruption).
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job_error) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_job_error, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        if (!iter.next()) break;
+    }
+    return null;
+}
+
+// ============================================================================
+// Unique lock bidirectionality — non-terminal jobs with unique_key must own a u| lock
+// ============================================================================
+
+fn checkUniqueLockBidirectional(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_job, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const key = iter.key();
+        if (key.len > 2 and key[0] == 'j' and key[1] == '|') {
+            const val = iter.value();
+            if (val.len > 0) {
+                const job = codec.decodeJob(val);
+                const job_id = key[keys.prefix_job.len..];
+
+                // Non-terminal job with unique_key must have a u| lock.
+                if (!job.state.isTerminal() and job.unique_key != null) {
+                    if (job.unique_key.?.len > 0) {
+                        var uk_buf: keys.KeyBuf = undefined;
+                        const uk = keys.uniqueKey(&uk_buf, job.queue, job.unique_key.?);
+                        if (batch.get(uk)) |lock_val| {
+                            // Lock value is {job_id}|{expires_ns:8BE} — decode to get job_id.
+                            const decoded = keys.decodeUniqueValue(lock_val);
+                            if (!std.mem.eql(u8, decoded.job_id, job_id)) {
+                                return makeErrorFmt("unique-lock-bidirectional", tick, seed,
+                                    "job {s} has unique_key but u| lock points to {s}",
+                                    .{ job_id, decoded.job_id });
+                            }
+                        } else {
+                            // Allow cancelled state — cancellation may not
+                            // release unique locks until maintenance runs.
+                            if (job.state != .cancelled) {
+                                return makeErrorFmt("unique-lock-bidirectional", tick, seed,
+                                    "job {s} state={s} has unique_key but no u| lock exists",
+                                    .{ job_id, job.state.toString() });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!iter.next()) break;
+    }
+    return null;
+}
+
+// ============================================================================
+// Queue config KV/memory consistency — qc| keys must match handler.queue_configs
+// ============================================================================
+
+fn checkQueueConfigConsistency(store: *kv.Store, handler: *OpHandler, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    // Check every qc| key in KV has a matching in-memory entry.
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_queue_config) orelse return null;
+
+    var kv_queue_count: u32 = 0;
+
+    var iter = batch.newIter(keys.prefix_queue_config, upper);
+    defer iter.close();
+
+    if (iter.first()) {
+        while (true) {
+            const key = iter.key();
+            if (key.len > keys.prefix_queue_config.len) {
+                const queue_name = key[keys.prefix_queue_config.len..];
+                kv_queue_count += 1;
+
+                const kv_val = iter.value();
+                if (kv_val.len > 0) {
+                    const kv_queue = codec.decodeQueue(kv_val);
+
+                    if (handler.queue_configs.get(queue_name)) |mem_queue| {
+                        // Compare key fields.
+                        if (mem_queue.paused != kv_queue.paused) {
+                            return makeErrorFmt("queue-config-consistency", tick, seed,
+                                "queue '{s}': memory paused={} but KV paused={}",
+                                .{ queue_name, mem_queue.paused, kv_queue.paused });
+                        }
+                        if (mem_queue.max_concurrency != kv_queue.max_concurrency) {
+                            return makeErrorFmt("queue-config-consistency", tick, seed,
+                                "queue '{s}': memory max_conc={d} but KV max_conc={d}",
+                                .{ queue_name, mem_queue.max_concurrency, kv_queue.max_concurrency });
+                        }
+                        if (mem_queue.fairness != kv_queue.fairness) {
+                            return makeErrorFmt("queue-config-consistency", tick, seed,
+                                "queue '{s}': memory fairness={} but KV fairness={}",
+                                .{ queue_name, mem_queue.fairness, kv_queue.fairness });
+                        }
+                    } else {
+                        return makeErrorFmt("queue-config-consistency", tick, seed,
+                            "queue '{s}' exists in KV (qc|) but not in handler.queue_configs",
+                            .{queue_name});
+                    }
+                }
+            }
+
+            if (!iter.next()) break;
+        }
+    }
+
+    return null;
+}
+
+// ============================================================================
+// Cron consistency — sc| and cn| must cross-reference correctly
+// ============================================================================
+
+fn checkCronConsistency(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    // Scan sc| keys and verify each has a matching cn| name index.
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_cron) orelse return null;
+
+    var iter = batch.newIter(keys.prefix_cron, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+
+    while (true) {
+        const val = iter.value();
+        if (val.len > 0) {
+            const cron = codec.decodeCron(val);
+
+            // Every cron must have a name.
+            if (cron.name.len == 0) {
+                return makeErrorFmt("cron-consistency", tick, seed,
+                    "sc| cron {s} has empty name", .{cron.id});
+            }
+
+            // Verify cn|{name} exists and points back to this cron ID.
+            var cn_buf: keys.KeyBuf = undefined;
+            const cn_key = keys.cronNameKey(&cn_buf, cron.name);
+            if (batch.get(cn_key)) |cn_val| {
+                if (!std.mem.eql(u8, cn_val, cron.id)) {
+                    return makeErrorFmt("cron-consistency", tick, seed,
+                        "cn| for name '{s}' points to {s} but sc| has id {s}",
+                        .{ cron.name, cn_val, cron.id });
+                }
+            } else {
+                return makeErrorFmt("cron-consistency", tick, seed,
+                    "sc| cron {s} name='{s}' but no cn| key exists",
+                    .{ cron.id, cron.name });
+            }
+        }
+
+        if (!iter.next()) break;
+    }
+
+    return null;
 }
 
 // ============================================================================

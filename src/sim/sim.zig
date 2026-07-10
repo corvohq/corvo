@@ -19,7 +19,6 @@ const corvo = @import("corvo");
 
 const kv = corvo.kv;
 const handler_mod = corvo.handler;
-const oplog_mod = corvo.oplog;
 const notify_mod = corvo.notify;
 const pipeline_mod = corvo.pipeline;
 const io_mod = corvo.io;
@@ -69,20 +68,21 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     defer handler.deinit();
     handler.rebuildState(&stores);
 
-    // --- Oplog ---
-    var oplog = oplog_mod.Log.init(allocator, .{ .now_fn = &globalClockNow }, null, 1024);
-    defer oplog.deinit();
-
     // --- Notifier ---
     var notify_inst = notify_mod.QueueNotifier.init(allocator);
     defer notify_inst.deinit();
 
     // --- SimBackend ---
+    // Buffer sizing mirrors main.zig's invariant: a FRESH send buffer must
+    // hold one max-size fetched job plus framing, or fulfillSubscriptions'
+    // one-max-job room check never admits a subscriber and the sim silently
+    // stops exercising the fetch/ack lifecycle (fetch=0 at any traffic level).
+    const buf_size = 64 * 1024 + corvo.rpc.FRAME_HEADER_SIZE + 1024;
     var backend = try SimBackend.init(allocator, .{
         .listen_fd = -1,
         .max_conns = max_clients + 4,
-        .recv_buf_size = 65536,
-        .send_buf_size = 65536,
+        .recv_buf_size = buf_size,
+        .send_buf_size = buf_size,
     });
     defer backend.deinit(allocator);
 
@@ -92,7 +92,6 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         &backend,
         &handler,
         &stores,
-        &oplog,
         &notify_inst,
         null,
         .{
@@ -140,6 +139,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         );
         clients[i].rng = clients[i].prng.random();
     }
+
+    // Reset invariant state from previous runs.
+    invariants.reset();
 
     // --- Main tick loop ---
     var tick: u32 = 0;
@@ -211,6 +213,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     var total_heartbeats: u32 = 0;
     var total_queue_ops: u32 = 0;
     var total_stale_acks: u32 = 0;
+    var total_cron_ops: u32 = 0;
+    var total_batch_creates: u32 = 0;
+    var total_chain_enqueues: u32 = 0;
 
     for (clients[0..num_clients]) |c| {
         total_enqueued += c.enqueued;
@@ -222,15 +227,18 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         total_heartbeats += c.heartbeats;
         total_queue_ops += c.queue_ops;
         total_stale_acks += c.stale_acks;
+        total_cron_ops += c.cron_ops;
+        total_batch_creates += c.batch_creates;
+        total_chain_enqueues += c.chain_enqueues;
     }
 
     std.debug.print(
-        "OK seed={d} ticks={d} clients={d} queues={d} | enq={d} fetch={d} ack={d} fail={d} bulk={d} maint={d} hb={d} qop={d} stale={d}\n",
+        "OK seed={d} ticks={d} clients={d} queues={d} | enq={d} fetch={d} ack={d} fail={d} bulk={d} maint={d} hb={d} qop={d} stale={d} cron={d} batch={d} chain={d}\n",
         .{
             seed,            config.ticks,       num_clients,        num_queues,
             total_enqueued,  total_fetched,      total_acked,        total_failed,
             total_bulk,      total_maintenance,  total_heartbeats,   total_queue_ops,
-            total_stale_acks,
+            total_stale_acks, total_cron_ops,    total_batch_creates, total_chain_enqueues,
         },
     );
 }

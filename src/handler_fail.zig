@@ -111,6 +111,7 @@ pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops
 
             var dk_buf: keys.KeyBuf = undefined;
             b.set(keys.deadKey(&dk_buf, op.now_ns, fail_job.job_id), "");
+            self.dead_since_purge += 1;
 
             self.checkWebhooks(fail_job.job_id, job.queue, .dead, op.now_ns);
 

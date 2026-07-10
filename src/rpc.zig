@@ -34,9 +34,12 @@ pub const MSG_ENQUEUE_BATCH: u8 = 0x01;
 pub const MSG_FETCH_BATCH: u8 = 0x02;
 pub const MSG_ACK_BATCH: u8 = 0x03;
 pub const MSG_PING: u8 = 0x04;
+pub const MSG_AUTH: u8 = 0x05; // client -> server: authenticate a connection (payload = length-prefixed key)
 pub const MSG_HEARTBEAT: u8 = 0x06;
 pub const MSG_FAIL_BATCH: u8 = 0x07;
 pub const MSG_CANCEL_SIGNAL: u8 = 0x08; // server -> client push (no request counterpart)
+pub const MSG_NOT_LEADER: u8 = 0x09; // server -> client: this node isn't leader; payload carries leader hint
+pub const MSG_AUTH_RESP: u8 = 0x85; // server -> client: auth result (payload = [status:1][role:1])
 
 // Management request types
 pub const MSG_MAINTENANCE: u8 = 0x10;
@@ -281,7 +284,7 @@ pub const BufReader = struct {
         return data;
     }
 
-    pub fn skip(self: *BufReader, n: u16) ParseError!void {
+    pub fn skip(self: *BufReader, n: usize) ParseError!void {
         if (self.pos + n > self.data.len) return error.ShortRead;
         self.pos += n;
     }

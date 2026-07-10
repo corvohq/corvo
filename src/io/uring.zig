@@ -17,7 +17,16 @@ const Config = io.Config;
 const Allocator = std.mem.Allocator;
 
 // ============================================================================
-// user_data encoding: [op:8][conn_id:16] packed into u64
+// user_data encoding: [generation:16][op:8][conn_id:16] packed into u64
+//
+// The generation guards against a stale CQE landing on a reused slot. When a
+// connection closes, ConnState.reset() bumps its generation and the LIFO free
+// list can hand the slot to a brand-new connection on the very next accept.
+// Recv/send/connect SQEs submitted for the old connection may still be in
+// flight; their CQEs carry the generation captured at submission time. On
+// completion we drop any CQE whose generation no longer matches the slot's
+// current generation — otherwise a late recv/send for the old connection would
+// be applied to the new one (cross-connection frame injection / wrong close).
 // ============================================================================
 
 const OP_ACCEPT: u8 = 1;
@@ -26,8 +35,8 @@ const OP_SEND: u8 = 3;
 const OP_CLOSE: u8 = 4;
 const OP_CONNECT: u8 = 5;
 
-fn encodeUserData(op: u8, conn_id: u16) u64 {
-    return (@as(u64, op) << 16) | @as(u64, conn_id);
+fn encodeUserData(op: u8, conn_id: u16, generation: u16) u64 {
+    return (@as(u64, generation) << 24) | (@as(u64, op) << 16) | @as(u64, conn_id);
 }
 
 fn decodeOp(user_data: u64) u8 {
@@ -36,6 +45,10 @@ fn decodeOp(user_data: u64) u8 {
 
 fn decodeConnId(user_data: u64) u16 {
     return @intCast(user_data & 0xFFFF);
+}
+
+fn decodeGen(user_data: u64) u16 {
+    return @intCast((user_data >> 24) & 0xFFFF);
 }
 
 // ============================================================================
@@ -182,6 +195,7 @@ pub const UringBackend = struct {
 
             const op = decodeOp(cqe.user_data);
             const conn_id = decodeConnId(cqe.user_data);
+            const gen = decodeGen(cqe.user_data);
 
             switch (op) {
                 OP_ACCEPT => {
@@ -211,6 +225,9 @@ pub const UringBackend = struct {
                     if (conn_id >= self.max_conns) continue;
                     const c = &self.conns[conn_id];
                     if (c.phase == .free) continue;
+                    // Drop a stale recv CQE for a slot that has since been
+                    // reused by a different connection (see encodeUserData).
+                    if (c.generation != gen) continue;
 
                     if (cqe.res <= 0) {
                         out[out_count] = .{ .conn_id = conn_id, .event = .closed };
@@ -228,6 +245,8 @@ pub const UringBackend = struct {
                     if (conn_id >= self.max_conns) continue;
                     const c = &self.conns[conn_id];
                     if (c.phase == .free) continue;
+                    // Drop a stale send CQE for a since-reused slot.
+                    if (c.generation != gen) continue;
 
                     if (cqe.res < 0) {
                         out[out_count] = .{ .conn_id = conn_id, .event = .closed };
@@ -251,6 +270,8 @@ pub const UringBackend = struct {
                     if (conn_id >= self.max_conns) continue;
                     const c = &self.conns[conn_id];
                     if (c.phase == .free) continue;
+                    // Drop a stale connect CQE for a since-reused slot.
+                    if (c.generation != gen) continue;
 
                     if (cqe.res < 0) {
                         out[out_count] = .{ .conn_id = conn_id, .event = .closed };
@@ -279,6 +300,19 @@ pub const UringBackend = struct {
         assert.check(len > 0, "queueSend: zero-length send on conn {d}", .{conn_id});
         assert.check(len <= c.send_buf.len, "queueSend: len {d} > buf size {d}", .{ len, c.send_buf.len });
 
+        // A send is already in flight. Callers append new bytes at the old
+        // send_len (a region the in-flight SQE is not transmitting) and grow
+        // send_len to `len`. Restarting from offset 0 would retransmit bytes
+        // the peer already received → duplicate frames on the wire and SDK
+        // framing desync (M4). Instead just extend send_len; when the in-flight
+        // send completes, queueSendInternal resumes from send_pos and ships the
+        // appended tail (it re-reads the now-larger send_len).
+        if (c.phase == .send_pending) {
+            assert.check(len >= c.send_len, "queueSend: in-flight send on conn {d} shrank ({d} < {d})", .{ conn_id, len, c.send_len });
+            c.send_len = len;
+            return;
+        }
+
         c.send_pos = 0;
         c.send_len = len;
         c.phase = .send_pending;
@@ -297,8 +331,10 @@ pub const UringBackend = struct {
 
     /// Queue accept on listen socket.
     pub fn queueAccept(self: *UringBackend) void {
+        // Accept targets no connection slot yet — generation is irrelevant and
+        // never checked for OP_ACCEPT.
         _ = self.ring.accept(
-            encodeUserData(OP_ACCEPT, 0),
+            encodeUserData(OP_ACCEPT, 0, 0),
             self.listen_fd,
             null,
             null,
@@ -336,7 +372,7 @@ pub const UringBackend = struct {
         assert.check(c.fd >= 0, "queueConnect: conn {d} has invalid fd", .{conn_id});
 
         _ = self.ring.connect(
-            encodeUserData(OP_CONNECT, conn_id),
+            encodeUserData(OP_CONNECT, conn_id, c.generation),
             c.fd,
             &addr.any,
             addr.getOsSockLen(),
@@ -373,7 +409,7 @@ pub const UringBackend = struct {
         assert.check(c.recv_pos < c.recv_buf.len, "queueRecvInternal: recv_buf full on conn {d}", .{conn_id});
 
         _ = self.ring.recv(
-            encodeUserData(OP_RECV, conn_id),
+            encodeUserData(OP_RECV, conn_id, c.generation),
             c.fd,
             .{ .buffer = c.recv_buf[c.recv_pos..] },
             0,
@@ -389,7 +425,7 @@ pub const UringBackend = struct {
         assert.check(c.send_pos < c.send_len, "queueSendInternal: nothing to send on conn {d}", .{conn_id});
 
         _ = self.ring.send(
-            encodeUserData(OP_SEND, conn_id),
+            encodeUserData(OP_SEND, conn_id, c.generation),
             c.fd,
             c.send_buf[c.send_pos..c.send_len],
             0,
@@ -420,7 +456,9 @@ pub const UringBackend = struct {
         self.freeConn(conn_id);
 
         if (fd >= 0) {
-            _ = self.ring.close(encodeUserData(OP_CLOSE, conn_id), fd) catch {
+            // OP_CLOSE completions are ignored (no state applied), so the
+            // generation is unused here.
+            _ = self.ring.close(encodeUserData(OP_CLOSE, conn_id, 0), fd) catch {
                 posix.close(fd);
             };
         }
@@ -442,24 +480,101 @@ pub const UringBackend = struct {
 // Tests
 // ============================================================================
 
-test "user_data encoding round-trips" {
+test "user_data encoding round-trips (op, conn_id, generation)" {
     const testing = std.testing;
 
-    const ud1 = encodeUserData(OP_ACCEPT, 0);
+    const ud1 = encodeUserData(OP_ACCEPT, 0, 0);
     try testing.expectEqual(OP_ACCEPT, decodeOp(ud1));
     try testing.expectEqual(@as(u16, 0), decodeConnId(ud1));
+    try testing.expectEqual(@as(u16, 0), decodeGen(ud1));
 
-    const ud2 = encodeUserData(OP_RECV, 42);
+    const ud2 = encodeUserData(OP_RECV, 42, 7);
     try testing.expectEqual(OP_RECV, decodeOp(ud2));
     try testing.expectEqual(@as(u16, 42), decodeConnId(ud2));
+    try testing.expectEqual(@as(u16, 7), decodeGen(ud2));
 
-    const ud3 = encodeUserData(OP_SEND, 4095);
+    const ud3 = encodeUserData(OP_SEND, 4095, 65535);
     try testing.expectEqual(OP_SEND, decodeOp(ud3));
     try testing.expectEqual(@as(u16, 4095), decodeConnId(ud3));
+    try testing.expectEqual(@as(u16, 65535), decodeGen(ud3));
 
-    const ud4 = encodeUserData(OP_CLOSE, 0xFFFF);
+    const ud4 = encodeUserData(OP_CLOSE, 0xFFFF, 0);
     try testing.expectEqual(OP_CLOSE, decodeOp(ud4));
     try testing.expectEqual(@as(u16, 0xFFFF), decodeConnId(ud4));
+
+    // conn_id, op, and generation occupy disjoint bit ranges — no cross-talk.
+    const ud5 = encodeUserData(OP_RECV, 0xABCD, 0x1234);
+    try testing.expectEqual(OP_RECV, decodeOp(ud5));
+    try testing.expectEqual(@as(u16, 0xABCD), decodeConnId(ud5));
+    try testing.expectEqual(@as(u16, 0x1234), decodeGen(ud5));
+}
+
+test "processCqes drops stale CQE with mismatched generation (M3)" {
+    const testing = std.testing;
+    // Loopback listener fd just so init() has a valid listen_fd.
+    const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(listen_fd);
+
+    var backend = UringBackend.init(testing.allocator, .{
+        .listen_fd = listen_fd,
+        .max_conns = 4,
+        .recv_buf_size = 256,
+        .send_buf_size = 256,
+    }) catch return; // skip if io_uring unavailable in the sandbox
+    defer backend.deinit(testing.allocator);
+
+    // Simulate an active connection on slot 1 at generation 5.
+    const c = &backend.conns[1];
+    c.fd = 100;
+    c.phase = .ready;
+    c.generation = 5;
+    c.recv_pos = 0;
+
+    var out: [4]Completion = undefined;
+
+    // Stale recv CQE carrying the OLD generation (4) must be dropped.
+    backend.cqe_buf[0] = .{ .user_data = encodeUserData(OP_RECV, 1, 4), .res = 10, .flags = 0 };
+    try testing.expectEqual(@as(u32, 0), backend.processCqes(&out, 1));
+    try testing.expectEqual(@as(u32, 0), c.recv_pos); // not advanced by stale data
+
+    // Matching generation (5) is delivered normally.
+    backend.cqe_buf[0] = .{ .user_data = encodeUserData(OP_RECV, 1, 5), .res = 10, .flags = 0 };
+    try testing.expectEqual(@as(u32, 1), backend.processCqes(&out, 1));
+    try testing.expectEqual(@as(u32, 10), c.recv_pos);
+    try testing.expectEqual(Completion.Event.recv, out[0].event);
+
+    c.fd = -1; // avoid deinit closing a bogus fd
+    c.phase = .free;
+}
+
+test "queueSend does not restart an in-flight send (M4)" {
+    const testing = std.testing;
+    const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(listen_fd);
+
+    var backend = UringBackend.init(testing.allocator, .{
+        .listen_fd = listen_fd,
+        .max_conns = 4,
+        .recv_buf_size = 256,
+        .send_buf_size = 256,
+    }) catch return; // skip if io_uring unavailable
+    defer backend.deinit(testing.allocator);
+
+    const c = &backend.conns[2];
+    c.fd = 100;
+    c.phase = .send_pending; // a send is already in flight
+    c.send_pos = 30; // 30 bytes already acked by the peer
+    c.send_len = 100;
+
+    // A second queueSend (more data appended, send_len grown to 150) must NOT
+    // rewind send_pos to 0 — that would retransmit the first 30 bytes.
+    backend.queueSend(2, 150);
+    try testing.expectEqual(@as(u32, 30), c.send_pos); // unchanged
+    try testing.expectEqual(@as(u32, 150), c.send_len); // extended
+    try testing.expectEqual(ConnState.Phase.send_pending, c.phase);
+
+    c.fd = -1;
+    c.phase = .free;
 }
 
 test "ConnState reset clears subscription fields" {

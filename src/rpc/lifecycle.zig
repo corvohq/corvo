@@ -277,11 +277,14 @@ pub fn encodeFetchResp(writer: *BufWriter, result: *const ops_mod.OpResult, payl
         var payload_buf: [65536]u8 = undefined;
         const payload = payload_fn(job_id, &payload_buf);
         if (payload) |p| {
-            assert.check(p.len <= 65535, "encodeFetchResp: payload too large ({d} > 65535)", .{p.len});
-            writer.writeU16(@intCast(p.len));
+            // Payload length is a u32 to match pipeline.encodeFetchResult (a
+            // u16 field panicked on legal >64 KiB payloads). This callback's
+            // scratch buffer bounds what it can carry.
+            assert.check(p.len <= payload_buf.len, "encodeFetchResp: payload exceeds scratch buffer ({d} > {d})", .{ p.len, payload_buf.len });
+            writer.writeU32(@intCast(p.len));
             writer.writeBytes(p);
         } else {
-            writer.writeU16(0);
+            writer.writeU32(0);
         }
 
         writer.writeU64(fetched.lease_token);

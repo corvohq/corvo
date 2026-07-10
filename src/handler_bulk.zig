@@ -26,6 +26,18 @@ const BatchMod = struct {
 };
 
 pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkActionOp) ops.OpResult {
+    // Bulk move requires an existing destination queue. Moving jobs into a queue
+    // with no config/name key strands them: fetch's getQueueConfig returns null
+    // and skips the queue, so the jobs are never claimable. Validate once, up
+    // front (client-provided target → error, not silent stranding).
+    if (op.action == .move) {
+        const move_to = op.move_to_queue orelse return .{ .err = "missing target queue" };
+        var qn_buf: keys.KeyBuf = undefined;
+        if (b.get(keys.queueNameKey(&qn_buf, move_to)) == null) {
+            return .{ .err = "target queue not found" };
+        }
+    }
+
     var affected: u32 = 0;
 
     // Track batch counter adjustments for delete/cancel.
@@ -150,6 +162,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                     keys.prefixEnd(&jee_buf, keys.jobErrorPrefix(&jep_buf, job_id)) orelse "",
                 );
                 self.recordBulkResult(job_id, .delete, "", "", op.now_ns);
+                self.total_jobs -|= 1;
                 affected += 1;
                 continue; // skip job write — it's deleted
             },
@@ -254,8 +267,15 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 }
                 // Delete tag indexes with old queue, then update queue, then rewrite
                 OpHandler.deleteTagIndexes(b, &job);
+                const old_queue = job.queue;
                 job.queue = move_to;
                 OpHandler.writeTagIndexes(b, &job);
+                // Update queue counters: decrement old queue, increment new queue.
+                self.decrQueueCounter(b, old_queue, job.state);
+                self.incrQueueCounter(b, move_to, job.state);
+                // Transition read indexes: delete old queue's jq|/jqs|, write new queue's.
+                OpHandler.deleteQueueReadIndexes(b, old_queue, &job);
+                OpHandler.writeQueueReadIndexes(b, &job);
                 self.recordBulkResult(job_id, .move, "pending", move_to, op.now_ns);
             },
 

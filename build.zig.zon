@@ -5,12 +5,16 @@
     .minimum_zig_version = "0.14.0",
     .dependencies = .{
         .@"talon-zig" = .{
-            .url = "git+https://github.com/corvohq/talon.git#v0.3.0",
-            .hash = "talon_zig-0.1.0-iuh4zuVIAgAEDpdDDmbEWwsev2N2-aZGPpa6KXrnh2TJ",
+            .url = "git+https://github.com/corvohq/talon.git#v0.4.0",
+            .hash = "talon_zig-0.1.0-iuh4zty0AgCdtYmCLYUTAvDFfUEVGEYaC2d2qWYKAUtl",
         },
         .zigstache = .{
             .url = "git+https://github.com/corvohq/zigstache.git#v0.1.0",
             .hash = "zigstache-0.1.0-rNuhg962AAAfQbLK7Jft7YfDRB0JOgjhvm2kbx0R3sUj",
+        },
+        .@"zig-raft" = .{
+            .url = "git+https://github.com/corvohq/zig-raft.git#v0.1.0",
+            .hash = "zig_raft-0.1.0-dNHn33T3BAAnUOj7oEJVNbUzgCl95PiaEusdMYNE3xml",
         },
     },
     .paths = .{

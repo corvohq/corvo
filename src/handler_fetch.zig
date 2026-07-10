@@ -16,6 +16,20 @@ const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
 const pending_index_mod = @import("pending_index.zig");
 
+/// Wire size of one job in the RPC fetch response. MUST match the layout
+/// pipeline.encodeFetchResult writes per job, whose actual field sizes are:
+///   1+id, 1+queue (both u8-length-prefixed), 2 attempt, 2 max_retries,
+///   1 checkpoint-len, 1 tags-len, 4 payload-len (u32), payload bytes,
+///   8 lease_token.
+/// Fixed overhead = 1+1+2+2+1+1+4+8 = 20 bytes. (The old comment mis-stated
+/// 2-byte id/queue prefixes and a 2-byte payload length; the u8 id/queue
+/// prefixes offset the u32 payload length exactly, so the total is still 20 —
+/// verified against encodeFetchResult, not the stale comment. This estimate is
+/// therefore EXACT, so fulfillSubscriptions no longer needs a slack margin.)
+pub fn fetchedJobWireSize(id_len: usize, queue_len: usize, payload_len: usize) usize {
+    return 20 + id_len + queue_len + payload_len;
+}
+
 pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) ops.OpResult {
     if (op.count == 0) return .{ .err = "invalid fetch count: 0" };
 
@@ -24,6 +38,9 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
     const max_fetch: u32 = @min(op.count, ops.OpResult.max_inline_fetch);
 
     var result: ops.OpResult = .{};
+    // Running total of encoded response bytes, shared across queues so a
+    // multi-queue fetch also respects the caller's send-buffer budget.
+    var bytes_used: usize = 0;
     const has_global_rl = self.global_rate_limit > 0 and self.global_rate_window_ms > 0;
 
     // Global rate limit check — applies across all queues.
@@ -39,9 +56,11 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
         );
         defer gl_iter.close();
         var gl_count: u32 = 0;
+        // Stop counting once the limit is reached — the exact overage is
+        // irrelevant, only whether we're at/over the cap (M13 scan cost).
         if (gl_iter.first()) {
             gl_count += 1;
-            while (gl_iter.next()) gl_count += 1;
+            while (gl_count < self.global_rate_limit and gl_iter.next()) gl_count += 1;
         }
         if (gl_count >= self.global_rate_limit) return result;
     }
@@ -55,7 +74,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
 
         // Check concurrency limit
         if (queue.max_concurrency > 0) {
-            if (self.getActiveCount(queue.name) >= @as(i32, @intCast(queue.max_concurrency))) continue;
+            if (self.getActiveCount(queue_name) >= @as(i32, @intCast(queue.max_concurrency))) continue;
         }
 
         // Check per-queue rate limit
@@ -71,9 +90,10 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             );
             defer rl_iter.close();
             var rate_count: u32 = 0;
+            // Stop once the limit is reached (M13 scan cost).
             if (rl_iter.first()) {
                 rate_count += 1;
-                while (rl_iter.next()) rate_count += 1;
+                while (rate_count < queue.rate_limit and rl_iter.next()) rate_count += 1;
             }
             if (rate_count >= queue.rate_limit) continue;
         }
@@ -84,7 +104,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
         // Separate from the normal pop loop to avoid any overhead on non-fairness queues.
         if (queue.fairness) {
             var fairness_budget: u32 = @max((@min(op.count, ops.OpResult.max_inline_fetch) - result.affected) * 2, 64);
-            fetchWithFairness(self, b, &result, queue_name, &fairness_budget, max_fetch, lease_expires_ns, lease_duration_ms, op, has_rl, has_global_rl, queue.max_concurrency);
+            fetchWithFairness(self, b, &result, queue_name, &fairness_budget, max_fetch, lease_expires_ns, lease_duration_ms, op, has_rl, has_global_rl, queue.max_concurrency, &bytes_used);
             continue; // next queue
         }
 
@@ -105,6 +125,32 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
 
             var job = codec.decodeJob(job_bytes.?);
             if (job.state != .pending) continue; // No longer pending — stale.
+            // Bulk-move pushes the job into the destination queue's index but
+            // leaves a stale entry in the source queue's index. Validate the
+            // job still belongs to THIS queue, else claiming it here writes the
+            // active key + concurrency counter under mismatched queues (corrupts
+            // active counts, panics on ack). Drop the stale entry.
+            if (!std.mem.eql(u8, job.queue, queue_name)) continue;
+
+            // Read the payload once, here, for both the send-buffer budget check
+            // and the response (the pipeline reuses this slice, avoiding a second
+            // read). Stop before the encoded response would overflow the caller's
+            // send buffer. The FIRST job (bytes_used == 0) is always admitted:
+            // fulfillSubscriptions only calls us for a connection whose free send
+            // buffer already fits one max-size job, so max_response_bytes bounds
+            // one such job — asserted below. Jobs left unclaimed stay pending for
+            // the next push — no loss.
+            var pk_buf: keys.KeyBuf = undefined;
+            const payload_slice: []const u8 = b.get(keys.jobPayloadKey(&pk_buf, job_id)) orelse "";
+            if (op.max_response_bytes > 0) {
+                const need = fetchedJobWireSize(job_id.len, queue_name.len, payload_slice.len);
+                if (bytes_used == 0) {
+                    assert.check(need <= op.max_response_bytes, "fetch: first job ({d}B) exceeds budget ({d}B) — caller must guarantee room for one max job", .{ need, op.max_response_bytes });
+                } else if (bytes_used + need > op.max_response_bytes) {
+                    self.pending.push(queue_name, job.priority, job.created_at_ns, job_id);
+                    break;
+                }
+            }
 
             // Claim the job.
             self.lease_counter += 1;
@@ -134,6 +180,11 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             b.set(OpHandler.jobActiveKey(&ak_buf, &job), &lease_val);
 
             self.incrActiveCount(queue_name);
+            assert.check(
+                queue.max_concurrency == 0 or self.getActiveCount(queue_name) <= @as(i32, @intCast(queue.max_concurrency)),
+                "fetch: active_count ({d}) exceeded max_concurrency ({d}) for queue after incrActiveCount",
+                .{ self.getActiveCount(queue_name), queue.max_concurrency },
+            );
 
             // Re-check concurrency after claiming — prevents overshooting when
             // prefetch > max_concurrency (the outer loop only checks once per queue).
@@ -145,14 +196,19 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
                 self.incrFairnessServed(queue_name, g);
             }
 
-            // Write rate limit entries.
+            // Write rate limit entries. Disambiguate with lease_counter (the
+            // just-assigned lease token), which is monotonic and unique per
+            // claim across the whole process. The old `random_seed +% affected`
+            // collided when two fetch ops ran in one tick with equal seeds (e.g.
+            // fulfillSubscriptions, where random_seed is 0), causing the window
+            // to undercount claims and the rate limit to be bypassed (M13).
             if (has_rl) {
                 var rlk_buf: keys.KeyBuf = undefined;
-                b.set(keys.rateLimitKey(&rlk_buf, queue_name, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected))), "");
+                b.set(keys.rateLimitKey(&rlk_buf, queue_name, op.now_ns, self.lease_counter), "");
             }
             if (has_global_rl) {
                 var gl_rlk_buf: keys.KeyBuf = undefined;
-                b.set(keys.globalRateLimitKey(&gl_rlk_buf, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected)) +% 0x80000000), "");
+                b.set(keys.globalRateLimitKey(&gl_rlk_buf, op.now_ns, self.lease_counter), "");
             }
             self.indexer.recordTransition(job_id, queue_name, .pending, .active, job.created_at_ns);
             self.updateQueueCounterMem(queue_name, .pending, .active);
@@ -171,6 +227,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             f.max_retries = job.max_retries;
             f.lease_duration_ms = lease_duration_ms;
             f.lease_token = job.lease_token;
+            bytes_used += fetchedJobWireSize(job_id.len, queue_name.len, payload_slice.len);
             result.affected += 1;
             if (conc_reached) break;
         }
@@ -225,6 +282,7 @@ fn fetchWithFairness(
     has_rl: bool,
     has_global_rl: bool,
     max_concurrency: u32,
+    bytes_used: *usize,
 ) void {
     const max_candidates: u32 = 16;
 
@@ -248,6 +306,8 @@ fn fetchWithFairness(
             if (job_bytes == null) continue;
             const job = codec.decodeJob(job_bytes.?);
             if (job.state != .pending) continue;
+            // Stale entry from a bulk-move into another queue (see non-fairness path).
+            if (!std.mem.eql(u8, job.queue, queue_name)) continue;
 
             assert.check(num_candidates < max_candidates, "fetch-fairness: num_candidates ({d}) >= max_candidates", .{num_candidates});
             candidates[num_candidates] = entry;
@@ -299,6 +359,23 @@ fn fetchWithFairness(
         assert.check(job_bytes != null, "fairness: validated job disappeared", .{});
         var job = codec.decodeJob(job_bytes.?);
 
+        // Send-buffer budget (see non-fairness path). Read payload once for both
+        // the check and the response. If the selected job won't fit, re-push it
+        // and stop — it stays pending for the next push.
+        var pk_buf: keys.KeyBuf = undefined;
+        const payload_slice: []const u8 = b.get(keys.jobPayloadKey(&pk_buf, sel_job_id)) orelse "";
+        if (op.max_response_bytes > 0) {
+            const need = fetchedJobWireSize(sel_job_id.len, queue_name.len, payload_slice.len);
+            // First job is always admitted (see non-fairness path): the caller
+            // guarantees room for one max-size job.
+            if (bytes_used.* == 0) {
+                assert.check(need <= op.max_response_bytes, "fetch-fairness: first job ({d}B) exceeds budget ({d}B) — caller must guarantee room for one max job", .{ need, op.max_response_bytes });
+            } else if (bytes_used.* + need > op.max_response_bytes) {
+                self.pending.push(queue_name, 255 - candidates[best_idx].inv_priority, candidates[best_idx].created_ns, sel_job_id);
+                break;
+            }
+        }
+
         self.lease_counter += 1;
         job.state = .active;
         job.worker_id = op.worker_id;
@@ -323,6 +400,11 @@ fn fetchWithFairness(
         b.set(OpHandler.jobActiveKey(&ak_buf, &job), &lease_val);
 
         self.incrActiveCount(queue_name);
+        assert.check(
+            max_concurrency == 0 or self.getActiveCount(queue_name) <= @as(i32, @intCast(max_concurrency)),
+            "fetch-fairness: active_count ({d}) exceeded max_concurrency ({d}) for queue after incrActiveCount",
+            .{ self.getActiveCount(queue_name), max_concurrency },
+        );
 
         // Re-check concurrency after claiming — prevents overshooting when
         // prefetch > max_concurrency (the outer loop only checks once per queue).
@@ -334,13 +416,16 @@ fn fetchWithFairness(
             self.incrFairnessServed(queue_name, g);
         }
 
+        // See non-fairness path: lease_counter is unique per claim, avoiding the
+        // random_seed collision that let two same-tick fetches undercount the
+        // rate-limit window (M13).
         if (has_rl) {
             var rlk_buf: keys.KeyBuf = undefined;
-            b.set(keys.rateLimitKey(&rlk_buf, queue_name, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected))), "");
+            b.set(keys.rateLimitKey(&rlk_buf, queue_name, op.now_ns, self.lease_counter), "");
         }
         if (has_global_rl) {
             var gl_rlk_buf: keys.KeyBuf = undefined;
-            b.set(keys.globalRateLimitKey(&gl_rlk_buf, op.now_ns, op.random_seed +% @as(u32, @intCast(result.affected)) +% 0x80000000), "");
+            b.set(keys.globalRateLimitKey(&gl_rlk_buf, op.now_ns, self.lease_counter), "");
         }
         self.indexer.recordTransition(sel_job_id, queue_name, .pending, .active, job.created_at_ns);
         self.updateQueueCounterMem(queue_name, .pending, .active);
@@ -358,6 +443,7 @@ fn fetchWithFairness(
         f.max_retries = job.max_retries;
         f.lease_duration_ms = lease_duration_ms;
         f.lease_token = job.lease_token;
+        bytes_used.* += fetchedJobWireSize(sel_job_id.len, queue_name.len, payload_slice.len);
         result.affected += 1;
         if (conc_reached) break;
     }

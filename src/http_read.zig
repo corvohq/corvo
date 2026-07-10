@@ -12,19 +12,19 @@ const http_ui = @import("http_ui.zig");
 const metrics_mod = @import("metrics.zig");
 const version = @import("version.zig");
 
-/// Cluster info for /cluster/status. Set by main.zig after election.
+/// Cluster info for /cluster/status. Set by main.zig at raft startup.
+/// is_leader points at the RaftHost's atomic — the raft thread owns it,
+/// reads here are lock-free.
 pub const ClusterInfo = struct {
     node_id: []const u8,
     is_leader: *const std.atomic.Value(bool),
-    election: *@import("election.zig").Election,
-    events: *metrics_mod.ClusterEventRing,
-    peer_count: u32,
+    peer_count: u8,
 };
 
 pub var g_cluster_info: ?*const ClusterInfo = null;
 pub var g_admin_password: []const u8 = "";
 pub var g_config: ?*const @import("config.zig").ServerConfig = null;
-pub var g_cluster_node: ?*@import("cluster.zig").ClusterNode = null;
+pub var g_raft_host: ?*@import("raft_host.zig").RaftHost = null;
 const ui_embed = @import("ui_embed");
 
 
@@ -81,8 +81,6 @@ pub fn dispatch(
         return authStatus(send_buf);
     if (std.mem.eql(u8, api, "/auth/login") and method == .POST)
         return handleLogin(send_buf, body);
-    if (std.mem.eql(u8, api, "/cluster/join") and method == .POST)
-        return handleClusterJoin(send_buf, body);
 
     // Backup/restore endpoints.
     if (std.mem.eql(u8, api, "/backup") and method == .POST)
@@ -152,14 +150,11 @@ fn serverInfo(send_buf: []u8) u32 {
         w.fieldInt("max_jobs", @as(i64, cfg.max_jobs));
         w.fieldInt("max_tags_per_queue", @as(i64, cfg.max_tags_per_queue));
         w.fieldBool("persist_completed", cfg.persist_completed);
-        w.fieldBool("sync_replication", cfg.sync_replication);
         w.fieldBool("cluster_mode", cfg.clusterMode());
         w.fieldBool("admin_password_set", cfg.admin_password.len > 0);
         w.fieldInt("purge_threshold", @as(i64, cfg.purge_threshold));
         w.fieldInt("purge_retention_ns", @as(i64, @intCast(cfg.purge_retention_ns)));
         w.fieldInt("worker_timeout_ns", @as(i64, @intCast(cfg.worker_timeout_ns)));
-        if (cfg.discover_dns_name.len > 0)
-            w.fieldStr("discover_dns_name", cfg.discover_dns_name);
         if (cfg.node_id.len > 0)
             w.fieldStr("node_id", cfg.node_id);
         if (cfg.peers.len > 0)
@@ -195,7 +190,7 @@ fn handleLogin(send_buf: []u8, body: []const u8) u32 {
     var decoded_buf: [256]u8 = undefined;
     const decoded = percentDecode(password, &decoded_buf);
 
-    if (!std.mem.eql(u8, decoded, g_admin_password))
+    if (!http.constantTimeEql(decoded, g_admin_password))
         return http.writeRedirect(send_buf, "/ui/login?error=1");
 
     // Valid — set session cookie and redirect to dashboard.
@@ -250,51 +245,6 @@ fn hexDigit(c: u8) ?u4 {
     if (c >= 'a' and c <= 'f') return @intCast(c - 'a' + 10);
     if (c >= 'A' and c <= 'F') return @intCast(c - 'A' + 10);
     return null;
-}
-
-// ============================================================================
-// Cluster join
-// ============================================================================
-
-fn handleClusterJoin(send_buf: []u8, body: []const u8) u32 {
-    const cn = g_cluster_node orelse
-        return writeError(send_buf, 400, "not in cluster mode");
-
-    if (!cn.isLeader()) {
-        const state = cn.election.currentState();
-        var body_buf: [256]u8 = undefined;
-        var w = json.JsonWriter.init(&body_buf);
-        w.beginObject();
-        w.fieldStr("error", "not leader");
-        w.fieldStr("leader_id", state.leader_id);
-        w.endObject();
-        return http.writeResponse(send_buf, 409, w.getWritten());
-    }
-
-    const node_id = http.extractJSONString(body, "node_id") orelse
-        return writeError(send_buf, 400, "missing node_id");
-    const addr_str = http.extractJSONString(body, "addr") orelse
-        return writeError(send_buf, 400, "missing addr");
-
-    // Parse addr as host:port.
-    const colon = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse
-        return writeError(send_buf, 400, "invalid addr format");
-    const host = addr_str[0..colon];
-    const port = std.fmt.parseInt(u16, addr_str[colon + 1 ..], 10) catch
-        return writeError(send_buf, 400, "invalid addr port");
-    const addr = std.net.Address.parseIp(host, port) catch
-        return writeError(send_buf, 400, "invalid addr IP");
-
-    cn.addPeer(node_id, addr);
-
-    var resp_buf: [256]u8 = undefined;
-    var w = json.JsonWriter.init(&resp_buf);
-    w.beginObject();
-    w.fieldStr("status", "ok");
-    w.fieldStr("node_id", node_id);
-    w.fieldStr("leader_id", cn.config.node_id);
-    w.endObject();
-    return http.writeResponse(send_buf, 200, w.getWritten());
 }
 
 // ============================================================================
@@ -355,26 +305,17 @@ pub fn metrics(send_buf: []u8, reader: ?*kv_read.Reader, server_metrics: ?*const
 
     // Cluster metrics gauges.
     if (g_cluster_info) |ci| {
-        const es = ci.election.currentState();
-        const state_val: u8 = @intFromEnum(es.state);
-        const now_i: i64 = @intCast(@as(i128, std.time.nanoTimestamp()));
-        const lease_valid: u8 = if (ci.election.leaseValid(now_i)) 1 else 0;
+        const state_val: u8 = if (ci.is_leader.load(.acquire)) 2 else 0;
 
         pos += (std.fmt.bufPrint(
             body_buf[pos..],
-            "# HELP corvo_cluster_state Node role (0=follower, 1=candidate, 2=leader)\n" ++
+            "# HELP corvo_cluster_state Node role (0=follower, 2=leader)\n" ++
                 "# TYPE corvo_cluster_state gauge\n" ++
                 "corvo_cluster_state {d}\n" ++
-                "# HELP corvo_cluster_epoch Current election epoch\n" ++
-                "# TYPE corvo_cluster_epoch gauge\n" ++
-                "corvo_cluster_epoch {d}\n" ++
-                "# HELP corvo_cluster_lease_valid Whether leader lease is valid (1=yes, 0=no)\n" ++
-                "# TYPE corvo_cluster_lease_valid gauge\n" ++
-                "corvo_cluster_lease_valid {d}\n" ++
                 "# HELP corvo_cluster_peers_total Number of cluster peers\n" ++
                 "# TYPE corvo_cluster_peers_total gauge\n" ++
                 "corvo_cluster_peers_total {d}\n",
-            .{ state_val, es.epoch, lease_valid, ci.peer_count },
+            .{ state_val, ci.peer_count },
         ) catch &[0]u8{}).len;
     }
 
@@ -396,68 +337,33 @@ fn clusterStatus(send_buf: []u8) u32 {
         return http.writeResponse(send_buf, 200, w.getWritten());
     };
 
-    const es = ci.election.currentState();
-    const state_str = switch (es.state) {
-        .leader => "leader",
-        .follower => "follower",
-        .candidate => "candidate",
-    };
+    const is_leader = ci.is_leader.load(.acquire);
+    const state_str = if (is_leader) "leader" else "follower";
 
     w.beginObject();
     w.fieldStr("mode", "cluster");
     w.fieldStr("status", "healthy");
     w.fieldStr("state", state_str);
     w.fieldStr("node_id", ci.node_id);
-    w.fieldStr("leader", es.leader_id);
-    w.fieldInt("epoch", es.epoch);
-
-    // Expose peer endpoints so Console can auto-discover all nodes.
-    if (g_cluster_node) |cn| {
-        w.beginArrayField("peers");
-        for (cn.config.peer_ids, cn.config.peer_addrs) |pid, addr| {
-            var addr_buf: [64]u8 = undefined;
-            // Expose HTTP port (cluster port - 1000).
-            var http_addr = addr;
-            http_addr.setPort(addr.getPort() -| 1000);
-            const addr_str = std.fmt.bufPrint(&addr_buf, "{any}", .{http_addr}) catch continue;
-            w.beginObject();
-            w.fieldStr("id", pid);
-            w.fieldStr("addr", addr_str);
-            w.endObject();
-        }
-        w.endArray();
-    }
-
+    // Leader identity is not plumbed out of the raft host yet; a follower
+    // reports only its own role. SDKs redial their peer set on
+    // MSG_NOT_LEADER, and operators read state per node.
+    w.fieldStr("leader", if (is_leader) ci.node_id else "");
+    w.fieldInt("peer_count", ci.peer_count);
     w.endObject();
     return http.writeResponse(send_buf, 200, w.getWritten());
 }
 
 
 fn clusterEvents(send_buf: []u8) u32 {
-    var body_buf: [8192]u8 = undefined;
+    // Raft leadership events are not surfaced yet (the PBR event ring's
+    // producer was removed with the PBR stack). Keep the endpoint shape so
+    // UI/Console clients don't break; events return once the raft host
+    // publishes transitions.
+    var body_buf: [256]u8 = undefined;
     var w = json.JsonWriter.init(&body_buf);
-
     w.beginObject();
     w.beginArrayField("events");
-
-    const ci = g_cluster_info orelse {
-        w.endArray();
-        w.endObject();
-        return http.writeResponse(send_buf, 200, w.getWritten());
-    };
-
-    var event_buf: [64]metrics_mod.ClusterEvent = undefined;
-    const count = ci.events.snapshot(&event_buf);
-    for (0..count) |i| {
-        const ev = &event_buf[i];
-        w.beginObject();
-        w.fieldStr("type", ev.typeStr());
-        w.fieldInt("epoch", ev.epoch);
-        w.fieldInt("timestamp_ns", ev.timestamp_ns);
-        if (ev.detail_len > 0) w.fieldStr("detail", ev.detailSlice());
-        w.endObject();
-    }
-
     w.endArray();
     w.endObject();
     return http.writeResponse(send_buf, 200, w.getWritten());

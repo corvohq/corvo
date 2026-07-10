@@ -11,6 +11,7 @@ const kv = @import("kv.zig");
 const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
 const handler_fail = @import("handler_fail.zig");
+const handler_cron = @import("handler_cron.zig");
 
 // Chain step sentinel values (matching handler_ack.zig / handler_fail.zig).
 const chain_step_max: u16 = 0xFFFD;
@@ -25,6 +26,7 @@ pub fn applyMaintenance(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Main
         .rate_limit => applyCleanRateLimit(b, op.cutoff_ns),
         .workers => applyCleanWorkers(b, op.cutoff_ns),
         .batches => applyCleanBatches(b, op.cutoff_ns),
+        .cron => handler_cron.applyCronScan(self, b, op.now_ns),
     };
 }
 
@@ -47,6 +49,9 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
             if (iter.first()) {
                 while (true) {
+                    // Cap per-tick promote to avoid an unbounded scan stalling
+                    // the pipeline thread (and to bound work like reclaim/expire).
+                    if (self.bulk_result_count >= OpHandler.max_bulk_results - 1) break;
                     const key = iter.key();
                     const scheduled_ns = extractTimestampFromScheduledKey(key);
                     if (scheduled_ns > now_ns) {
@@ -98,6 +103,9 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
             if (iter.first()) {
                 while (true) {
+                    // Cap per-tick promote to avoid an unbounded scan stalling
+                    // the pipeline thread (and to bound work like reclaim/expire).
+                    if (self.bulk_result_count >= OpHandler.max_bulk_results - 1) break;
                     const key = iter.key();
                     const retry_ns = extractTimestampFromScheduledKey(key);
                     if (retry_ns > now_ns) {
@@ -209,8 +217,12 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     }
                 }
 
-                if (job.max_retries > 0 and job.attempt >= job.max_retries) {
-                    // Dead — retries exhausted
+                if (job.attempt >= job.max_retries) {
+                    // Dead — retries exhausted. max_retries==0 means "no retries"
+                    // (dead on first failure), matching handler_fail's semantics.
+                    // The old `max_retries > 0` guard made reclaim treat 0 as
+                    // unlimited, so a lease-expired no-retry job looped forever
+                    // back to pending instead of dying (minor).
                     job.state = .dead;
                     job.completed_at_ns = now_ns;
                     job.failed_at_ns = now_ns;
@@ -229,6 +241,12 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
                     var dk_buf: keys.KeyBuf = undefined;
                     b.set(keys.deadKey(&dk_buf, now_ns, job_id), "");
+                    self.dead_since_purge += 1;
+
+                    // Fire death webhook (reclaim dead was missing this — a job
+                    // that dies via lease expiry now notifies the same as one
+                    // that dies via an explicit fail).
+                    self.checkWebhooks(job_id, job.queue, .dead, now_ns);
 
                     // Batch failure tracking.
                     if (job.batch_id) |bid| {
@@ -300,10 +318,11 @@ fn applyExpire(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                 const key = iter.key();
                 const prefix_len = keys.prefix_expire.len;
                 const expires_at = keys.getU64BE(key[prefix_len .. prefix_len + 8]);
-                if (expires_at >= now_ns) {
-                    if (!iter.next()) break;
-                    continue;
-                }
+                // x| keys are globally sorted by expires_at (timestamp follows
+                // the prefix directly), so the first not-yet-expired key means
+                // every remaining key is also in the future — stop scanning
+                // instead of walking the whole index each tick (M12).
+                if (expires_at >= now_ns) break;
 
                 const job_id = key[prefix_len + 8 ..];
                 var jk_buf: keys.KeyBuf = undefined;
@@ -355,6 +374,9 @@ fn applyExpire(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                 self.verifyJobIndexes(b, &job, "expire");
                 var dk_buf: keys.KeyBuf = undefined;
                 b.set(keys.deadKey(&dk_buf, now_ns, job_id), "");
+                self.dead_since_purge += 1;
+                // Fire death webhook — expiry to dead was missing this.
+                self.checkWebhooks(job_id, job.queue, .dead, now_ns);
                 self.recordBulkResult(job_id, .update_state, "dead", "", now_ns);
 
                 affected += 1;
@@ -383,6 +405,12 @@ fn applyPurge(self: *OpHandler, b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult 
 
         if (iter.first()) {
             while (true) {
+                // Cap per-tick purge. A large backlog (e.g. millions of terminal
+                // jobs crossing the retention cutoff at once) would otherwise
+                // delete everything in a single batch, stalling the pipeline
+                // thread for seconds and freezing all connections. The remainder
+                // is drained on subsequent ticks / count-triggered runs.
+                if (affected >= OpHandler.max_bulk_results) break;
                 const key = iter.key();
                 const prefix_len = keys.prefix_dead.len;
                 const completed_at = keys.getU64BE(key[prefix_len .. prefix_len + 8]);

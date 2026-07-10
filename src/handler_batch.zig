@@ -12,6 +12,16 @@ const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
 
 pub fn applyBatchCreate(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.CreateBatchOp) ops.OpResult {
+    // Reject a duplicate batch id (client-provided data → error, not a silent
+    // overwrite). Overwriting reset the counters of an in-flight batch, which
+    // later underflowed and tripped an assert-panic in adjustBatchForDeletedJob
+    // / applyBatchMods when its jobs completed. TigerStyle: boundary data is an
+    // error, not an assert.
+    var dup_bk_buf: keys.KeyBuf = undefined;
+    if (b.get(keys.batchKey(&dup_bk_buf, op.batch_id)) != null) {
+        return .{ .err = "batch already exists" };
+    }
+
     var batch = types.Batch{
         .id = op.batch_id,
         .open = true,
