@@ -2,7 +2,6 @@
 //! Ported from Go internal/ops/ops_ack_fail.go (fail portion).
 
 const std = @import("std");
-const assert = @import("assert.zig");
 const types = @import("types.zig");
 const ops = @import("ops.zig");
 const keys = @import("keys.zig");
@@ -18,6 +17,20 @@ const chain_step_max: u16 = 0xFFFD;
 
 pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops.OpResult {
     if (op.jobs.len == 0) return .{ .err = "no jobs provided" };
+    for (op.jobs) |*fail_job| {
+        if (fail_job.job_id.len == 0 or fail_job.job_id.len > types.max_job_id_len or
+            std.mem.indexOfScalar(u8, fail_job.job_id, 0) != null)
+            return .{ .err = "invalid fail job_id" };
+        if (fail_job.queue.len > types.max_queue_name_len or
+            std.mem.indexOfScalar(u8, fail_job.queue, 0) != null)
+            return .{ .err = "invalid fail queue" };
+        if (fail_job.error_msg.len > types.max_metadata_field_len)
+            return .{ .err = "fail message too large" };
+        if (fail_job.backtrace) |backtrace| {
+            if (backtrace.len > types.max_metadata_field_len)
+                return .{ .err = "fail backtrace too large" };
+        }
+    }
 
     var affected: u32 = 0;
 
@@ -44,21 +57,21 @@ pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops
         // Write job error to KV: je|{job_id}\x00{attempt:4BE} → error JSON.
         {
             var ek_buf: keys.KeyBuf = undefined;
-            var err_val_buf: [1024]u8 = undefined;
+            var err_val_buf: [8192]u8 = undefined;
             const bt = fail_job.backtrace orelse "";
             const err_json = if (bt.len > 0)
-                std.fmt.bufPrint(&err_val_buf, "{{\"job_id\":\"{s}\",\"attempt\":{d},\"error\":\"{s}\",\"backtrace\":\"{s}\",\"created_at_ns\":{d}}}", .{
-                    fail_job.job_id,
+                std.fmt.bufPrint(&err_val_buf, "{{\"job_id\":{f},\"attempt\":{d},\"error\":{f},\"backtrace\":{f},\"created_at_ns\":{d}}}", .{
+                    std.json.fmt(fail_job.job_id, .{}),
                     job.attempt,
-                    fail_job.error_msg,
-                    bt,
+                    std.json.fmt(fail_job.error_msg, .{}),
+                    std.json.fmt(bt, .{}),
                     op.now_ns,
                 }) catch ""
             else
-                std.fmt.bufPrint(&err_val_buf, "{{\"job_id\":\"{s}\",\"attempt\":{d},\"error\":\"{s}\",\"created_at_ns\":{d}}}", .{
-                    fail_job.job_id,
+                std.fmt.bufPrint(&err_val_buf, "{{\"job_id\":{f},\"attempt\":{d},\"error\":{f},\"created_at_ns\":{d}}}", .{
+                    std.json.fmt(fail_job.job_id, .{}),
                     job.attempt,
-                    fail_job.error_msg,
+                    std.json.fmt(fail_job.error_msg, .{}),
                     op.now_ns,
                 }) catch "";
             if (err_json.len > 0) {
@@ -162,7 +175,10 @@ pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops
         affected += 1;
     }
 
-    return .{ .affected = affected };
+    return .{
+        .affected = affected,
+        .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
+    };
 }
 
 /// Fire chain on_failure handler when a job goes dead.
@@ -190,12 +206,10 @@ pub fn fireChainOnFailure(self: *OpHandler, b: *kv.WriteBatch, job: *const types
     const queue = on_failure.queue orelse return;
 
     var id_buf: [64]u8 = undefined;
-    const chain_job_id = std.fmt.bufPrint(&id_buf, "chain_{s}_{d}", .{ job.id, chain_step_failure }) catch return;
-
-    // Assert: chain failure job must not already exist.
-    var check_jk_buf: keys.KeyBuf = undefined;
-    assert.check(b.get(keys.jobKey(&check_jk_buf, chain_job_id)) == null,
-        "fireChainOnFailure: chain failure job already exists: parent={s}", .{job.id});
+    const chain_job_id = switch (handler.resolveChainChildId(b, &id_buf, job.id, job.chain_id, chain_step_failure)) {
+        .available => |id| id,
+        .existing, .exhausted => return,
+    };
 
     const chain_job = ops.EnqueueJob{
         .job_id = chain_job_id,
@@ -219,5 +233,6 @@ pub fn fireChainOnFailure(self: *OpHandler, b: *kv.WriteBatch, job: *const types
     const enq_result = self.applyEnqueue(b, &enqueue_op);
     if (enq_result.err == null) {
         self.recordSideEffect(&chain_job);
+        self.recordPromoteQueue(chain_job.queue);
     }
 }

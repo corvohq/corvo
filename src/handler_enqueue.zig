@@ -13,13 +13,12 @@ const OpHandler = handler.OpHandler;
 const metrics_mod = handler.metrics_mod;
 
 pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueOp) ops.OpResult {
-    if (op.jobs.len == 0) {
-        return .{ .err = "no jobs provided" };
-    }
-
-    if (self.max_jobs > 0 and self.total_jobs + @as(u32, @intCast(op.jobs.len)) > self.max_jobs) {
-        return .{ .err = "max jobs exceeded" };
-    }
+    // Validate the WHOLE operation before touching KV or in-memory indexes.
+    // Enqueue is one RPC/HTTP batch with one success bit; partially applying a
+    // prefix and then returning an error makes a retry fail on those duplicate
+    // IDs forever, so the suffix is silently lost. Besides atomicity, this
+    // pre-pass keeps all external lengths inside the fixed hot-path buffers.
+    if (validateEnqueue(self, b, op)) |err| return err;
 
     var affected: u32 = 0;
 
@@ -29,21 +28,7 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
     var last_queue_buf: [64]u8 = undefined;
     var last_queue_len: u8 = 0;
 
-    // Any early return below accounts the jobs already written this op into
-    // total_jobs first — otherwise a mid-batch error skips `total_jobs +=
-    // affected` and undercounts, drifting the max-jobs limit (M2). The jobs
-    // written before the error are real (they commit with the shared batch), so
-    // total_jobs must count them.
     for (op.jobs) |*enq| {
-        if (enq.queue.len == 0) {
-            self.total_jobs += affected;
-            return .{ .err = "missing queue" };
-        }
-        if (enq.job_id.len == 0) {
-            self.total_jobs += affected;
-            return .{ .err = "missing job_id" };
-        }
-
         assert.check(op.now_ns > 0, "enqueue op missing now_ns", .{});
         assert.check(enq.state == .pending or enq.state == .scheduled, "enqueue op has invalid state", .{});
 
@@ -53,15 +38,9 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
                 var bk_buf: keys.KeyBuf = undefined;
                 var batch_val_buf: [codec.max_batch_encoded_size]u8 = undefined;
                 const batch_bytes = b.getInto(keys.batchKey(&bk_buf, batch_id), &batch_val_buf);
-                if (batch_bytes == null) {
-                    self.total_jobs += affected;
-                    return .{ .err = "batch not found" };
-                }
+                assert.check(batch_bytes != null, "validated enqueue batch disappeared", .{});
                 const batch = codec.decodeBatch(batch_bytes.?);
-                if (!batch.open) {
-                    self.total_jobs += affected;
-                    return .{ .err = "batch sealed" };
-                }
+                assert.check(batch.open, "validated enqueue batch became sealed", .{});
             }
         }
 
@@ -73,16 +52,7 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
                 const uk_key = keys.uniqueKey(&uk_buf, enq.queue, uk);
                 var uk_val_buf: [256]u8 = undefined;
                 const existing = b.getInto(uk_key, &uk_val_buf);
-                if (existing != null) {
-                    // Unique key already exists — return existing job ID.
-                    const decoded = keys.decodeUniqueValue(existing.?);
-                    var result: ops.OpResult = .{ .err = "unique_existing" };
-                    const id_len = @min(decoded.job_id.len, result.unique_job_id_buf.len);
-                    @memcpy(result.unique_job_id_buf[0..id_len], decoded.job_id[0..id_len]);
-                    result.unique_job_id_len = @intCast(id_len);
-                    self.total_jobs += affected;
-                    return result;
-                }
+                assert.check(existing == null, "validated unique key became occupied", .{});
                 unique_key_val = uk_key;
             }
         }
@@ -97,10 +67,7 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
             var qc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
             if (b.getInto(keys.queueConfigKey(&qc_buf, enq.queue), &qc_val_buf) == null) {
                 // New queue — enforce resource limit.
-                if (self.queue_configs.count() >= self.max_queues) {
-                    self.total_jobs += affected;
-                    return .{ .err = "max queues exceeded" };
-                }
+                assert.check(self.queue_configs.count() < self.max_queues, "validated queue capacity exceeded", .{});
                 var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
                 const default_q = types.Queue{ .name = enq.queue };
                 const qc_data = codec.encodeQueue(&qc_enc_buf, &default_q);
@@ -122,10 +89,7 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
         // Reject duplicate job IDs — client-provided IDs are external input.
         var jk_buf: keys.KeyBuf = undefined;
         var existing_buf: [codec.max_job_encoded_size]u8 = undefined;
-        if (b.getInto(keys.jobKey(&jk_buf, job.id), &existing_buf) != null) {
-            self.total_jobs += affected;
-            return .{ .err = "job already exists" };
-        }
+        assert.check(b.getInto(keys.jobKey(&jk_buf, job.id), &existing_buf) == null, "validated job id became occupied", .{});
 
         if (job.expire_after_ms > 0) {
             job.expire_at_ns = op.now_ns + @as(u64, job.expire_after_ms) * 1_000_000;
@@ -147,10 +111,7 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
 
         // Write state index
         if (job.state == .scheduled) {
-            if (job.scheduled_at_ns == 0) {
-                self.total_jobs += affected;
-                return .{ .err = "invalid scheduled time" };
-            }
+            assert.check(job.scheduled_at_ns > 0, "validated scheduled job lost its timestamp", .{});
             var sk_buf: keys.KeyBuf = undefined;
             b.set(OpHandler.jobScheduledKey(&sk_buf, &job), "");
         } else {
@@ -203,6 +164,143 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
 
     self.total_jobs += affected;
     return .{ .affected = affected };
+}
+
+/// Boundary validation for an enqueue operation. Returns the same OpResult
+/// shape as applyEnqueue so unique conflicts can still report their owner.
+/// O(n^2) duplicate checks are deliberately bounded by MAX_BATCH_JOBS (256)
+/// and avoid heap allocation on the hot path.
+fn validateEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueOp) ?ops.OpResult {
+    if (op.jobs.len == 0) return .{ .err = "no jobs provided" };
+    if (op.now_ns == 0) return .{ .err = "invalid enqueue timestamp" };
+
+    const job_count: u32 = @intCast(op.jobs.len);
+    if (self.max_jobs > 0 and
+        (job_count > self.max_jobs or self.total_jobs > self.max_jobs - job_count))
+    {
+        return .{ .err = "max jobs exceeded" };
+    }
+
+    var new_queue_count: u32 = 0;
+
+    for (op.jobs, 0..) |*enq, i| {
+        if (enq.queue.len == 0) return .{ .err = "missing queue" };
+        if (enq.queue.len > types.max_queue_name_len or
+            std.mem.indexOfScalar(u8, enq.queue, 0) != null)
+            return .{ .err = "invalid queue" };
+        if (enq.job_id.len == 0) return .{ .err = "missing job_id" };
+        if (enq.job_id.len > types.max_job_id_len or
+            std.mem.indexOfScalar(u8, enq.job_id, 0) != null)
+            return .{ .err = "job_id too long" };
+        if (enq.state != .pending and enq.state != .scheduled)
+            return .{ .err = "invalid job state" };
+        if (enq.state == .scheduled and enq.scheduled_at_ns == 0)
+            return .{ .err = "invalid scheduled time" };
+        if (enq.unique_key) |value| {
+            if (value.len > 255 or std.mem.indexOfScalar(u8, value, 0) != null)
+                return .{ .err = "invalid unique_key" };
+        }
+        if (enq.tags) |value| {
+            // One parsed tag pair is embedded in tq| alongside queue+job ID.
+            // 256 keeps the worst possible pair below keys.max_key_len.
+            if (value.len > 256) return .{ .err = "tags too large" };
+        }
+        if (enq.parent_id) |value| {
+            if (value.len > types.max_job_id_len or std.mem.indexOfScalar(u8, value, 0) != null)
+                return .{ .err = "parent_id too long" };
+        }
+        if (enq.chain_id) |value| {
+            if (value.len > types.max_entity_id_len or std.mem.indexOfScalar(u8, value, 0) != null)
+                return .{ .err = "chain_id too long" };
+        }
+        if (enq.group) |value| {
+            if (value.len > types.max_entity_id_len) return .{ .err = "group too long" };
+        }
+        const encoded_job = enqueueToJob(enq);
+        if (codec.jobEncodedSize(&encoded_job) > codec.max_enqueue_job_encoded_size)
+            return .{ .err = "job metadata too large" };
+
+        // Existing or intra-batch duplicate job IDs reject the whole batch.
+        var jk_buf: keys.KeyBuf = undefined;
+        if (b.get(keys.jobKey(&jk_buf, enq.job_id)) != null)
+            return .{ .err = "job already exists" };
+        for (op.jobs[0..i]) |*prior| {
+            if (std.mem.eql(u8, prior.job_id, enq.job_id))
+                return .{ .err = "duplicate job_id in batch" };
+        }
+
+        // Count distinct queues this operation would create, before creating
+        // any of them, so max_queues can never yield a partial prefix.
+        var qc_buf: keys.KeyBuf = undefined;
+        if (b.get(keys.queueConfigKey(&qc_buf, enq.queue)) == null) {
+            var seen = false;
+            for (op.jobs[0..i]) |*prior| {
+                if (std.mem.eql(u8, prior.queue, enq.queue)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) new_queue_count += 1;
+        }
+
+        if (enq.batch_id) |batch_id| {
+            if (batch_id.len > 0) {
+                if (batch_id.len > types.max_entity_id_len or
+                    std.mem.indexOfScalar(u8, batch_id, 0) != null)
+                    return .{ .err = "batch_id too long" };
+                var bk_buf: keys.KeyBuf = undefined;
+                const batch_bytes = b.get(keys.batchKey(&bk_buf, batch_id)) orelse
+                    return .{ .err = "batch not found" };
+                const batch = codec.decodeBatch(batch_bytes);
+                if (!batch.open) return .{ .err = "batch sealed" };
+
+                var additions: u32 = 1;
+                for (op.jobs[0..i]) |*prior| {
+                    if (prior.batch_id) |prior_id| {
+                        if (std.mem.eql(u8, prior_id, batch_id)) additions += 1;
+                    }
+                }
+                if (batch.total > std.math.maxInt(u32) - additions)
+                    return .{ .err = "batch job limit exceeded" };
+            }
+        }
+
+        if (enq.unique_key) |unique_key| {
+            if (unique_key.len > 0) {
+                var uk_buf: keys.KeyBuf = undefined;
+                if (b.get(keys.uniqueKey(&uk_buf, enq.queue, unique_key))) |existing| {
+                    return uniqueConflict(existing);
+                }
+                for (op.jobs[0..i]) |*prior| {
+                    const prior_key = prior.unique_key orelse continue;
+                    if (std.mem.eql(u8, prior.queue, enq.queue) and
+                        std.mem.eql(u8, prior_key, unique_key))
+                    {
+                        var result: ops.OpResult = .{ .err = "unique_existing" };
+                        const n = @min(prior.job_id.len, result.unique_job_id_buf.len);
+                        @memcpy(result.unique_job_id_buf[0..n], prior.job_id[0..n]);
+                        result.unique_job_id_len = @intCast(n);
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+
+    if (new_queue_count > self.max_queues or
+        self.queue_configs.count() > self.max_queues - new_queue_count)
+        return .{ .err = "max queues exceeded" };
+
+    return null;
+}
+
+fn uniqueConflict(existing: []const u8) ops.OpResult {
+    const decoded = keys.decodeUniqueValue(existing);
+    var result: ops.OpResult = .{ .err = "unique_existing" };
+    const n = @min(decoded.job_id.len, result.unique_job_id_buf.len);
+    @memcpy(result.unique_job_id_buf[0..n], decoded.job_id[0..n]);
+    result.unique_job_id_len = @intCast(n);
+    return result;
 }
 
 fn enqueueToJob(enq: *const ops.EnqueueJob) types.Job {

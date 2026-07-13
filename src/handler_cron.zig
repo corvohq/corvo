@@ -65,24 +65,22 @@ pub fn applyCronScan(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpRes
 
         const fire_slot: u64 = @intCast(cron.next_run_ns);
 
-        // Advance to the next fire. A bad expression disables the cron so it is
-        // not rescanned forever.
+        // Compute the next fire. Do not persist the advance until the enqueue
+        // succeeds: resource pressure must leave this slot due for a retry,
+        // rather than silently dropping a scheduled run.
         const parsed = cron_expr.parse(cron.schedule) catch {
             cron.enabled = false;
             var db_buf: [codec.max_cron_encoded_size]u8 = undefined;
             b.set(keys.cronKey(&ck_buf, cron_id), codec.encodeCron(&db_buf, &cron));
             continue;
         };
-        cron.next_run_ns = @intCast(cron_expr.nextFire(&parsed, now_ns) orelse 0);
-        cron.last_run_ns = @intCast(now_ns);
-        var enc_buf: [codec.max_cron_encoded_size]u8 = undefined;
-        b.set(keys.cronKey(&ck_buf, cron_id), codec.encodeCron(&enc_buf, &cron));
+        const next_run_ns: i64 = @intCast(cron_expr.nextFire(&parsed, now_ns) orelse 0);
 
-        // Deterministic per-slot job id: a re-fire of the same slot (e.g. after a
-        // crash before the advance was persisted) collides and is idempotently
-        // rejected by the enqueue handler, so a cron never double-enqueues a slot.
-        var jid_buf: [96]u8 = undefined;
-        const job_id = std.fmt.bufPrint(&jid_buf, "{s}-{d}", .{ cron_id, fire_slot }) catch continue;
+        // Prefer a readable deterministic per-slot ID, but probe hash-derived
+        // alternatives when a user has occupied it or the cron ID is too long.
+        // The enqueue and schedule advance commit in the same atomic batch.
+        var jid_buf: [64]u8 = undefined;
+        const job_id = handler.resolveCronFireId(b, &jid_buf, cron_id, fire_slot) orelse continue;
 
         var enq_job = ops.EnqueueJob{
             .job_id = job_id,
@@ -96,7 +94,13 @@ pub fn applyCronScan(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpRes
         if (cron.unique_key) |uk| enq_job.unique_key = uk;
         const jobs = [_]ops.EnqueueJob{enq_job};
         const enqueue_op = ops.EnqueueOp{ .jobs = &jobs, .now_ns = now_ns };
-        _ = self.applyEnqueue(b, &enqueue_op); // dup id (re-fire) → no-op
+        const result = self.applyEnqueue(b, &enqueue_op);
+        if (result.err != null) continue;
+
+        cron.next_run_ns = next_run_ns;
+        cron.last_run_ns = @intCast(now_ns);
+        var enc_buf: [codec.max_cron_encoded_size]u8 = undefined;
+        b.set(keys.cronKey(&ck_buf, cron_id), codec.encodeCron(&enc_buf, &cron));
         self.recordPromoteQueue(cron.queue);
         affected += 1;
     }
@@ -108,10 +112,21 @@ pub fn applyCronScan(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpRes
 }
 
 pub fn applyCreateCron(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.CreateCronOp) ops.OpResult {
-    // Check name uniqueness
-    var cn_buf: keys.KeyBuf = undefined;
-    if (b.get(keys.cronNameKey(&cn_buf, op.name)) != null) {
-        return .{ .err = "cron name conflict" };
+    if (op.cron_id.len == 0 or op.cron_id.len > types.max_entity_id_len or
+        std.mem.indexOfScalar(u8, op.cron_id, 0) != null)
+        return .{ .err = "invalid cron_id" };
+    if (op.name.len == 0 or op.name.len > 255 or
+        std.mem.indexOfScalar(u8, op.name, 0) != null)
+        return .{ .err = "invalid cron name" };
+    if (op.queue.len == 0 or op.queue.len > types.max_queue_name_len or
+        std.mem.indexOfScalar(u8, op.queue, 0) != null)
+        return .{ .err = "invalid cron queue" };
+    if (op.schedule.len == 0) return .{ .err = "invalid cron schedule" };
+    _ = cron_expr.parse(op.schedule) catch return .{ .err = "invalid cron schedule" };
+    if (op.created_at_ns == 0) return .{ .err = "invalid cron timestamp" };
+    if (op.unique_key) |uk| {
+        if (uk.len > 255 or std.mem.indexOfScalar(u8, uk, 0) != null)
+            return .{ .err = "invalid cron unique_key" };
     }
 
     var cron = types.Cron{
@@ -137,6 +152,18 @@ pub fn applyCreateCron(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.CreateCr
     if (op.unique_key) |uk| {
         if (uk.len > 0) cron.unique_key = uk;
     }
+    if (codec.cronEncodedSize(&cron) > codec.max_cron_encoded_size)
+        return .{ .err = "cron metadata too large" };
+
+    // IDs and names are independent unique indexes. Checking only cn| allowed
+    // an ID collision to overwrite sc| while leaving the old cn| orphaned.
+    var existing_ck_buf: keys.KeyBuf = undefined;
+    if (b.get(keys.cronKey(&existing_ck_buf, op.cron_id)) != null)
+        return .{ .err = "cron already exists" };
+
+    var cn_buf: keys.KeyBuf = undefined;
+    if (b.get(keys.cronNameKey(&cn_buf, op.name)) != null)
+        return .{ .err = "cron name conflict" };
 
     var cron_enc_buf: [codec.max_cron_encoded_size]u8 = undefined;
     var ck_buf: keys.KeyBuf = undefined;
@@ -147,34 +174,42 @@ pub fn applyCreateCron(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.CreateCr
 }
 
 pub fn applyUpdateCron(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.UpdateCronOp) ops.OpResult {
+    if (op.cron_id.len == 0 or op.cron_id.len > types.max_entity_id_len or
+        std.mem.indexOfScalar(u8, op.cron_id, 0) != null)
+        return .{ .err = "invalid cron_id" };
     var ck_buf: keys.KeyBuf = undefined;
     const cron_bytes = b.get(keys.cronKey(&ck_buf, op.cron_id));
     if (cron_bytes == null) {
         return .{ .err = "cron not found" };
     }
 
-    var cron = codec.decodeCron(cron_bytes.?);
+    const old_cron = codec.decodeCron(cron_bytes.?);
+    var cron = old_cron;
+    var reschedule = false;
 
-    // Update name (with uniqueness check)
+    // Build and validate the entire replacement before changing either the
+    // cron record or its name index. Previously a name update was written
+    // first, so a later invalid schedule returned an error with a partial rename.
     if (op.name) |name| {
         if (name.len > 0) {
-            var cn_buf: keys.KeyBuf = undefined;
-            const existing = b.get(keys.cronNameKey(&cn_buf, name));
-            if (existing != null and !std.mem.eql(u8, existing.?, op.cron_id)) {
-                return .{ .err = "cron name conflict" };
-            }
-            // Delete old name key, set new
-            var old_cn_buf: keys.KeyBuf = undefined;
-            b.delete(keys.cronNameKey(&old_cn_buf, cron.name));
+            if (name.len > 255 or std.mem.indexOfScalar(u8, name, 0) != null)
+                return .{ .err = "invalid cron name" };
             cron.name = name;
-            b.set(keys.cronNameKey(&cn_buf, name), op.cron_id);
         }
     }
     if (op.queue) |q| {
-        if (q.len > 0) cron.queue = q;
+        if (q.len > 0) {
+            if (q.len > types.max_queue_name_len or std.mem.indexOfScalar(u8, q, 0) != null)
+                return .{ .err = "invalid cron queue" };
+            cron.queue = q;
+        }
     }
     if (op.schedule) |s| {
-        if (s.len > 0) cron.schedule = s;
+        if (s.len > 0) {
+            _ = cron_expr.parse(s) catch return .{ .err = "invalid cron schedule" };
+            cron.schedule = s;
+            reschedule = true;
+        }
     }
     if (op.timezone) |tz| {
         if (tz.len > 0) cron.timezone = tz;
@@ -183,16 +218,37 @@ pub fn applyUpdateCron(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.UpdateCr
         cron.payload = p;
     }
     if (op.unique_key) |uk| {
+        if (uk.len > 255 or std.mem.indexOfScalar(u8, uk, 0) != null)
+            return .{ .err = "invalid cron unique_key" };
         cron.unique_key = uk;
     }
     if (op.max_retries) |mr| {
         cron.max_retries = mr;
     }
     if (op.enabled) |e| {
+        if (e and !cron.enabled) reschedule = true;
         cron.enabled = e;
     }
     if (op.next_run_ns > 0) {
         cron.next_run_ns = op.next_run_ns;
+    } else if (reschedule and cron.enabled) {
+        if (op.now_ns == 0) return .{ .err = "invalid cron timestamp" };
+        cron.next_run_ns = @intCast(computeInitialNextRun(cron.schedule, op.now_ns));
+    } else if (!cron.enabled) {
+        cron.next_run_ns = 0;
+    }
+    if (codec.cronEncodedSize(&cron) > codec.max_cron_encoded_size)
+        return .{ .err = "cron metadata too large" };
+
+    if (!std.mem.eql(u8, old_cron.name, cron.name)) {
+        var cn_buf: keys.KeyBuf = undefined;
+        const existing = b.get(keys.cronNameKey(&cn_buf, cron.name));
+        if (existing != null and !std.mem.eql(u8, existing.?, op.cron_id))
+            return .{ .err = "cron name conflict" };
+
+        var old_cn_buf: keys.KeyBuf = undefined;
+        b.delete(keys.cronNameKey(&old_cn_buf, old_cron.name));
+        b.set(keys.cronNameKey(&cn_buf, cron.name), op.cron_id);
     }
 
     var cron_enc_buf: [codec.max_cron_encoded_size]u8 = undefined;
@@ -202,6 +258,9 @@ pub fn applyUpdateCron(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.UpdateCr
 }
 
 pub fn applyDeleteCron(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.DeleteCronOp) ops.OpResult {
+    if (op.cron_id.len == 0 or op.cron_id.len > types.max_entity_id_len or
+        std.mem.indexOfScalar(u8, op.cron_id, 0) != null)
+        return .{ .err = "invalid cron_id" };
     var ck_buf: keys.KeyBuf = undefined;
     const cron_bytes = b.get(keys.cronKey(&ck_buf, op.cron_id));
     if (cron_bytes == null) {
@@ -217,6 +276,13 @@ pub fn applyDeleteCron(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.DeleteCr
 }
 
 pub fn applyTriggerCron(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.TriggerCronOp) ops.OpResult {
+    if (op.cron_id.len == 0 or op.cron_id.len > types.max_entity_id_len or
+        std.mem.indexOfScalar(u8, op.cron_id, 0) != null)
+        return .{ .err = "invalid cron_id" };
+    if (op.job_id.len == 0 or op.job_id.len > types.max_job_id_len or
+        std.mem.indexOfScalar(u8, op.job_id, 0) != null)
+        return .{ .err = "invalid cron job_id" };
+    if (op.now_ns == 0) return .{ .err = "invalid cron timestamp" };
     var ck_buf: keys.KeyBuf = undefined;
     const cron_bytes = b.get(keys.cronKey(&ck_buf, op.cron_id));
     if (cron_bytes == null) {
@@ -224,15 +290,6 @@ pub fn applyTriggerCron(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Trig
     }
 
     var cron = codec.decodeCron(cron_bytes.?);
-    cron.last_run_ns = @intCast(op.now_ns);
-
-    if (op.next_run_ns > 0) {
-        cron.next_run_ns = op.next_run_ns;
-    }
-
-    // Write updated cron
-    var cron_enc_buf: [codec.max_cron_encoded_size]u8 = undefined;
-    b.set(keys.cronKey(&ck_buf, op.cron_id), codec.encodeCron(&cron_enc_buf, &cron));
 
     // Create the job via enqueue
     var enq_job = ops.EnqueueJob{
@@ -254,6 +311,16 @@ pub fn applyTriggerCron(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Trig
         .now_ns = op.now_ns,
     };
 
+    var result = self.applyEnqueue(b, &enqueue_op);
+    if (result.err != null) return result;
+
+    cron.last_run_ns = @intCast(op.now_ns);
+    if (op.next_run_ns > 0) cron.next_run_ns = op.next_run_ns;
+    var cron_enc_buf: [codec.max_cron_encoded_size]u8 = undefined;
+    b.set(keys.cronKey(&ck_buf, op.cron_id), codec.encodeCron(&cron_enc_buf, &cron));
+
     self.recordSideEffect(&enq_job);
-    return self.applyEnqueue(b, &enqueue_op);
+    self.recordPromoteQueue(enq_job.queue);
+    result.notify_queues = self.promoteQueueSlices();
+    return result;
 }

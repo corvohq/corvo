@@ -570,6 +570,7 @@ pub const Reader = struct {
         return count;
     }
 
+
     // ====================================================================
     // Workers
     // ====================================================================
@@ -946,7 +947,6 @@ pub const Reader = struct {
         return count;
     }
 
-
     // ====================================================================
     // Internal helpers
     // ====================================================================
@@ -1267,7 +1267,7 @@ fn stateCountFromStats(stats: *const QueueStats, state: []const u8) i32 {
 }
 
 fn copyField(dest: anytype, len_ptr: *u8, src: []const u8) void {
-    const l: u8 = @intCast(@min(src.len, dest.len));
+    const l: u8 = @intCast(@min(src.len, dest.len, std.math.maxInt(u8)));
     @memcpy(dest[0..l], src[0..l]);
     len_ptr.* = l;
 }
@@ -1279,9 +1279,21 @@ fn copyField16(dest: anytype, len_ptr: *u16, src: []const u8) void {
 }
 
 fn copyField16x(dest: anytype, len_ptr: *u8, src: []const u8) void {
-    const l: u8 = @intCast(@min(src.len, dest.len));
+    const l: u8 = @intCast(@min(src.len, dest.len, std.math.maxInt(u8)));
     @memcpy(dest[0..l], src[0..l]);
     len_ptr.* = l;
+}
+
+test "job row safely truncates fields whose storage is wider than its u8 length" {
+    const long_reason = [_]u8{'r'} ** 512;
+    const job = types.Job{
+        .id = "row-job",
+        .queue = "row-q",
+        .hold_reason = &long_reason,
+    };
+    const row = jobToRow(&job);
+    try std.testing.expectEqual(std.math.maxInt(u8), row.hold_reason_len);
+    try std.testing.expectEqual(@as(usize, std.math.maxInt(u8)), row.holdReasonSlice().len);
 }
 
 /// Format nanosecond timestamp as ISO 8601 string (seconds precision).

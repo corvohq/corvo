@@ -32,6 +32,16 @@ pub fn fetchedJobWireSize(id_len: usize, queue_len: usize, payload_len: usize) u
 
 pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) ops.OpResult {
     if (op.count == 0) return .{ .err = "invalid fetch count: 0" };
+    if (op.worker_id.len > types.max_worker_id_len or
+        std.mem.indexOfScalar(u8, op.worker_id, 0) != null)
+        return .{ .err = "invalid worker_id" };
+    if (op.hostname.len > types.max_hostname_len)
+        return .{ .err = "invalid hostname" };
+    for (op.queues) |queue_name| {
+        if (queue_name.len == 0 or queue_name.len > types.max_queue_name_len or
+            std.mem.indexOfScalar(u8, queue_name, 0) != null)
+            return .{ .err = "invalid fetch queue" };
+    }
 
     const lease_duration_ms: u32 = if (op.lease_duration_ms == 0) 60_000 else op.lease_duration_ms;
     const lease_expires_ns = op.now_ns + @as(u64, lease_duration_ms) * 1_000_000;
@@ -153,7 +163,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             }
 
             // Claim the job.
-            self.lease_counter += 1;
+            _ = self.nextLeaseToken(b);
             job.state = .active;
             job.worker_id = op.worker_id;
             job.hostname = op.hostname;
@@ -257,6 +267,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             q_len += copy_len;
         }
         if (q_len > 0) w.queues = q_buf[0..q_len];
+        assert.check(codec.workerEncodedSize(&w) <= codec.max_worker_encoded_size, "fetch: validated worker exceeds codec buffer", .{});
 
         var wk_buf: keys.KeyBuf = undefined;
         var w_enc_buf: [codec.max_worker_encoded_size]u8 = undefined;
@@ -376,7 +387,7 @@ fn fetchWithFairness(
             }
         }
 
-        self.lease_counter += 1;
+        _ = self.nextLeaseToken(b);
         job.state = .active;
         job.worker_id = op.worker_id;
         job.hostname = op.hostname;

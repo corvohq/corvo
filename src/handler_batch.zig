@@ -12,6 +12,14 @@ const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
 
 pub fn applyBatchCreate(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.CreateBatchOp) ops.OpResult {
+    if (op.batch_id.len == 0 or op.batch_id.len > types.max_entity_id_len or
+        std.mem.indexOfScalar(u8, op.batch_id, 0) != null)
+        return .{ .err = "invalid batch_id" };
+    if (op.callback_queue.len > types.max_queue_name_len or
+        std.mem.indexOfScalar(u8, op.callback_queue, 0) != null)
+        return .{ .err = "invalid callback queue" };
+    if (op.created_at_ns == 0) return .{ .err = "invalid batch timestamp" };
+
     // Reject a duplicate batch id (client-provided data → error, not a silent
     // overwrite). Overwriting reset the counters of an in-flight batch, which
     // later underflowed and tripped an assert-panic in adjustBatchForDeletedJob
@@ -37,6 +45,8 @@ pub fn applyBatchCreate(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.CreateB
     if (op.callback_payload) |cp| {
         batch.callback_payload = cp;
     }
+    if (codec.batchEncodedSize(&batch) > codec.max_batch_encoded_size)
+        return .{ .err = "batch metadata too large" };
 
     var batch_enc_buf: [codec.max_batch_encoded_size]u8 = undefined;
     var bk_buf: keys.KeyBuf = undefined;
@@ -46,6 +56,10 @@ pub fn applyBatchCreate(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.CreateB
 }
 
 pub fn applySealBatch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.SealBatchOp) ops.OpResult {
+    if (op.batch_id.len == 0 or op.batch_id.len > types.max_entity_id_len or
+        std.mem.indexOfScalar(u8, op.batch_id, 0) != null)
+        return .{ .err = "invalid batch_id" };
+    if (op.now_ns == 0) return .{ .err = "invalid batch timestamp" };
     var bk_buf: keys.KeyBuf = undefined;
     const bkey = keys.batchKey(&bk_buf, op.batch_id);
     const batch_bytes = b.get(bkey);
@@ -55,6 +69,20 @@ pub fn applySealBatch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.SealBa
 
     var batch = codec.decodeBatch(batch_bytes.?);
     if (!batch.open) {
+        // A callback enqueue may previously have failed under resource
+        // pressure after the batch's last job completed. Keep completed_at=0
+        // and let an idempotent seal retry finish the callback atomically.
+        if (batch.pending == 0 and batch.total > 0 and batch.completed_at_ns == 0) {
+            if (!self.enqueueBatchCallback(b, &batch, op.now_ns))
+                return .{ .err = "batch callback unavailable" };
+            batch.completed_at_ns = op.now_ns;
+            var retry_enc_buf: [codec.max_batch_encoded_size]u8 = undefined;
+            b.set(bkey, codec.encodeBatch(&retry_enc_buf, &batch));
+            return .{
+                .affected = 1,
+                .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
+            };
+        }
         return .{ .err = "batch already sealed" };
     }
 
@@ -63,35 +91,16 @@ pub fn applySealBatch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.SealBa
 
     // Check if batch is already complete (all jobs finished before seal)
     if (batch.pending == 0 and batch.total > 0) {
+        if (!self.enqueueBatchCallback(b, &batch, op.now_ns))
+            return .{ .err = "batch callback unavailable" };
         batch.completed_at_ns = op.now_ns;
-        // Fire callback if defined
-        if (batch.callback_queue) |cq| {
-            if (cq.len > 0) {
-                var cb_id_buf: [64]u8 = undefined;
-                const cb_id = std.fmt.bufPrint(&cb_id_buf, "batch_cb_{s}", .{op.batch_id}) catch "batch_cb_err";
-                const callback_job = ops.EnqueueJob{
-                    .job_id = cb_id,
-                    .queue = cq,
-                    .payload = batch.callback_payload,
-                    .state = .pending,
-                    .created_at_ns = op.now_ns,
-                };
-                assert.check(callback_job.batch_id == null, "callback job cannot have batch id", .{});
-                const jobs = [_]ops.EnqueueJob{callback_job};
-                const enqueue_op = ops.EnqueueOp{
-                    .jobs = &jobs,
-                    .now_ns = op.now_ns,
-                };
-                const enq_result = self.applyEnqueue(b, &enqueue_op);
-                if (enq_result.err == null) {
-                    self.recordSideEffect(&callback_job);
-                }
-            }
-        }
     }
 
     var batch_enc_buf: [codec.max_batch_encoded_size]u8 = undefined;
     b.set(bkey, codec.encodeBatch(&batch_enc_buf, &batch));
 
-    return .{ .affected = 1 };
+    return .{
+        .affected = 1,
+        .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
+    };
 }

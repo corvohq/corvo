@@ -221,8 +221,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 return @intCast(@max(0, clock() - self.t));
             }
         } else struct {
-            pub fn start(_: anytype) @This() { return .{}; }
-            pub fn elapsed(_: @This(), _: anytype) u64 { return 0; }
+            pub fn start(_: anytype) @This() {
+                return .{};
+            }
+            pub fn elapsed(_: @This(), _: anytype) u64 {
+                return 0;
+            }
         };
 
         fn addPhase(val: *u64, ns: u64) void {
@@ -244,7 +248,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
         /// inline arrays are stack-safe. storeSubscription also rejects
         /// gracefully rather than asserting if this is ever exceeded.
         const max_waiting_conns: u32 = 20480;
-        const max_notified_queues: u32 = 64;
+        const max_notified_queues: u32 = rpc.MAX_BATCH_JOBS;
         const max_prepare_slots: u32 = 4;
         /// Upper bound on parked non-frame (maintenance + fulfill-claim)
         /// proposal tokens in flight at once. Both come from proposeRecorded's
@@ -284,7 +288,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
             tokens: [max_tick_tokens]*ProposeToken = undefined,
             token_count: u32 = 0,
         };
-
 
         // ====================================================================
         // Config
@@ -597,7 +600,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         } else if (c.recv_pos > 0) {
                             var dup = false;
                             for (recv_conns[0..recv_conn_count]) |existing| {
-                                if (existing == completion.conn_id) { dup = true; break; }
+                                if (existing == completion.conn_id) {
+                                    dup = true;
+                                    break;
+                                }
                             }
                             if (!dup) {
                                 recv_conns[recv_conn_count] = completion.conn_id;
@@ -1176,8 +1182,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
             const is_ui_route = std.mem.eql(u8, clean_path, "/ui") or std.mem.startsWith(u8, clean_path, "/ui/");
             const is_ui_static = is_ui_route and
                 (std.mem.endsWith(u8, clean_path, ".js") or
-                std.mem.endsWith(u8, clean_path, ".css") or
-                std.mem.endsWith(u8, clean_path, ".svg"));
+                    std.mem.endsWith(u8, clean_path, ".css") or
+                    std.mem.endsWith(u8, clean_path, ".svg"));
             const admin_pw_set = self.config.admin_password.len > 0;
 
             const skip_auth = std.mem.eql(u8, clean_path, "/healthz") or
@@ -1648,8 +1654,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         \\  EXEC BREAKDOWN ({d} ticks, {d} frames): apply={d}us commit={d}us notify={d}us oplog={d}us
                         \\
                     , .{
-                        t, self.applied_total,
-                        self.exec_apply_ns / (t * 1000), self.exec_commit_ns / (t * 1000),
+                        t,                                self.applied_total,
+                        self.exec_apply_ns / (t * 1000),  self.exec_commit_ns / (t * 1000),
                         self.exec_notify_ns / (t * 1000), self.exec_oplog_ns / (t * 1000),
                     });
                     self.exec_apply_ns = 0;
@@ -1807,8 +1813,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
                 rpc.MSG_CLEAR_QUEUE => {
                     var reader = BufReader{ .data = frame.payload };
-                    const parsed = rpc.management.parseClearQueue(&reader) catch
+                    var parsed = rpc.management.parseClearQueue(&reader) catch
                         return .{ .err = "parse error" };
+                    parsed.now_ns = self.nowNs();
                     const op_data = ops_mod.OpData{ .clear_queue = parsed };
                     const result = self.handler.apply(batch, .clear_queue, &op_data);
                     self.emitMirrorOp(.clear_queue, &op_data, &result);
@@ -1817,8 +1824,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
                 rpc.MSG_DELETE_QUEUE => {
                     var reader = BufReader{ .data = frame.payload };
-                    const parsed = rpc.management.parseDeleteQueue(&reader) catch
+                    var parsed = rpc.management.parseDeleteQueue(&reader) catch
                         return .{ .err = "parse error" };
+                    parsed.now_ns = self.nowNs();
                     const op_data = ops_mod.OpData{ .delete_queue = parsed };
                     const result = self.handler.apply(batch, .delete_queue, &op_data);
                     self.emitMirrorOp(.delete_queue, &op_data, &result);
@@ -1839,8 +1847,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
                 rpc.MSG_BATCH_CREATE => {
                     var reader = BufReader{ .data = frame.payload };
-                    const parsed = rpc.batch.parseBatchCreate(&reader) catch
+                    var parsed = rpc.batch.parseBatchCreate(&reader) catch
                         return .{ .err = "parse error" };
+                    const now_ns = self.nowNs();
+                    self.http_id_counter += 1;
+                    const id = http.generateId(&self.http_id_bufs[frame_idx], now_ns, self.http_id_counter);
+                    frame.path_param = id;
+                    parsed.batch_id = id;
+                    parsed.created_at_ns = now_ns;
                     const op_data = ops_mod.OpData{ .batch_create = parsed };
                     const result = self.handler.apply(batch, .batch_create, &op_data);
                     self.emitMirrorOp(.batch_create, &op_data, &result);
@@ -1849,8 +1863,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
                 rpc.MSG_BATCH_SEAL => {
                     var reader = BufReader{ .data = frame.payload };
-                    const parsed = rpc.batch.parseBatchSeal(&reader) catch
+                    var parsed = rpc.batch.parseBatchSeal(&reader) catch
                         return .{ .err = "parse error" };
+                    parsed.now_ns = self.nowNs();
                     const op_data = ops_mod.OpData{ .batch_seal = parsed };
                     const result = self.handler.apply(batch, .batch_seal, &op_data);
                     self.emitMirrorOp(.batch_seal, &op_data, &result);
@@ -1859,8 +1874,15 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
                 rpc.MSG_CRON_CREATE => {
                     var reader = BufReader{ .data = frame.payload };
-                    const parsed = rpc.cron.parseCronCreate(&reader) catch
+                    var parsed = rpc.cron.parseCronCreate(&reader) catch
                         return .{ .err = "parse error" };
+                    const now_ns = self.nowNs();
+                    self.http_id_counter += 1;
+                    const id = http.generateId(&self.http_id_bufs[frame_idx], now_ns, self.http_id_counter);
+                    frame.path_param = id;
+                    parsed.cron_id = id;
+                    parsed.created_at_ns = now_ns;
+                    parsed.now_ns = now_ns;
                     const op_data = ops_mod.OpData{ .cron_create = parsed };
                     const result = self.handler.apply(batch, .cron_create, &op_data);
                     self.emitMirrorOp(.cron_create, &op_data, &result);
@@ -1869,8 +1891,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
                 rpc.MSG_CRON_UPDATE => {
                     var reader = BufReader{ .data = frame.payload };
-                    const parsed = rpc.cron.parseCronUpdate(&reader) catch
+                    var parsed = rpc.cron.parseCronUpdate(&reader) catch
                         return .{ .err = "parse error" };
+                    parsed.now_ns = self.nowNs();
                     const op_data = ops_mod.OpData{ .cron_update = parsed };
                     const result = self.handler.apply(batch, .cron_update, &op_data);
                     self.emitMirrorOp(.cron_update, &op_data, &result);
@@ -1889,8 +1912,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
 
                 rpc.MSG_CRON_TRIGGER => {
                     var reader = BufReader{ .data = frame.payload };
-                    const parsed = rpc.cron.parseCronTrigger(&reader) catch
+                    var parsed = rpc.cron.parseCronTrigger(&reader) catch
                         return .{ .err = "parse error" };
+                    const now_ns = self.nowNs();
+                    self.http_id_counter += 1;
+                    parsed.job_id = http.generateId(&self.http_id_bufs[frame_idx], now_ns, self.http_id_counter);
+                    parsed.now_ns = now_ns;
                     const op_data = ops_mod.OpData{ .cron_trigger = parsed };
                     const result = self.handler.apply(batch, .cron_trigger, &op_data);
                     self.emitMirrorOp(.cron_trigger, &op_data, &result);
@@ -2034,7 +2061,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
             return result;
         }
 
-
         // ====================================================================
         // Encode — write responses into send_bufs
         // ====================================================================
@@ -2047,8 +2073,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 const c = self.io.conn(frame.conn_id);
                 if (c.phase == .free) continue;
 
-                // RPC fetch: always subscribe. fulfillSubscriptions serves jobs.
-                // HTTP fetch returns empty immediately (request-response protocol).
+                // RPC fetch: always subscribe; fulfillSubscriptions serves jobs.
+                // HTTP fetch is ordinary request-response and reaches encoding.
                 if (frame.msg_type == rpc.MSG_FETCH_BATCH and frame.protocol == .rpc and
                     self.results[i].err == null)
                 {
@@ -2129,7 +2155,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 var writer = BufWriter{ .buf = c.send_buf[write_start..] };
                 writer.pos = rpc.FRAME_HEADER_SIZE; // reserve header space
 
-                self.encodeResult(&writer, frame.msg_type, &self.results[i], frame.count);
+                self.encodeResult(&writer, frame.msg_type, &self.results[i], frame.count, frame.path_param);
 
                 const payload_len: u32 = @intCast(writer.pos - rpc.FRAME_HEADER_SIZE);
                 rpc.writeFrameHeader(
@@ -2190,7 +2216,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
             }
         }
 
-        fn encodeResult(self: *Self, writer: *BufWriter, msg_type: u8, result: *const ops_mod.OpResult, count: u16) void {
+        fn encodeResult(self: *Self, writer: *BufWriter, msg_type: u8, result: *const ops_mod.OpResult, count: u16, generated_id: []const u8) void {
             switch (msg_type) {
                 rpc.MSG_PING => {},
                 rpc.MSG_ENQUEUE_BATCH => rpc.encodeEnqueueResp(writer, result, count),
@@ -2204,13 +2230,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 rpc.MSG_DELETE_QUEUE,
                 rpc.MSG_BULK_ACTION,
                 => rpc.management.encodeGenericResp(writer, result),
-                rpc.MSG_BATCH_CREATE => {
-                    // batch_create response needs the generated batch_id
-                    // For now, use generic response
-                    rpc.management.encodeGenericResp(writer, result);
-                },
+                rpc.MSG_BATCH_CREATE => rpc.batch.encodeBatchCreateResp(writer, result, generated_id),
+                rpc.MSG_CRON_CREATE => rpc.cron.encodeCronCreateResp(writer, result, generated_id),
                 rpc.MSG_BATCH_SEAL,
-                rpc.MSG_CRON_CREATE,
                 rpc.MSG_CRON_UPDATE,
                 rpc.MSG_CRON_DELETE,
                 rpc.MSG_CRON_TRIGGER,
@@ -2270,8 +2292,6 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 writer.writeU64(fetched.lease_token);
             }
         }
-
-
 
         // ====================================================================
         // Fetch subscriptions — store and fulfill
@@ -2653,7 +2673,8 @@ pub fn Pipeline(comptime IoBackend: type) type {
             for (self.handler.webhook_events[0..self.handler.webhook_event_count]) |*ev| {
                 // Build delivery record JSON.
                 var val_buf: [1024]u8 = undefined;
-                const val = std.fmt.bufPrint(&val_buf,
+                const val = std.fmt.bufPrint(
+                    &val_buf,
                     "{{\"webhook_id\":\"{s}\",\"url\":\"{s}\",\"job_id\":\"{s}\",\"queue\":\"{s}\",\"event\":\"{s}\",\"attempt\":0,\"max_attempts\":5,\"created_at_ns\":{d}}}",
                     .{ ev.webhookIdSlice(), ev.urlSlice(), ev.jobId(), ev.queueSlice(), ev.eventName(), ev.now_ns },
                 ) catch continue;
@@ -2678,6 +2699,10 @@ pub fn Pipeline(comptime IoBackend: type) type {
         /// is deferred to a later tick by the single-threaded event loop, so
         /// recording here (pre-commit) is safe.
         fn recordHttpNotify(self: *Self, op_type: ops_mod.OpType, data: *const ops_mod.OpData, result: *const ops_mod.OpResult) void {
+            if (result.notify_queues) |queues| {
+                self.notify.notifyQueues(queues);
+                for (queues) |q| self.recordNotifiedQueue(q);
+            }
             switch (op_type) {
                 .enqueue => for (data.enqueue.jobs) |job| {
                     if (job.queue.len == 0) continue;
@@ -2694,13 +2719,7 @@ pub fn Pipeline(comptime IoBackend: type) type {
                     self.notify.notify(job.queue);
                     self.recordNotifiedQueue(job.queue);
                 },
-                // Bulk/other ops (e.g. requeue → pending) report affected queues
-                // via notify_queues; honor them the same way the RPC else-branch
-                // in notifyForFrame does.
-                else => if (result.notify_queues) |queues| {
-                    self.notify.notifyQueues(queues);
-                    for (queues) |q| self.recordNotifiedQueue(q);
-                },
+                else => {},
             }
         }
 
@@ -2712,6 +2731,14 @@ pub fn Pipeline(comptime IoBackend: type) type {
             // LOCAL KV, and then fail the proposal — a false divergence panic
             // (Bug A). This mirrors the HTTP path's `if err == null` notify gate.
             if (result.err != null) return;
+            // Internal enqueues (chain steps, batch callbacks, requeues, manual
+            // cron triggers) are not present in the client frame payload. Their
+            // handlers report destination queues explicitly so subscribers on
+            // a different queue wake immediately.
+            if (result.notify_queues) |queues| {
+                self.notify.notifyQueues(queues);
+                for (queues) |q| self.recordNotifiedQueue(q);
+            }
             // HTTP frames carry JSON payloads that the binary re-parse below can't
             // read; their wakes are recorded at decode time via recordHttpNotify.
             if (frame.protocol == .http) return;
@@ -2767,28 +2794,12 @@ pub fn Pipeline(comptime IoBackend: type) type {
                         const parsed = rpc.management.parseMaintenance(&reader) catch return;
                         switch (parsed.action) {
                             // cron fires jobs → wake workers, same as promote/reclaim.
-                            .promote, .reclaim, .cron => {
-                                if (result.notify_queues) |queues| {
-                                    self.notify.notifyQueues(queues);
-                                    for (queues) |q| {
-                                        self.recordNotifiedQueue(q);
-                                    }
-                                }
-                            },
+                            .promote, .reclaim, .cron => {},
                             .expire, .purge, .unique, .rate_limit, .workers, .batches => {},
                         }
                     }
                 },
-                else => {
-                    // For any other op (bulk, queue config, cron, etc.):
-                    // if the handler populated notify_queues, honor them.
-                    if (result.notify_queues) |queues| {
-                        self.notify.notifyQueues(queues);
-                        for (queues) |q| {
-                            self.recordNotifiedQueue(q);
-                        }
-                    }
-                },
+                else => {},
             }
         }
 
@@ -2870,9 +2881,9 @@ pub fn Pipeline(comptime IoBackend: type) type {
                 \\  compact:  {d}us  requeue:  {d}us  submit:  {d}us
                 \\
             , .{
-                t, self.phase_frames, self.phase_fulfills,
-                self.phase_drain_ns / (t * 1000), self.phase_extract_ns / (t * 1000), self.phase_maint_ns / (t * 1000),
-                self.phase_execute_ns / (t * 1000), self.phase_encode_ns / (t * 1000), self.phase_cancel_ns / (t * 1000),
+                t,                                  self.phase_frames,                  self.phase_fulfills,
+                self.phase_drain_ns / (t * 1000),   self.phase_extract_ns / (t * 1000), self.phase_maint_ns / (t * 1000),
+                self.phase_execute_ns / (t * 1000), self.phase_encode_ns / (t * 1000),  self.phase_cancel_ns / (t * 1000),
                 self.phase_webhook_ns / (t * 1000), self.phase_fulfill_ns / (t * 1000), self.phase_flush_ns / (t * 1000),
                 self.phase_compact_ns / (t * 1000), self.phase_requeue_ns / (t * 1000), self.phase_submit_ns / (t * 1000),
             });
@@ -2996,10 +3007,10 @@ const TestContext = struct {
         self.handler.rebuildState(&self.stores);
         self.notify = QueueNotifier.init(allocator);
         // Mirror main.zig's buffer sizing (max_payload_size + frame header +
-        // 1024) so the send buffer can hold one max-size job plus framing — the
+        // 4096) so the send buffer can hold one max-size job plus framing — the
         // invariant fulfillSubscriptions' one_max_job room check relies on. The
         // TestPipeline uses the default max_payload_size (64 KiB).
-        const test_buf_size: u32 = 64 * 1024 + @as(u32, rpc.FRAME_HEADER_SIZE) + 1024;
+        const test_buf_size: u32 = 64 * 1024 + @as(u32, rpc.FRAME_HEADER_SIZE) + 4096;
         self.backend = SimBackend.init(allocator, .{
             .listen_fd = -1,
             .max_conns = 16,
@@ -3161,6 +3172,484 @@ test "enqueue round-trip" {
     defer verify_batch.close();
     var out_buf: [4096]u8 = undefined;
     try testing.expect(verify_batch.getInto(job_key, &out_buf) != null);
+}
+
+test "enqueue batch validation is atomic and rejects oversized identifiers" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-enqueue-atomic");
+    defer ctx.destroy();
+
+    const conn = ctx.backend.connect().?;
+    var buf: [2048]u8 = undefined;
+    var w = BufWriter{ .buf = &buf };
+    w.writeU16(2);
+
+    // A valid first item followed by an invalid second item used to commit the
+    // first job and return one batch-level error, making retries impossible.
+    for (0..2) |i| {
+        w.writePrefixed("atomic-q");
+        if (i == 0) {
+            w.writePrefixed("must-not-partially-commit");
+        } else {
+            var long_id: [65]u8 = [_]u8{'x'} ** 65;
+            w.writePrefixed(&long_id);
+        }
+        w.writeU8(128);
+        w.writeU16(3);
+        w.writeU8(0);
+        w.writeU32(0);
+        w.writeU32(0);
+        w.writeU32(0);
+        w.writeU64(0);
+        w.writeU32(0);
+        w.writeU16(0);
+        w.writeU16(0);
+    }
+
+    ctx.injectFrame(conn, rpc.MSG_ENQUEUE_BATCH, 1, w.written());
+    ctx.pipeline.tick();
+    const raw = ctx.backend.readResponse(conn).?;
+    const hdr = rpc.readFrameHeader(raw).?;
+    try testing.expectEqual(rpc.MSG_ENQUEUE_BATCH_RESP, hdr.msg_type);
+    var rr = BufReader{ .data = raw[rpc.FRAME_HEADER_SIZE..] };
+    try testing.expectEqual(@as(u16, 2), try rr.readU16());
+    try testing.expectEqual(@as(u8, 1), try rr.readU8());
+
+    var b = ctx.stores[0].newBatch();
+    defer b.close();
+    var jk: keys.KeyBuf = undefined;
+    try testing.expect(b.get(keys.jobKey(&jk, "must-not-partially-commit")) == null);
+    try testing.expectEqual(@as(u32, 0), ctx.handler.total_jobs);
+    try testing.expectEqual(@as(u32, 0), ctx.handler.pending.queueCount("atomic-q"));
+}
+
+test "RPC batch and cron lifecycle use generated IDs and real timestamps" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-rpc-entities");
+    defer ctx.destroy();
+
+    // Batch create returns a usable ID and persists a non-zero timestamp.
+    const batch_conn = ctx.backend.connect().?;
+    var batch_buf: [256]u8 = undefined;
+    var bw = BufWriter{ .buf = &batch_buf };
+    bw.writePrefixed("callback-q");
+    bw.writeU8(0);
+    ctx.injectFrame(batch_conn, rpc.MSG_BATCH_CREATE, 1, bw.written());
+    ctx.pipeline.tick();
+    const batch_raw = ctx.backend.readResponse(batch_conn).?;
+    try testing.expectEqual(rpc.MSG_BATCH_CREATE_RESP, rpc.readFrameHeader(batch_raw).?.msg_type);
+    var br = BufReader{ .data = batch_raw[rpc.FRAME_HEADER_SIZE..] };
+    const batch_id = try br.readPrefixed();
+    try testing.expect(batch_id.len > 0);
+    try testing.expectEqual(@as(u8, 0), try br.readU8());
+    var batch_id_copy: [64]u8 = undefined;
+    @memcpy(batch_id_copy[0..batch_id.len], batch_id);
+    const stable_batch_id = batch_id_copy[0..batch_id.len];
+    {
+        var dbb = ctx.stores[0].newBatch();
+        defer dbb.close();
+        var bk: keys.KeyBuf = undefined;
+        const stored = dbb.get(keys.batchKey(&bk, stable_batch_id)).?;
+        try testing.expect(codec.decodeBatch(stored).created_at_ns > 0);
+    }
+
+    // Cron create likewise returns an ID; trigger must generate a non-empty
+    // job ID (the old RPC path always attempted to enqueue "" and failed).
+    const cron_conn = ctx.backend.connect().?;
+    var cron_buf: [512]u8 = undefined;
+    var cw = BufWriter{ .buf = &cron_buf };
+    cw.writePrefixed("rpc-cron");
+    cw.writePrefixed("cron-q");
+    cw.writePrefixed("* * * * *");
+    cw.writePrefixed("UTC");
+    cw.writeU16(3);
+    cw.writeU8(1);
+    cw.writeU8(0);
+    ctx.injectFrame(cron_conn, rpc.MSG_CRON_CREATE, 2, cw.written());
+    ctx.pipeline.tick();
+    const cron_raw = ctx.backend.readResponse(cron_conn).?;
+    try testing.expectEqual(rpc.MSG_CRON_CREATE_RESP, rpc.readFrameHeader(cron_raw).?.msg_type);
+    var cr = BufReader{ .data = cron_raw[rpc.FRAME_HEADER_SIZE..] };
+    const cron_id = try cr.readPrefixed();
+    try testing.expect(cron_id.len > 0);
+    try testing.expectEqual(@as(u8, 0), try cr.readU8());
+    var cron_id_copy: [64]u8 = undefined;
+    @memcpy(cron_id_copy[0..cron_id.len], cron_id);
+    const stable_cron_id = cron_id_copy[0..cron_id.len];
+
+    var trigger_buf: [128]u8 = undefined;
+    var tw = BufWriter{ .buf = &trigger_buf };
+    tw.writePrefixed(stable_cron_id);
+    ctx.injectFrame(cron_conn, rpc.MSG_CRON_TRIGGER, 3, tw.written());
+    ctx.pipeline.tick();
+    const trigger_raw = ctx.backend.readResponse(cron_conn).?;
+    try testing.expectEqual(rpc.MSG_CRON_TRIGGER_RESP, rpc.readFrameHeader(trigger_raw).?.msg_type);
+    var tr = BufReader{ .data = trigger_raw[rpc.FRAME_HEADER_SIZE..] };
+    try testing.expectEqual(@as(u16, 1), try tr.readU16());
+    try testing.expectEqual(@as(u8, 0), try tr.readU8());
+    try testing.expectEqual(@as(u32, 1), ctx.handler.total_jobs);
+    try testing.expectEqual(@as(u32, 1), ctx.handler.pending.queueCount("cron-q"));
+}
+
+test "chain child IDs tolerate user collisions and maximum-length parents" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-chain-ids");
+    defer ctx.destroy();
+
+    var b = ctx.stores[0].newBatch();
+    defer b.close();
+
+    // A user can legally occupy the legacy generated name. This must select a
+    // deterministic fallback, not assert-crash the server.
+    const alien = types.Job{
+        .id = "chain_parent_1",
+        .queue = "other-q",
+        .state = .pending,
+        .created_at_ns = 1,
+    };
+    var enc: [codec.max_job_encoded_size]u8 = undefined;
+    var jk: keys.KeyBuf = undefined;
+    b.set(keys.jobKey(&jk, alien.id), codec.encodeJob(&enc, &alien));
+
+    var child_buf: [64]u8 = undefined;
+    const child_id = switch (handler_mod.resolveChainChildId(&b, &child_buf, "parent", "chain", 1)) {
+        .available => |id| id,
+        .existing, .exhausted => return error.ExpectedAvailableChainId,
+    };
+    try testing.expect(!std.mem.eql(u8, child_id, alien.id));
+    try testing.expect(child_id.len <= types.max_job_id_len);
+
+    // Once that logical child exists, replay recognizes it instead of creating
+    // a second fallback child.
+    const child = types.Job{
+        .id = child_id,
+        .queue = "chain-q",
+        .state = .pending,
+        .created_at_ns = 2,
+        .parent_id = "parent",
+        .chain_id = "chain",
+        .chain_step = 1,
+    };
+    b.set(keys.jobKey(&jk, child.id), codec.encodeJob(&enc, &child));
+    try testing.expect(handler_mod.resolveChainChildId(&b, &child_buf, "parent", "chain", 1) == .existing);
+
+    const max_parent = [_]u8{'p'} ** types.max_job_id_len;
+    var long_buf: [64]u8 = undefined;
+    const long_child = switch (handler_mod.resolveChainChildId(&b, &long_buf, &max_parent, "long-chain", 2)) {
+        .available => |id| id,
+        .existing, .exhausted => return error.ExpectedAvailableLongChainId,
+    };
+    try testing.expect(long_child.len > 0 and long_child.len <= types.max_job_id_len);
+}
+
+test "cron updates are atomic and generated side-effect IDs remain available" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-generated-ids");
+    defer ctx.destroy();
+
+    const long_cron_id = [_]u8{'c'} ** types.max_entity_id_len;
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const create = ops_mod.OpData{ .cron_create = .{
+            .cron_id = &long_cron_id,
+            .name = "original-name",
+            .queue = "long-cron-q",
+            .schedule = "* * * * *",
+            .next_run_ns = 1000,
+            .created_at_ns = 1,
+        } };
+        try testing.expect(ctx.handler.apply(&b, .cron_create, &create).err == null);
+        b.commit();
+    }
+
+    // An invalid schedule following a rename used to leave cn| partially
+    // changed even though the update returned an error.
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const update = ops_mod.OpData{ .cron_update = .{
+            .cron_id = &long_cron_id,
+            .name = "must-not-stick",
+            .schedule = "definitely not a cron",
+            .now_ns = 2,
+        } };
+        try testing.expect(ctx.handler.apply(&b, .cron_update, &update).err != null);
+
+        var cn: keys.KeyBuf = undefined;
+        try testing.expectEqualStrings(&long_cron_id, b.get(keys.cronNameKey(&cn, "original-name")).?);
+        try testing.expect(b.get(keys.cronNameKey(&cn, "must-not-stick")) == null);
+        var ck: keys.KeyBuf = undefined;
+        try testing.expectEqualStrings("original-name", codec.decodeCron(b.get(keys.cronKey(&ck, &long_cron_id)).?).name);
+    }
+
+    // A 64-byte cron ID cannot fit in the old readable "id-slot" job ID.
+    // The scan must generate a legal fallback and still enqueue the fire.
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const scan = ops_mod.OpData{ .maintenance = .{ .action = .cron, .now_ns = 2000 } };
+        try testing.expectEqual(@as(u32, 1), ctx.handler.apply(&b, .maintenance, &scan).affected);
+        try testing.expectEqual(@as(u32, 1), ctx.handler.pending.queueCount("long-cron-q"));
+        b.commit();
+    }
+
+    // Batch callbacks also live in the user job namespace. Occupying the old
+    // readable ID must select a fallback instead of silently losing callback.
+    ctx.handler.resetEffects();
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const alien = types.Job{
+            .id = "batch_cb_collision-batch",
+            .queue = "alien-q",
+            .state = .pending,
+            .created_at_ns = 1,
+        };
+        var job_buf: [codec.max_job_encoded_size]u8 = undefined;
+        var jk: keys.KeyBuf = undefined;
+        b.set(keys.jobKey(&jk, alien.id), codec.encodeJob(&job_buf, &alien));
+
+        const batch = types.Batch{
+            .id = "collision-batch",
+            .callback_queue = "callback-q",
+            .open = true,
+            .total = 1,
+            .pending = 0,
+            .succeeded = 1,
+            .created_at_ns = 1,
+        };
+        var batch_buf: [codec.max_batch_encoded_size]u8 = undefined;
+        var bk: keys.KeyBuf = undefined;
+        b.set(keys.batchKey(&bk, batch.id), codec.encodeBatch(&batch_buf, &batch));
+
+        const seal = ops_mod.OpData{ .batch_seal = .{ .batch_id = batch.id, .now_ns = 2 } };
+        const seal_result = ctx.handler.apply(&b, .batch_seal, &seal);
+        try testing.expect(seal_result.err == null);
+        try testing.expectEqualStrings("callback-q", seal_result.notify_queues.?[0]);
+        try testing.expectEqual(@as(u32, 1), ctx.handler.pending.queueCount("callback-q"));
+    }
+}
+
+test "oversized encoded records are rejected without partial writes" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-record-bounds");
+    defer ctx.destroy();
+
+    const huge = [_]u8{'x'} ** 3000;
+    var b = ctx.stores[0].newBatch();
+    defer b.close();
+
+    const batch_create = ops_mod.OpData{ .batch_create = .{
+        .batch_id = "too-large-batch",
+        .callback_payload = &huge,
+        .created_at_ns = 1,
+    } };
+    try testing.expect(ctx.handler.apply(&b, .batch_create, &batch_create).err != null);
+    var bk: keys.KeyBuf = undefined;
+    try testing.expect(b.get(keys.batchKey(&bk, "too-large-batch")) == null);
+
+    const cron_create = ops_mod.OpData{ .cron_create = .{
+        .cron_id = "too-large-cron",
+        .name = "too-large-cron",
+        .queue = "bounds-q",
+        .schedule = "* * * * *",
+        .payload = &huge,
+        .created_at_ns = 1,
+    } };
+    try testing.expect(ctx.handler.apply(&b, .cron_create, &cron_create).err != null);
+    var ck: keys.KeyBuf = undefined;
+    var cn: keys.KeyBuf = undefined;
+    try testing.expect(b.get(keys.cronKey(&ck, "too-large-cron")) == null);
+    try testing.expect(b.get(keys.cronNameKey(&cn, "too-large-cron")) == null);
+}
+
+test "leadership rebuild restores configuration when the cluster has no jobs" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-empty-rebuild");
+    defer ctx.destroy();
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const queue = ops_mod.OpData{ .queue_config = .{
+            .queue = "configured-empty-q",
+            .action = .throttle,
+            .rate_limit = 17,
+            .rate_window_ms = 23_000,
+        } };
+        try testing.expect(ctx.handler.apply(&b, .queue_config, &queue).err == null);
+        const global = ops_mod.OpData{ .global_config = .{
+            .rate_limit = 31,
+            .rate_window_ms = 47_000,
+        } };
+        try testing.expect(ctx.handler.apply(&b, .global_config, &global).err == null);
+        b.commit();
+    }
+
+    var promoted = handler_mod.OpHandler.init(testing.allocator);
+    defer promoted.deinit();
+    promoted.rebuildState(ctx.stores[0..]);
+
+    const queue = promoted.queue_configs.get("configured-empty-q").?;
+    try testing.expectEqual(@as(u32, 17), queue.rate_limit);
+    try testing.expectEqual(@as(u32, 23_000), queue.rate_window_ms);
+    try testing.expectEqual(@as(u32, 31), promoted.global_rate_limit);
+    try testing.expectEqual(@as(u32, 47_000), promoted.global_rate_window_ms);
+    try testing.expectEqual(@as(u32, 0), promoted.total_jobs);
+}
+
+test "cron retries a due slot when enqueue is temporarily unavailable" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-cron-retry");
+    defer ctx.destroy();
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const jobs = [_]ops_mod.EnqueueJob{.{
+            .job_id = "capacity-holder",
+            .queue = "capacity-q",
+            .created_at_ns = 1,
+        }};
+        const enqueue = ops_mod.OpData{ .enqueue = .{ .jobs = &jobs, .now_ns = 1 } };
+        try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+        const cron = ops_mod.OpData{ .cron_create = .{
+            .cron_id = "retry-cron",
+            .name = "retry-cron",
+            .queue = "cron-retry-q",
+            .schedule = "* * * * *",
+            .next_run_ns = 1000,
+            .created_at_ns = 1,
+        } };
+        try testing.expect(ctx.handler.apply(&b, .cron_create, &cron).err == null);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    ctx.handler.max_jobs = 1;
+    ctx.handler.resetEffects();
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const scan = ops_mod.OpData{ .maintenance = .{ .action = .cron, .now_ns = 2000 } };
+        try testing.expectEqual(@as(u32, 0), ctx.handler.apply(&b, .maintenance, &scan).affected);
+        var ck: keys.KeyBuf = undefined;
+        try testing.expectEqual(@as(i64, 1000), codec.decodeCron(b.get(keys.cronKey(&ck, "retry-cron")).?).next_run_ns);
+    }
+
+    ctx.handler.max_jobs = 2;
+    ctx.handler.resetEffects();
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const scan = ops_mod.OpData{ .maintenance = .{ .action = .cron, .now_ns = 2000 } };
+        try testing.expectEqual(@as(u32, 1), ctx.handler.apply(&b, .maintenance, &scan).affected);
+        try testing.expectEqual(@as(u32, 1), ctx.handler.pending.queueCount("cron-retry-q"));
+    }
+}
+
+test "clearing the last batch job fires and notifies its callback queue" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-clear-batch-callback");
+    defer ctx.destroy();
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const create = ops_mod.OpData{ .batch_create = .{
+            .batch_id = "clear-batch",
+            .callback_queue = "clear-callback-q",
+            .created_at_ns = 1,
+        } };
+        try testing.expect(ctx.handler.apply(&b, .batch_create, &create).err == null);
+        const jobs = [_]ops_mod.EnqueueJob{.{
+            .job_id = "clear-batch-job",
+            .queue = "clear-source-q",
+            .batch_id = "clear-batch",
+            .created_at_ns = 1,
+        }};
+        const enqueue = ops_mod.OpData{ .enqueue = .{ .jobs = &jobs, .now_ns = 1 } };
+        try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+        const seal = ops_mod.OpData{ .batch_seal = .{ .batch_id = "clear-batch", .now_ns = 2 } };
+        try testing.expect(ctx.handler.apply(&b, .batch_seal, &seal).err == null);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    ctx.handler.resetEffects();
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const clear = ops_mod.OpData{ .clear_queue = .{ .queue = "clear-source-q", .now_ns = 3 } };
+        const result = ctx.handler.apply(&b, .clear_queue, &clear);
+        try testing.expect(result.err == null);
+        try testing.expectEqualStrings("clear-callback-q", result.notify_queues.?[0]);
+        try testing.expectEqual(@as(u32, 1), ctx.handler.pending.queueCount("clear-callback-q"));
+        var bk: keys.KeyBuf = undefined;
+        const batch = codec.decodeBatch(b.get(keys.batchKey(&bk, "clear-batch")).?);
+        try testing.expectEqual(@as(u32, 0), batch.pending);
+        try testing.expectEqual(@as(u32, 1), batch.failed);
+        try testing.expectEqual(@as(u64, 3), batch.completed_at_ns);
+    }
+}
+
+test "bulk action updates counters for 256 distinct batches" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-bulk-batches");
+    defer ctx.destroy();
+
+    const count = rpc.MAX_BATCH_JOBS;
+    var batch_ids: [count][32]u8 = undefined;
+    var batch_lens: [count]u8 = undefined;
+    var job_ids: [count][32]u8 = undefined;
+    var job_lens: [count]u8 = undefined;
+    var bulk_ids: [count][]const u8 = undefined;
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        for (0..count) |i| {
+            const batch_id = std.fmt.bufPrint(&batch_ids[i], "batch-{d}", .{i}) catch unreachable;
+            batch_lens[i] = @intCast(batch_id.len);
+            const job_id = std.fmt.bufPrint(&job_ids[i], "job-{d}", .{i}) catch unreachable;
+            job_lens[i] = @intCast(job_id.len);
+            bulk_ids[i] = job_ids[i][0..job_lens[i]];
+
+            const create = ops_mod.OpData{ .batch_create = .{
+                .batch_id = batch_ids[i][0..batch_lens[i]],
+                .created_at_ns = 1000,
+            } };
+            try testing.expect(ctx.handler.apply(&b, .batch_create, &create).err == null);
+            const jobs = [_]ops_mod.EnqueueJob{.{
+                .job_id = bulk_ids[i],
+                .queue = "bulk-batch-q",
+                .state = .pending,
+                .created_at_ns = 1000,
+                .batch_id = batch_ids[i][0..batch_lens[i]],
+            }};
+            const enqueue = ops_mod.OpData{ .enqueue = .{ .jobs = &jobs, .now_ns = 1000 } };
+            try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+        }
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const cancel = ops_mod.OpData{ .bulk_action = .{
+            .job_ids = &bulk_ids,
+            .action = .cancel,
+            .now_ns = 2000,
+        } };
+        const result = ctx.handler.apply(&b, .bulk_action, &cancel);
+        try testing.expect(result.err == null);
+        try testing.expectEqual(@as(u32, count), result.affected);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    var verify = ctx.stores[0].newBatch();
+    defer verify.close();
+    for (0..count) |i| {
+        var bk: keys.KeyBuf = undefined;
+        const batch = codec.decodeBatch(verify.get(keys.batchKey(&bk, batch_ids[i][0..batch_lens[i]])).?);
+        try testing.expectEqual(@as(u32, 1), batch.total);
+        try testing.expectEqual(@as(u32, 0), batch.pending);
+        try testing.expectEqual(@as(u32, 1), batch.failed);
+    }
 }
 
 test "multiple frames in one tick" {
@@ -3386,7 +3875,8 @@ test "HTTP POST /api/v1/enqueue creates job" {
     const conn_id = ctx.backend.connect().?;
     const body = "{\"queue\":\"default\",\"priority\":5}";
     var req_buf: [512]u8 = undefined;
-    const req = std.fmt.bufPrint(&req_buf,
+    const req = std.fmt.bufPrint(
+        &req_buf,
         "POST /api/v1/enqueue HTTP/1.1\r\nContent-Length: {d}\r\nHost: localhost\r\n\r\n{s}",
         .{ body.len, body },
     ) catch unreachable;
@@ -3401,6 +3891,55 @@ test "HTTP POST /api/v1/enqueue creates job" {
     try testing.expect(std.mem.indexOf(u8, resp_body, "\"id\":\"job_") != null);
     // Batch was used.
     try testing.expectEqual(@as(u64, 1), ctx.pipeline.applied_total);
+}
+
+test "HTTP fetch returns exactly one claimed job and supports payloads above 32 KiB" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-http-fetch-boundary");
+    defer ctx.destroy();
+
+    const large_payload = [_]u8{'0'} ** 40_000;
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const jobs = [_]ops_mod.EnqueueJob{
+            .{
+                .job_id = "http-large-first",
+                .queue = "http-fetch-q",
+                .payload = &large_payload,
+                .priority = 200,
+                .created_at_ns = 1,
+            },
+            .{
+                .job_id = "http-small-second",
+                .queue = "http-fetch-q",
+                .payload = "{}",
+                .priority = 1,
+                .created_at_ns = 1,
+            },
+        };
+        const enqueue = ops_mod.OpData{ .enqueue = .{ .jobs = &jobs, .now_ns = 1 } };
+        try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    const conn = ctx.backend.connect().?;
+    const body = "{\"queues\":[\"http-fetch-q\"],\"worker_id\":\"http-worker\",\"count\":10}";
+    var req_buf: [512]u8 = undefined;
+    const req = std.fmt.bufPrint(
+        &req_buf,
+        "POST /api/v1/fetch HTTP/1.1\r\nContent-Length: {d}\r\nHost: localhost\r\n\r\n{s}",
+        .{ body.len, body },
+    ) catch unreachable;
+    ctx.injectHttp(conn, req);
+    ctx.pipeline.tick();
+
+    const response = ctx.readHttpResponse(conn).?;
+    try testing.expectEqual(@as(u16, 200), TestContext.httpResponseStatus(response).?);
+    try testing.expect(response.len > large_payload.len);
+    try testing.expect(std.mem.indexOf(u8, TestContext.httpResponseBody(response).?, "\"job_id\":\"http-large-first\"") != null);
+    try testing.expectEqual(@as(i32, 1), ctx.handler.getActiveCount("http-fetch-q"));
+    try testing.expectEqual(@as(u32, 1), ctx.handler.pending.queueCount("http-fetch-q"));
 }
 
 test "HTTP protocol detection — same pipeline handles both" {

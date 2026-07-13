@@ -12,6 +12,9 @@ const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
 
 pub fn applyQueueConfig(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.QueueOp) ops.OpResult {
+    if (op.queue.len == 0 or op.queue.len > types.max_queue_name_len or
+        std.mem.indexOfScalar(u8, op.queue, 0) != null)
+        return .{ .err = "invalid queue" };
     var qn_buf: keys.KeyBuf = undefined;
     var qc_buf: keys.KeyBuf = undefined;
     const qc_key = keys.queueConfigKey(&qc_buf, op.queue);
@@ -72,6 +75,10 @@ pub fn applyQueueConfig(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Queu
 }
 
 pub fn applyClearQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.ClearQueueOp) ops.OpResult {
+    if (op.queue.len == 0 or op.queue.len > types.max_queue_name_len or
+        std.mem.indexOfScalar(u8, op.queue, 0) != null)
+        return .{ .err = "invalid queue" };
+    if (op.now_ns == 0) return .{ .err = "invalid queue timestamp" };
     var qn_buf: keys.KeyBuf = undefined;
     if (b.get(keys.queueNameKey(&qn_buf, op.queue)) == null) {
         return .{ .err = "queue not found" };
@@ -110,10 +117,16 @@ pub fn applyClearQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Clear
     // tick re-accumulate their own deltas and flush correctly on top of zero.
     self.indexer.resetQueueStateDeltas(op.queue, &.{ .pending, .scheduled, .retrying });
 
-    return .{};
+    return .{
+        .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
+    };
 }
 
 pub fn applyDeleteQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.DeleteQueueOp) ops.OpResult {
+    if (op.queue.len == 0 or op.queue.len > types.max_queue_name_len or
+        std.mem.indexOfScalar(u8, op.queue, 0) != null)
+        return .{ .err = "invalid queue" };
+    if (op.now_ns == 0) return .{ .err = "invalid queue timestamp" };
     var qn_buf: keys.KeyBuf = undefined;
     if (b.get(keys.queueNameKey(&qn_buf, op.queue)) == null) {
         return .{ .err = "queue not found" };
@@ -137,7 +150,9 @@ pub fn applyDeleteQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Dele
         b.deleteRange(up, end);
     }
 
-    return .{};
+    return .{
+        .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
+    };
 }
 
 // ============================================================================
@@ -388,7 +403,7 @@ fn deleteJobsByPrefix(
 /// Adjust batch counters when a non-terminal job is force-deleted (clear/delete queue).
 /// The job was still "pending" from the batch's perspective, so decrement pending
 /// and increment failed.
-fn adjustBatchForDeletedJob(_: *OpHandler, b: *kv.WriteBatch, batch_id: []const u8, now_ns: u64) void {
+fn adjustBatchForDeletedJob(self: *OpHandler, b: *kv.WriteBatch, batch_id: []const u8, now_ns: u64) void {
     var bk_buf: keys.KeyBuf = undefined;
     const bkey = keys.batchKey(&bk_buf, batch_id);
     const batch_bytes = b.get(bkey);
@@ -403,7 +418,7 @@ fn adjustBatchForDeletedJob(_: *OpHandler, b: *kv.WriteBatch, batch_id: []const 
     assert.check(batch.succeeded + batch.failed <= batch.total, "adjustBatchForDeletedJob: completed ({d}+{d}) exceeds total ({d}) for batch {s}", .{ batch.succeeded, batch.failed, batch.total, batch_id });
 
     if (batch.pending == 0 and !batch.open and batch.total > 0) {
-        batch.completed_at_ns = now_ns;
+        if (self.enqueueBatchCallback(b, &batch, now_ns)) batch.completed_at_ns = now_ns;
     }
 
     var batch_enc_buf: [codec.max_batch_encoded_size]u8 = undefined;

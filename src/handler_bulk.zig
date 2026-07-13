@@ -11,9 +11,11 @@ const kv = @import("kv.zig");
 const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
 
-/// Track batch counter adjustments during bulk actions.
-/// Fixed-size to avoid allocation. Max 64 distinct batches per bulk op.
-const max_batch_mods = 64;
+/// Track batch counter adjustments during bulk actions. One RPC can carry 256
+/// jobs and every job can belong to a different batch; a 64-slot table silently
+/// dropped counter updates for jobs 65..256, leaving those batches permanently
+/// pending. Match the protocol boundary exactly while staying allocation-free.
+const max_batch_mods = @import("rpc.zig").MAX_BATCH_JOBS;
 const BatchMod = struct {
     batch_id_buf: [128]u8 = undefined,
     batch_id_len: u8 = 0,
@@ -26,12 +28,20 @@ const BatchMod = struct {
 };
 
 pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkActionOp) ops.OpResult {
+    for (op.job_ids) |job_id| {
+        if (job_id.len == 0 or job_id.len > types.max_job_id_len or
+            std.mem.indexOfScalar(u8, job_id, 0) != null)
+            return .{ .err = "invalid bulk job_id" };
+    }
     // Bulk move requires an existing destination queue. Moving jobs into a queue
     // with no config/name key strands them: fetch's getQueueConfig returns null
     // and skips the queue, so the jobs are never claimable. Validate once, up
     // front (client-provided target → error, not silent stranding).
     if (op.action == .move) {
         const move_to = op.move_to_queue orelse return .{ .err = "missing target queue" };
+        if (move_to.len == 0 or move_to.len > types.max_queue_name_len or
+            std.mem.indexOfScalar(u8, move_to, 0) != null)
+            return .{ .err = "invalid target queue" };
         var qn_buf: keys.KeyBuf = undefined;
         if (b.get(keys.queueNameKey(&qn_buf, move_to)) == null) {
             return .{ .err = "target queue not found" };
@@ -64,7 +74,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 if (!job.state.isTerminal()) continue;
 
                 // Load payload from jp| key into stack buffer.
-                var payload_buf: [8192]u8 = undefined;
+                var payload_buf: [@import("rpc.zig").MAX_PAYLOAD_SIZE]u8 = undefined;
                 var jpk_buf: keys.KeyBuf = undefined;
                 const payload = b.getInto(keys.jobPayloadKey(&jpk_buf, job_id), &payload_buf);
 
@@ -107,10 +117,11 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 const enq_result = self.applyEnqueue(b, &enqueue_op);
                 if (enq_result.err == null) {
                     self.recordSideEffect(&enq_job);
+                    self.recordPromoteQueue(enq_job.queue);
+                    affected += 1;
                 }
 
                 // Old job stays terminal — don't modify it.
-                affected += 1;
                 continue; // skip job write — old job is unchanged
             },
 
@@ -364,9 +375,9 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 // Write job error KV entry for rejected jobs.
                 {
                     var ek_buf: keys.KeyBuf = undefined;
-                    var err_val_buf: [256]u8 = undefined;
-                    const err_json = std.fmt.bufPrint(&err_val_buf, "{{\"job_id\":\"{s}\",\"attempt\":{d},\"error\":\"rejected\",\"created_at_ns\":{d}}}", .{
-                        job_id, job.attempt, op.now_ns,
+                    var err_val_buf: [1024]u8 = undefined;
+                    const err_json = std.fmt.bufPrint(&err_val_buf, "{{\"job_id\":{f},\"attempt\":{d},\"error\":\"rejected\",\"created_at_ns\":{d}}}", .{
+                        std.json.fmt(job_id, .{}), job.attempt, op.now_ns,
                     }) catch "";
                     if (err_json.len > 0) {
                         b.set(keys.jobErrorKey(&ek_buf, job_id, @intCast(job.attempt)), err_json);
@@ -442,31 +453,7 @@ fn applyBatchMods(self: *OpHandler, b: *kv.WriteBatch, mods: []const BatchMod, c
 
         // Check if batch is now complete.
         if (batch.pending == 0 and !batch.open and batch.total > 0) {
-            batch.completed_at_ns = now_ns;
-            // Fire callback directly.
-            if (batch.callback_queue) |cq| {
-                if (cq.len > 0) {
-                    var id_buf: [64]u8 = undefined;
-                    const cb_id = std.fmt.bufPrint(&id_buf, "batch_cb_{s}", .{m.batchId()}) catch "batch_cb_err";
-                    const cb_job = ops.EnqueueJob{
-                        .job_id = cb_id,
-                        .queue = cq,
-                        .payload = batch.callback_payload,
-                        .state = .pending,
-                        .priority = types.priority_normal,
-                        .created_at_ns = now_ns,
-                    };
-                    const jobs_arr = [_]ops.EnqueueJob{cb_job};
-                    const enqueue_op = ops.EnqueueOp{
-                        .jobs = &jobs_arr,
-                        .now_ns = now_ns,
-                    };
-                    const enq_result2 = self.applyEnqueue(b, &enqueue_op);
-                    if (enq_result2.err == null) {
-                        self.recordSideEffect(&cb_job);
-                    }
-                }
-            }
+            if (self.enqueueBatchCallback(b, &batch, now_ns)) batch.completed_at_ns = now_ns;
         }
 
         var batch_enc_buf: [codec.max_batch_encoded_size]u8 = undefined;

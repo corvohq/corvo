@@ -254,6 +254,35 @@ pub const Batcher = struct {
         self.pending_bytes = 0;
     }
 
+    /// On leader step-down, fail only proposals above the Raft commit index.
+    /// An entry can reach quorum and advance commit_index, then a higher-term
+    /// message later in the same inbound batch demotes the node before
+    /// Runtime.applyReady applies it. Failing that committed completion makes
+    /// the pipeline panic for a write the cluster DID accept. Keep committed
+    /// entries until applyReady marks/applies them and onCommitted succeeds;
+    /// fail every uncommitted in-flight and not-yet-flushed proposal.
+    pub fn failUncommitted(self: *Batcher, commit_index: u64) void {
+        var write: usize = 0;
+        for (0..self.in_flight_count) |i| {
+            const entry = &self.in_flight[i];
+            if (entry.entry_index <= commit_index) {
+                if (write != i) self.in_flight[write] = entry.*;
+                write += 1;
+            } else {
+                for (entry.completions.items) |c| c.on_complete(c.ctx, false);
+                entry.completions.deinit(self.allocator);
+            }
+        }
+        self.in_flight_count = write;
+
+        for (0..self.pending_count) |i| {
+            const c = self.pending[i].completion;
+            c.on_complete(c.ctx, false);
+        }
+        self.pending_count = 0;
+        self.pending_bytes = 0;
+    }
+
     fn encodePending(self: *Batcher) ![]u8 {
         // Concatenate all pending mutations into one []Mutation, then
         // single-encode via oplog.encodeMutations.
@@ -458,6 +487,34 @@ test "batcher: failAll fires failures and clears" {
     try testing.expectEqual(@as(usize, 2), counter.failures);
     try testing.expectEqual(@as(usize, 0), b.pendingCount());
     try testing.expectEqual(@as(usize, 0), b.inFlightCount());
+}
+
+test "batcher: step-down preserves committed completion and fails only suffix" {
+    var batcher = Batcher.init(testing.allocator);
+    defer batcher.deinit();
+    var proposer = TestProposer{ .allocator = testing.allocator };
+    defer proposer.deinit();
+    var committed = TestCounter{};
+    var uncommitted = TestCounter{};
+    var pending = TestCounter{};
+    const mutation = [_]Mutation{.{ .op = .set, .key = "k", .value = "v" }};
+
+    try batcher.enqueue(&mutation, committed.completion(), true);
+    try batcher.flush(@ptrCast(&proposer), TestProposer.propose);
+    try batcher.enqueue(&mutation, uncommitted.completion(), true);
+    try batcher.flush(@ptrCast(&proposer), TestProposer.propose);
+    try batcher.enqueue(&mutation, pending.completion(), true);
+
+    batcher.failUncommitted(1);
+    try testing.expectEqual(@as(usize, 0), committed.successes);
+    try testing.expectEqual(@as(usize, 0), committed.failures);
+    try testing.expectEqual(@as(usize, 1), uncommitted.failures);
+    try testing.expectEqual(@as(usize, 1), pending.failures);
+    try testing.expectEqual(@as(usize, 1), batcher.inFlightCount());
+
+    batcher.onCommitted(1);
+    try testing.expectEqual(@as(usize, 1), committed.successes);
+    try testing.expectEqual(@as(usize, 0), batcher.inFlightCount());
 }
 
 test "batcher: onCommitted only fires for committed entries" {

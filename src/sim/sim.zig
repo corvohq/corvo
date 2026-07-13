@@ -36,7 +36,22 @@ const max_clients = 16;
 const SimBackend = io_mod.SimBackend;
 const Pipeline = pipeline_mod.Pipeline(SimBackend);
 
-pub fn run(allocator: std.mem.Allocator, config: Config) !void {
+pub const Stats = struct {
+    enqueued: u32 = 0,
+    fetched: u32 = 0,
+    acked: u32 = 0,
+    failed: u32 = 0,
+    bulk: u32 = 0,
+    maintenance: u32 = 0,
+    heartbeats: u32 = 0,
+    queue_ops: u32 = 0,
+    stale_acks: u32 = 0,
+    cron_ops: u32 = 0,
+    batch_creates: u32 = 0,
+    chain_enqueues: u32 = 0,
+};
+
+pub fn run(allocator: std.mem.Allocator, config: Config) !Stats {
     const seed: u64 = if (config.seed == 0)
         @intCast(@as(u128, @bitCast(std.time.nanoTimestamp())) & 0xFFFFFFFFFFFFFFFF)
     else
@@ -175,6 +190,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
                 &handler,
                 tick,
                 seed,
+                @intCast(clock.now()),
             );
             if (result) |err| {
                 std.debug.print(
@@ -193,6 +209,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
             &handler,
             config.ticks,
             seed,
+            @intCast(clock.now()),
         );
         if (result) |err| {
             std.debug.print(
@@ -235,12 +252,27 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     std.debug.print(
         "OK seed={d} ticks={d} clients={d} queues={d} | enq={d} fetch={d} ack={d} fail={d} bulk={d} maint={d} hb={d} qop={d} stale={d} cron={d} batch={d} chain={d}\n",
         .{
-            seed,            config.ticks,       num_clients,        num_queues,
-            total_enqueued,  total_fetched,      total_acked,        total_failed,
-            total_bulk,      total_maintenance,  total_heartbeats,   total_queue_ops,
+            seed,             config.ticks,      num_clients,         num_queues,
+            total_enqueued,   total_fetched,     total_acked,         total_failed,
+            total_bulk,       total_maintenance, total_heartbeats,    total_queue_ops,
             total_stale_acks, total_cron_ops,    total_batch_creates, total_chain_enqueues,
         },
     );
+
+    return .{
+        .enqueued = total_enqueued,
+        .fetched = total_fetched,
+        .acked = total_acked,
+        .failed = total_failed,
+        .bulk = total_bulk,
+        .maintenance = total_maintenance,
+        .heartbeats = total_heartbeats,
+        .queue_ops = total_queue_ops,
+        .stale_acks = total_stale_acks,
+        .cron_ops = total_cron_ops,
+        .batch_creates = total_batch_creates,
+        .chain_enqueues = total_chain_enqueues,
+    };
 }
 
 // ============================================================================
@@ -248,7 +280,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
 // ============================================================================
 
 test "sim smoke" {
-    try run(std.testing.allocator, .{
+    _ = try run(std.testing.allocator, .{
         .seed = 42,
         .ticks = 100,
         .clients = 2,
@@ -257,10 +289,59 @@ test "sim smoke" {
 }
 
 test "sim stress" {
-    try run(std.testing.allocator, .{
+    const stats = try run(std.testing.allocator, .{
         .seed = 12345,
         .ticks = 5000,
         .clients = 5,
         .queues = 3,
     });
+
+    // A green invariant run is only meaningful if the major feature paths
+    // actually fired. These assertions caught malformed chain frames and the
+    // empty-ID cron/batch simulator that previously reported false coverage.
+    try std.testing.expect(stats.enqueued > 0);
+    try std.testing.expect(stats.fetched > 0);
+    try std.testing.expect(stats.acked > 0);
+    try std.testing.expect(stats.failed > 0);
+    try std.testing.expect(stats.bulk > 0);
+    try std.testing.expect(stats.heartbeats > 0);
+    try std.testing.expect(stats.queue_ops > 0);
+    try std.testing.expect(stats.stale_acks > 0);
+    try std.testing.expect(stats.cron_ops > 0);
+    try std.testing.expect(stats.batch_creates > 0);
+    try std.testing.expect(stats.chain_enqueues > 0);
+}
+
+test "sim seed sweep — time jumps and feature interleavings" {
+    // One long seed can miss rare orderings. Sweep independent deterministic
+    // histories with more aggressive clocks so expiry, reclaim, retry,
+    // uniqueness, cron, batch, queue, and chain state overlap differently.
+    const seeds = [_]u64{ 1, 7, 42, 31337, 0xC0FFEE, 0xDEADBEEF, 20260709, 0xFFFF_FFFF_FFFF_FFC5 };
+    var aggregate = Stats{};
+    for (seeds) |seed| {
+        const stats = try run(std.testing.allocator, .{
+            .seed = seed,
+            .ticks = 1000,
+            .clients = 4,
+            .queues = 4,
+            .time_jump_prob = 0.08,
+            .time_jump_max_ns = 300_000_000_000,
+            .check_interval = 5,
+        });
+        aggregate.enqueued += stats.enqueued;
+        aggregate.fetched += stats.fetched;
+        aggregate.acked += stats.acked;
+        aggregate.failed += stats.failed;
+        aggregate.bulk += stats.bulk;
+        aggregate.heartbeats += stats.heartbeats;
+        aggregate.queue_ops += stats.queue_ops;
+        aggregate.cron_ops += stats.cron_ops;
+        aggregate.batch_creates += stats.batch_creates;
+        aggregate.chain_enqueues += stats.chain_enqueues;
+    }
+    try std.testing.expect(aggregate.enqueued > 0 and aggregate.fetched > 0);
+    try std.testing.expect(aggregate.acked > 0 and aggregate.failed > 0);
+    try std.testing.expect(aggregate.bulk > 0 and aggregate.queue_ops > 0);
+    try std.testing.expect(aggregate.cron_ops > 0 and aggregate.batch_creates > 0);
+    try std.testing.expect(aggregate.chain_enqueues > 0);
 }

@@ -1127,8 +1127,10 @@ fn decodeFetch(body: []const u8, now_ns: u64, scratch: *DecodeScratch) DecodeRes
 
     const worker_id = extractJSONString(body, "worker_id") orelse "";
     const hostname = extractJSONString(body, "hostname") orelse "";
-    const count_val = extractJSONInt(body, "count");
-    const count: u32 = if (count_val) |c| @intCast(std.math.clamp(c, 1, 512)) else 1;
+    // The HTTP response schema is one flat job object (the RPC protocol is the
+    // batched/push surface). Claim exactly one: honoring count>1 here leased
+    // several jobs but returned only fetched[0], invisibly stranding the rest.
+    const count: u32 = 1;
 
     return .{
         .op_data = .{ .fetch = .{
@@ -1802,7 +1804,7 @@ fn encodeFetchResponse(send_buf: []u8, result: *const ops_mod.OpResult, store: ?
         return writeResponse(send_buf, 200, "{\"job_id\":\"\",\"queue\":\"\",\"payload\":null,\"attempt\":0,\"max_retries\":0,\"lease_duration\":0}");
     }
 
-    var body_buf: [32768]u8 = undefined;
+    var body_buf: [rpc.MAX_PAYLOAD_SIZE + 2048]u8 = undefined;
     var jw = json.JsonWriter.init(&body_buf);
 
     const f = &result.fetched[0];
@@ -1821,7 +1823,7 @@ fn encodeFetchResponse(send_buf: []u8, result: *const ops_mod.OpResult, store: ?
         defer batch.close();
 
         // Load payload from KV
-        var payload_buf: [32768]u8 = undefined;
+        var payload_buf: [rpc.MAX_PAYLOAD_SIZE]u8 = undefined;
         var jpk_buf: keys.KeyBuf = undefined;
         const payload_key = keys.jobPayloadKey(&jpk_buf, job_id);
         if (batch.getInto(payload_key, &payload_buf)) |payload_bytes| {
@@ -1831,7 +1833,7 @@ fn encodeFetchResponse(send_buf: []u8, result: *const ops_mod.OpResult, store: ?
         }
 
         // Load checkpoint and tags from job header
-        var header_buf: [4096]u8 = undefined;
+        var header_buf: [codec.max_job_encoded_size]u8 = undefined;
         var jk_buf: keys.KeyBuf = undefined;
         const job_key = keys.jobKey(&jk_buf, job_id);
         if (batch.getInto(job_key, &header_buf)) |job_bytes| {
@@ -1878,8 +1880,7 @@ fn encodeHeartbeatResponse(send_buf: []u8, request_body: []const u8, store: ?*kv
             defer batch.close();
             var jk_buf: keys.KeyBuf = undefined;
             const job_key = keys.jobKey(&jk_buf, jid);
-            var val_buf: [4096]u8 = undefined;
-            break :blk if (batch.getInto(job_key, &val_buf) != null) "ok" else "cancel";
+            break :blk if (batch.get(job_key) != null) "ok" else "cancel";
         } else "ok";
 
         jw.beginObjectField(jid);
@@ -2399,7 +2400,7 @@ test "decodeFetch" {
     try std.testing.expectEqual(@as(usize, 2), op.queues.len);
     try std.testing.expectEqualStrings("q1", op.queues[0]);
     try std.testing.expectEqualStrings("w1", op.worker_id);
-    try std.testing.expectEqual(@as(u32, 10), op.count);
+    try std.testing.expectEqual(@as(u32, 1), op.count);
 }
 
 test "decodeAck" {

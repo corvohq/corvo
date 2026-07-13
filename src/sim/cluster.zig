@@ -40,12 +40,11 @@
 //! distinct from the user retry-index prefix "r|" (0x72 0x7c), so the exclusion
 //! never drops a job index.
 //!
-//! Maintenance (promote/reclaim/expire/purge/...) is left DISABLED (all
-//! intervals 0, the Config default) so quiescence is purely traffic-driven and
-//! fully deterministic; maintenance-mutation application is covered by the
-//! single-node sim + raft_runtime tests. All client-op mutations (enqueue /
-//! fetch-claim / ack / fail / bulk / cron / batch / queue-config) DO replicate
-//! and are checked.
+//! Maintenance defaults to DISABLED (all intervals 0) so general convergence
+//! tests are traffic-driven. Dedicated failover tests enable scheduled promote
+//! and lease reclaim on the elected replacement, proving leader-only maintenance
+//! mutations replicate too. All client-op mutations (enqueue / fetch-claim /
+//! ack / fail / bulk / cron / batch / queue-config) are checked.
 
 const std = @import("std");
 const talon = @import("talon");
@@ -432,6 +431,27 @@ const Cluster = struct {
             };
             n.bridge.afterRaftTick();
         }
+        self.assertElectionSafety();
+    }
+
+    /// Raft permits an isolated old leader and a new leader in a later term to
+    /// overlap briefly, but never two leaders in the SAME term. Check this on
+    /// every full-stack simulator round rather than only at final convergence.
+    fn assertElectionSafety(self: *Cluster) void {
+        for (self.nodes, 0..) |*a, i| {
+            if (!a.ticking or !a.runtime.node.isLeader()) continue;
+            const a_term = a.runtime.node.status().term;
+            for (self.nodes[i + 1 ..]) |*b| {
+                if (!b.ticking or !b.runtime.node.isLeader()) continue;
+                const b_term = b.runtime.node.status().term;
+                if (a_term == b_term) {
+                    std.debug.panic(
+                        "cluster sim election safety: leaders {s} and {s} share term {d}",
+                        .{ a.id, b.id, a_term },
+                    );
+                }
+            }
+        }
     }
 
     fn pumpRounds(self: *Cluster, n: u32) void {
@@ -459,6 +479,18 @@ const Cluster = struct {
         return error.NoLeaderElected;
     }
 
+    fn electReplacementLeading(self: *Cluster, old_leader: usize, max_rounds: u32) !usize {
+        var r: u32 = 0;
+        while (r < max_rounds) : (r += 1) {
+            self.pumpRound();
+            if (self.leaderIdx()) |li| {
+                if (li != old_leader and self.nodes[li].pipeline.raft_state == .leading)
+                    return li;
+            }
+        }
+        return error.NoReplacementLeader;
+    }
+
     /// True when replicated traffic has settled: a leader is leading with no
     /// in-flight proposals, and every ticking node has applied the same number
     /// of raft entries (so their KV is identical).
@@ -471,9 +503,14 @@ const Cluster = struct {
         if (leader.runtime.batcher.pendingCount() != 0) return false;
         if (leader.runtime.batcher.inFlightCount() != 0) return false;
         const applied = leader.runtime.fsm.lastApplied();
-        for (self.nodes) |*n| {
+        for (self.nodes, 0..) |*n, i| {
             if (!n.ticking) continue;
             if (n.runtime.fsm.lastApplied() != applied) return false;
+            // A resumed/deposed leader learns the higher term in Runtime.tick,
+            // while Pipeline observes that role change on its next tick. Do
+            // not declare quiescence in between those phases: it could still
+            // retain subscribers and stale `.leading` write eligibility.
+            if (i != li and n.pipeline.raft_state != .follower) return false;
         }
         return true;
     }
@@ -506,6 +543,11 @@ const Cluster = struct {
 
     fn setPartition(self: *Cluster, idx: usize, up: bool) void {
         self.net.setUp(idx, up);
+    }
+
+    fn setStopped(self: *Cluster, idx: usize, stopped: bool) void {
+        self.nodes[idx].ticking = !stopped;
+        self.net.setUp(idx, !stopped);
     }
 
     /// Deterministically exercise the full completed-job lifecycle through the
@@ -692,6 +734,10 @@ fn printKey(key: []const u8) void {
 /// field order in SimClient.doEnqueue with only the required fields). Returns
 /// the total frame length.
 fn buildEnqueueFrame(buf: []u8, req_id: u32, queue: []const u8, job_id: []const u8) usize {
+    return buildEnqueueFrameAt(buf, req_id, queue, job_id, 0);
+}
+
+fn buildEnqueueFrameAt(buf: []u8, req_id: u32, queue: []const u8, job_id: []const u8, scheduled_at_ns: u64) usize {
     var w = rpc.BufWriter{ .buf = buf[rpc.FRAME_HEADER_SIZE..] };
     w.writeU16(1); // count
     w.writePrefixed(queue);
@@ -702,7 +748,7 @@ fn buildEnqueueFrame(buf: []u8, req_id: u32, queue: []const u8, job_id: []const 
     w.writeU32(0); // base_delay_ms
     w.writeU32(0); // max_delay_ms
     w.writeU32(0); // unique_period_s
-    w.writeU64(0); // scheduled_at_ns
+    w.writeU64(scheduled_at_ns);
     w.writeU32(0); // expire_after_ms
     w.writeU16(0); // chain_step
     w.writeU16(rpc.FLAG_PAYLOAD); // flags
@@ -713,9 +759,13 @@ fn buildEnqueueFrame(buf: []u8, req_id: u32, queue: []const u8, job_id: []const 
 
 /// Build a MSG_FETCH_BATCH (subscribe) frame — mirrors SimClient.doFetch.
 fn buildFetchFrame(buf: []u8, req_id: u32, worker: []const u8, queue: []const u8) usize {
+    return buildFetchFrameLease(buf, req_id, worker, queue, 30000);
+}
+
+fn buildFetchFrameLease(buf: []u8, req_id: u32, worker: []const u8, queue: []const u8, lease_ms: u32) usize {
     var w = rpc.BufWriter{ .buf = buf[rpc.FRAME_HEADER_SIZE..] };
     w.writeU16(1); // credits
-    w.writeU32(30000); // lease_ms
+    w.writeU32(lease_ms);
     w.writePrefixed(worker);
     w.writeU8(1); // queue_count
     w.writePrefixed(queue);
@@ -1031,6 +1081,243 @@ test "cluster raft: failover — deposed leader evicts subscriber, new leader se
         "OK failover: old={s} new={s} post-enq={d} applied={d} jobs={d}\n",
         .{ cluster.nodes[old_leader].id, cluster.nodes[nl].id, client2.enqueued, cluster.nodes[nl].runtime.fsm.lastApplied(), jobs },
     );
+}
+
+test "cluster raft: stopped leader — follower promotes, serves, and old node catches up" {
+    var clock = SimClock.init(1_000_000_000_000);
+    setGlobalClock(&clock);
+    var cluster = try Cluster.init(sim_allocator, 3, &clock);
+    defer cluster.deinit();
+
+    const old_leader = try cluster.electLeaderLeading(400);
+    var frame: [256]u8 = undefined;
+
+    // Commit state before the stop so the replacement must inherit it.
+    const old_conn = cluster.nodes[old_leader].backend.connect().?;
+    const baseline_len = buildEnqueueFrame(&frame, 1, "stop-q", "before-stop");
+    cluster.nodes[old_leader].backend.injectRecv(old_conn, frame[0..baseline_len]);
+    cluster.pumpRounds(rounds_per_step);
+    try std.testing.expect(cluster.quiesce(400));
+    _ = cluster.nodes[old_leader].backend.readResponse(old_conn);
+
+    // A stopped process neither ticks nor participates in the network. The two
+    // surviving followers must elect and finish the acquisition barrier.
+    cluster.setStopped(old_leader, true);
+    const new_leader = try cluster.electReplacementLeading(old_leader, 400);
+    try std.testing.expect(new_leader != old_leader);
+
+    const new_conn = cluster.nodes[new_leader].backend.connect().?;
+    const after_len = buildEnqueueFrame(&frame, 2, "stop-q", "after-stop");
+    cluster.nodes[new_leader].backend.injectRecv(new_conn, frame[0..after_len]);
+    cluster.pumpRounds(rounds_per_step);
+    try std.testing.expect(cluster.quiesce(400)); // converges across the live quorum
+    const new_resp = cluster.nodes[new_leader].backend.readResponse(new_conn);
+    try std.testing.expect(new_resp != null);
+    try std.testing.expect(hasKey(&cluster.nodes[new_leader], "j|before-stop"));
+    try std.testing.expect(hasKey(&cluster.nodes[new_leader], "j|after-stop"));
+
+    // Resume the old node. It first learns the higher term, steps down, then
+    // catches up both user state and the durable lease/config metadata.
+    cluster.setStopped(old_leader, false);
+    try std.testing.expect(cluster.quiesce(800));
+    try std.testing.expect(!cluster.nodes[old_leader].runtime.node.isLeader());
+    try std.testing.expect(cluster.nodes[old_leader].pipeline.raft_state == .follower);
+    _ = try cluster.assertConsistent(new_leader);
+}
+
+test "cluster raft: repeated follower promotions preserve every committed term" {
+    var clock = SimClock.init(1_000_000_000_000);
+    setGlobalClock(&clock);
+    var cluster = try Cluster.init(sim_allocator, 5, &clock);
+    defer cluster.deinit();
+
+    var leader = try cluster.electLeaderLeading(500);
+    var previous_term = cluster.nodes[leader].runtime.node.status().term;
+    var frame: [256]u8 = undefined;
+
+    for (0..4) |cycle| {
+        // Stop the current leader only after all prior writes have committed.
+        try std.testing.expect(cluster.quiesce(500));
+        const stopped = leader;
+        cluster.setStopped(stopped, true);
+        leader = try cluster.electReplacementLeading(stopped, 500);
+        const term = cluster.nodes[leader].runtime.node.status().term;
+        try std.testing.expect(term > previous_term);
+        previous_term = term;
+
+        var id_buf: [32]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buf, "promotion-term-{d}", .{cycle}) catch unreachable;
+        const conn = cluster.nodes[leader].backend.connect().?;
+        const n = buildEnqueueFrame(&frame, @intCast(cycle + 1), "terms-q", id);
+        cluster.nodes[leader].backend.injectRecv(conn, frame[0..n]);
+        cluster.pumpRounds(rounds_per_step);
+        try std.testing.expect(cluster.quiesce(500));
+        try std.testing.expect(cluster.nodes[leader].backend.readResponse(conn) != null);
+
+        // Rejoin the deposed member and require full convergence before the
+        // next term change. Election-safety is checked inside every pumpRound.
+        cluster.setStopped(stopped, false);
+        try std.testing.expect(cluster.quiesce(1000));
+        _ = try cluster.assertConsistent(leader);
+    }
+
+    for (0..4) |cycle| {
+        var key_buf: [48]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "j|promotion-term-{d}", .{cycle}) catch unreachable;
+        for (cluster.nodes) |*node| try std.testing.expect(hasKey(node, key));
+    }
+}
+
+test "cluster raft: promoted follower runs scheduled promotion after failover" {
+    var clock = SimClock.init(1_000_000_000_000);
+    setGlobalClock(&clock);
+    var cluster = try Cluster.init(sim_allocator, 3, &clock);
+    defer cluster.deinit();
+
+    for (cluster.nodes) |*n| n.pipeline.config.promote_interval_ns = 100_000_000;
+    const old_leader = try cluster.electLeaderLeading(400);
+
+    // Schedule far enough ahead that the isolated old leader has time to lose
+    // CheckQuorum before the job becomes due.
+    const due_ns: u64 = @intCast(cluster.clock.now() + 2_000_000_000);
+    var frame: [512]u8 = undefined;
+    const producer = cluster.nodes[old_leader].backend.connect().?;
+    const enq_len = buildEnqueueFrameAt(&frame, 1, "promotion-q", "scheduled-on-old", due_ns);
+    cluster.nodes[old_leader].backend.injectRecv(producer, frame[0..enq_len]);
+    cluster.pumpRounds(rounds_per_step);
+    try std.testing.expect(cluster.quiesce(400));
+    _ = cluster.nodes[old_leader].backend.readResponse(producer);
+
+    cluster.setPartition(old_leader, false);
+    const new_leader = try cluster.electReplacementLeading(old_leader, 400);
+
+    // Subscribe on the promoted follower. Its rebuilt pending/config state and
+    // leader-only maintenance must promote, replicate, and claim the due job.
+    const worker = cluster.nodes[new_leader].backend.connect().?;
+    const fetch_len = buildFetchFrame(&frame, 2, "promotion-worker", "promotion-q");
+    cluster.nodes[new_leader].backend.injectRecv(worker, frame[0..fetch_len]);
+
+    var fetched: ?FetchedJob = null;
+    var r: u32 = 0;
+    while (r < 120 and fetched == null) : (r += 1) {
+        cluster.pumpRound();
+        if (cluster.nodes[new_leader].backend.readResponse(worker)) |response| {
+            fetched = parseFirstFetchedJob(response);
+        }
+    }
+    try std.testing.expect(fetched != null);
+    try std.testing.expectEqualStrings("scheduled-on-old", fetched.?.id());
+
+    cluster.setPartition(old_leader, true);
+    try std.testing.expect(cluster.quiesce(800));
+    _ = try cluster.assertConsistent(new_leader);
+}
+
+test "cluster raft: lease fencing survives follower promotion and reclaim" {
+    var clock = SimClock.init(1_000_000_000_000);
+    setGlobalClock(&clock);
+    var cluster = try Cluster.init(sim_allocator, 3, &clock);
+    defer cluster.deinit();
+
+    for (cluster.nodes) |*n| n.pipeline.config.reclaim_interval_ns = 100_000_000;
+    const old_leader = try cluster.electLeaderLeading(400);
+    var frame: [512]u8 = undefined;
+
+    // Claim a job on the first leader with a 2s lease.
+    const worker1 = cluster.nodes[old_leader].backend.connect().?;
+    const sub1_len = buildFetchFrameLease(&frame, 1, "worker-old", "lease-failover-q", 2000);
+    cluster.nodes[old_leader].backend.injectRecv(worker1, frame[0..sub1_len]);
+    cluster.pumpRounds(2);
+    const producer = cluster.nodes[old_leader].backend.connect().?;
+    const enq_len = buildEnqueueFrame(&frame, 2, "lease-failover-q", "lease-across-term");
+    cluster.nodes[old_leader].backend.injectRecv(producer, frame[0..enq_len]);
+    cluster.pumpRounds(rounds_per_step);
+    try std.testing.expect(cluster.quiesce(400));
+    const old_claim = parseFirstFetchedJob(cluster.nodes[old_leader].backend.readResponse(worker1).?).?;
+    _ = cluster.nodes[old_leader].backend.readResponse(producer);
+    try std.testing.expect(old_claim.lease_token > 0);
+
+    cluster.setPartition(old_leader, false);
+    const new_leader = try cluster.electReplacementLeading(old_leader, 400);
+
+    // Wait on the promoted follower. Once the old lease expires, leader-only
+    // reclaim returns the job to pending and the new worker receives a NEW
+    // fencing token, so the old worker can no longer acknowledge it.
+    const worker2 = cluster.nodes[new_leader].backend.connect().?;
+    const sub2_len = buildFetchFrameLease(&frame, 3, "worker-new", "lease-failover-q", 2000);
+    cluster.nodes[new_leader].backend.injectRecv(worker2, frame[0..sub2_len]);
+    var new_claim: ?FetchedJob = null;
+    var r: u32 = 0;
+    while (r < 120 and new_claim == null) : (r += 1) {
+        cluster.pumpRound();
+        if (cluster.nodes[new_leader].backend.readResponse(worker2)) |response| {
+            new_claim = parseFirstFetchedJob(response);
+        }
+    }
+    try std.testing.expect(new_claim != null);
+    try std.testing.expectEqualStrings(old_claim.id(), new_claim.?.id());
+    try std.testing.expect(new_claim.?.lease_token > old_claim.lease_token);
+
+    // Replay the old worker's ack at the new leader. It must be a no-op and
+    // leave the new worker's active lease intact.
+    const stale_conn = cluster.nodes[new_leader].backend.connect().?;
+    const stale_len = buildAckFrame(&frame, 4, old_claim.id(), "lease-failover-q", old_claim.lease_token);
+    cluster.nodes[new_leader].backend.injectRecv(stale_conn, frame[0..stale_len]);
+    cluster.pumpRounds(rounds_per_step);
+    _ = cluster.nodes[new_leader].backend.readResponse(stale_conn);
+    {
+        var b = cluster.nodes[new_leader].stores[0].newBatch();
+        defer b.close();
+        var jk: corvo.keys.KeyBuf = undefined;
+        const job = corvo.codec.decodeJob(b.get(corvo.keys.jobKey(&jk, new_claim.?.id())).?);
+        try std.testing.expect(job.state == .active);
+        try std.testing.expectEqual(new_claim.?.lease_token, job.lease_token);
+    }
+
+    cluster.setPartition(old_leader, true);
+    try std.testing.expect(cluster.quiesce(800));
+    _ = try cluster.assertConsistent(new_leader);
+}
+
+test "cluster raft: no follower promotes without quorum; cluster recovers" {
+    var clock = SimClock.init(1_000_000_000_000);
+    setGlobalClock(&clock);
+    var cluster = try Cluster.init(sim_allocator, 3, &clock);
+    defer cluster.deinit();
+
+    const old_leader = try cluster.electLeaderLeading(400);
+    var isolated_follower: usize = 0;
+    while (isolated_follower == old_leader) : (isolated_follower += 1) {}
+
+    // Leave every voter in a one-node island: old leader down to self, one
+    // follower down to self, and the remaining follower unable to reach either.
+    cluster.setPartition(old_leader, false);
+    cluster.setPartition(isolated_follower, false);
+    cluster.pumpRounds(80);
+    try std.testing.expect(cluster.leaderIdx() == null);
+    for (cluster.nodes) |*n| {
+        try std.testing.expect(!n.runtime.node.isLeader());
+        try std.testing.expect(n.pipeline.raft_state == .follower);
+    }
+
+    // A lone follower explicitly rejects writes and cannot mutate its local KV.
+    var lone: usize = 0;
+    while (lone == old_leader or lone == isolated_follower) : (lone += 1) {}
+    const conn = cluster.nodes[lone].backend.connect().?;
+    var frame: [256]u8 = undefined;
+    const n = buildEnqueueFrame(&frame, 1, "no-quorum-q", "must-not-commit");
+    cluster.nodes[lone].backend.injectRecv(conn, frame[0..n]);
+    cluster.pumpRound();
+    const response = cluster.nodes[lone].backend.readResponse(conn).?;
+    try std.testing.expect(respHasType(response, rpc.MSG_NOT_LEADER));
+    try std.testing.expect(!hasKey(&cluster.nodes[lone], "j|must-not-commit"));
+
+    // Heal both islands; exactly one follower is promoted and all state catches up.
+    cluster.setPartition(old_leader, true);
+    cluster.setPartition(isolated_follower, true);
+    const healed_leader = try cluster.electLeaderLeading(400);
+    try std.testing.expect(cluster.quiesce(800));
+    _ = try cluster.assertConsistent(healed_leader);
 }
 
 test "cluster raft: non-leader rejects write with MSG_NOT_LEADER, no mutation" {

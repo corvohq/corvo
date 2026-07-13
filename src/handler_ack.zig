@@ -2,7 +2,6 @@
 //! Ported from Go internal/ops/ops_ack_fail.go (ack portion).
 
 const std = @import("std");
-const assert = @import("assert.zig");
 const types = @import("types.zig");
 const ops = @import("ops.zig");
 const keys = @import("keys.zig");
@@ -19,6 +18,31 @@ const chain_step_max: u16 = 0xFFFD; // max valid step index
 
 pub fn applyAck(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.AckOp) ops.OpResult {
     if (op.acks.len == 0) return .{ .err = "no jobs provided" };
+
+    // Validate the complete batch before applying any completion side effects.
+    // HTTP result/checkpoint bodies are not naturally limited by the u8 RPC
+    // prefixes and previously could panic the fixed job encoder after earlier
+    // acknowledgements in the same request had already mutated state.
+    for (op.acks) |*ack| {
+        if (ack.job_id.len == 0 or ack.job_id.len > types.max_job_id_len or
+            std.mem.indexOfScalar(u8, ack.job_id, 0) != null)
+            return .{ .err = "invalid ack job_id" };
+        if (ack.queue.len > types.max_queue_name_len or
+            std.mem.indexOfScalar(u8, ack.queue, 0) != null)
+            return .{ .err = "invalid ack queue" };
+        if (ack.result) |value| {
+            if (value.len > types.max_metadata_field_len)
+                return .{ .err = "ack result too large" };
+        }
+        if (ack.checkpoint) |value| {
+            if (value.len > types.max_metadata_field_len)
+                return .{ .err = "ack checkpoint too large" };
+        }
+        if (ack.hold_reason) |value| {
+            if (value.len > types.max_metadata_field_len)
+                return .{ .err = "ack hold reason too large" };
+        }
+    }
 
     var affected: u32 = 0;
 
@@ -137,7 +161,10 @@ pub fn applyAck(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.AckOp) ops.O
         affected += 1;
     }
 
-    return .{ .affected = affected };
+    return .{
+        .affected = affected,
+        .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
+    };
 }
 
 /// Advance a chain after successful ack. Parses chain_config JSON to find
@@ -240,16 +267,13 @@ fn advanceChain(self: *OpHandler, b: *kv.WriteBatch, job: *const types.Job, ack:
     }
     const merged_payload = fbs.getWritten();
 
-    // Generate a job ID for the next chain step.
+    // Generate a deterministic child ID. Client IDs share the same keyspace,
+    // so collisions are boundary conditions, not assertion failures.
     var id_buf: [64]u8 = undefined;
-    const chain_job_id = std.fmt.bufPrint(&id_buf, "chain_{s}_{d}", .{ job.id, next_chain_step }) catch return;
-
-    // Assert: chain job must not already exist. If it does, something re-triggered
-    // advanceChain for a parent that already spawned this step (e.g. bulk retry on parent
-    // without cleaning up downstream chain state).
-    var check_jk_buf: keys.KeyBuf = undefined;
-    assert.check(b.get(keys.jobKey(&check_jk_buf, chain_job_id)) == null,
-        "advanceChain: chain job already exists: step={d} parent={s}", .{ next_chain_step, job.id });
+    const chain_job_id = switch (handler.resolveChainChildId(b, &id_buf, job.id, job.chain_id, next_chain_step)) {
+        .available => |id| id,
+        .existing, .exhausted => return,
+    };
 
     const chain_job = ops.EnqueueJob{
         .job_id = chain_job_id,
@@ -273,6 +297,6 @@ fn advanceChain(self: *OpHandler, b: *kv.WriteBatch, job: *const types.Job, ack:
     const enq_result = self.applyEnqueue(b, &enqueue_op);
     if (enq_result.err == null) {
         self.recordSideEffect(&chain_job);
+        self.recordPromoteQueue(chain_job.queue);
     }
 }
-

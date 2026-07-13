@@ -6,6 +6,17 @@
 
 const std = @import("std");
 
+/// Identifiers are copied into fixed-size hot-path buffers (PendingEntry,
+/// FetchedJob, simulator state, and several response encoders). Keep the
+/// accepted boundary in one place so a job can never be durable in KV but
+/// absent from the in-memory pending index merely because its ID was too long.
+pub const max_job_id_len: usize = 64;
+pub const max_queue_name_len: usize = 64;
+pub const max_entity_id_len: usize = 64;
+pub const max_worker_id_len: usize = 128;
+pub const max_hostname_len: usize = 255;
+pub const max_metadata_field_len: usize = 512;
+
 // ============================================================================
 // Job State
 // ============================================================================

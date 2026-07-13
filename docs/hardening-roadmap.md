@@ -208,8 +208,10 @@ fixes (M3/M4/M10/M11) read-verified, backed by the sim counter invariants across
 - [x] M6 max_waiting_conns 4096→20480 + graceful subscription reject (stack-safe: heap).
 - [x] M12 expire uses break (time-sorted keys); M13 rate-limit key collision fixed
       (monotonic lease_counter; count scans early-break).
-- [~] M2 total_jobs drift fixed; the poison-batch partial-commit residual is NOT
-      closed (needs a validation pre-pass rejected on hot-path perf grounds).
+- [x] M2 total_jobs drift + poison-batch partial commits fixed. Enqueue now
+      validates the complete bounded batch before touching KV or in-memory
+      indexes, including duplicate IDs/uniques, batch capacity, queue limits,
+      fixed-buffer boundaries, and encoded metadata size.
 - [x] minors: reclaim/expire death fire the dead webhook; max_retries==0 → dead;
       duplicate batch id → error; bulk move validates the destination queue.
 - [ ] NOT done (were out of the agent's scope): M5 frame-backpressure starvation,
@@ -225,3 +227,31 @@ fixes (M3/M4/M10/M11) read-verified, backed by the sim counter invariants across
 - [D] "Leader fsyncs, followers don't" as a middle-ground durability default.
 - [D] TLS on cluster + webhook transports (HMAC auth stops injection but the
       wire is still cleartext).
+
+---
+
+## Correctness review (2026-07-09)
+
+- [x] Cluster failover coverage now stops and resumes leaders, repeatedly
+      promotes followers across five nodes, checks election safety every round,
+      verifies quorum loss cannot elect/serve, and exercises scheduled promotion
+      plus stale-lease rejection after leadership changes.
+- [x] Lease fencing tokens are persisted and replicated (`g|lease`) so a
+      promoted follower cannot reuse an old worker's token. Leadership rebuild
+      also restores queue/global configuration when the database has zero jobs.
+- [x] Step-down preserves already-committed proposal completions while failing
+      only the uncommitted suffix; the committed-before-demotion race no longer
+      causes a false local-divergence panic.
+- [x] RPC cron/batch creation returns real generated IDs and server timestamps;
+      cron trigger IDs are non-empty; cron updates validate atomically.
+- [x] Generated chain, cron-fire, and batch-callback IDs tolerate user
+      collisions and maximum-length parent/entity IDs.
+- [x] Internal enqueues (chain steps, batch callbacks, bulk requeues, manual
+      cron triggers) report their destination queue so waiting workers wake.
+- [x] Boundary validation covers job/queue/worker/entity IDs and encoded job,
+      worker, cron, batch, and budget sizes, converting external oversize input
+      from fixed-buffer panics into client errors.
+- [x] Simulator clients now use returned cron/batch IDs and attach jobs to open
+      batches. Deep invariants check exact pending/scheduled/retrying identity,
+      lease-counter persistence, queue config parity, and cron name cross-links.
+      An eight-seed, 8,000-tick time-jump sweep is part of `zig build sim`.

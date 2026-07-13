@@ -85,6 +85,7 @@ pub fn build(b: *std.Build) void {
         .root_module = sim_mod,
     });
     sim_tests.stack_size = 128 * 1024 * 1024; // same test-frame growth issue as unit tests
+    if (b.args) |a| sim_tests.filters = a;
     const run_sim_tests = b.addRunArtifact(sim_tests);
     const sim_step = b.step("sim", "Run VOPR simulator");
     sim_step.dependOn(&run_sim_tests.step);

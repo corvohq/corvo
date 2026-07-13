@@ -26,6 +26,12 @@ pub fn applyModifySetting(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Mo
         return .{ .affected = 1 };
     }
 
+    const key_len = prefix.len + op.id.len + if (op.scope.len > 0) op.scope.len + 1 else 0;
+    if (op.id.len == 0 or key_len > keys.max_key_len or
+        std.mem.indexOfScalar(u8, op.id, 0) != null or
+        std.mem.indexOfScalar(u8, op.scope, 0) != null)
+        return .{ .err = "invalid setting key" };
+
     var ek_buf: keys.KeyBuf = undefined;
     const key = if (op.scope.len > 0)
         keys.settingScopeKey(&ek_buf, prefix, op.scope, op.id)
@@ -84,9 +90,21 @@ pub fn writeAuditEntry(
         .global_config => .{ .op_name = "global_rate_limit", .target = "" },
         // Not auditable: enqueue, fetch, ack, fail, heartbeat, maintenance,
         // batch_create, batch_seal, cron_*, set_budget, delete_budget.
-        .enqueue, .fetch, .ack, .fail, .heartbeat, .maintenance,
-        .batch_create, .batch_seal, .cron_create, .cron_update,
-        .cron_delete, .cron_trigger, .set_budget, .delete_budget, .multi,
+        .enqueue,
+        .fetch,
+        .ack,
+        .fail,
+        .heartbeat,
+        .maintenance,
+        .batch_create,
+        .batch_seal,
+        .cron_create,
+        .cron_update,
+        .cron_delete,
+        .cron_trigger,
+        .set_budget,
+        .delete_budget,
+        .multi,
         => return,
     };
 

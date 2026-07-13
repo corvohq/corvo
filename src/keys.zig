@@ -40,6 +40,7 @@ pub const prefix_queue_append = "qa|"; // qa|{queue}\x00{created_ns:8BE}{job_id}
 pub const prefix_queue_cursor = "qac|"; // qac|{queue}
 pub const prefix_global_rate_limit = "gl|"; // gl|{fetched_ns:8BE}{random:8BE}
 pub const key_global_config = "g|rl"; // singleton: [rate:u32LE][window_ms:u32LE]
+pub const key_lease_counter = "g|lease"; // singleton: latest issued lease token (u64 BE)
 // Read indexes (for HTTP/UI reads — written by handlers on state transitions)
 pub const prefix_job_time = "jt|"; // jt|{inv_created_ns:8BE}{job_id}
 pub const prefix_job_queue = "jq|"; // jq|{queue}\x00{inv_created_ns:8BE}{job_id}

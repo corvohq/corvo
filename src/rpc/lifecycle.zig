@@ -217,6 +217,9 @@ pub fn parseFetchSubscribe(reader: *BufReader) ParseError!FetchSubscription {
     sub.prefetch = try reader.readU16();
     sub.lease_ms = try reader.readU32();
     sub.worker_id = try reader.readPrefixed();
+    if (sub.worker_id.len > types.max_worker_id_len or
+        std.mem.indexOfScalar(u8, sub.worker_id, 0) != null)
+        return error.InvalidCount;
 
     const queue_count = try reader.readU8();
     if (queue_count == 0 or queue_count > 16) return error.InvalidCount;
@@ -224,6 +227,9 @@ pub fn parseFetchSubscribe(reader: *BufReader) ParseError!FetchSubscription {
 
     for (0..queue_count) |i| {
         sub.queues[i] = try reader.readPrefixed();
+        if (sub.queues[i].len == 0 or sub.queues[i].len > types.max_queue_name_len or
+            std.mem.indexOfScalar(u8, sub.queues[i], 0) != null)
+            return error.InvalidCount;
     }
 
     return sub;
@@ -328,6 +334,47 @@ test "parseEnqueue roundtrip" {
     try std.testing.expectEqual(@as(u8, 75), result.op.jobs[0].priority);
     try std.testing.expectEqual(types.Backoff.exponential, result.op.jobs[0].backoff);
     try std.testing.expectEqualStrings("{\"task\":\"test\"}", result.op.jobs[0].payload.?);
+}
+
+test "parseEnqueue roundtrip — every optional field preserves wire alignment" {
+    var buf: [1024]u8 = undefined;
+    var w = BufWriter{ .buf = &buf };
+    w.writeU16(1);
+    w.writePrefixed("queue");
+    w.writePrefixed("job");
+    w.writeU8(200);
+    w.writeU16(4);
+    w.writeU8(@intFromEnum(types.Backoff.linear));
+    w.writeU32(10);
+    w.writeU32(100);
+    w.writeU32(60);
+    w.writeU64(1234);
+    w.writeU32(5000);
+    w.writeU16(2);
+    w.writeU16(FLAG_PAYLOAD | FLAG_UNIQUE_KEY | FLAG_TAGS | FLAG_BATCH_ID |
+        FLAG_CHAIN_ID | FLAG_CHAIN_CONFIG | FLAG_GROUP | FLAG_PARENT_ID);
+    w.writeU16Prefixed("payload");
+    w.writePrefixed("unique");
+    w.writePrefixed("{\"env\":\"test\"}");
+    w.writePrefixed("batch");
+    w.writePrefixed("chain");
+    w.writePrefixed("{\"steps\":[{\"queue\":\"queue\"}]}");
+    w.writePrefixed("group");
+    w.writePrefixed("parent");
+
+    var jobs_buf: [MAX_BATCH_JOBS]ops_mod.EnqueueJob = undefined;
+    var r = BufReader{ .data = w.written() };
+    const parsed = try parseEnqueue(&r, &jobs_buf, 999);
+    const job = parsed.op.jobs[0];
+    try std.testing.expectEqualStrings("payload", job.payload.?);
+    try std.testing.expectEqualStrings("unique", job.unique_key.?);
+    try std.testing.expectEqualStrings("{\"env\":\"test\"}", job.tags.?);
+    try std.testing.expectEqualStrings("batch", job.batch_id.?);
+    try std.testing.expectEqualStrings("chain", job.chain_id.?);
+    try std.testing.expectEqualStrings("{\"steps\":[{\"queue\":\"queue\"}]}", job.chain_config.?);
+    try std.testing.expectEqualStrings("group", job.group.?);
+    try std.testing.expectEqualStrings("parent", job.parent_id.?);
+    try std.testing.expectEqual(@as(usize, 0), r.remaining());
 }
 
 test "parseAck roundtrip" {

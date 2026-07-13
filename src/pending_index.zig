@@ -109,6 +109,18 @@ pub const PendingIndex = struct {
         return 0;
     }
 
+    /// Exact membership check used by simulator invariants. Stale heap entries
+    /// are permitted, but every durable pending job must have at least one
+    /// matching entry; a count-only comparison lets one duplicate hide one
+    /// missing (and therefore permanently unfetchable) job.
+    pub fn contains(self: *const PendingIndex, queue: []const u8, job_id: []const u8) bool {
+        const heap = self.queues.get(queue) orelse return false;
+        for (heap.items) |*entry| {
+            if (std.mem.eql(u8, entry.jobId(), job_id)) return true;
+        }
+        return false;
+    }
+
     /// Rebuild index from KV store by scanning all j| keys and
     /// selecting jobs with state=pending. Called once at startup.
     pub fn rebuild(self: *PendingIndex, shards: []kv.Store) void {
@@ -219,6 +231,15 @@ test "PendingIndex queueCount" {
     idx.push("q", 50, 1000, "j1");
     idx.push("q", 50, 2000, "j2");
     try std.testing.expectEqual(@as(u32, 2), idx.queueCount("q"));
+}
+
+test "PendingIndex contains checks identity, not only count" {
+    var idx = PendingIndex.init(std.testing.allocator);
+    defer idx.deinit();
+    idx.push("q", 50, 1000, "j1");
+    idx.push("q", 50, 1000, "j1");
+    try std.testing.expect(idx.contains("q", "j1"));
+    try std.testing.expect(!idx.contains("q", "j2"));
 }
 
 test "PendingIndex parsePendingKey" {

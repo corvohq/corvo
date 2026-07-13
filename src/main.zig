@@ -478,9 +478,9 @@ pub fn main() !void {
     const listen_fd = listener.stream.handle;
 
     // --- IO backend ---
-    // Buffer sizes derived from max_payload_size: must fit a complete frame
-    // (header + payload) plus headroom for protocol framing.
-    const buf_size: u32 = config.max_payload_size + @as(u32, rpc.FRAME_HEADER_SIZE) + 1024;
+    // Buffer sizes must fit a complete frame plus an HTTP fetch response's JSON
+    // fields and headers around a maximum-size payload.
+    const buf_size: u32 = config.max_payload_size + @as(u32, rpc.FRAME_HEADER_SIZE) + 4096;
     var io_backend = try io_mod.Backend.init(allocator, .{
         .listen_fd = listen_fd,
         .max_conns = config.max_conns,

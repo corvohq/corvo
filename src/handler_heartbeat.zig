@@ -12,7 +12,23 @@ const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
 
 pub fn applyHeartbeat(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.HeartbeatOp) ops.OpResult {
-    assert.check(op.job_ids.len == op.job_ops.len, "heartbeat: job_ids.len ({d}) != job_ops.len ({d})", .{ op.job_ids.len, op.job_ops.len });
+    if (op.job_ids.len != op.job_ops.len) return .{ .err = "invalid heartbeat jobs" };
+    if (op.worker_id.len > types.max_worker_id_len or
+        std.mem.indexOfScalar(u8, op.worker_id, 0) != null)
+        return .{ .err = "invalid worker_id" };
+    for (op.job_ids, op.job_ops) |job_id, update_op| {
+        if (job_id.len == 0 or job_id.len > types.max_job_id_len or
+            std.mem.indexOfScalar(u8, job_id, 0) != null)
+            return .{ .err = "invalid heartbeat job_id" };
+        if (update_op.progress) |p| {
+            if (p.len > types.max_metadata_field_len)
+                return .{ .err = "heartbeat progress too large" };
+        }
+        if (update_op.checkpoint) |cp| {
+            if (cp.len > types.max_metadata_field_len)
+                return .{ .err = "heartbeat checkpoint too large" };
+        }
+    }
 
     const lease_expires_ns = op.now_ns + 60 * 1_000_000_000;
     var affected: u32 = 0;
@@ -69,6 +85,7 @@ pub fn applyHeartbeat(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Heartb
         if (worker_bytes != null) {
             var w = codec.decodeWorker(worker_bytes.?);
             w.last_heartbeat_ns = op.now_ns;
+            assert.check(codec.workerEncodedSize(&w) <= codec.max_worker_encoded_size, "heartbeat: stored worker exceeds codec buffer", .{});
             var w_enc_buf: [codec.max_worker_encoded_size]u8 = undefined;
             b.set(keys.workerKey(&wk_buf, op.worker_id), codec.encodeWorker(&w_enc_buf, &w));
         }

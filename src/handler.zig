@@ -65,7 +65,7 @@ pub const OpHandler = struct {
     promote_queue_bufs: [max_promote_queues][64]u8 = undefined,
     promote_queue_lens: [max_promote_queues]u8 = [_]u8{0} ** max_promote_queues,
     promote_queue_slices: [max_promote_queues][]const u8 = undefined,
-    promote_queue_count: u8 = 0,
+    promote_queue_count: u16 = 0,
     /// Allocator for handler-owned state (maps, etc).
     allocator: Allocator,
 
@@ -99,7 +99,9 @@ pub const OpHandler = struct {
     const max_cancel_signals = 256;
     const max_webhook_events = 256;
     pub const max_webhooks = 64;
-    const max_promote_queues = 32;
+    // One bounded RPC can create/requeue/callback into 256 distinct queues.
+    // Preserve every destination so no subscribed queue is silently skipped.
+    const max_promote_queues = @import("rpc.zig").MAX_BATCH_JOBS;
 
     pub const CancelSignal = struct {
         job_id: [64]u8 = undefined,
@@ -314,6 +316,7 @@ pub const OpHandler = struct {
     ///   - active_counts (for concurrency limits)
     ///   - queue_configs (cached queue settings)
     pub fn rebuildState(self: *OpHandler, shards: []kv.Store) void {
+        self.lease_counter = 0;
         var pending_count: u32 = 0;
         var active_count: u32 = 0;
         var total_count: u32 = 0;
@@ -321,6 +324,16 @@ pub const OpHandler = struct {
         for (shards) |*shard| {
             var batch = shard.newBatch();
             defer batch.close();
+
+            // Lease tokens fence stale workers. Persisting and restoring the
+            // sequence is essential across restart and leader promotion: if a
+            // new leader restarted at token 1, an old worker's token 1 could
+            // acknowledge the NEW worker's lease for the same job.
+            if (batch.get(keys.key_lease_counter)) |counter_bytes| {
+                if (counter_bytes.len == 8) {
+                    self.lease_counter = @max(self.lease_counter, keys.getU64BE(counter_bytes));
+                }
+            }
 
             // Scan all j| keys.
             var jp_buf: keys.KeyBuf = undefined;
@@ -332,27 +345,31 @@ pub const OpHandler = struct {
             var iter = batch.newIter(jp_buf[0..jp.len], end);
             defer iter.close();
 
-            if (!iter.first()) continue;
+            if (iter.first()) {
+                while (true) {
+                    const val = iter.value();
+                    const job = codec.decodeJob(val);
+                    // Backward-compatible recovery for databases created before
+                    // g|lease existed. Reclaimed pending jobs retain their last
+                    // token, so scanning headers preserves the fence on upgrade.
+                    self.lease_counter = @max(self.lease_counter, job.lease_token);
+                    total_count += 1;
 
-            while (true) {
-                const val = iter.value();
-                const job = codec.decodeJob(val);
-                total_count += 1;
+                    switch (job.state) {
+                        .pending => {
+                            self.pending.push(job.queue, job.priority, job.created_at_ns, job.id);
+                            pending_count += 1;
+                        },
+                        .active => {
+                            self.incrActiveCount(job.queue);
+                            if (job.group) |g| self.incrFairnessActive(job.queue, g);
+                            active_count += 1;
+                        },
+                        .retrying, .completed, .dead, .cancelled, .scheduled, .held => {},
+                    }
 
-                switch (job.state) {
-                    .pending => {
-                        self.pending.push(job.queue, job.priority, job.created_at_ns, job.id);
-                        pending_count += 1;
-                    },
-                    .active => {
-                        self.incrActiveCount(job.queue);
-                        if (job.group) |g| self.incrFairnessActive(job.queue, g);
-                        active_count += 1;
-                    },
-                    .retrying, .completed, .dead, .cancelled, .scheduled, .held => {},
+                    if (!iter.next()) break;
                 }
-
-                if (!iter.next()) break;
             }
 
             // Also rebuild queue configs from qc| keys.
@@ -387,12 +404,23 @@ pub const OpHandler = struct {
                     }
                 }
             }
-
         }
 
         self.total_jobs = total_count;
         self.recomputeMaxRateWindow();
         std.debug.print("corvo: state ready — {d} jobs ({d} pending, {d} active)\n", .{ total_count, pending_count, active_count });
+    }
+
+    /// Allocate and durably record the next lease fencing token in the same
+    /// batch as the job claim. The singleton mutation is replicated through
+    /// Raft, so a promoted follower always starts above every issued token.
+    pub fn nextLeaseToken(self: *OpHandler, b: *kv.WriteBatch) u64 {
+        assert.check(self.lease_counter < std.math.maxInt(u64), "lease token space exhausted", .{});
+        self.lease_counter += 1;
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, self.lease_counter, .big);
+        b.set(keys.key_lease_counter, &encoded);
+        return self.lease_counter;
     }
 
     // ========================================================================
@@ -1075,33 +1103,36 @@ pub const OpHandler = struct {
 
         // Check if batch is complete (sealed + no pending jobs).
         if (batch.pending == 0 and !batch.open) {
-            batch.completed_at_ns = now_ns;
-
-            // Fire callback if configured.
-            if (batch.callback_queue) |cq| {
-                if (cq.len > 0) {
-                    var id_buf: [64]u8 = undefined;
-                    const cb_id = std.fmt.bufPrint(&id_buf, "batch_cb_{s}", .{batch_id}) catch "batch_cb_err";
-                    const cb_job = ops.EnqueueJob{
-                        .job_id = cb_id,
-                        .queue = cq,
-                        .payload = batch.callback_payload,
-                        .state = .pending,
-                        .priority = types.priority_normal,
-                        .created_at_ns = now_ns,
-                    };
-                    const jobs = [_]ops.EnqueueJob{cb_job};
-                    const enqueue_op = ops.EnqueueOp{
-                        .jobs = &jobs,
-                        .now_ns = now_ns,
-                    };
-                    _ = self.applyEnqueue(b, &enqueue_op);
-                }
-            }
+            if (self.enqueueBatchCallback(b, &batch, now_ns)) batch.completed_at_ns = now_ns;
         }
 
         var batch_enc_buf: [codec.max_batch_encoded_size]u8 = undefined;
         b.set(bkey, codec.encodeBatch(&batch_enc_buf, &batch));
+    }
+
+    /// Enqueue a completed batch's callback in the caller's atomic KV batch.
+    /// False leaves completed_at_ns unset so an explicit seal retry can recover
+    /// from resource pressure instead of recording success with no callback.
+    pub fn enqueueBatchCallback(self: *OpHandler, b: *kv.WriteBatch, batch: *const types.Batch, now_ns: u64) bool {
+        const queue = batch.callback_queue orelse return true;
+        if (queue.len == 0) return true;
+
+        var id_buf: [64]u8 = undefined;
+        const callback_id = resolveBatchCallbackId(b, &id_buf, batch.id) orelse return false;
+        const callback_job = ops.EnqueueJob{
+            .job_id = callback_id,
+            .queue = queue,
+            .payload = batch.callback_payload,
+            .state = .pending,
+            .priority = types.priority_normal,
+            .created_at_ns = now_ns,
+        };
+        const jobs = [_]ops.EnqueueJob{callback_job};
+        const enqueue_op = ops.EnqueueOp{ .jobs = &jobs, .now_ns = now_ns };
+        const result = self.applyEnqueue(b, &enqueue_op);
+        if (result.err != null) return false;
+        self.recordPromoteQueue(queue);
+        return true;
     }
 };
 
@@ -1157,6 +1188,94 @@ pub fn getJobIDFromTimeSortedKey(prefix_len: usize, key: []const u8) []const u8 
     const id_offset = prefix_len + 8; // ns(8)
     assert.check(key.len > id_offset, "invalid time-sorted key length", .{});
     return key[id_offset..];
+}
+
+/// Resolve a deterministic ID for a generated chain child without trusting a
+/// client-reservable namespace. The legacy readable ID is tried first for
+/// compatibility; on collision (or a long parent ID), bounded hash-derived
+/// alternatives are used. Replaying the same transition recognizes the
+/// existing logical child and returns `.existing`, preserving idempotency.
+pub const ChainChildId = union(enum) {
+    available: []const u8,
+    existing,
+    exhausted,
+};
+
+pub fn resolveChainChildId(
+    b: *kv.WriteBatch,
+    out: *[64]u8,
+    parent_id: []const u8,
+    chain_id: ?[]const u8,
+    chain_step: u16,
+) ChainChildId {
+    var attempt: u16 = 0;
+    while (attempt < 256) : (attempt += 1) {
+        const candidate = if (attempt == 0)
+            std.fmt.bufPrint(out, "chain_{s}_{d}", .{ parent_id, chain_step }) catch continue
+        else blk: {
+            const hash = std.hash.Wyhash.hash(attempt, parent_id);
+            break :blk std.fmt.bufPrint(out, "chain_{x:0>16}_{x:0>4}_{x:0>2}", .{ hash, chain_step, attempt }) catch
+                return .exhausted;
+        };
+
+        var jk: keys.KeyBuf = undefined;
+        const existing_bytes = b.get(keys.jobKey(&jk, candidate)) orelse
+            return .{ .available = candidate };
+        const existing = codec.decodeJob(existing_bytes);
+        if (existing.chain_step == chain_step and
+            optionalEql(existing.parent_id, parent_id) and
+            optionalOptionalEql(existing.chain_id, chain_id))
+        {
+            return .existing;
+        }
+    }
+    return .exhausted;
+}
+
+/// Generated callbacks and cron fires share the user-visible job ID namespace.
+/// Probe bounded hash-derived alternatives so a user-created collision cannot
+/// suppress an internal side effect, and long entity IDs still produce legal
+/// 64-byte job IDs.
+pub fn resolveBatchCallbackId(b: *kv.WriteBatch, out: *[64]u8, batch_id: []const u8) ?[]const u8 {
+    var attempt: u16 = 0;
+    while (attempt < 256) : (attempt += 1) {
+        const candidate = if (attempt == 0)
+            std.fmt.bufPrint(out, "batch_cb_{s}", .{batch_id}) catch continue
+        else blk: {
+            const hash = std.hash.Wyhash.hash(attempt, batch_id);
+            break :blk std.fmt.bufPrint(out, "batch_cb_{x:0>16}_{x:0>2}", .{ hash, attempt }) catch return null;
+        };
+        var jk: keys.KeyBuf = undefined;
+        if (b.get(keys.jobKey(&jk, candidate)) == null) return candidate;
+    }
+    return null;
+}
+
+pub fn resolveCronFireId(b: *kv.WriteBatch, out: *[64]u8, cron_id: []const u8, fire_slot: u64) ?[]const u8 {
+    var attempt: u16 = 0;
+    while (attempt < 256) : (attempt += 1) {
+        const candidate = if (attempt == 0)
+            std.fmt.bufPrint(out, "{s}-{d}", .{ cron_id, fire_slot }) catch continue
+        else blk: {
+            var seed_buf: [96]u8 = undefined;
+            const seed = std.fmt.bufPrint(&seed_buf, "{s}-{d}", .{ cron_id, fire_slot }) catch return null;
+            const hash = std.hash.Wyhash.hash(attempt, seed);
+            break :blk std.fmt.bufPrint(out, "cron_{x:0>16}_{x:0>16}_{x:0>2}", .{ hash, fire_slot, attempt }) catch return null;
+        };
+        var jk: keys.KeyBuf = undefined;
+        if (b.get(keys.jobKey(&jk, candidate)) == null) return candidate;
+    }
+    return null;
+}
+
+fn optionalEql(value: ?[]const u8, expected: []const u8) bool {
+    const actual = value orelse return false;
+    return std.mem.eql(u8, actual, expected);
+}
+
+fn optionalOptionalEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 /// Parse webhook JSON value into a WebhookCached entry.
@@ -1219,4 +1338,17 @@ test "calculateBackoffNs" {
     try testing.expectEqual(@as(u64, 4000 * 1_000_000), calculateBackoffNs(.exponential, 3, 1000, 0));
     // Clamped
     try testing.expectEqual(@as(u64, 5000 * 1_000_000), calculateBackoffNs(.exponential, 10, 1000, 5000));
+}
+
+test "queue notifications preserve every destination in a maximum RPC batch" {
+    var h = OpHandler.init(std.testing.allocator);
+    defer h.deinit();
+
+    var names: [OpHandler.max_promote_queues][16]u8 = undefined;
+    for (0..OpHandler.max_promote_queues) |i| {
+        const name = std.fmt.bufPrint(&names[i], "q-{d}", .{i}) catch unreachable;
+        h.recordPromoteQueue(name);
+    }
+    try std.testing.expectEqual(@as(u16, OpHandler.max_promote_queues), h.promote_queue_count);
+    try std.testing.expectEqual(@as(usize, OpHandler.max_promote_queues), h.promoteQueueSlices().len);
 }

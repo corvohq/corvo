@@ -61,8 +61,11 @@ pub const SimClient = struct {
     // Queue pause state tracking.
     paused_queues: [8]bool = [_]bool{false} ** 8,
 
-    // Cron tracking: whether we have an active cron (binary RPC uses empty ID).
-    cron_count: usize = 0,
+    // Server-generated entity IDs learned from create responses.
+    cron_id_buf: [64]u8 = undefined,
+    cron_id_len: usize = 0,
+    batch_id_buf: [64]u8 = undefined,
+    batch_id_len: usize = 0,
 
     // Chain sequence counter for generating chain IDs.
     chain_seq: u32 = 0,
@@ -263,6 +266,14 @@ pub const SimClient = struct {
                     self.parseFetchPayload(payload);
                     self.fetch_subscribed = false;
                 },
+                rpc.MSG_CRON_CREATE_RESP => self.parseCronCreatePayload(payload),
+                rpc.MSG_BATCH_CREATE_RESP => self.parseBatchCreatePayload(payload),
+                rpc.MSG_CRON_DELETE_RESP => {
+                    if (genericResponseOk(payload)) self.cron_id_len = 0;
+                },
+                rpc.MSG_BATCH_SEAL_RESP => {
+                    if (genericResponseOk(payload)) self.batch_id_len = 0;
+                },
                 else => {},
             }
 
@@ -371,12 +382,20 @@ pub const SimClient = struct {
 
             // Build a 2-step chain config with on_exit handler.
             const target_q = self.queues[self.rng.intRangeAtMost(usize, 0, self.queues.len - 1)];
-            const cc = std.fmt.bufPrint(&chain_config_buf,
+            const cc = std.fmt.bufPrint(
+                &chain_config_buf,
                 "{{\"steps\":[{{\"queue\":\"{s}\"}},{{\"queue\":\"{s}\"}}],\"on_exit\":{{\"queue\":\"{s}\"}}}}",
                 .{ q, target_q, q },
             ) catch unreachable;
             chain_config_len = cc.len;
             self.chain_enqueues += 1;
+        }
+
+        // Attach jobs to the currently-open batch. The previous simulator had
+        // batch knobs but never wrote FLAG_BATCH_ID, so batch counters and
+        // completion callbacks were not exercised at all.
+        if (self.batch_id_len > 0 and self.chance(self.config.batch_enqueue_rate)) {
+            flags |= rpc.FLAG_BATCH_ID;
         }
 
         w.writeU16(chain_step);
@@ -390,11 +409,14 @@ pub const SimClient = struct {
         if (flags & rpc.FLAG_TAGS != 0) {
             w.writePrefixed(tag_buf[0..tag_len]);
         }
+        if (flags & rpc.FLAG_BATCH_ID != 0) {
+            w.writePrefixed(self.batch_id_buf[0..self.batch_id_len]);
+        }
         if (flags & rpc.FLAG_CHAIN_ID != 0) {
             w.writePrefixed(chain_id_buf[0..chain_id_len]);
         }
         if (flags & rpc.FLAG_CHAIN_CONFIG != 0) {
-            w.writeU16Prefixed(chain_config_buf[0..chain_config_len]);
+            w.writePrefixed(chain_config_buf[0..chain_config_len]);
         }
         if (flags & rpc.FLAG_GROUP != 0) {
             w.writePrefixed(group_buf[0..group_len]);
@@ -421,23 +443,21 @@ pub const SimClient = struct {
     fn doCronOp(self: *SimClient) void {
         const q = self.queues[self.rng.intRangeAtMost(usize, 0, self.queues.len - 1)];
 
-        // Binary RPC cron_create doesn't include cron_id (server generates it
-        // in the HTTP path). So binary creates produce crons with empty ID.
-        // We track cron names and use the empty-string ID for update/delete/trigger.
-        if (self.cron_count > 0 and self.chance(0.6)) {
-            // Operate on existing cron (empty ID from binary create).
+        if (self.cron_id_len > 0 and self.chance(0.6)) {
+            const cron_id = self.cron_id_buf[0..self.cron_id_len];
+            // Operate on the actual server-generated cron ID.
             const op = self.rng.intRangeAtMost(u8, 0, 2);
             switch (op) {
                 0 => {
                     // Trigger — fires the cron to enqueue a job
                     var w = self.payloadWriter();
-                    w.writePrefixed(""); // cron_id (empty from binary create)
+                    w.writePrefixed(cron_id);
                     self.sendFrame(rpc.MSG_CRON_TRIGGER, w.pos);
                 },
                 1 => {
                     // Update: toggle enabled
                     var w = self.payloadWriter();
-                    w.writePrefixed(""); // cron_id
+                    w.writePrefixed(cron_id);
                     w.writeU16(0x0080); // CRON_UPD_ENABLED
                     w.writeU8(if (self.chance(0.5)) 1 else 0);
                     self.sendFrame(rpc.MSG_CRON_UPDATE, w.pos);
@@ -445,14 +465,13 @@ pub const SimClient = struct {
                 2 => {
                     // Delete
                     var w = self.payloadWriter();
-                    w.writePrefixed(""); // cron_id
+                    w.writePrefixed(cron_id);
                     self.sendFrame(rpc.MSG_CRON_DELETE, w.pos);
-                    self.cron_count = 0;
                 },
                 else => unreachable,
             }
         } else {
-            // Create new cron (overwrites previous empty-ID cron).
+            // Create a cron; the response supplies its server-generated ID.
             self.job_seq += 1;
             var name_buf: [32]u8 = undefined;
             const name = std.fmt.bufPrint(&name_buf, "cron-{d}-{d}", .{ self.id, self.job_seq }) catch unreachable;
@@ -468,7 +487,6 @@ pub const SimClient = struct {
             w.writeU16Prefixed("{\"cron\":true}");
 
             self.sendFrame(rpc.MSG_CRON_CREATE, w.pos);
-            self.cron_count = 1; // Track that we have an active cron
         }
         self.cron_ops += 1;
     }
@@ -480,10 +498,9 @@ pub const SimClient = struct {
     fn doBatchLifecycle(self: *SimClient) void {
         const q = self.queues[self.rng.intRangeAtMost(usize, 0, self.queues.len - 1)];
 
-        // Create batch — exercises handler_batch.applyBatchCreate.
-        // Binary RPC doesn't support client-supplied batch_id, so the handler
-        // creates batches with empty ID. We also send occasional seals.
-        if (self.chance(0.6)) {
+        // Create one open batch, attach enqueues to it, then seal it. The create
+        // response supplies the ID used by both enqueue and seal.
+        if (self.batch_id_len == 0) {
             var w = self.payloadWriter();
             w.writePrefixed(q); // callback_queue
             const use_payload = self.chance(0.3);
@@ -493,11 +510,28 @@ pub const SimClient = struct {
             }
             self.sendFrame(rpc.MSG_BATCH_CREATE, w.pos);
         } else {
-            // Seal the empty-ID batch (may not exist — handler returns error, which is fine).
             var w = self.payloadWriter();
-            w.writePrefixed(""); // batch_id
+            w.writePrefixed(self.batch_id_buf[0..self.batch_id_len]);
             self.sendFrame(rpc.MSG_BATCH_SEAL, w.pos);
         }
+    }
+
+    fn parseCronCreatePayload(self: *SimClient, payload: []const u8) void {
+        var r = BufReader{ .data = payload };
+        const id = r.readPrefixed() catch return;
+        const failed = r.readU8() catch return;
+        if (failed != 0 or id.len == 0 or id.len > self.cron_id_buf.len) return;
+        @memcpy(self.cron_id_buf[0..id.len], id);
+        self.cron_id_len = id.len;
+    }
+
+    fn parseBatchCreatePayload(self: *SimClient, payload: []const u8) void {
+        var r = BufReader{ .data = payload };
+        const id = r.readPrefixed() catch return;
+        const failed = r.readU8() catch return;
+        if (failed != 0 or id.len == 0 or id.len > self.batch_id_buf.len) return;
+        @memcpy(self.batch_id_buf[0..id.len], id);
+        self.batch_id_len = id.len;
         self.batch_creates += 1;
     }
 
@@ -895,3 +929,9 @@ pub const SimClient = struct {
         return self.rng.float(f64) < prob;
     }
 };
+
+fn genericResponseOk(payload: []const u8) bool {
+    var r = BufReader{ .data = payload };
+    _ = r.readU16() catch return false;
+    return (r.readU8() catch return false) == 0;
+}

@@ -124,13 +124,37 @@ fn readOptStr(data: []const u8, pos: usize) struct { val: ?[]const u8, next: usi
 
 const job_fixed_size: usize = 91;
 
-/// Maximum encoded job header size. Generous upper bound.
-pub const max_job_encoded_size: usize = 4096;
+/// New jobs are capped below this value by the enqueue handler, leaving room
+/// for worker, heartbeat, and completion metadata added over the job's life.
+pub const max_enqueue_job_encoded_size: usize = 4096;
+pub const max_job_encoded_size: usize = 8192;
+
+/// Exact bytes encodeJob will write. Boundary handlers use this before the
+/// fixed-buffer encoder so oversized combinations of individually-valid fields
+/// become client errors instead of slice-bounds panics.
+pub fn jobEncodedSize(job: *const types.Job) usize {
+    return job_fixed_size + 15 * 2 +
+        job.id.len + job.queue.len +
+        (job.unique_key orelse "").len +
+        (job.batch_id orelse "").len +
+        (job.worker_id orelse "").len +
+        (job.hostname orelse "").len +
+        (job.parent_id orelse "").len +
+        (job.chain_id orelse "").len +
+        (job.chain_config orelse "").len +
+        (job.group orelse "").len +
+        (job.hold_reason orelse "").len +
+        (job.tags orelse "").len +
+        (job.progress orelse "").len +
+        (job.checkpoint orelse "").len +
+        (job.result orelse "").len;
+}
 
 /// Encode a Job header into buf. Returns the encoded slice.
 /// Payload is NOT included — stored separately at jp|{id}.
 pub fn encodeJob(buf: []u8, job: *const types.Job) []const u8 {
     assert.check(buf.len >= job_fixed_size, "encodeJob: buffer too small ({d})", .{buf.len});
+    assert.check(jobEncodedSize(job) <= buf.len, "encodeJob: encoded job exceeds buffer ({d} > {d})", .{ jobEncodedSize(job), buf.len });
 
     var pos: usize = 0;
 
@@ -472,8 +496,16 @@ pub fn decodeQueue(data: []const u8) types.Queue {
 const worker_fixed_size: usize = 17;
 pub const max_worker_encoded_size: usize = 1024;
 
+pub fn workerEncodedSize(w: *const types.Worker) usize {
+    return worker_fixed_size + 3 * 2 +
+        w.id.len +
+        (w.hostname orelse "").len +
+        (w.queues orelse "").len;
+}
+
 pub fn encodeWorker(buf: []u8, w: *const types.Worker) []const u8 {
     assert.check(buf.len >= worker_fixed_size, "encodeWorker: buffer too small", .{});
+    assert.check(workerEncodedSize(w) <= buf.len, "encodeWorker: encoded worker exceeds buffer ({d} > {d})", .{ workerEncodedSize(w), buf.len });
 
     var pos: usize = 0;
     pos = writeU8(buf, pos, format_version);
@@ -538,8 +570,16 @@ pub fn decodeWorker(data: []const u8) types.Worker {
 const cron_fixed_size: usize = 28;
 pub const max_cron_encoded_size: usize = 2048;
 
+pub fn cronEncodedSize(c: *const types.Cron) usize {
+    return cron_fixed_size + 7 * 2 +
+        c.id.len + c.name.len + c.queue.len + c.schedule.len + c.timezone.len +
+        (c.payload orelse "").len +
+        (c.unique_key orelse "").len;
+}
+
 pub fn encodeCron(buf: []u8, c: *const types.Cron) []const u8 {
     assert.check(buf.len >= cron_fixed_size, "encodeCron: buffer too small", .{});
+    assert.check(cronEncodedSize(c) <= buf.len, "encodeCron: encoded cron exceeds buffer ({d} > {d})", .{ cronEncodedSize(c), buf.len });
 
     var pos: usize = 0;
     pos = writeU8(buf, pos, format_version);
@@ -645,8 +685,16 @@ pub fn decodeCron(data: []const u8) types.Cron {
 const batch_fixed_size: usize = 34;
 pub const max_batch_encoded_size: usize = 2048;
 
+pub fn batchEncodedSize(b: *const types.Batch) usize {
+    return batch_fixed_size + 3 * 2 +
+        b.id.len +
+        (b.callback_queue orelse "").len +
+        (b.callback_payload orelse "").len;
+}
+
 pub fn encodeBatch(buf: []u8, b: *const types.Batch) []const u8 {
     assert.check(buf.len >= batch_fixed_size, "encodeBatch: buffer too small", .{});
+    assert.check(batchEncodedSize(b) <= buf.len, "encodeBatch: encoded batch exceeds buffer ({d} > {d})", .{ batchEncodedSize(b), buf.len });
 
     var pos: usize = 0;
     pos = writeU8(buf, pos, format_version);
@@ -733,8 +781,13 @@ const budget_fixed_size: usize = 1 + 8 + 8 + 8; // 25 bytes
 
 pub const max_budget_encoded_size: usize = 1024;
 
+pub fn budgetEncodedSize(bg: *const types.Budget) usize {
+    return budget_fixed_size + 3 * 2 + bg.scope.len + bg.target.len + bg.on_exceed.len;
+}
+
 pub fn encodeBudget(buf: []u8, bg: *const types.Budget) []const u8 {
     assert.check(buf.len >= budget_fixed_size, "encodeBudget: buffer too small", .{});
+    assert.check(budgetEncodedSize(bg) <= buf.len, "encodeBudget: encoded budget exceeds buffer ({d} > {d})", .{ budgetEncodedSize(bg), buf.len });
 
     var pos: usize = 0;
     pos = writeU8(buf, pos, format_version);
@@ -784,7 +837,6 @@ pub fn decodeBudget(data: []const u8) types.Budget {
 
     return bg;
 }
-
 
 // ============================================================================
 // Tests
@@ -970,4 +1022,3 @@ test "batch encode/decode roundtrip" {
     try testing.expectEqualStrings("results", decoded.callback_queue.?);
     try testing.expectEqualStrings("{\"notify\":true}", decoded.callback_payload.?);
 }
-

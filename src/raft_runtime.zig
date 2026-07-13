@@ -242,9 +242,10 @@ pub const Runtime = struct {
     fn handleStepDown(self: *Runtime) !void {
         const role = self.node.role;
         if (self.last_role == .leader and role != .leader) {
-            // We just stepped down — the entries we proposed but didn't
-            // commit are no longer ours to complete.
-            self.batcher.failAll();
+            // Preserve entries already committed before the higher-term
+            // message demoted us; applyReady completes them this tick. Only
+            // the uncommitted suffix is no longer ours to complete.
+            self.batcher.failUncommitted(self.node.commit_index);
         }
         self.last_role = role;
     }
@@ -301,9 +302,11 @@ pub const Runtime = struct {
         if (r.snapshot) |snap| {
             try self.fsm.loadSnapshot(snap.data, snap.meta.last_included_index);
             self.node.advance(snap.meta.last_included_index);
-            // After a snapshot replaces FSM state wholesale, fail any
-            // in-flight batcher commits — they predate the snapshot view.
-            self.batcher.failAll();
+            // The installed snapshot includes every committed entry through
+            // last_included_index. Complete those successfully and fail only
+            // a local suffix the snapshot superseded.
+            self.batcher.failUncommitted(snap.meta.last_included_index);
+            self.batcher.onCommitted(snap.meta.last_included_index);
             return;
         }
         if (r.committed.len == 0) return;
