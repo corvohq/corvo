@@ -1368,30 +1368,36 @@ fn checkUniqueLockBidirectional(store: *kv.Store, tick: u32, seed: u64, now_ns: 
 
                 // A finite unique period intentionally releases while the job
                 // can still be pending/active, after which another enqueue may
-                // own the same key. Require bidirectionality only through the
-                // original job's lock lifetime; period=0 means until terminal.
-                if (!job.state.isTerminal() and job.unique_key != null) {
+                // own the same key (new lock, new owner) or the lock may be
+                // gone entirely. Require bidirectionality only through the
+                // ORIGINAL job's lock lifetime; period=0 means until terminal.
+                //
+                // The original lock's stored expiry is unrecoverable once the
+                // lock is released or re-taken (the current u| value carries
+                // the NEW owner's expiry), so approximate this job's window
+                // from below: created_at_ns is stamped at frame-decode time,
+                // the lock expiry at apply time on the same monotonic clock,
+                // so `created_at_ns + period` UNDER-approximates the stored
+                // expiry — inside that window this job's lock cannot have
+                // legitimately expired, so a missing lock or a different
+                // owner is definite corruption. Cancelled jobs are exempt:
+                // cancellation may not release the lock until maintenance,
+                // and a re-enqueue after release legitimately re-owns the key.
+                if (!job.state.isTerminal() and job.state != .cancelled and job.unique_key != null) {
                     if (job.unique_key.?.len > 0) {
-                        const lock_expires_ns = if (job.unique_period_s == 0)
+                        const surely_live_until = if (job.unique_period_s == 0)
                             std.math.maxInt(u64)
                         else
                             job.created_at_ns +| @as(u64, job.unique_period_s) *| 1_000_000_000;
-                        if (now_ns > lock_expires_ns) {
-                            if (!iter.next()) break;
-                            continue;
-                        }
                         var uk_buf: keys.KeyBuf = undefined;
                         const uk = keys.uniqueKey(&uk_buf, job.queue, job.unique_key.?);
                         if (batch.get(uk)) |lock_val| {
-                            // Lock value is {job_id}|{expires_ns:8BE} — decode to get job_id.
                             const decoded = keys.decodeUniqueValue(lock_val);
-                            if (!std.mem.eql(u8, decoded.job_id, job_id)) {
+                            if (!std.mem.eql(u8, decoded.job_id, job_id) and now_ns <= surely_live_until) {
                                 return makeErrorFmt("unique-lock-bidirectional", tick, seed, "job {s} has unique_key but u| lock points to {s}", .{ job_id, decoded.job_id });
                             }
                         } else {
-                            // Allow cancelled state — cancellation may not
-                            // release unique locks until maintenance runs.
-                            if (job.state != .cancelled) {
+                            if (now_ns <= surely_live_until) {
                                 return makeErrorFmt("unique-lock-bidirectional", tick, seed, "job {s} state={s} has unique_key but no u| lock exists", .{ job_id, job.state.toString() });
                             }
                         }

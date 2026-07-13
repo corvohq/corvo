@@ -277,7 +277,12 @@ pub const PeerNet = struct {
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) !PeerNet {
         check(cfg.self_id.len > 0 and cfg.self_id.len <= codec.max_id_len, "self_id len {d}", .{cfg.self_id.len});
-        check(cfg.recv_buf_size >= frame_len_prefix + 64, "recv_buf_size too small: {d}", .{cfg.recv_buf_size});
+        // Floor both buffers at the largest handshake message (the 72-byte
+        // connector response, hs_response_len) plus the frame prefix: both
+        // directions send AND receive handshake payloads up to that size, so
+        // a smaller buffer would pass init and then overflow mid-handshake.
+        check(cfg.recv_buf_size >= frame_len_prefix + hs_response_len, "recv_buf_size too small: {d}", .{cfg.recv_buf_size});
+        check(cfg.send_buf_size >= frame_len_prefix + hs_response_len, "send_buf_size too small: {d}", .{cfg.send_buf_size});
         check(cfg.cluster_secret.len <= max_secret_len, "cluster_secret len {d}", .{cfg.cluster_secret.len});
 
         const listen_fd = try createListenFd(cfg.bind_addr);

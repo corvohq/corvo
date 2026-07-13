@@ -35,6 +35,13 @@ pub const ServerConfig = struct {
     data_dir: []const u8 = "/tmp/corvo-data",
     mirror: bool = true,
     max_conns: u16 = 4096,
+    /// fdatasync the KV store on every commit (talon's Options.sync). Off by
+    /// default: fsync bounds every commit by device flush latency. Without it
+    /// a power loss can drop recently-committed writes — including persisted
+    /// raft state (votes, log entries), which violates raft's persistence
+    /// assumptions in cluster mode. Recommended for cluster production; see
+    /// docs/operating-corvo.md.
+    sync: bool = false,
 
     // Auth
     admin_password: []const u8 = "",
@@ -140,6 +147,10 @@ pub const ServerConfig = struct {
     ///   EXCLUDED (node-local, legitimately per-node):
     ///     bind, port, data_dir, cluster_port — network/disk placement.
     ///     mirror, max_conns                  — local resource knobs.
+    ///     sync                               — local durability knob (fsync on
+    ///                                          commit); affects crash recovery
+    ///                                          of THIS node's disk, not the
+    ///                                          replicated state machine.
     ///     admin_password                     — local auth; must never be hashed
     ///                                          or leaked onto the wire.
     ///     node_id, peers                     — per-node identity/topology view.
@@ -234,6 +245,8 @@ pub const ServerConfig = struct {
             self.mirror = parseBool(val) orelse return error.InvalidValue;
         } else if (eql(key, "max-conns")) {
             self.max_conns = parseInt(u16, val) orelse return error.InvalidValue;
+        } else if (eql(key, "sync")) {
+            self.sync = parseBool(val) orelse return error.InvalidValue;
         } else if (eql(key, "max-payload-size")) {
             self.max_payload_size = parseInt(u32, val) orelse return error.InvalidValue;
         } else if (eql(key, "max-queues")) {
@@ -423,6 +436,7 @@ test "config: cluster hash ignores node-local params" {
     c2.data_dir = "/other/path";
     c2.mirror = false;
     c2.max_conns = 8192;
+    c2.sync = true;
     c2.admin_password = "hunter2";
     c2.node_id = "node-2";
     c2.peers = "node-1@10.0.0.1:9878";
@@ -473,4 +487,17 @@ test "config: bool parsing" {
 
     try c.loadFile("mirror = 0\n");
     try testing.expect(!c.mirror);
+}
+
+test "config: sync option" {
+    var c = ServerConfig{};
+    try testing.expect(!c.sync); // opt-in: default off
+
+    try c.loadFile("sync = true\n");
+    try testing.expect(c.sync);
+
+    try c.loadFile("sync = false\n");
+    try testing.expect(!c.sync);
+
+    try testing.expectError(error.InvalidValue, c.loadFile("sync = maybe\n"));
 }

@@ -60,7 +60,16 @@ pub const Store = struct {
     /// Create a new write batch for atomic apply.
     /// Auto-sorts every 64 writes for fast reads during batch execution.
     pub fn newBatch(self: *Store) WriteBatch {
-        return .{ .batch = self.db.newBatchWithOptions(.{ .sort_every = 64 }), .db = self.db };
+        var wb = WriteBatch{ .batch = self.db.newBatchWithOptions(.{ .sort_every = 64 }), .db = self.db };
+        // Pre-reserve the get-allocation tracker (pre-initialized memory) so
+        // the hot path never grows it: the largest bounded read burst on one
+        // batch is a maintenance pass — promote/reclaim/expire share the
+        // per-tick bulk cap (max_bulk_results = 4096 job reads) and purge adds
+        // its own capped 4096 — so 8192 covers it. Batch creation is a safe
+        // fail-stop point; growth beyond the reserve fail-stops in get().
+        wb.get_allocs.ensureTotalCapacity(self.db.allocator, get_allocs_reserve) catch
+            @panic("kv: out of memory reserving batch read tracker");
+        return wb;
     }
 
     /// Close the store. Caller owns the talon.DB lifecycle.
@@ -73,6 +82,10 @@ pub const Store = struct {
 // ============================================================================
 // WriteBatch — buffered read-write batch
 // ============================================================================
+
+/// get_allocs capacity reserved at newBatch(). Sized for one maintenance
+/// pass (see Store.newBatch); explicit bound per TigerStyle.
+pub const get_allocs_reserve: usize = 8192;
 
 pub const WriteBatch = struct {
     batch: *talon.Batch,
@@ -98,8 +111,11 @@ pub const WriteBatch = struct {
         // Fail-stop on page corruption (see Store.get).
         const val = (self.batch.get(key) catch @panic("talon: page corruption on read (batch.get)")) orelse return null;
         // Talon's batch.get() always allocates via db.allocator.dupe().
-        // Track for bulk free on close().
-        self.get_allocs.append(self.db.allocator, val) catch {};
+        // Track for bulk free on close(). get_allocs is exactly the list
+        // close() walks to free, so a dropped append would leak val
+        // permanently — fail-stop like the set/delete recorders. Capacity is
+        // pre-reserved in newBatch(), so this only fails on true OOM.
+        self.get_allocs.append(self.db.allocator, val) catch unreachable;
         return val;
     }
 

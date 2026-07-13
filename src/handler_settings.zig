@@ -110,19 +110,35 @@ pub fn writeAuditEntry(
 
     const affected = result.affected;
 
-    // Key: audit|{ts_ns}
+    // Key: audit|{ts_ns}. prefix (6) + u64 digits (20) always fits KeyBuf (512).
     var key_buf: keys.KeyBuf = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "{s}{d}", .{ keys.prefix_audit, now_ns }) catch return;
+    const key = std.fmt.bufPrint(&key_buf, "{s}{d}", .{ keys.prefix_audit, now_ns }) catch
+        assert.fail("audit key exceeds KeyBuf", .{});
 
-    // JSON value.
-    var val_buf: [512]u8 = undefined;
-    const val = std.fmt.bufPrint(&val_buf, "{{\"op\":\"{s}\",\"target\":\"{s}\",\"count\":{d},\"actor\":\"{s}\",\"ts\":{d}}}", .{
-        entry.op_name,
-        entry.target,
+    // JSON value. Every string field goes through std.json.fmt so
+    // client-controlled bytes (setting ids, queue names) cannot forge audit
+    // fields by embedding quotes.
+    //
+    // val_buf is sized to the provable worst case so the write can never fail
+    // and an audit entry is never silently dropped:
+    //   skeleton {"op":,"target":,"count":,"actor":,"ts":}     41 bytes
+    //   count (u32)                                            10 digits
+    //   ts (u64)                                               20 digits
+    //   each string field: 2 quotes + 6 bytes/char (\uXXXX worst case)
+    //     op_name <= 64  (op_name_buf / short static strings)
+    //     target  <= keys.max_key_len (setting ids are bounded only by the
+    //                key limit; target_buf is 256; queue names are 64)
+    //     actor   <= 128 (AuthInfo.actor / pipeline frame actor)
+    const max_val_len = 41 + 10 + 20 +
+        (2 + 64 * 6) + (2 + keys.max_key_len * 6) + (2 + 128 * 6);
+    var val_buf: [max_val_len]u8 = undefined;
+    const val = std.fmt.bufPrint(&val_buf, "{{\"op\":{f},\"target\":{f},\"count\":{d},\"actor\":{f},\"ts\":{d}}}", .{
+        std.json.fmt(entry.op_name, .{}),
+        std.json.fmt(entry.target, .{}),
         affected,
-        actor,
+        std.json.fmt(actor, .{}),
         now_ns,
-    }) catch return;
+    }) catch assert.fail("audit value exceeds sized buffer", .{});
 
     b.set(key, val);
 }
@@ -133,6 +149,10 @@ const AuditFields = struct {
 };
 
 fn auditBulkAction(op: *const ops.BulkActionOp, target_buf: *[256]u8) AuditFields {
+    // catch "" is tolerable here: the audit entry is still written (with an
+    // empty target), and only op.queue can overflow — bulk job_ids are
+    // validated <= 64 by applyBulkAction, while op.queue is display-only
+    // metadata that protocol decoders do not length-limit.
     const target = if (op.queue.len > 0)
         std.fmt.bufPrint(target_buf, "queue:{s}", .{op.queue}) catch ""
     else if (op.job_ids.len == 1)

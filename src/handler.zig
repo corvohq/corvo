@@ -517,8 +517,8 @@ pub const OpHandler = struct {
     }
 
     /// Check webhook cache and record events for matching webhooks.
-    /// Writes whd| delivery records to the batch (atomic with state transition)
-    /// and records events in the effect buffer (for pipeline awareness).
+    /// Records matching events in webhook_events; the pipeline writes the
+    /// whd| delivery records post-commit (recorded + proposed in cluster mode).
     pub fn checkWebhooks(self: *OpHandler, job_id: []const u8, queue: []const u8, event: WebhookEvent.EventType, now_ns: u64) void {
         for (self.webhook_cache[0..self.webhook_cache_count]) |*wh| {
             if (!wh.enabled) continue;

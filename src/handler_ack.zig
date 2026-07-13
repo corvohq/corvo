@@ -2,6 +2,7 @@
 //! Ported from Go internal/ops/ops_ack_fail.go (ack portion).
 
 const std = @import("std");
+const assert = @import("assert.zig");
 const types = @import("types.zig");
 const ops = @import("ops.zig");
 const keys = @import("keys.zig");
@@ -186,6 +187,8 @@ fn advanceChain(self: *OpHandler, b: *kv.WriteBatch, job: *const types.Job, ack:
     };
 
     // Use a stack allocator for JSON parsing (no heap allocation).
+    // Parse failure (malformed chain_config) deliberately skips chain
+    // advancement — an invalid config never had a runnable next step.
     var parse_buf: [8192]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&parse_buf);
     const parsed = std.json.parseFromSlice(ChainDef, fba.allocator(), cc, .{
@@ -229,41 +232,65 @@ fn advanceChain(self: *OpHandler, b: *kv.WriteBatch, job: *const types.Job, ack:
 
     // Merge previous_job_id and previous_result into payload (matches Go).
     // Off the hot path — only runs for chain jobs.
+    //
+    // merged_buf is sized to the provable worst case, so a write can never
+    // fail and a chain continuation is never silently dropped:
+    //   {"previous_job_id":                                     19 bytes
+    //   json.fmt(job.id): 2 quotes + 64*6 (\uXXXX worst case)  386 bytes
+    //   ,"previous_result": + result (<= max_metadata_field_len,
+    //   validated in applyAck)                                  19 + 512
+    //   payload arm: bounded by the chain_config source text — the parsed
+    //   string is at most its source length, and std.json re-serialization
+    //   never emits more bytes than a token's source form (short escapes stay
+    //   short, \uXXXX came from \uXXXX). cc passed validateEnqueue, so
+    //   cc.len < max_enqueue_job_encoded_size (4096).
+    //   closing }                                                1 byte
+    //   total <= 19 + 386 + 19 + 512 + 4096 + 1 = 5033 < 8192.
     var merged_buf: [8192]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&merged_buf);
     const w = fbs.writer();
-    w.writeAll("{\"previous_job_id\":\"") catch return;
-    w.writeAll(job.id) catch return;
-    w.writeByte('"') catch return;
+    w.print("{{\"previous_job_id\":{f}", .{std.json.fmt(job.id, .{})}) catch
+        assert.fail("chain merge exceeds sized buffer", .{});
     if (ack.result) |r| {
         if (r.len > 0) {
-            w.writeAll(",\"previous_result\":") catch return;
-            w.writeAll(r) catch return;
+            w.writeAll(",\"previous_result\":") catch
+                assert.fail("chain merge exceeds sized buffer", .{});
+            w.writeAll(r) catch
+                assert.fail("chain merge exceeds sized buffer", .{});
         }
     }
     if (next_payload) |pv| {
         switch (pv) {
             .string => |s| {
                 if (s.len > 2 and s[0] == '{') {
-                    w.writeByte(',') catch return;
-                    w.writeAll(s[1..]) catch return;
+                    w.writeByte(',') catch
+                        assert.fail("chain merge exceeds sized buffer", .{});
+                    w.writeAll(s[1..]) catch
+                        assert.fail("chain merge exceeds sized buffer", .{});
                 } else {
-                    w.writeByte('}') catch return;
+                    w.writeByte('}') catch
+                        assert.fail("chain merge exceeds sized buffer", .{});
                 }
             },
             .object => {
                 var obj_iter = pv.object.iterator();
                 while (obj_iter.next()) |entry| {
-                    w.writeByte(',') catch return;
-                    w.print("{f}:", .{std.json.fmt(entry.key_ptr.*, .{})}) catch return;
-                    w.print("{f}", .{std.json.fmt(entry.value_ptr.*, .{})}) catch return;
+                    w.writeByte(',') catch
+                        assert.fail("chain merge exceeds sized buffer", .{});
+                    w.print("{f}:", .{std.json.fmt(entry.key_ptr.*, .{})}) catch
+                        assert.fail("chain merge exceeds sized buffer", .{});
+                    w.print("{f}", .{std.json.fmt(entry.value_ptr.*, .{})}) catch
+                        assert.fail("chain merge exceeds sized buffer", .{});
                 }
-                w.writeByte('}') catch return;
+                w.writeByte('}') catch
+                    assert.fail("chain merge exceeds sized buffer", .{});
             },
-            else => w.writeByte('}') catch return,
+            else => w.writeByte('}') catch
+                assert.fail("chain merge exceeds sized buffer", .{}),
         }
     } else {
-        w.writeByte('}') catch return;
+        w.writeByte('}') catch
+            assert.fail("chain merge exceeds sized buffer", .{});
     }
     const merged_payload = fbs.getWritten();
 

@@ -129,25 +129,37 @@ const job_fixed_size: usize = 91;
 pub const max_enqueue_job_encoded_size: usize = 4096;
 pub const max_job_encoded_size: usize = 8192;
 
+/// Variable-length job fields in wire order — the single source of truth for
+/// jobEncodedSize, encodeJob, and decodeJob. All three iterate this list at
+/// comptime, so the size pre-check, the encoder, and the decoder can never
+/// disagree on field count or order: adding a 16th field here updates all of
+/// them in one place (a hand-written 15-field sum would silently undercount).
+const job_var_fields = [_][]const u8{
+    "id",          "queue",     "unique_key", "batch_id",     "worker_id",
+    "hostname",    "parent_id", "chain_id",   "chain_config", "group",
+    "hold_reason", "tags",      "progress",   "checkpoint",   "result",
+};
+
+/// Comptime-typed access to a variable job field, normalizing optionals
+/// (null encodes as the empty string, exactly like writeOptStr).
+fn jobFieldSlice(job: *const types.Job, comptime name: []const u8) []const u8 {
+    const v = @field(job, name);
+    return switch (@typeInfo(@TypeOf(v))) {
+        .optional => v orelse "",
+        else => v,
+    };
+}
+
 /// Exact bytes encodeJob will write. Boundary handlers use this before the
 /// fixed-buffer encoder so oversized combinations of individually-valid fields
-/// become client errors instead of slice-bounds panics.
+/// become client errors instead of slice-bounds panics. Driven by
+/// job_var_fields — provably in lockstep with encodeJob.
 pub fn jobEncodedSize(job: *const types.Job) usize {
-    return job_fixed_size + 15 * 2 +
-        job.id.len + job.queue.len +
-        (job.unique_key orelse "").len +
-        (job.batch_id orelse "").len +
-        (job.worker_id orelse "").len +
-        (job.hostname orelse "").len +
-        (job.parent_id orelse "").len +
-        (job.chain_id orelse "").len +
-        (job.chain_config orelse "").len +
-        (job.group orelse "").len +
-        (job.hold_reason orelse "").len +
-        (job.tags orelse "").len +
-        (job.progress orelse "").len +
-        (job.checkpoint orelse "").len +
-        (job.result orelse "").len;
+    var size: usize = job_fixed_size + job_var_fields.len * 2;
+    inline for (job_var_fields) |name| {
+        size += jobFieldSlice(job, name).len;
+    }
+    return size;
 }
 
 /// Encode a Job header into buf. Returns the encoded slice.
@@ -186,22 +198,12 @@ pub fn encodeJob(buf: []u8, job: *const types.Job) []const u8 {
     // Lease token
     pos = writeU64LE(buf, pos, job.lease_token);
 
-    // Variable-length fields
-    pos = writeStr(buf, pos, job.id);
-    pos = writeStr(buf, pos, job.queue);
-    pos = writeOptStr(buf, pos, job.unique_key);
-    pos = writeOptStr(buf, pos, job.batch_id);
-    pos = writeOptStr(buf, pos, job.worker_id);
-    pos = writeOptStr(buf, pos, job.hostname);
-    pos = writeOptStr(buf, pos, job.parent_id);
-    pos = writeOptStr(buf, pos, job.chain_id);
-    pos = writeOptStr(buf, pos, job.chain_config);
-    pos = writeOptStr(buf, pos, job.group);
-    pos = writeOptStr(buf, pos, job.hold_reason);
-    pos = writeOptStr(buf, pos, job.tags);
-    pos = writeOptStr(buf, pos, job.progress);
-    pos = writeOptStr(buf, pos, job.checkpoint);
-    pos = writeOptStr(buf, pos, job.result);
+    // Variable-length fields — driven by job_var_fields so the sequence can
+    // never diverge from jobEncodedSize / decodeJob. Optionals encode null as
+    // the empty string (writeOptStr semantics, via jobFieldSlice).
+    inline for (job_var_fields) |name| {
+        pos = writeStr(buf, pos, jobFieldSlice(job, name));
+    }
 
     return buf[0..pos];
 }
@@ -296,66 +298,20 @@ pub fn decodeJob(data: []const u8) types.Job {
     pos = lease_token.next;
     job.lease_token = lease_token.val;
 
-    // Variable fields
-    const id = readStr(data, pos);
-    pos = id.next;
-    job.id = id.val;
-
-    const queue = readStr(data, pos);
-    pos = queue.next;
-    job.queue = queue.val;
-
-    const unique_key = readOptStr(data, pos);
-    pos = unique_key.next;
-    job.unique_key = unique_key.val;
-
-    const batch_id = readOptStr(data, pos);
-    pos = batch_id.next;
-    job.batch_id = batch_id.val;
-
-    const worker_id = readOptStr(data, pos);
-    pos = worker_id.next;
-    job.worker_id = worker_id.val;
-
-    const hostname = readOptStr(data, pos);
-    pos = hostname.next;
-    job.hostname = hostname.val;
-
-    const parent_id = readOptStr(data, pos);
-    pos = parent_id.next;
-    job.parent_id = parent_id.val;
-
-    const chain_id = readOptStr(data, pos);
-    pos = chain_id.next;
-    job.chain_id = chain_id.val;
-
-    const chain_config = readOptStr(data, pos);
-    pos = chain_config.next;
-    job.chain_config = chain_config.val;
-
-    const group = readOptStr(data, pos);
-    pos = group.next;
-    job.group = group.val;
-
-    const hold_reason = readOptStr(data, pos);
-    pos = hold_reason.next;
-    job.hold_reason = hold_reason.val;
-
-    const tag_data = readOptStr(data, pos);
-    pos = tag_data.next;
-    job.tags = tag_data.val;
-
-    const progress_data = readOptStr(data, pos);
-    pos = progress_data.next;
-    job.progress = progress_data.val;
-
-    const checkpoint_data = readOptStr(data, pos);
-    pos = checkpoint_data.next;
-    job.checkpoint = checkpoint_data.val;
-
-    const result_data = readOptStr(data, pos);
-    pos = result_data.next;
-    job.result = result_data.val;
+    // Variable fields — same job_var_fields list as encodeJob, so the read
+    // sequence tracks the write sequence by construction. Optional fields
+    // decode the empty string back to null (readOptStr semantics).
+    inline for (job_var_fields) |name| {
+        if (@typeInfo(@TypeOf(@field(job, name))) == .optional) {
+            const r = readOptStr(data, pos);
+            pos = r.next;
+            @field(job, name) = r.val;
+        } else {
+            const r = readStr(data, pos);
+            pos = r.next;
+            @field(job, name) = r.val;
+        }
+    }
 
     return job;
 }

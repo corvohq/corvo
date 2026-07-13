@@ -242,6 +242,15 @@ const SimNet = struct {
         self.peers[idx].up = up;
     }
 
+    /// Re-point a node's slot at a NEW transport after a crash-restart. The
+    /// hook (net + from_idx) is unchanged; messages queued in the old
+    /// transport's rings are lost, exactly like a real process crash.
+    fn replaceTransport(self: *SimNet, idx: usize, transport: *RaftTransport) void {
+        std.debug.assert(idx < self.count);
+        self.peers[idx].transport = transport;
+        transport.setSend(@ptrCast(&self.hooks[idx]), sendFn);
+    }
+
     fn sendFn(ctx: *anyopaque, to: []const u8, bytes: []const u8) bool {
         const hook: *SendHook = @ptrCast(@alignCast(ctx));
         const self = hook.net;
@@ -550,6 +559,79 @@ const Cluster = struct {
         self.net.setUp(idx, !stopped);
     }
 
+    /// Crash-restart node `idx`: tear its whole stack down in the exact order
+    /// `deinit` uses — including CLOSING the talon DB — then re-open the DB
+    /// from the same on-disk files and re-run Runtime.init + node bring-up.
+    /// This is the production process-restart path: Runtime.init must rebuild
+    /// term/log/applied from the persisted r:meta / r:log:* / r:applied keys
+    /// instead of starting from an empty log. Client connections and any
+    /// messages queued in the old transport are lost, as in a real crash.
+    fn restartNode(self: *Cluster, idx: usize) !void {
+        const n = &self.nodes[idx];
+
+        // Teardown — mirrors Cluster.deinit's per-node order, but the DB
+        // files are deliberately NOT deleted.
+        n.pipeline.destroyHeap();
+        n.runtime.deinit();
+        n.bridge.deinit();
+        n.handler.deinit();
+        n.notify.deinit();
+        n.backend.deinit(self.allocator);
+        n.db.close();
+
+        // Bring-up — mirrors Cluster.init's per-node wiring against the
+        // SAME path so Runtime.init replays the persisted raft state.
+        var path_buf: [96]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/tmp/corvo-clustersim-{d}-{d}", .{ self.instance_id, idx }) catch unreachable;
+        const db = try talon.DB.open(self.allocator, path, .{});
+
+        var peers_buf: [max_nodes - 1]PeerSpec = undefined;
+        var pn: usize = 0;
+        for (0..self.nodes.len) |j| {
+            if (idx == j) continue;
+            peers_buf[pn] = .{ .id = self.node_ids[j], .uuid = raft_host.deriveUuid(self.node_ids[j]) };
+            pn += 1;
+        }
+
+        n.db = db;
+        n.stores = [1]kv.Store{kv.Store.init(db)};
+        n.handler = OpHandler.init(self.allocator);
+        n.notify = QueueNotifier.init(self.allocator);
+        n.runtime = try Runtime.init(self.allocator, db, .{
+            .node_id = self.node_ids[idx],
+            .instance_uuid = raft_host.deriveUuid(self.node_ids[idx]),
+            .cluster_id = cluster_id,
+            .peers = peers_buf[0..pn],
+            .raft_config = raftConfig(),
+            .bootstrap_initial_config = false,
+            .snapshot_threshold_entries = 0,
+        });
+        n.backend = try SimBackend.init(self.allocator, .{
+            .listen_fd = -1,
+            .max_conns = max_clients + 8,
+            .recv_buf_size = 65536,
+            .send_buf_size = 256 * 1024, // same rationale as Cluster.init
+        });
+        n.bridge = .{ .runtime = &n.runtime, .allocator = self.allocator };
+        const p = try self.allocator.create(Pipeline);
+        p.* = Pipeline.init(
+            self.allocator,
+            &n.backend,
+            &n.handler,
+            n.stores[0..],
+            &n.notify,
+            null,
+            .{
+                .clock_fn = &globalClockNow,
+                .raft = n.bridge.iface(),
+            },
+        );
+        n.pipeline = p;
+        self.net.replaceTransport(idx, &n.runtime.transport);
+        n.ticking = true;
+        self.net.setUp(idx, true);
+    }
+
     /// Deterministically exercise the full completed-job lifecycle through the
     /// leader on a dedicated queue and assert AUTO-DELETE REPLICATES: enqueue →
     /// fetch (an already-pending job fulfills synchronously) → ack (done, which
@@ -835,6 +917,38 @@ fn firstFrameType(resp: []const u8) ?u8 {
     return hdr.msg_type;
 }
 
+/// Read a response only if the pipeline actually SENT it. Deferred responses
+/// are already encoded into the conn's send_buf at execute time, but their
+/// io.queueSend is withheld until the raft token commits — so send_pos stays 0
+/// (SimBackend.submit marks a real send by advancing send_pos to send_len).
+/// Plain readResponse cannot tell the two apart and would steal a deferred
+/// ack out of the buffer before the client could ever legally observe it.
+fn readSentResponse(node: *Node, conn_id: u16) ?[]const u8 {
+    const c = node.backend.conn(conn_id);
+    if (c.send_len == 0 or c.send_pos < c.send_len) return null;
+    return node.backend.readResponse(conn_id);
+}
+
+/// True if any MSG_ENQUEUE_BATCH_RESP frame in `resp` reports success for its
+/// first job (err byte 0 — the wire layout parseEnqueuePayload reads).
+fn respHasSuccessfulEnqueue(resp: []const u8) bool {
+    var pos: usize = 0;
+    while (pos + rpc.FRAME_HEADER_SIZE <= resp.len) {
+        const hdr = rpc.readFrameHeader(resp[pos..]) orelse break;
+        const body_start = pos + rpc.FRAME_HEADER_SIZE;
+        const body_end = body_start + hdr.payload_len;
+        if (body_end > resp.len) break;
+        if (hdr.msg_type == rpc.MSG_ENQUEUE_BATCH_RESP) {
+            var r = rpc.BufReader{ .data = resp[body_start..body_end] };
+            _ = r.readU16() catch return false; // count
+            const err_byte = r.readU8() catch return false;
+            if (err_byte == 0) return true;
+        }
+        pos = body_end;
+    }
+    return false;
+}
+
 /// True if any frame in `resp` has the given msg_type.
 fn respHasType(resp: []const u8, msg_type: u8) bool {
     var pos: usize = 0;
@@ -864,6 +978,10 @@ const Stats = struct {
     failed: u32 = 0,
     applied: u64 = 0,
     leader_jobs: usize = 0,
+    /// Byte-for-byte digest of the leader's user keyspace at the end of the
+    /// run (userKvHash). Two same-seed runs must produce identical KV, not
+    /// just identical aggregate counters.
+    leader_kv_hash: u64 = 0,
 };
 
 const rounds_per_step: u32 = 8;
@@ -925,7 +1043,11 @@ fn runReplication(
     // asserting the deletion replicates to every follower.
     if (check_lifecycle) try cluster.assertLifecycleReplicates(leader_idx);
 
-    var s = Stats{ .applied = cluster.nodes[leader_idx].runtime.fsm.lastApplied(), .leader_jobs = leader_jobs };
+    var s = Stats{
+        .applied = cluster.nodes[leader_idx].runtime.fsm.lastApplied(),
+        .leader_jobs = leader_jobs,
+        .leader_kv_hash = userKvHash(&cluster.nodes[leader_idx]),
+    };
     for (clients[0..nc]) |c| {
         s.enqueued += c.enqueued;
         s.fetched += c.fetched;
@@ -1390,7 +1512,9 @@ test "cluster raft: non-leader rejects write with MSG_NOT_LEADER, no mutation" {
 
 test "cluster raft: deterministic — same seed reproduces identical stats" {
     // Determinism check: two independent runs with the same seed must produce
-    // byte-identical outcomes.
+    // byte-identical outcomes — aggregate counters AND a byte-for-byte digest
+    // of the leader's entire user keyspace (matching counters alone could
+    // hide divergent job contents/timestamps).
     const a = try runReplication(sim_allocator, 3, 12345, 2, 2, 40, false);
     const b = try runReplication(sim_allocator, 3, 12345, 2, 2, 40, false);
     try std.testing.expectEqual(a.enqueued, b.enqueued);
@@ -1399,5 +1523,179 @@ test "cluster raft: deterministic — same seed reproduces identical stats" {
     try std.testing.expectEqual(a.failed, b.failed);
     try std.testing.expectEqual(a.applied, b.applied);
     try std.testing.expectEqual(a.leader_jobs, b.leader_jobs);
-    std.debug.print("OK deterministic: enq={d} applied={d} jobs={d}\n", .{ a.enqueued, a.applied, a.leader_jobs });
+    try std.testing.expectEqual(a.leader_kv_hash, b.leader_kv_hash);
+    std.debug.print("OK deterministic: enq={d} applied={d} jobs={d} kv_hash={x}\n", .{ a.enqueued, a.applied, a.leader_jobs, a.leader_kv_hash });
+}
+
+test "cluster raft: mid-batch step-down — in-flight write never phantom-acks, never diverges" {
+    // Every other deposing scenario quiesces (pendingCount()==0 AND
+    // inFlightCount()==0) before the partition, so the batcher's step-down
+    // completion path never runs against a LIVE proposal. Here the leader is
+    // partitioned while a client write is genuinely in flight: proposed,
+    // flushed into the leader's log, AppendEntries handed to the followers,
+    // commit not yet learned. Post-fix contract:
+    //   - the client never observes a SUCCESS ack for a write the cluster
+    //     discarded (a deferred ack may flush only if the write survived);
+    //   - the deposed leader must not resolve the in-flight completion
+    //     term-blindly (no false divergence fail-stop, no false success);
+    //   - after healing, all nodes converge (assertConsistent) and the write
+    //     is present on every node or absent from every node — never mixed.
+    var clock = SimClock.init(1_000_000_000_000);
+    setGlobalClock(&clock);
+    var cluster = try Cluster.init(sim_allocator, 3, &clock);
+    defer cluster.deinit();
+
+    const old_leader = try cluster.electLeaderLeading(400);
+    const leader = &cluster.nodes[old_leader];
+
+    // Inject one enqueue and tick ONLY the leader's pipeline: the mutations
+    // commit to the leader's local KV and are proposed into the batcher; no
+    // Runtime.tick has run, so nothing is flushed or replicated yet.
+    const conn = leader.backend.connect().?;
+    var frame: [256]u8 = undefined;
+    const n = buildEnqueueFrame(&frame, 1, "midbatch-q", "midbatch-1");
+    leader.backend.injectRecv(conn, frame[0..n]);
+    leader.pipeline.tick();
+    // Loud setup guard: the proposal must be live in the batcher BEFORE the
+    // partition. If this trips, the setup raced to quiescence and the
+    // scenario exercises nothing.
+    try std.testing.expect(leader.runtime.batcher.pendingCount() > 0);
+
+    // One leader-only raft tick: flush pending → in-flight; the entry's
+    // AppendEntries lands in both followers' inbound rings (delivered, not
+    // yet processed — the followers have not ticked).
+    cluster.now_ns += round_ns;
+    clock.advance(round_ns);
+    leader.runtime.tick(cluster.now_ns) catch |e|
+        std.debug.panic("leader runtime.tick failed: {s}", .{@errorName(e)});
+    leader.bridge.afterRaftTick();
+    try std.testing.expect(leader.runtime.batcher.inFlightCount() > 0);
+    // The ack must still be deferred (encoded but NOT queued for send) —
+    // commit has not been learned.
+    try std.testing.expect(readSentResponse(leader, conn) == null);
+
+    // Partition the leader BEFORE the followers' acks can reach it: the
+    // proposal can never commit on the deposed leader in its own term.
+    cluster.setPartition(old_leader, false);
+
+    var saw_success = false;
+    var saw_not_leader = false;
+    var new_leader: ?usize = null;
+    var r: u32 = 0;
+    while (r < 400) : (r += 1) {
+        cluster.pumpRound();
+        if (readSentResponse(leader, conn)) |resp| {
+            if (respHasSuccessfulEnqueue(resp)) saw_success = true;
+            if (respHasType(resp, rpc.MSG_NOT_LEADER)) saw_not_leader = true;
+        }
+        if (cluster.leaderIdx()) |li| {
+            if (li != old_leader and cluster.nodes[li].pipeline.raft_state == .leading and
+                !leader.runtime.node.isLeader())
+            {
+                new_leader = li;
+                break;
+            }
+        }
+    }
+    // Bounded: a replacement must win with the surviving quorum.
+    try std.testing.expect(new_leader != null);
+
+    // Heal; every node must converge with no divergence.
+    cluster.setPartition(old_leader, true);
+    var heal_r: u32 = 0;
+    while (heal_r < 800) : (heal_r += 1) {
+        if (cluster.converged()) break;
+        cluster.pumpRound();
+        if (readSentResponse(leader, conn)) |resp| {
+            if (respHasSuccessfulEnqueue(resp)) saw_success = true;
+            if (respHasType(resp, rpc.MSG_NOT_LEADER)) saw_not_leader = true;
+        }
+    }
+    try std.testing.expect(cluster.converged());
+    const nl = cluster.leaderIdx().?;
+    _ = try cluster.assertConsistent(nl);
+
+    // The write is present everywhere or absent everywhere — never mixed.
+    const present = hasKey(&cluster.nodes[nl], "j|midbatch-1");
+    for (cluster.nodes) |*node| {
+        try std.testing.expectEqual(present, hasKey(node, "j|midbatch-1"));
+    }
+    // Never a success ack for a write the cluster discarded.
+    if (saw_success) try std.testing.expect(present);
+    if (!present) try std.testing.expect(!saw_success);
+    // The client observed a definite outcome — a (truthful) ack or a
+    // not-leader redirect — not silence.
+    try std.testing.expect(saw_success or saw_not_leader);
+    std.debug.print(
+        "OK mid-batch step-down: old={s} new={s} present={} success_ack={} not_leader={}\n",
+        .{ leader.id, cluster.nodes[nl].id, present, saw_success, saw_not_leader },
+    );
+}
+
+test "cluster raft: follower crash-restart recovers raft log and user KV from disk" {
+    // setStopped only stops ticking — the talon DB stays open and Runtime is
+    // never re-initialized, so Runtime.init's disk-replay path (r:meta /
+    // r:log:* / r:applied rebuild) otherwise only ever runs against an empty
+    // log. Here a follower holding committed entries is crash-restarted via
+    // restartNode (DB closed, re-opened from the same files, Runtime.init +
+    // full node bring-up re-run) and must come back byte-identical, then
+    // reconverge on fresh writes.
+    var clock = SimClock.init(1_000_000_000_000);
+    setGlobalClock(&clock);
+    var cluster = try Cluster.init(sim_allocator, 3, &clock);
+    defer cluster.deinit();
+
+    const leader_idx = try cluster.electLeaderLeading(400);
+    var frame: [256]u8 = undefined;
+
+    // Commit a handful of entries so the persisted log is non-trivial.
+    const conn = cluster.nodes[leader_idx].backend.connect().?;
+    for (0..3) |i| {
+        var id_buf: [24]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buf, "pre-restart-{d}", .{i}) catch unreachable;
+        const len = buildEnqueueFrame(&frame, @intCast(i + 1), "restart-q", id);
+        cluster.nodes[leader_idx].backend.injectRecv(conn, frame[0..len]);
+        cluster.pumpRounds(rounds_per_step);
+        try std.testing.expect(cluster.quiesce(400));
+        try std.testing.expect(cluster.nodes[leader_idx].backend.readResponse(conn) != null);
+    }
+
+    var follower_idx: usize = 0;
+    while (follower_idx == leader_idx) : (follower_idx += 1) {}
+    const follower = &cluster.nodes[follower_idx];
+
+    const pre_term = follower.runtime.node.status().term;
+    const pre_applied = follower.runtime.fsm.lastApplied();
+    const pre_last_index = follower.runtime.storage.storage().lastIndex();
+    const pre_hash = userKvHash(follower);
+    // Loud setup guards: the follower must actually hold committed entries.
+    try std.testing.expect(pre_applied > 0);
+    try std.testing.expect(pre_last_index >= pre_applied);
+
+    try cluster.restartNode(follower_idx);
+
+    // Disk replay rebuilt the raft state and the user keyspace exactly.
+    try std.testing.expectEqual(pre_term, follower.runtime.node.status().term);
+    try std.testing.expectEqual(pre_applied, follower.runtime.fsm.lastApplied());
+    try std.testing.expectEqual(pre_last_index, follower.runtime.storage.storage().lastIndex());
+    try std.testing.expectEqual(pre_hash, userKvHash(follower));
+    try compareUserKv(&cluster.nodes[leader_idx], follower);
+    for (0..3) |i| {
+        var key_buf: [32]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "j|pre-restart-{d}", .{i}) catch unreachable;
+        try std.testing.expect(hasKey(follower, key));
+    }
+
+    // The restarted node rejoins and reconverges on fresh replicated writes.
+    const post_len = buildEnqueueFrame(&frame, 9, "restart-q", "post-restart");
+    cluster.nodes[leader_idx].backend.injectRecv(conn, frame[0..post_len]);
+    cluster.pumpRounds(rounds_per_step);
+    try std.testing.expect(cluster.quiesce(800));
+    const final_leader = cluster.leaderIdx().?;
+    _ = try cluster.assertConsistent(final_leader);
+    for (cluster.nodes) |*node| try std.testing.expect(hasKey(node, "j|post-restart"));
+    std.debug.print(
+        "OK crash-restart: follower={s} term={d} applied={d} log_end={d} rejoined\n",
+        .{ follower.id, pre_term, pre_applied, pre_last_index },
+    );
 }

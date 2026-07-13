@@ -111,6 +111,59 @@ Do not run Corvo on ephemeral disks unless durability is not required.
 
 ---
 
+# Durability and fsync (`--sync`)
+
+By default Corvo does **not** fsync on commit. Writes are committed to the
+data store and handed to the operating system, which flushes them to disk on
+its own schedule. A process crash loses nothing (the OS still holds the
+pages), but a **power loss or kernel crash can lose the most recent commits**.
+
+Enabling `--sync` (or `sync = true` in the config file) makes Corvo call
+`fdatasync` on every commit: once a commit returns, it is on disk.
+
+```bash
+corvo --sync
+```
+
+## The tradeoff
+
+fsync bounds every commit by your storage device's flush latency. On NVMe
+this is tens of microseconds; on SATA SSDs or cloud block storage it can be
+milliseconds. Throughput drops accordingly. This is why `--sync` is opt-in.
+
+## Single node
+
+Without `--sync`, a power loss can lose jobs enqueued (or acknowledged) in
+the final moments before the outage. If your workload tolerates replaying or
+re-submitting a few seconds of work, the default is a reasonable trade. If
+every accepted job must survive power loss, run with `--sync`.
+
+## Cluster mode — read this before going to production
+
+**Running a cluster without `--sync` is not just a durability trade — it can
+violate the consensus protocol's safety assumptions.**
+
+The replication protocol assumes that once a node persists its vote or a log
+entry, that state survives restarts. Without `--sync`, a power loss can roll
+a node back to before a vote or entry it already reported as persisted:
+
+- A node that voted in an election, lost power, and restarted without that
+  vote on disk **can vote again in the same term** — allowing two leaders to
+  be elected for one term, whose logs then diverge.
+- Entries acknowledged toward a quorum can vanish from disk, so data the
+  cluster reported as committed can be lost if the wrong combination of
+  nodes loses power together.
+
+An ordinary process crash or restart is safe either way; the risk is
+specifically machine-level failure (power loss, kernel panic). Because
+simultaneous power loss across nodes is exactly what shared-rack or
+shared-AZ deployments experience, **`--sync` is recommended for cluster
+production deployments.** Leave it off only when the cluster spans
+independent failure domains and losing a recently-committed suffix in a
+correlated outage is acceptable.
+
+---
+
 # Cluster Formation
 
 Nodes join via:

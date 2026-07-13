@@ -203,18 +203,19 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                 job.hostname = null;
                 job.lease_expires_at_ns = 0;
 
-                // Write error KV entry for lease expiry.
+                // Write error KV entry for lease expiry. job_id goes through
+                // std.json.fmt — RPC enqueue accepts ids containing quotes.
+                // Bound: skeleton + digits (~89) + escaped id (2 + 64*6 = 386)
+                // fits 512, so the write can never fail.
                 {
                     var ek_buf: keys.KeyBuf = undefined;
-                    var err_val_buf: [256]u8 = undefined;
-                    const err_json = std.fmt.bufPrint(&err_val_buf, "{{\"job_id\":\"{s}\",\"attempt\":{d},\"error\":\"lease expired\",\"created_at_ns\":{d}}}", .{
-                        job_id,
+                    var err_val_buf: [512]u8 = undefined;
+                    const err_json = std.fmt.bufPrint(&err_val_buf, "{{\"job_id\":{f},\"attempt\":{d},\"error\":\"lease expired\",\"created_at_ns\":{d}}}", .{
+                        std.json.fmt(job_id, .{}),
                         job.attempt,
                         now_ns,
-                    }) catch "";
-                    if (err_json.len > 0) {
-                        b.set(keys.jobErrorKey(&ek_buf, job_id, @intCast(job.attempt)), err_json);
-                    }
+                    }) catch assert.fail("reclaim error entry exceeds sized buffer", .{});
+                    b.set(keys.jobErrorKey(&ek_buf, job_id, @intCast(job.attempt)), err_json);
                 }
 
                 if (job.attempt >= job.max_retries) {
@@ -333,18 +334,19 @@ fn applyExpire(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
                 b.delete(key); // expire key
 
-                // Write error KV entry for job expiry.
+                // Write error KV entry for job expiry. job_id goes through
+                // std.json.fmt — RPC enqueue accepts ids containing quotes.
+                // Bound: skeleton + digits (~87) + escaped id (2 + 64*6 = 386)
+                // fits 512, so the write can never fail.
                 {
                     var ek_buf: keys.KeyBuf = undefined;
-                    var err_val_buf: [256]u8 = undefined;
-                    const err_json = std.fmt.bufPrint(&err_val_buf, "{{\"job_id\":\"{s}\",\"attempt\":{d},\"error\":\"job expired\",\"created_at_ns\":{d}}}", .{
-                        job_id,
+                    var err_val_buf: [512]u8 = undefined;
+                    const err_json = std.fmt.bufPrint(&err_val_buf, "{{\"job_id\":{f},\"attempt\":{d},\"error\":\"job expired\",\"created_at_ns\":{d}}}", .{
+                        std.json.fmt(job_id, .{}),
                         job.attempt,
                         now_ns,
-                    }) catch "";
-                    if (err_json.len > 0) {
-                        b.set(keys.jobErrorKey(&ek_buf, job_id, @intCast(job.attempt)), err_json);
-                    }
+                    }) catch assert.fail("expire error entry exceeds sized buffer", .{});
+                    b.set(keys.jobErrorKey(&ek_buf, job_id, @intCast(job.attempt)), err_json);
                 }
 
                 job.state = .dead;

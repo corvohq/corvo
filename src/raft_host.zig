@@ -29,14 +29,18 @@
 //!     `releaseToken` exactly once, at ANY time — pending or final; releasing
 //!     a still-pending token IS the abandon operation. The host drops its
 //!     reference on exactly one finish path per token: the batcher completion
-//!     callback (`onCommitTokenCallback`, commit or failAll), the
-//!     propose-error path in `proposeOne`, or `drainInboxOnShutdown` for
-//!     tokens never handed to the runtime. `destroy` finishes every
-//!     outstanding token (inbox drain, then runtime deinit's failAll), so a
-//!     pipeline release after destroy is safe via `ProposeToken.release`.
+//!     callback (`onCommitTokenCallback`, commit or fail), the
+//!     terminal-rejection path in `proposeOne` (NotLeader / oversize
+//!     proposal), or `drainInboxOnShutdown` for tokens never handed to the
+//!     runtime. Back-pressure is NOT a finish path: a proposal the runtime
+//!     can't take this tick stays queued in the inbox, token pending, and is
+//!     retried in order on later ticks. `destroy` finishes every outstanding
+//!     token (inbox drain, then runtime deinit's failAll), so a pipeline
+//!     release after destroy is safe via `ProposeToken.release`.
 //!
 //! TigerStyle: bounded inbox (`max_inbox`), per-entry arena for mutation
-//! deep-copy, exhaustive switches in callbacks, no allocations on the
+//! deep-copy (freed as soon as the batcher copies the bytes into its own
+//! pending buffer), exhaustive switches in callbacks, no allocations on the
 //! tick hot path beyond the inbox arenas (which are caller-budget).
 
 const std = @import("std");
@@ -148,9 +152,13 @@ fn finishTokenHostSide(token: *ProposeToken, state: TokenState) void {
 }
 
 // ============================================================================
-// Inbox entry — owned by host between proposeAsync() and the raft thread's
-// drainInbox(). Each entry carries a per-entry arena that backs the deep-
-// copied Mutations + their key/value bytes.
+// Inbox entry — owned by host from proposeAsync() until the raft thread's
+// drainInbox() hands it to the runtime (or rejects it terminally). Each entry
+// carries a per-entry arena that backs the deep-copied Mutations + their
+// key/value bytes; the arena is freed the moment the batcher accepts the
+// proposal (it copies the bytes into its own pending buffer) or the token is
+// finished. On back-pressure the entry stays in the inbox, arena intact, and
+// is retried in order on a later tick.
 // ============================================================================
 
 const InboxEntry = struct {
@@ -173,19 +181,15 @@ pub const RaftHost = struct {
     running: std.atomic.Value(bool) = .init(false),
     started: bool = false,
 
-    // Inbox: pipeline → raft. Mutex-protected ring buffer.
+    // Inbox: pipeline → raft. Mutex-protected ring buffer. Doubles as the
+    // ordered retry queue under back-pressure: drainInbox only pops an entry
+    // once the runtime accepted it (or rejected it terminally), so proposals
+    // reach the raft log in exactly the order the pipeline committed them.
     inbox: [max_inbox]?InboxEntry = .{null} ** max_inbox,
     inbox_head: usize = 0,
     inbox_tail: usize = 0,
     inbox_count: usize = 0,
     inbox_mu: std.Thread.Mutex = .{},
-
-    // Active set: entries pulled from the inbox this tick. Their arenas
-    // back the mutation slices that batcher.enqueue captures, and must
-    // outlive batcher.flush — which runs during runtime.tick later in
-    // the same doOneTick. Cleared at end-of-tick.
-    active: [max_inbox]?InboxEntry = .{null} ** max_inbox,
-    active_count: usize = 0,
 
     // Atomics for pipeline thread to poll.
     last_committed_index: std.atomic.Value(u64) align(64) = .init(0),
@@ -194,9 +198,10 @@ pub const RaftHost = struct {
     // Drop counters — observable for tests + metrics.
     drops_inbox_full: std.atomic.Value(u64) = .init(0),
     drops_not_leader: std.atomic.Value(u64) = .init(0),
-    // Recoverable tick errors (backpressure, transient encode/OOM). Counted so
-    // operators can alert on a persistently-failing node without the process
-    // crashing on a single transient hiccup.
+    // Recoverable tick errors (transient OOM in snapshot serialization,
+    // node.tick storage hiccups that were not fail-stop). Counted AND logged
+    // (rate-limited) so a persistently-failing node is visible to operators
+    // without the process crashing on a single transient hiccup.
     tick_errors: std.atomic.Value(u64) = .init(0),
 
     tick_interval_ns: u64 = default_tick_interval_ns,
@@ -354,33 +359,48 @@ pub const RaftHost = struct {
 
     fn doOneTick(self: *RaftHost) void {
         const now: i64 = @intCast(std.time.nanoTimestamp());
-        // drainInbox is DB-free (batcher enqueue is memory-only), so the
-        // inbox mutex and the DB lock are never held together on this
-        // thread — the pipeline may nest them in the other order safely.
-        self.drainInbox();
-        if (self.db_lock) |l| l.lock();
-        defer if (self.db_lock) |l| l.unlock();
+        // Peer socket I/O (reconnects, HMAC handshakes, frame decode) never
+        // touches the DB — run it OUTSIDE the db_lock so client traffic on
+        // the pipeline thread doesn't stall behind peer-socket work.
+        // Inbound frames land in the runtime's transport queues; the locked
+        // runtime.tick below drains them on this same thread.
         self.peer_net.tick(now, &self.runtime.transport);
-        self.runtime.tick(now) catch {
-            // A single tick failing is recoverable: dropped messages, proposal
-            // back-pressure (InFlightFull), or a transient encode/OOM. The node
-            // retries next tick, so record it and continue rather than aborting
-            // the whole process (which co-locates client traffic). Genuinely
-            // fatal FSM-apply failures still fail-stop via panic inside
-            // applyReady. Storage corruption surfaces the same way there.
-            _ = self.tick_errors.fetchAdd(1, .monotonic);
-        };
+        {
+            if (self.db_lock) |l| l.lock();
+            defer if (self.db_lock) |l| l.unlock();
+            // drainInbox runs under the DB lock: accepting a proposal can
+            // flush the batcher into raft storage (a talon write) when a
+            // batch crosses the per-entry cap. Lock nesting is
+            // db_lock → inbox_mu on this thread only; the pipeline takes
+            // inbox_mu solely inside proposeAsync, which never touches the
+            // DB lock — no cycle, no deadlock.
+            self.runtime.tick_now = now;
+            self.drainInbox();
+            self.runtime.tick(now) catch |err| {
+                // A failed tick here is recoverable-by-retry: transient OOM
+                // (e.g. snapshot serialization) or a node.tick storage
+                // hiccup; nothing was lost — proposals stay queued and
+                // committed entries re-surface via ready(). Genuinely fatal
+                // failures never reach this catch: FSM-apply failures and
+                // step()/propose() storage failures fail-stop via panic
+                // inside the runtime. Count + log (rate-limited: first and
+                // every 1024th) so a node erroring every tick is visible.
+                const n = self.tick_errors.fetchAdd(1, .monotonic);
+                if (n == 0 or n % 1024 == 0) {
+                    std.debug.print("raft: tick error (total {d}): {s}\n", .{ n + 1, @errorName(err) });
+                }
+            };
+        }
         self.publishObservables();
-        self.deinitActive();
     }
 
-    /// Move all currently-queued inbox entries into `active`, calling
-    /// `proposeOne` on each. The arenas stay alive in `active` until
-    /// `deinitActive` runs at end-of-tick, so the batcher's flush (which
-    /// runs inside runtime.tick later this tick) can safely walk the
-    /// captured mutation slices.
+    /// Feed queued proposals to the runtime, in order. An entry is popped
+    /// only once the runtime accepted it (batcher copied the bytes) or
+    /// rejected it terminally (token failed); on back-pressure the entry —
+    /// arena intact — stays at the head of the inbox and the drain stops,
+    /// preserving proposal order across ticks.
     fn drainInbox(self: *RaftHost) void {
-        // Snapshot drain count under the lock, then drain entries one at a
+        // Snapshot drain count under the lock, then work one entry at a
         // time, releasing the lock between so proposeAsync isn't blocked.
         self.inbox_mu.lock();
         const drain_count = self.inbox_count;
@@ -389,33 +409,39 @@ pub const RaftHost = struct {
         var i: usize = 0;
         while (i < drain_count) : (i += 1) {
             self.inbox_mu.lock();
-            const entry_opt = self.inbox[self.inbox_head];
-            if (entry_opt == null) {
+            if (self.inbox_count == 0) {
                 self.inbox_mu.unlock();
                 break;
             }
-            self.inbox[self.inbox_head] = null;
-            self.inbox_head = (self.inbox_head + 1) % max_inbox;
-            self.inbox_count -= 1;
+            const head = self.inbox_head;
             self.inbox_mu.unlock();
 
-            check(self.active_count < max_inbox, "active overflow", .{});
-            self.active[self.active_count] = entry_opt.?;
-            const slot = &self.active[self.active_count].?;
-            self.active_count += 1;
-            self.proposeOne(slot);
+            // Only this thread pops; the head slot is stable outside the
+            // lock (producers touch only the tail).
+            const entry = &self.inbox[head].?;
+            switch (self.proposeOne(entry)) {
+                .accepted, .rejected => {
+                    entry.arena.deinit();
+                    self.inbox[head] = null;
+                    self.inbox_mu.lock();
+                    self.inbox_head = (head + 1) % max_inbox;
+                    self.inbox_count -= 1;
+                    self.inbox_mu.unlock();
+                },
+                // Runtime can't take it this tick (raft log in-flight window
+                // full, or transient OOM before capture). The token is still
+                // pending and no bytes were captured — leave the entry
+                // queued and retry next tick. Back-pressure propagates to
+                // the pipeline as a pending token / a filling inbox, never
+                // as a failed token for a write that was merely delayed.
+                .backpressure => return,
+            }
         }
     }
 
-    fn deinitActive(self: *RaftHost) void {
-        for (0..self.active_count) |i| {
-            if (self.active[i]) |*e| e.arena.deinit();
-            self.active[i] = null;
-        }
-        self.active_count = 0;
-    }
+    const ProposeOutcome = enum { accepted, rejected, backpressure };
 
-    fn proposeOne(self: *RaftHost, entry: *InboxEntry) void {
+    fn proposeOne(self: *RaftHost, entry: *InboxEntry) ProposeOutcome {
         const completion = Completion{
             .ctx = @ptrCast(entry.token),
             .on_complete = onCommitTokenCallback,
@@ -423,15 +449,30 @@ pub const RaftHost = struct {
         // locally_applied: proposeAsync's contract is that the caller (the
         // pipeline) committed these mutations to talon before proposing —
         // the FSM records commit without re-applying (docs/raft-wiring.md).
-        self.runtime.propose(entry.mutations, completion, true) catch |err| {
-            // Either NotLeader or batcher back-pressure. Both fail BEFORE
-            // the batcher captures the completion, so no callback will ever
-            // fire for this token — this error path is its host-side finish.
-            if (err == error.NotLeader) {
+        self.runtime.propose(entry.mutations, completion, true) catch |err| switch (err) {
+            // Terminal rejections: the proposal can never be accepted, and
+            // it failed BEFORE the batcher captured the completion, so no
+            // callback will ever fire — this is the token's host-side finish.
+            error.NotLeader => {
                 _ = self.drops_not_leader.fetchAdd(1, .monotonic);
-            }
-            finishTokenHostSide(entry.token, .failed);
+                finishTokenHostSide(entry.token, .failed);
+                return .rejected;
+            },
+            error.ProposalTooLarge => {
+                finishTokenHostSide(entry.token, .failed);
+                return .rejected;
+            },
+            // Back-pressure: legal load, NOT a failure. Failing the token
+            // here would make the pipeline treat an already-locally-committed
+            // write as divergence and fail-stop ("wipe the data dir") for
+            // hitting a rate limit. The caller keeps the entry queued.
+            error.InFlightFull, error.OutOfMemory => return .backpressure,
+            // Runtime.propose flushes + retries PendingFull internally;
+            // NotInitialized/ProposeFailed have no path out of propose
+            // (storage failures panic inside proposeBridge).
+            error.PendingFull, error.ProposeFailed, error.NotInitialized => unreachable,
         };
+        return .accepted;
     }
 
     fn publishObservables(self: *RaftHost) void {
@@ -467,11 +508,14 @@ pub const RaftHost = struct {
 // Completion callback — invoked by raft_batcher on the raft thread.
 // ============================================================================
 
-// The batcher fires each accepted completion exactly once — onCommitted on
-// commit, failAll on step-down / snapshot install / runtime deinit — and
-// proposeOne only registers it when runtime.propose succeeds (its error path
-// finishes the token instead). So this callback is the token's one and only
-// host-side finish.
+// The batcher fires each accepted completion exactly once — completeCommitted
+// on commit (success on an (index, term) match, failure when another leader's
+// entry landed at our index), failDiscarded when a new leader truncates the
+// entry out of our log, failPending on step-down (unflushed proposals only),
+// failAll on snapshot install / runtime deinit — and proposeOne only
+// registers it when runtime.propose succeeds (its terminal-rejection path
+// finishes the token instead; back-pressure finishes nothing). So this
+// callback is the token's one and only host-side finish.
 fn onCommitTokenCallback(ctx: *anyopaque, success: bool) void {
     const token: *ProposeToken = @ptrCast(@alignCast(ctx));
     finishTokenHostSide(token, if (success) .committed else .failed);
@@ -591,8 +635,8 @@ test "raft_host: token — pipeline abandons pending, host finish frees" {
 }
 
 /// Single-node follower host — never started, so tests drive the raft-thread
-/// internals (`drainInbox`/`deinitActive`) directly and deterministically
-/// (no election ticks means `runtime.propose` always returns NotLeader).
+/// internals (`drainInbox`) directly and deterministically (no election
+/// ticks means `runtime.propose` always returns NotLeader).
 fn createFollowerHost(allocator: Allocator, db: *talon.DB) !*RaftHost {
     const peers = [_]PeerSpec{};
     return RaftHost.create(allocator, db, .{
@@ -633,10 +677,10 @@ test "raft_host: abandon pending token, raft side finishes via propose error" {
     try testing.expectEqual(TokenState.pending, token.loadState());
     host.releaseToken(token);
     // Raft-thread side: the follower rejects the proposal (NotLeader), so
-    // proposeOne's error path finishes the token and drops the last
-    // reference. Any write into freed memory would trip testing.allocator.
+    // proposeOne's terminal-rejection path finishes the token and drops the
+    // last reference. Any write into freed memory would trip
+    // testing.allocator.
     host.drainInbox();
-    host.deinitActive();
     try testing.expectEqual(@as(u64, 1), host.drops_not_leader.load(.monotonic));
 }
 
@@ -655,7 +699,6 @@ test "raft_host: host finishes token first, pipeline releases after" {
     const muts = [_]Mutation{.{ .op = .set, .key = "k", .value = "v" }};
     const token = try host.proposeAsync(&muts);
     host.drainInbox();
-    host.deinitActive();
     try testing.expectEqual(TokenState.failed, token.loadState());
     host.releaseToken(token);
 }

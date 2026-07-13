@@ -16,6 +16,7 @@ const kv = @import("kv.zig");
 const codec = @import("codec.zig");
 const assert = @import("assert.zig");
 const rpc = @import("rpc.zig");
+const handler = @import("handler.zig");
 
 pub const Indexer = struct {
     effects: [max_effects]IndexEffect = undefined,
@@ -26,12 +27,17 @@ pub const Indexer = struct {
     counter_deltas: [max_counter_deltas]CounterDelta = undefined,
     counter_delta_count: u32 = 0,
 
-    const max_effects: u32 = 8192;
-    const max_counter_deltas: u32 = 1024;
+    /// Buffer sizes are derived from the per-op ceilings below: each buffer
+    /// holds one worst-case op (the nearFull() reservation) plus batching
+    /// headroom, so an op arriving right at the flush threshold provably fits.
+    ///   max_effects        = 8192 (per-op) + 8192 (headroom) = 16384
+    ///   max_counter_deltas = 8192 (per-op) + 1024 (headroom) =  9216
+    const max_effects: u32 = max_effects_per_op + 8192;
+    const max_counter_deltas: u32 = max_counter_deltas_per_op + 1024;
 
-    /// Worst-case record* calls a single job can drive. The largest op is a
-    /// batch ack/fail (rpc.MAX_BATCH_JOBS jobs); per job the record* calls are:
-    /// (1) its own primary transition/delete
+    /// Worst-case record* calls a single job can drive on the CLIENT write
+    /// path. The largest op is a batch ack/fail (rpc.MAX_BATCH_JOBS jobs); per
+    /// job the record* calls are: (1) its own primary transition/delete
     /// (recordTransition/recordDeleteAll), (2) a chain-advance enqueue
     /// (handler_ack.advanceChain / handler_fail.fireChainOnFailure →
     /// applyEnqueue → recordCreate), and (3) a batch-completion callback
@@ -40,13 +46,31 @@ pub const Indexer = struct {
     /// recurses. Three is the ceiling.
     const records_per_job: u32 = 3;
 
+    /// Worst-case record* calls per job processed by ONE maintenance apply.
+    /// Maintenance writes its own read indexes inline (transitionReadIndexes /
+    /// deleteReadIndexes go straight to the batch), so its indexer effects
+    /// come only from the enqueues it triggers: reclaiming a job to dead can
+    /// fire (1) a batch-completion callback enqueue (handleBatchJobComplete →
+    /// enqueueBatchCallback → applyEnqueue → recordCreate) and (2) a chain
+    /// on_failure enqueue (fireChainOnFailure → applyEnqueue → recordCreate).
+    /// Expire fires only (1); promote/purge fire none; cron enqueues ≤64 per
+    /// scan (handler_cron.max_fire_per_scan). Two is the ceiling.
+    const records_per_maintenance_job: u32 = 2;
+
     /// Max effects a single op (one pipeline frame / maintenance action /
-    /// fetch) can buffer before the pipeline's next nearFull() check. Every
-    /// record* call emits exactly one effect, so the batch ack/fail worst case
-    /// bounds it. The other flush contexts are smaller: cron enqueues ≤64 jobs
-    /// per maintenance action (handler_cron.max_fire_per_scan) and a fetch
-    /// transitions ≤ops.OpResult.max_inline_fetch (128) jobs per fulfillment.
-    const max_effects_per_op: u32 = rpc.MAX_BATCH_JOBS * records_per_job;
+    /// fetch) can buffer before the pipeline's next nearFull() check — the
+    /// pipeline flushes only BETWEEN ops/actions, never inside one. Every
+    /// record* call emits exactly one effect. Candidates:
+    ///   batch ack/fail:  records_per_job × MAX_BATCH_JOBS = 3 × 256   =  768
+    ///   one maintenance apply (reclaim is the worst): up to
+    ///   max_bulk_results jobs per apply (bulk_result_count cap) ×
+    ///   records_per_maintenance_job                   = 2 × 4096      = 8192
+    ///   fetch: ≤ ops.OpResult.max_inline_fetch (128) transitions      =  128
+    /// The maintenance ceiling dominates.
+    const max_effects_per_op: u32 = @max(
+        rpc.MAX_BATCH_JOBS * records_per_job,
+        handler.OpHandler.max_bulk_results * records_per_maintenance_job,
+    );
 
     /// Max distinct-queue counter-delta slots a single op can consume. Each
     /// record* call touches exactly one queue and a new slot is used only for a
@@ -406,12 +430,15 @@ test "nearFull reserves exactly one op's headroom, not the whole buffer (M10)" {
 
     // Dozens of ops' worth of buffered effects and deltas must NOT trip
     // nearFull — batching only pays off if a tick accumulates far more than one
-    // op before flushing. The prior bug reserved the entire 1024-slot counter
-    // buffer as headroom, so a single buffered delta (every write op emits at
-    // least one) tripped nearFull and flushed after essentially every op. These
-    // concrete moderate loads must stay below the threshold regardless of the
-    // named caps, so they fail against that buggy nearFull.
-    idx.effect_count = 4 * Indexer.max_effects_per_op; // 3072 ≪ effect cap
+    // op before flushing. The prior bug reserved the entire counter buffer as
+    // headroom, so a single buffered delta (every write op emits at least one)
+    // tripped nearFull and flushed after essentially every op. These concrete
+    // moderate loads (four batch-ack ops' worth of effects — the common hot-path
+    // op, not the rare maintenance ceiling that sizes max_effects_per_op) must
+    // stay below the threshold regardless of the named caps, so they fail
+    // against that buggy nearFull.
+    const batch_op_effects = 4 * Indexer.records_per_job * rpc.MAX_BATCH_JOBS; // 3072 ≪ effect cap
+    idx.effect_count = batch_op_effects;
     idx.counter_delta_count = 50; // dozens of single-queue ops
     try testing.expect(!idx.nearFull());
 
@@ -424,7 +451,7 @@ test "nearFull reserves exactly one op's headroom, not the whole buffer (M10)" {
     try testing.expect(idx.nearFull());
 
     // Counter-delta buffer: same one-op headroom. The honest cap puts the
-    // threshold a full op below the buffer (256 free slots), not at 1 delta.
+    // threshold a full op below the buffer (1024 free slots), not at 1 delta.
     idx.effect_count = 0;
     idx.counter_delta_count = Indexer.max_counter_deltas - Indexer.max_counter_deltas_per_op;
     try testing.expect(!idx.nearFull());

@@ -10,6 +10,98 @@ const codec = @import("codec.zig");
 const kv = @import("kv.zig");
 const handler = @import("handler.zig");
 const OpHandler = handler.OpHandler;
+const batcher = @import("raft_batcher.zig");
+
+/// Byte budget for ONE clear/delete invocation's recorded mutations. In
+/// cluster mode a client frame's mutations are replicated as a single raft
+/// entry (the pipeline's proposeRecordedFrames splits at frame boundaries
+/// only — one op's mutations must apply atomically on followers), capped at
+/// raft_batcher.max_entry_bytes. An unbounded clear/delete would blow that
+/// cap AFTER the local commit — a divergence panic on legal input (B2) — so
+/// each invocation deletes only as many jobs as provably fit and reports the
+/// partial count in OpResult.affected; the client repeats until affected
+/// drops to zero (clear) / the metadata pass completes (delete). Single-node
+/// has no entry cap but uses the same budget to keep one code path (and
+/// bound the tick latency of a huge clear).
+/// The 8 KiB headroom covers the op's non-per-job mutations: qc| counter
+/// rewrite, qa|/rate-limit/unique deleteRanges, queue metadata deletes, and
+/// the HTTP audit entry that shares the frame's proposal segment.
+const max_clear_mutation_bytes: usize = batcher.max_entry_bytes - 8192;
+
+/// b| re-encode plus a possible batch-completion callback enqueue: the
+/// callback job's queue and payload come from the batch record (each ≤
+/// max_batch_encoded_size), plus the callback's own record, read indexes,
+/// queue marker/counter and framing (< 4096).
+const batch_adjust_bound: usize = 2 * codec.max_batch_encoded_size + 4096;
+
+/// Deletion budget for one clear/delete invocation (B2).
+const DeleteBudget = struct {
+    remaining: usize = max_clear_mutation_bytes,
+    exhausted: bool = false,
+
+    /// Spend `cost` bytes; returns false (and latches exhausted) when the
+    /// budget cannot cover it — the caller must stop BEFORE mutating.
+    fn spend(self: *DeleteBudget, cost: usize) bool {
+        if (self.exhausted or cost > self.remaining) {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining -= cost;
+        return true;
+    }
+};
+
+/// Per-state deletion counts for one clear/delete invocation, used to keep
+/// queue counters consistent on a partial (budget-exhausted) pass.
+const StateCounts = struct {
+    counts: [8]u32 = [_]u32{0} ** 8,
+
+    fn add(self: *StateCounts, state: types.JobState) void {
+        self.counts[@intFromEnum(state)] += 1;
+    }
+    fn addN(self: *StateCounts, state: types.JobState, n: u32) void {
+        self.counts[@intFromEnum(state)] += n;
+    }
+    fn total(self: *const StateCounts) u32 {
+        var sum: u32 = 0;
+        for (self.counts) |c| sum += c;
+        return sum;
+    }
+    fn subtractFrom(self: *const StateCounts, q: *types.Queue) void {
+        q.pending_count -|= self.counts[@intFromEnum(types.JobState.pending)];
+        q.active_count -|= self.counts[@intFromEnum(types.JobState.active)];
+        q.retrying_count -|= self.counts[@intFromEnum(types.JobState.retrying)];
+        q.completed_count -|= self.counts[@intFromEnum(types.JobState.completed)];
+        q.dead_count -|= self.counts[@intFromEnum(types.JobState.dead)];
+        q.cancelled_count -|= self.counts[@intFromEnum(types.JobState.cancelled)];
+        q.scheduled_count -|= self.counts[@intFromEnum(types.JobState.scheduled)];
+        q.held_count -|= self.counts[@intFromEnum(types.JobState.held)];
+    }
+};
+
+/// Over-estimate of the recorded-mutation bytes deleting ONE job produces:
+/// ≤ 12 fixed-shape keys (the triggering index entry or dead key, expire,
+/// active, the 4 read indexes, job record, payload, and both error-range
+/// bounds) each ≤ framing + 14B prefix/timestamp + queue + id; plus the
+/// tag-index deletes (tag pairs parse into ≥5-byte chunks whose content is
+/// a subset of the tag string), the unique lock, and the batch-record
+/// adjustment with its possible completion-callback enqueue.
+fn jobDeleteBound(job: *const types.Job) usize {
+    const fr: usize = 7; // oplog framing per mutation (op + keylen + vallen)
+    const id = job.id.len;
+    const q = job.queue.len;
+    var total: usize = 12 * (fr + 14 + q + id);
+    if (job.tags) |t| {
+        if (t.len > 0) total += t.len + (t.len / 5) * (q + id + 13 + fr);
+    }
+    if (job.unique_key) |u| {
+        if (u.len > 0) total += fr + (2 + q + 1 + u.len);
+    }
+    if (job.batch_id) |bid| {
+        if (bid.len > 0) total += batch_adjust_bound;
+    }
+    return total;
+}
 
 pub fn applyQueueConfig(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.QueueOp) ops.OpResult {
     if (op.queue.len == 0 or op.queue.len > types.max_queue_name_len or
@@ -83,9 +175,34 @@ pub fn applyClearQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Clear
     if (b.get(keys.queueNameKey(&qn_buf, op.queue)) == null) {
         return .{ .err = "queue not found" };
     }
-    const deleted = deleteAllQueueJobs(self, b, op.queue, op.now_ns);
+    var budget = DeleteBudget{};
+    var counts = StateCounts{};
+    deleteAllQueueJobs(self, b, op.queue, op.now_ns, &budget, &counts);
+    const deleted = counts.total();
     self.total_jobs -|= deleted;
     // PendingIndex already drained inside deleteAllQueueJobs.
+
+    if (budget.exhausted) {
+        // Partial clear (B2): one invocation's deletes are byte-budgeted so
+        // the frame's raft proposal provably fits one entry. Subtract exactly
+        // what was deleted from the counters (memory + KV); the completing
+        // pass below hard-resets them. The client repeats until affected
+        // reaches zero.
+        if (self.queue_configs.getPtr(op.queue)) |q| counts.subtractFrom(q);
+        var pqc_buf: keys.KeyBuf = undefined;
+        var pqc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
+        const pqc_key = keys.queueConfigKey(&pqc_buf, op.queue);
+        if (b.getInto(pqc_key, &pqc_val_buf)) |qc_bytes| {
+            var q = codec.decodeQueue(qc_bytes);
+            counts.subtractFrom(&q);
+            var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
+            b.set(pqc_key, codec.encodeQueue(&qc_enc_buf, &q));
+        }
+        return .{
+            .affected = deleted,
+            .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
+        };
+    }
 
     // Reset in-memory counters for cleared states. deleteAllQueueJobs removes
     // pending, scheduled, and retrying jobs. Active and held jobs are NOT
@@ -118,6 +235,7 @@ pub fn applyClearQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Clear
     self.indexer.resetQueueStateDeltas(op.queue, &.{ .pending, .scheduled, .retrying });
 
     return .{
+        .affected = deleted,
         .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
     };
 }
@@ -131,10 +249,35 @@ pub fn applyDeleteQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Dele
     if (b.get(keys.queueNameKey(&qn_buf, op.queue)) == null) {
         return .{ .err = "queue not found" };
     }
-    const deleted1 = deleteAllQueueJobs(self, b, op.queue, op.now_ns);
-    const deleted2 = deleteTerminalQueueJobs(self, b, op.queue, op.now_ns);
-    self.total_jobs -|= deleted1 + deleted2;
+    var budget = DeleteBudget{};
+    var counts = StateCounts{};
+    deleteAllQueueJobs(self, b, op.queue, op.now_ns, &budget, &counts);
+    if (!budget.exhausted) deleteTerminalQueueJobs(self, b, op.queue, op.now_ns, &budget, &counts);
+    const deleted = counts.total();
+    self.total_jobs -|= deleted;
     // PendingIndex already drained inside deleteAllQueueJobs.
+
+    if (budget.exhausted) {
+        // Partial delete (B2): keep the queue registered (qn|/qc| survive) so
+        // the client repeats the delete until the metadata pass below runs;
+        // subtract the deleted jobs from the counters so reads stay sane
+        // meanwhile.
+        if (self.queue_configs.getPtr(op.queue)) |q| counts.subtractFrom(q);
+        var pqc_buf: keys.KeyBuf = undefined;
+        var pqc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
+        const pqc_key = keys.queueConfigKey(&pqc_buf, op.queue);
+        if (b.getInto(pqc_key, &pqc_val_buf)) |qc_bytes| {
+            var q = codec.decodeQueue(qc_bytes);
+            counts.subtractFrom(&q);
+            var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
+            b.set(pqc_key, codec.encodeQueue(&qc_enc_buf, &q));
+        }
+        return .{
+            .affected = deleted,
+            .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
+        };
+    }
+
     self.removeQueueConfig(op.queue);
 
     // Remove queue metadata and auxiliary data.
@@ -151,6 +294,7 @@ pub fn applyDeleteQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Dele
     }
 
     return .{
+        .affected = deleted,
         .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
     };
 }
@@ -159,17 +303,23 @@ pub fn applyDeleteQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Dele
 // Internal helpers
 // ============================================================================
 
-fn deleteAllQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, now_ns: u64) u32 {
+fn deleteAllQueueJobs(
+    self: *OpHandler,
+    b: *kv.WriteBatch,
+    queue: []const u8,
+    now_ns: u64,
+    budget: *DeleteBudget,
+    counts: *StateCounts,
+) void {
     // NOTE: active jobs are NOT deleted — they have a worker processing them.
     // They will complete naturally via ack/fail, or be reclaimed by maintenance.
-    var deleted: u32 = 0;
 
     // Delete scheduled jobs
     var sp_buf: keys.KeyBuf = undefined;
     var spe_buf: keys.KeyBuf = undefined;
     const sp = keys.scheduledScanPrefix(&sp_buf, queue);
     if (keys.prefixEnd(&spe_buf, sp)) |end| {
-        deleted += deleteJobsByPrefix(self, b, sp, end, extractJobIDFromTimeSorted, now_ns);
+        counts.addN(.scheduled, deleteJobsByPrefix(self, b, sp, end, extractJobIDFromTimeSorted, now_ns, budget));
     }
 
     // Delete retrying jobs
@@ -177,12 +327,15 @@ fn deleteAllQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, no
     var rpe_buf: keys.KeyBuf = undefined;
     const rp = keys.retryingScanPrefix(&rp_buf, queue);
     if (keys.prefixEnd(&rpe_buf, rp)) |end| {
-        deleted += deleteJobsByPrefix(self, b, rp, end, extractJobIDFromTimeSorted, now_ns);
+        counts.addN(.retrying, deleteJobsByPrefix(self, b, rp, end, extractJobIDFromTimeSorted, now_ns, budget));
     }
 
     // Delete pending jobs — tracked in PendingIndex only (no KV index key).
-    // Drain the index to get job IDs, then delete their KV data.
-    while (self.pending.pop(queue)) |entry| {
+    // Drain the index to get job IDs, then delete their KV data. Stale
+    // entries (missing/moved/non-pending jobs) cost no mutations and are
+    // dropped without touching the budget, exactly as before.
+    while (!budget.exhausted) {
+        const entry = self.pending.pop(queue) orelse break;
         const pjob_id = entry.jobId();
         var pjk_buf: keys.KeyBuf = undefined;
         const pjob_bytes = b.get(keys.jobKey(&pjk_buf, pjob_id));
@@ -190,6 +343,13 @@ fn deleteAllQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, no
         const pjob = codec.decodeJob(pjob_bytes.?);
         if (pjob.state != .pending) continue; // stale
         if (!std.mem.eql(u8, pjob.queue, queue)) continue; // wrong queue
+
+        // Budget check BEFORE any of this job's mutations (B2). Restore the
+        // popped entry so the repeat invocation deletes it.
+        if (!budget.spend(jobDeleteBound(&pjob))) {
+            self.pending.push(queue, 255 - entry.inv_priority, entry.created_ns, pjob_id);
+            break;
+        }
 
         // Clean up unique lock
         var puk_buf: keys.KeyBuf = undefined;
@@ -224,8 +384,13 @@ fn deleteAllQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, no
         if (keys.prefixEnd(&pjee_buf, perr_prefix)) |perr_end| {
             b.deleteRange(perr_prefix, perr_end);
         }
-        deleted += 1;
+        counts.add(.pending);
     }
+
+    // Queue-wide cleanup runs only on the COMPLETING pass: qa| entries and
+    // rate-limit data are still referenced while jobs remain, and the repeat
+    // invocation reaches here once the budget covers the final job batch.
+    if (budget.exhausted) return;
 
     // Clean up qa| with DeleteRange — do NOT iterate because qa| entries
     // persist for moved/completed/re-enqueued jobs.
@@ -255,12 +420,16 @@ fn deleteAllQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, no
     if (keys.prefixEnd(&rle_buf, rl)) |end| {
         b.deleteRange(rl, end);
     }
-
-    return deleted;
 }
 
-fn deleteTerminalQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, now_ns: u64) u32 {
-    var deleted: u32 = 0;
+fn deleteTerminalQueueJobs(
+    self: *OpHandler,
+    b: *kv.WriteBatch,
+    queue: []const u8,
+    now_ns: u64,
+    budget: *DeleteBudget,
+    counts: *StateCounts,
+) void {
     var jp_buf: keys.KeyBuf = undefined;
     var jpe_buf: keys.KeyBuf = undefined;
     const jp = keys.prefix_job;
@@ -279,6 +448,9 @@ fn deleteTerminalQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u
                     if (!iter.next()) break;
                     continue;
                 }
+
+                // Budget check BEFORE any of this job's mutations (B2).
+                if (!budget.spend(jobDeleteBound(&job))) break;
 
                 const job_id = key[jp.len..];
 
@@ -320,17 +492,17 @@ fn deleteTerminalQueueJobs(self: *OpHandler, b: *kv.WriteBatch, queue: []const u
                     var dk_buf: keys.KeyBuf = undefined;
                     b.delete(keys.deadKey(&dk_buf, job.completed_at_ns, job_id));
                 }
-                deleted += 1;
+                counts.add(job.state);
 
                 if (!iter.next()) break;
             }
         }
     }
-    return deleted;
 }
 
 /// Iterate a prefix, extract job IDs, delete index key + job data.
-/// Returns count of jobs deleted.
+/// Returns count of jobs deleted. Stops (leaving the remainder for a repeat
+/// invocation) when the deletion budget cannot cover the next job (B2).
 fn deleteJobsByPrefix(
     self: *OpHandler,
     b: *kv.WriteBatch,
@@ -338,6 +510,7 @@ fn deleteJobsByPrefix(
     end: []const u8,
     extractJobID: *const fn (key: []const u8, prefix_len: usize) []const u8,
     now_ns: u64,
+    budget: *DeleteBudget,
 ) u32 {
     var deleted: u32 = 0;
     var iter = b.newIter(prefix, end);
@@ -347,10 +520,12 @@ fn deleteJobsByPrefix(
     if (!iter.first()) return 0;
     while (true) {
         const key = iter.key();
-        b.delete(key);
 
         const job_id = extractJobID(key, prefix_len);
         if (job_id.len == 0) {
+            // Malformed index entry: only the index-key delete below.
+            if (!budget.spend(7 + key.len)) break;
+            b.delete(key);
             if (!iter.next()) break;
             continue;
         }
@@ -360,6 +535,11 @@ fn deleteJobsByPrefix(
         const job_bytes = b.get(keys.jobKey(&jk_buf, job_id));
         if (job_bytes != null) {
             const job = codec.decodeJob(job_bytes.?);
+
+            // Budget check BEFORE any of this job's mutations (B2); the
+            // triggering index delete is part of jobDeleteBound's key count.
+            if (!budget.spend(jobDeleteBound(&job))) break;
+            b.delete(key);
 
             // Delete unique lock if owned by this job
             var uk_buf: keys.KeyBuf = undefined;
@@ -382,6 +562,10 @@ fn deleteJobsByPrefix(
             // Clean up read indexes + tag indexes.
             OpHandler.deleteReadIndexes(b, &job);
             OpHandler.deleteTagIndexes(b, &job);
+        } else {
+            // Dangling index entry: index + job/payload/error-range deletes.
+            if (!budget.spend(4 * (7 + 8 + key.len))) break;
+            b.delete(key);
         }
 
         b.delete(keys.jobKey(&jk_buf, job_id));

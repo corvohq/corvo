@@ -7,9 +7,12 @@
 //!   2. Call `node.tick(now)` for time-based progress (heartbeats, elections).
 //!     Forward outputs.
 //!   3. If leader and pending proposals exist, `batcher.flush(node)`.
+//!     Flush back-pressure is NOT an error: the batch is retained and
+//!     retried, and the apply step below always runs so in-flight entries
+//!     keep draining.
 //!   4. Pull `node.ready()`. If a snapshot landed, hand it to FSM. Else
 //!     apply committed entries via FSM.
-//!   5. Fire batcher completions for the new commit_index.
+//!   5. Fire batcher completions per committed entry, (index, term)-matched.
 //!
 //! This module does NOT own the network. Callers (main.zig, tests, sim)
 //! are responsible for moving bytes between sockets and `transport`. For
@@ -31,6 +34,7 @@ const OplogFsm = @import("raft_fsm.zig").OplogFsm;
 const Batcher = @import("raft_batcher.zig").Batcher;
 const BatcherError = @import("raft_batcher.zig").BatcherError;
 const Completion = @import("raft_batcher.zig").Completion;
+const ProposedEntry = @import("raft_batcher.zig").ProposedEntry;
 
 const Mutation = kv.Mutation;
 const Node = raft.Node;
@@ -98,6 +102,12 @@ pub const Runtime = struct {
     // we can fail in-flight batcher completions.
     last_role: Role = .follower,
 
+    // Injected timestamp of the current/most recent tick (determinism: no
+    // wall-clock reads inside the runtime). Set at the top of tick(); the
+    // host also refreshes it before its pre-tick inbox drain so a
+    // flush-on-overflow inside propose() proposes at the tick's time.
+    tick_now: i64 = 0,
+
     // Identity, retained for validating inbound messages at the trust boundary
     // (see pumpInbound). The Raft library's step() assumes callers only hand it
     // messages addressed to this node from a peer; hostile network input must be
@@ -126,7 +136,7 @@ pub const Runtime = struct {
         errdefer transport.deinit();
         var fsm = try OplogFsm.init(allocator, db);
         errdefer fsm.deinit();
-        var batcher = Batcher.init(allocator);
+        var batcher = try Batcher.init(allocator);
         errdefer batcher.deinit();
 
         var node = try Node.init(
@@ -148,7 +158,12 @@ pub const Runtime = struct {
         // state by definition; finish the swap now.
         if (storage.snap_meta) |sm| {
             if (sm.last_included_index > fsm.lastApplied()) {
-                const snap = storage.storage().loadSnapshot().?;
+                // snap_meta is durable but the blob failed to load
+                // (missing chunk, hash mismatch): on-disk state is a
+                // boundary — refuse to start with context rather than
+                // unwrap-panic. The operator restores or wipes + rejoins.
+                const snap = storage.storage().loadSnapshot() orelse
+                    return error.SnapshotBlobUnreadable;
                 try fsm.loadSnapshot(snap.data, sm.last_included_index);
             }
         }
@@ -209,57 +224,138 @@ pub const Runtime = struct {
     /// node is not currently the leader. `locally_applied` = the caller has
     /// already committed these mutations to talon (the pipeline's contract);
     /// on commit the FSM records the entry applied without re-writing data.
+    ///
+    /// Back-pressure contract: PendingFull is handled HERE — the current
+    /// batch is flushed as one entry and the enqueue retried, so a caller
+    /// never sees PendingFull. InFlightFull (the raft log's own back-pressure)
+    /// and OutOfMemory do surface: the proposal was NOT captured and the
+    /// caller may retry it on a later tick. Neither is a terminal failure.
     pub fn propose(self: *Runtime, mutations: []const Mutation, completion: Completion, locally_applied: bool) RuntimeError!void {
         if (!self.node.isLeader()) return RuntimeError.NotLeader;
-        try self.batcher.enqueue(mutations, completion, locally_applied);
+        self.batcher.enqueue(mutations, completion, locally_applied) catch |err| switch (err) {
+            error.PendingFull => {
+                // The batch is at the per-entry byte cap (or slot/flag
+                // limit): flush it as one raft entry now and retry. Two
+                // 256 KiB enqueues in one tick are legal load, not an error.
+                try self.batcher.flush(@ptrCast(self), proposeBridge, self.tick_now);
+                // An empty pending batch always accepts a proposal that
+                // already passed the ProposalTooLarge check.
+                self.batcher.enqueue(mutations, completion, locally_applied) catch |err2| {
+                    assert_mod.fail("enqueue after flush failed: {s}", .{@errorName(err2)});
+                };
+            },
+            else => |e| return e,
+        };
     }
 
     /// Drive one full tick. Caller passes the current monotonic timestamp
     /// (nanoseconds). Returns nothing — outbound messages already flowed
     /// through the registered send hook.
     pub fn tick(self: *Runtime, now: i64) !void {
-        try self.handleStepDown();
-        try self.pumpInbound(now);
+        self.tick_now = now;
+        // Entry-data slices returned by storage.getEntries during a tick are
+        // arena-backed; reclaim them even when a stage errors, or every
+        // failing tick pins another arena generation.
+        defer self.storage.releaseReads();
+        self.handleStepDown();
+        self.pumpInbound(now);
         try self.tickNode(now);
-        // Re-check step-down BEFORE applying commits. pumpInbound/tickNode can
-        // demote us this tick (a higher-term AppendEntries truncates our
-        // uncommitted entries and installs the new leader's). applyReady below
-        // fires batcher completions by index; without failing our in-flight
-        // proposals here first, a truncated-then-overwritten index would be
-        // reported to the client as a durable commit of an entry that was in
-        // fact discarded. handleStepDown at the top only catches the PRIOR
-        // tick's demotion — too late for commits landing this tick.
-        try self.handleStepDown();
-        try self.flushIfLeader(now);
+        // Re-check step-down BEFORE applying commits: pumpInbound/tickNode
+        // can demote us this tick, and the pending proposals failed here
+        // must not be re-flushed under a role we no longer hold.
+        // handleStepDown at the top only catches the PRIOR tick's demotion.
+        self.handleStepDown();
+        // A higher-term AppendEntries processed above may have truncated
+        // in-flight entries out of our log — resolve those NOW as failures.
+        // Waiting for completeCommitted would hang their tokens forever if
+        // the cluster never commits anything at those indices again.
+        self.reconcileInFlight();
+        // Flush before apply, but NEVER let flush back-pressure block the
+        // apply step: in-flight entries only drain via applyReady, so
+        // erroring out here would wedge the write path forever once
+        // in_flight hit its cap with proposals still pending.
+        self.flushIfLeader(now);
         try self.applyReady();
         try self.maybeCompact();
-        // All entry-data slices returned by storage.getEntries during this
-        // tick have been encoded onto the wire and applied to the FSM —
-        // safe to reclaim arena memory.
-        self.storage.releaseReads();
     }
 
-    fn handleStepDown(self: *Runtime) !void {
+    fn handleStepDown(self: *Runtime) void {
         const role = self.node.role;
         if (self.last_role == .leader and role != .leader) {
-            // Preserve entries already committed before the higher-term
-            // message demoted us; applyReady completes them this tick. Only
-            // the uncommitted suffix is no longer ours to complete.
-            self.batcher.failUncommitted(self.node.commit_index);
+            // Fail ONLY unflushed pending proposals: they never reached any
+            // log and the follower gate blocks re-flushing them, so their
+            // locally-committed mutations are genuinely divergent. In-flight
+            // entries are KEPT — each is in our log and possibly replicated,
+            // so its fate is the log's to decide: commit under its original
+            // (index, term) → success (even via a new leader that inherited
+            // it — failing it here would be a false divergence fail-stop for
+            // a write the cluster DID accept); truncation/overwrite →
+            // failure via reconcileInFlight or completeCommitted.
+            self.batcher.failPending();
         }
         self.last_role = role;
     }
 
-    fn pumpInbound(self: *Runtime, now: i64) !void {
+    /// Fail in-flight proposals whose log slot no longer holds the entry we
+    /// proposed — a new leader truncated them (with or without a
+    /// replacement at that index). Leaders skip this: only step() on a
+    /// higher-term AppendEntries truncates our log, and that also demotes
+    /// us before this runs.
+    fn reconcileInFlight(self: *Runtime) void {
+        if (self.node.isLeader()) return;
+        if (self.batcher.inFlightCount() == 0) return;
+        self.batcher.failDiscarded(@ptrCast(self), inFlightDiscarded);
+    }
+
+    fn inFlightDiscarded(ctx: *anyopaque, entry_index: u64, entry_term: u64) bool {
+        const self: *Runtime = @ptrCast(@alignCast(ctx));
+        const st = self.storage.storage();
+        // Truncated below our index with nothing in its place yet.
+        if (entry_index > st.lastIndex()) return true;
+        // Compacted away: a snapshot covering this index was installed (or
+        // is about to surface via ready()); the snapshot branch of
+        // applyReady fails these — keep here to avoid double-firing.
+        if (entry_index < st.firstIndex()) return false;
+        // Same index, different term: overwritten by another leader's entry.
+        const term_here = st.termAt(entry_index) catch return true;
+        return term_here != entry_term;
+    }
+
+    fn pumpInbound(self: *Runtime, now: i64) void {
         const tr = self.transport.transport();
         const self_id = self.node.status().id;
         while (tr.recv()) |incoming| {
             if (!self.acceptInbound(incoming.msg, self_id)) continue;
-            // A single message that step() can't process (e.g. LogTooShort on a
-            // stale AppendEntries overlapping a compacted log) must not abort the
-            // tick or crash the node — Raft tolerates message loss, so drop it
-            // and move on. The sender retries on the next heartbeat.
-            const out = self.node.step(incoming.msg, now) catch continue;
+            const out = self.node.step(incoming.msg, now) catch |err| switch (err) {
+                // Message-shaped errors (e.g. LogTooShort on a stale
+                // AppendEntries overlapping a compacted log) must not abort
+                // the tick or crash the node — Raft tolerates message loss,
+                // so drop the message and move on. The sender retries on the
+                // next heartbeat.
+                error.NotLeader,
+                error.BadMessage,
+                error.LogTooShort,
+                error.ConfChangeInFlight,
+                error.ConfTooLarge,
+                error.ConfMalformed,
+                error.ReadQueueFull,
+                error.InstanceUuidMismatch,
+                error.ClusterIdMismatch,
+                => continue,
+                // StorageError is NOT message-shaped: a follower whose log
+                // append fails on every AppendEntries (disk full, torn
+                // write) would otherwise silently stop replicating forever
+                // while looking healthy. Fail-stop with context — same
+                // philosophy as kv.zig's PageCorrupt handling.
+                error.OutOfMemory,
+                error.IndexOutOfRange,
+                error.TermNotFound,
+                error.IoError,
+                => std.debug.panic(
+                    "raft storage failure in step() for {s} message: {s}",
+                    .{ @tagName(incoming.msg.type_), @errorName(err) },
+                ),
+            };
             for (out) |m| tr.send(m.to, m);
         }
     }
@@ -290,11 +386,26 @@ pub const Runtime = struct {
         for (out) |m| tr.send(m.to, m);
     }
 
-    fn flushIfLeader(self: *Runtime, now: i64) !void {
-        _ = now;
+    fn flushIfLeader(self: *Runtime, now: i64) void {
         if (!self.node.isLeader()) return;
         if (self.batcher.pendingCount() == 0) return;
-        try self.batcher.flush(@ptrCast(self), proposeBridge);
+        self.batcher.flush(@ptrCast(self), proposeBridge, now) catch |err| switch (err) {
+            // Back-pressure: the in-flight window is full. Tolerable — the
+            // batch is retained in the batcher-owned pending buffer and
+            // applyReady (which always runs this tick) drains in_flight, so
+            // the retry on the next tick makes progress. No completion fires
+            // and no data is lost.
+            error.InFlightFull => {},
+            // Transient allocator pressure reserving the completion list —
+            // it happens BEFORE the entry reaches the log, so the batch is
+            // retained intact and retried next tick. Nothing is lost.
+            error.OutOfMemory => {},
+            // isLeader() was checked above and nothing yields between the
+            // check and node.propose (single-threaded tick); storage
+            // failures panic inside proposeBridge before mapping to
+            // ProposeFailed. PendingFull/ProposalTooLarge are enqueue-only.
+            error.ProposeFailed, error.PendingFull, error.ProposalTooLarge => unreachable,
+        };
     }
 
     fn applyReady(self: *Runtime) !void {
@@ -302,11 +413,14 @@ pub const Runtime = struct {
         if (r.snapshot) |snap| {
             try self.fsm.loadSnapshot(snap.data, snap.meta.last_included_index);
             self.node.advance(snap.meta.last_included_index);
-            // The installed snapshot includes every committed entry through
-            // last_included_index. Complete those successfully and fail only
-            // a local suffix the snapshot superseded.
-            self.batcher.failUncommitted(snap.meta.last_included_index);
-            self.batcher.onCommitted(snap.meta.last_included_index);
+            // An installed snapshot replaced our state wholesale; there is
+            // no way to verify that any in-flight proposal's (index, term)
+            // is what the snapshot actually contains — a same-index entry
+            // from another leader may have superseded ours. Completing them
+            // as success could falsely ack a discarded write, so FAIL every
+            // in-flight (and pending) completion; the pipeline's divergence
+            // fail-stop handles a failed token after local commit.
+            self.batcher.failAll();
             return;
         }
         if (r.committed.len == 0) return;
@@ -317,17 +431,26 @@ pub const Runtime = struct {
         // the applied sequence, so the next data entry tripped the gap check
         // and panicked every node — fatal for any cluster that bootstraps an
         // initial config or performs a membership change.
+        //
+        // Per-tick apply budget: r.committed is bounded by zig-raft's
+        // entries_scratch (max_out_msgs × max_entries_per_msg entries), so
+        // this loop cannot process an unbounded backlog in one tick — deep
+        // backlogs drain over successive ready() calls.
         var max_committed: u64 = 0;
         for (r.committed) |entry| {
             // Leader fast-path (docs/raft-wiring.md): the pipeline commits
             // its mutations to talon BEFORE proposing, so re-applying a
             // self-proposed entry here would transiently roll back keys a
             // newer in-flight batch has since written locally — only record
-            // it applied. Entries without an in-flight locally_applied
-            // record (prior-term catch-up, direct runtime.propose callers,
-            // post-step-down commits) take the full apply path, which is
-            // idempotent over any earlier local commit.
-            if (self.batcher.isLocallyApplied(entry.index)) {
+            // it applied. The match is by (index, term): a committed entry
+            // whose index matches an in-flight record but whose term differs
+            // is a NEW leader's entry that overwrote ours after truncation —
+            // it carries different data and MUST take the full apply path.
+            // Entries without an in-flight record at all (prior-term
+            // catch-up, direct runtime.propose callers, post-step-down
+            // commits) also take the full apply path, which is idempotent
+            // over any earlier local commit.
+            if (self.batcher.isLocallyApplied(entry.index, entry.term)) {
                 self.fsm.markApplied(entry) catch |err| {
                     std.debug.panic("fsm markApplied failed for committed entry {d}: {s}", .{ entry.index, @errorName(err) });
                 };
@@ -337,10 +460,23 @@ pub const Runtime = struct {
                     std.debug.panic("fsm apply failed for committed entry {d}: {s}", .{ entry.index, @errorName(err) });
                 };
             }
+            // Resolve the completion AFTER the FSM recorded the entry:
+            // success on an exact (index, term) match, failure when a
+            // different leader's entry landed at this index (the client's
+            // write was discarded — never ack it).
+            self.batcher.completeCommitted(entry.index, entry.term);
             if (entry.index > max_committed) max_committed = entry.index;
         }
         self.node.advance(max_committed);
-        self.batcher.onCommitted(max_committed);
+        // Every in-flight record at or below the applied range must have
+        // been resolved by completeCommitted above — a leftover would be a
+        // completion that can never fire (its index will never be ready()
+        // again), i.e. a pipeline token stuck pending forever.
+        check(
+            !self.batcher.hasInFlightAtOrBelow(max_committed),
+            "in-flight proposal at or below applied index {d} not resolved",
+            .{max_committed},
+        );
     }
 
     /// Snapshot trigger policy: once `snapshot_threshold_entries` entries
@@ -367,16 +503,31 @@ pub const Runtime = struct {
         try self.node.compact(applied, blob);
     }
 
-    fn proposeBridge(ctx: *anyopaque, payload: []const u8) BatcherError!u64 {
+    fn proposeBridge(ctx: *anyopaque, payload: []const u8, now: i64) BatcherError!ProposedEntry {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
-        const now: i64 = @intCast(std.time.nanoTimestamp());
-        const out = self.node.propose(payload, now) catch return BatcherError.ProposeFailed;
+        // node.propose stamps the entry with the node's current term;
+        // capture it so the batcher can match completions by (index, term).
+        const term = self.node.term;
+        const out = self.node.propose(payload, now) catch |err| switch (err) {
+            error.NotLeader => return BatcherError.ProposeFailed,
+            // The leader failing to append to its OWN log (or read it back
+            // for the AppendEntries fan-out) is a local storage failure, not
+            // back-pressure — retrying re-fails forever while writes silently
+            // stall. Fail-stop with context, like kv.zig's PageCorrupt.
+            error.OutOfMemory,
+            error.IndexOutOfRange,
+            error.TermNotFound,
+            error.IoError,
+            => std.debug.panic("raft log append failed on leader: {s}", .{@errorName(err)}),
+            // propose() only appends + fans out — no message-shaped errors.
+            else => unreachable,
+        };
         // The new entry is now at lastIndex of the storage.
         const idx = self.storage.storage().lastIndex();
         // Send out the AppendEntries that propose() generated.
         const tr = self.transport.transport();
         for (out) |m| tr.send(m.to, m);
-        return idx;
+        return .{ .index = idx, .term = term };
     }
 };
 

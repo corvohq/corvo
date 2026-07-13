@@ -11,6 +11,7 @@
 //!   --bind <addr>             Listen address (default: 0.0.0.0)
 //!   --port <port>             Listen port (default: 9878)
 //!   --data-dir <dir>          Data directory (default: /tmp/corvo-data)
+//!   --sync                    fdatasync on every commit (default: off)
 //!   --node-id <id>            Node ID (enables cluster mode)
 //!   --peers <spec>            Peer list: id[:uuidhex]@host:port,... (client addrs)
 //!   --cluster-id <n>          Cluster identifier (u64, required in cluster mode)
@@ -45,7 +46,19 @@ const RaftHost = raft_host_mod.RaftHost;
 // RaftIface adapter — bridges the pipeline's consensus vtable to RaftHost.
 fn raftProposeFn(ptr: *anyopaque, muts: []const kv.Mutation) ?*pipeline_mod.ProposeToken {
     const host: *RaftHost = @ptrCast(@alignCast(ptr));
-    return host.proposeAsync(muts) catch null;
+    return host.proposeAsync(muts) catch |err| switch (err) {
+        // Raft-inbox backpressure — retryable. The pipeline bounds its
+        // in-flight proposal window, so null is reported there as
+        // "raft inbox full"; keep that message accurate for this case only.
+        error.InboxFull => null,
+        // Allocation failure copying the proposal is NOT backpressure —
+        // conflating it with InboxFull would surface as a misleading
+        // "raft inbox full" panic. Fail-stop with the real cause.
+        error.OutOfMemory => @panic("corvo: out of memory copying raft proposal"),
+        // Lifecycle errors from the shared HostError set: proposeAsync never
+        // returns these, and main only wires this fn after host.start().
+        error.AlreadyStarted, error.NotStarted => unreachable,
+    };
 }
 
 fn raftIsLeaderFn(ptr: *anyopaque) bool {
@@ -107,9 +120,13 @@ fn parsePeers(spec: []const u8, out: *[max_peers]ParsedPeer) !u8 {
         const host = host_port[0..colon_pos];
         const port_str = host_port[colon_pos + 1 ..];
         const client_port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPeerSpec;
+        // The raft transport dials client port + 1000, which must itself fit
+        // in a u16. Peer specs are operator input (boundary): reject instead
+        // of saturating, which would silently collide ports > 64535 on 65535.
+        if (client_port > std.math.maxInt(u16) - 1000) return error.InvalidPeerSpec;
 
         var addr = try std.net.Address.parseIp(host, client_port);
-        addr.setPort(client_port +| 1000);
+        addr.setPort(client_port + 1000);
 
         out[count] = .{
             .spec = .{ .id = id, .uuid = uuid },
@@ -136,6 +153,8 @@ fn printHelp() void {
         \\  --bind <addr>             Listen address (default: 0.0.0.0)
         \\  --port <port>             Listen port (default: 9878)
         \\  --data-dir <dir>          Data directory (default: /tmp/corvo-data)
+        \\  --sync                    fdatasync on every commit (default: off; recommended
+        \\                            for cluster production — see docs/operating-corvo.md)
         \\  --max-payload-size <n>    Max payload bytes (default: 65536, max: 262144)
         \\  --max-conns <n>           Max connections (default: 4096)
         \\  --max-queues <n>          Max queues (default: 100)
@@ -235,109 +254,117 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--bind")) {
             config.bind = args.next() orelse {
                 std.debug.print("--bind requires an argument\n", .{});
-                return;
+                                std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--port")) {
             const val = args.next() orelse {
                 std.debug.print("--port requires an argument\n", .{});
-                return;
+                                std.process.exit(1);
             };
             config.port = std.fmt.parseInt(u16, val, 10) catch {
                 std.debug.print("invalid port: {s}\n", .{val});
-                return;
+                                std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--data-dir")) {
             config.data_dir = args.next() orelse {
                 std.debug.print("--data-dir requires an argument\n", .{});
-                return;
+                                std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--no-mirror")) {
             // Kept for backward compat — no-op, mirror removed.
         } else if (std.mem.eql(u8, arg, "--node-id")) {
             config.node_id = args.next() orelse {
                 std.debug.print("--node-id requires an argument\n", .{});
-                return;
+                                std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--peers")) {
             config.peers = args.next() orelse {
                 std.debug.print("--peers requires an argument\n", .{});
-                return;
+                                std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--cluster-id")) {
             const val = args.next() orelse {
                 std.debug.print("--cluster-id requires an argument\n", .{});
-                return;
+                                std.process.exit(1);
             };
             config.cluster_id = std.fmt.parseInt(u64, val, 10) catch {
                 std.debug.print("invalid cluster-id: {s}\n", .{val});
-                return;
+                                std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--max-payload-size")) {
             const val = args.next() orelse {
                 std.debug.print("--max-payload-size requires an argument\n", .{});
-                return;
+                                std.process.exit(1);
             };
             config.max_payload_size = std.fmt.parseInt(u32, val, 10) catch {
                 std.debug.print("invalid max-payload-size: {s}\n", .{val});
-                return;
+                                std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--max-conns")) {
             const val = args.next() orelse {
                 std.debug.print("--max-conns requires an argument\n", .{});
-                return;
+                                std.process.exit(1);
             };
             config.max_conns = std.fmt.parseInt(u16, val, 10) catch {
                 std.debug.print("invalid max-conns: {s}\n", .{val});
-                return;
+                                std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--max-queues")) {
             const val = args.next() orelse {
                 std.debug.print("--max-queues requires an argument\n", .{});
-                return;
+                                std.process.exit(1);
             };
             config.max_queues = std.fmt.parseInt(u32, val, 10) catch {
                 std.debug.print("invalid max-queues: {s}\n", .{val});
-                return;
+                                std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--max-jobs")) {
             const val = args.next() orelse {
                 std.debug.print("--max-jobs requires an argument\n", .{});
-                return;
+                                std.process.exit(1);
             };
             config.max_jobs = std.fmt.parseInt(u32, val, 10) catch {
                 std.debug.print("invalid max-jobs: {s}\n", .{val});
-                return;
+                                std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--max-tags-per-queue")) {
             const val = args.next() orelse {
                 std.debug.print("--max-tags-per-queue requires an argument\n", .{});
-                return;
+                                std.process.exit(1);
             };
             config.max_tags_per_queue = std.fmt.parseInt(u32, val, 10) catch {
                 std.debug.print("invalid max-tags-per-queue: {s}\n", .{val});
-                return;
+                                std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--purge-threshold")) {
             const val = args.next() orelse {
                 std.debug.print("--purge-threshold requires an argument\n", .{});
-                return;
+                                std.process.exit(1);
             };
             config.purge_threshold = std.fmt.parseInt(u32, val, 10) catch {
                 std.debug.print("invalid purge-threshold: {s}\n", .{val});
-                return;
+                                std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--persist-completed")) {
             config.persist_completed = true;
+        } else if (std.mem.eql(u8, arg, "--sync")) {
+            config.sync = true;
         } else if (std.mem.eql(u8, arg, "--admin-password")) {
             config.admin_password = args.next() orelse {
                 std.debug.print("--admin-password requires an argument\n", .{});
-                return;
+                                std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--cluster-secret")) {
             config.cluster_secret = args.next() orelse {
                 std.debug.print("--cluster-secret requires an argument\n", .{});
-                return;
+                                std.process.exit(1);
             };
+        } else {
+            // CLI input is a boundary: an unrecognized flag (including
+            // --key=value forms — flags take space-separated values) must
+            // fail loudly, never start the server with defaults.
+            std.debug.print("unknown argument: {s} (see --help)\n", .{arg});
+            std.process.exit(1);
         }
     }
 
@@ -368,7 +395,10 @@ pub fn main() !void {
     std.debug.print("corvo: opening data store ({s}/kv)...\n", .{config.data_dir});
     var kv_path_buf: [256]u8 = undefined;
     const kv_path = std.fmt.bufPrint(&kv_path_buf, "{s}/kv", .{config.data_dir}) catch unreachable;
-    const db = try talon.DB.open(allocator, kv_path, .{});
+    // --sync: fdatasync on every commit. Off by default (opt-in); without it
+    // a power loss can drop committed writes, including persisted raft state
+    // — see the --sync section in docs/operating-corvo.md.
+    const db = try talon.DB.open(allocator, kv_path, .{ .sync = config.sync });
     defer db.close();
 
     const kvstore = kv.Store.init(db);
@@ -380,7 +410,13 @@ pub fn main() !void {
     // handler state is unused (writes are rejected with MSG_NOT_LEADER).
     // The pipeline rebuilds it on leadership acquisition, after the barrier
     // proposal commits (docs/raft-wiring.md).
-    var handler = handler_mod.OpHandler.init(allocator);
+    // Heap-allocated for the same reason as the Pipeline below: OpHandler
+    // embeds the indexer's multi-megabyte effect buffers — far too large for
+    // the thread stack (a stack OpHandler overflows the 8 MB default limit
+    // on the first deep request path and dies with a silent SIGSEGV).
+    const handler = try allocator.create(handler_mod.OpHandler);
+    defer allocator.destroy(handler);
+    handler.* = handler_mod.OpHandler.init(allocator);
     handler.max_queues = config.max_queues;
     handler.max_jobs = config.max_jobs;
     handler.max_tags_per_queue = config.max_tags_per_queue;
@@ -497,7 +533,7 @@ pub fn main() !void {
     var pipeline = RealPipeline.initHeap(
         allocator,
         &io_backend,
-        &handler,
+        handler,
         &stores,
         &notify,
         &kv_reader,

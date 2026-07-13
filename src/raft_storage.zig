@@ -329,14 +329,17 @@ pub const Storage = struct {
         const expected_first = if (self.last_idx == 0) entries[0].index else self.last_idx + 1;
         if (entries[0].index != expected_first) return StorageError.IndexOutOfRange;
         // Encode all entries first (heap-buffered for batch lifetime, freed below).
+        // Pre-reserve the list so appending an encoded buffer can never fail
+        // and leak it (the buffer would be untracked by the cleanup defer).
         var encoded = std.array_list.Managed([]u8).init(self.allocator);
         defer {
             for (encoded.items) |b| self.allocator.free(b);
             encoded.deinit();
         }
+        encoded.ensureTotalCapacity(entries.len) catch return StorageError.OutOfMemory;
         for (entries) |e| {
             const buf = encodeEntryAlloc(self.allocator, e) catch return StorageError.OutOfMemory;
-            encoded.append(buf) catch return StorageError.OutOfMemory;
+            encoded.appendAssumeCapacity(buf);
         }
         var batch = self.db.newBatch();
         defer self.db.closeBatch(batch);
@@ -419,15 +422,21 @@ pub const Storage = struct {
             batch.set(&key_buf, data[off..end]);
         }
         batch.commit();
-        // Refresh cache: free old, copy new.
-        self.freeSnapshotCache();
-        const data_owned = try self.allocator.alloc(u8, data.len);
+        // Refresh cache: build the new owned copies FIRST, then swap and free
+        // the old. Freeing first would leave snap_meta null on an alloc
+        // failure while disk already holds the new snapshot — cache and disk
+        // must never diverge like that (snapshotMeta would report "none").
+        const data_owned = self.allocator.alloc(u8, data.len) catch return StorageError.OutOfMemory;
         @memcpy(data_owned, data);
-        const cfg_owned = if (meta.config.len == 0) null else blk: {
-            const c = try self.allocator.alloc(u8, meta.config.len);
+        const cfg_owned: ?[]u8 = if (meta.config.len == 0) null else blk: {
+            const c = self.allocator.alloc(u8, meta.config.len) catch {
+                self.allocator.free(data_owned);
+                return StorageError.OutOfMemory;
+            };
             @memcpy(c, meta.config);
             break :blk c;
         };
+        self.freeSnapshotCache();
         self.snap_meta = .{
             .last_included_index = meta.last_included_index,
             .last_included_term = meta.last_included_term,
@@ -557,7 +566,10 @@ fn encodeEntryAlloc(allocator: std.mem.Allocator, e: Entry) ![]u8 {
 
 fn decodeEntry(bytes: []const u8, allocator: std.mem.Allocator) !Entry {
     if (bytes.len < 21) return error.InvalidEntry;
-    const t: EntryType = @enumFromInt(bytes[0]);
+    // Disk bytes are a boundary: range-check the type byte like every other
+    // field (an unchecked @enumFromInt on a corrupt byte is a safety panic,
+    // not an error the caller can map to StorageError.IoError).
+    const t = std.meta.intToEnum(EntryType, bytes[0]) catch return error.InvalidEntry;
     const term = std.mem.readInt(u64, bytes[1..9], .big);
     const index = std.mem.readInt(u64, bytes[9..17], .big);
     const data_len = std.mem.readInt(u32, bytes[17..21], .big);

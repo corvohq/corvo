@@ -8,9 +8,14 @@
 //! Snapshot semantics:
 //!   serialize: dump every Talon key NOT under "r:" (raft state) as a
 //!     `set` mutation. This becomes the snapshot blob.
-//!   load: clear all non-"r:" keys, then apply the encoded mutations.
+//!   load: clear all non-"r:" keys, then apply the encoded mutations
+//!     in bounded talon batches (see loadSnapshot).
 //!
-//! TigerStyle: bounded-loop apply, asserts on idempotency invariant
+//! Per-tick apply budget: the runtime applies exactly what node.ready()
+//! surfaces, which zig-raft bounds by its entries_scratch — there is no
+//! separate FSM-side budget.
+//!
+//! TigerStyle: bounded batch sizes, asserts on idempotency invariant
 //! (last_applied monotonic, entry.index sequential).
 
 const std = @import("std");
@@ -27,9 +32,11 @@ const MutOp = kv.MutOp;
 
 /// Talon key holding the FSM's last_applied index.
 const key_applied = "r:applied";
-/// Cap on entries applied per `applyMany` call. Keeps the per-tick budget
-/// bounded — large backlogs apply over multiple ticks.
-pub const max_apply_per_tick: usize = 256;
+/// Cap on mutations written per talon batch while loading a snapshot.
+/// talon asserts a batch stays within its max_batch_size (1<<20 writes) —
+/// LIVE in ReleaseSafe — so a snapshot of a large DB must be split across
+/// multiple bounded batches rather than committed as one.
+pub const max_snapshot_load_batch: usize = 64 * 1024;
 /// Raft state prefix (mirrors raft_storage.zig). Snapshot serialization
 /// excludes any keys under this prefix so FSM and Raft state stay separate.
 const raft_prefix: []const u8 = "r:";
@@ -108,19 +115,6 @@ pub const OplogFsm = struct {
         try self.bumpApplied(entry.index);
     }
 
-    /// Apply many committed entries in one Talon batch. Bounded by
-    /// `max_apply_per_tick` — caller is expected to call repeatedly when
-    /// the queue is deep.
-    pub fn applyMany(self: *OplogFsm, entries: []const Entry) FsmError!usize {
-        if (entries.len == 0) return 0;
-        const n = @min(entries.len, max_apply_per_tick);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            try self.apply(entries[i]);
-        }
-        return n;
-    }
-
     fn applyMutations(self: *OplogFsm, muts: []Mutation, entry_index: u64) FsmError!void {
         var batch = self.db.newBatch();
         defer self.db.closeBatch(batch);
@@ -197,9 +191,10 @@ pub const OplogFsm = struct {
         // (anything above the inline threshold) — resolve those with point
         // reads now that the iterator's shared lock is released. A
         // legitimately empty value re-reads as empty, so the fixup is
-        // idempotent. Snapshot serialization runs on the raft thread, which
-        // is the only writer of this DB, so the scan and the point reads
-        // observe the same state.
+        // idempotent. Snapshot serialization runs on the raft thread while it
+        // holds the shared db mutex (the pipeline thread also writes, but only
+        // under that same lock), so the scan and the point reads observe one
+        // consistent state.
         for (out.items[start_len..]) |*m| {
             if (m.value.len != 0) continue;
             const got = (self.db.get(m.key) catch return FsmError.SnapshotFailed) orelse
@@ -214,29 +209,60 @@ pub const OplogFsm = struct {
 
     /// Load snapshot bytes — clears all FSM-owned keys, then writes the
     /// encoded mutations. Resets `last_applied` to `applied_at_snapshot`.
+    ///
+    /// Chunked across multiple talon batches, each bounded by
+    /// max_snapshot_load_batch: talon's batch-size assert (live in
+    /// ReleaseSafe) means one giant batch would crash any follower loading
+    /// a snapshot of a DB with more than max_batch_size keys — a
+    /// crash-loop on every rejoin. Chunking also bounds talon's per-batch
+    /// working memory instead of buffering the whole snapshot twice.
+    ///
+    /// Crash safety: `r:applied` is bumped ONLY in the FINAL batch. A crash
+    /// mid-load leaves last_applied below the snapshot's index, so
+    /// Runtime.init sees the durable snapshot still pending
+    /// (snap_meta.last_included_index > fsm.lastApplied()) and re-runs this
+    /// load from the wipe — every batch here is an idempotent assignment,
+    /// so a partial load is always recoverable. The intermediate states are
+    /// never visible to readers: callers hold the DB exclusively (raft
+    /// thread under db_lock, or single-threaded startup).
     pub fn loadSnapshot(self: *OplogFsm, bytes: []const u8, applied_at_snapshot: u64) FsmError!void {
         const muts = oplog.decodeMutations(self.allocator, bytes) catch return FsmError.DecodeFailed;
         defer self.allocator.free(muts);
-        var batch = self.db.newBatch();
-        defer self.db.closeBatch(batch);
-        // Wipe every key NOT under the raft prefix.
-        const empty: []const u8 = "";
-        const max_key: []const u8 = "\xff\xff\xff\xff";
-        batch.deleteRange(empty, raft_prefix);
-        batch.deleteRange(raft_prefix_upper, max_key);
-        // Write the snapshot mutations.
-        for (muts) |m| {
-            switch (m.op) {
-                .set => batch.set(m.key, m.value),
-                .delete => batch.delete(m.key),
-                .delete_range => batch.deleteRange(m.key, m.value),
-            }
+        // Batch 1: wipe every key NOT under the raft prefix.
+        {
+            var batch = self.db.newBatch();
+            defer self.db.closeBatch(batch);
+            const empty: []const u8 = "";
+            const max_key: []const u8 = "\xff\xff\xff\xff";
+            batch.deleteRange(empty, raft_prefix);
+            batch.deleteRange(raft_prefix_upper, max_key);
+            batch.commit();
         }
-        // Bump applied to the snapshot's index.
-        var applied_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, applied_buf[0..8], applied_at_snapshot, .big);
-        batch.set(key_applied, &applied_buf);
-        batch.commit();
+        // Write the snapshot mutations in bounded chunks; the last chunk
+        // also bumps r:applied, making the load visible atomically with its
+        // final writes.
+        var off: usize = 0;
+        while (true) {
+            const n = @min(muts.len - off, max_snapshot_load_batch);
+            const last_chunk = off + n == muts.len;
+            var batch = self.db.newBatch();
+            defer self.db.closeBatch(batch);
+            for (muts[off..][0..n]) |m| {
+                switch (m.op) {
+                    .set => batch.set(m.key, m.value),
+                    .delete => batch.delete(m.key),
+                    .delete_range => batch.deleteRange(m.key, m.value),
+                }
+            }
+            if (last_chunk) {
+                var applied_buf: [8]u8 = undefined;
+                std.mem.writeInt(u64, applied_buf[0..8], applied_at_snapshot, .big);
+                batch.set(key_applied, &applied_buf);
+            }
+            batch.commit();
+            off += n;
+            if (last_chunk) break;
+        }
         self.last_applied = applied_at_snapshot;
     }
 };
@@ -310,18 +336,39 @@ test "fsm: apply set + delete idempotently" {
     try testing.expect((try env.db.getInto("job:1", &buf)) == null);
 }
 
-test "fsm: applyMany respects budget" {
-    var env = try TestEnv.init(testing.allocator, "/tmp/corvo-fsm-many");
+test "fsm: loadSnapshot with more keys than one batch chunk" {
+    var env = try TestEnv.init(testing.allocator, "/tmp/corvo-fsm-chunked");
     defer env.deinit();
-    var entries: [3]Entry = undefined;
-    inline for (0..3) |i| {
-        const muts = [_]Mutation{.{ .op = .set, .key = "k", .value = "v" }};
-        entries[i] = try buildEntry(testing.allocator, @as(u64, i + 1), &muts);
+    // A snapshot larger than max_snapshot_load_batch must load across
+    // multiple bounded talon batches — one batch would trip talon's
+    // batch-size assert on a big-enough DB (live in ReleaseSafe).
+    const key_count: usize = max_snapshot_load_batch + 3;
+    const muts = try testing.allocator.alloc(Mutation, key_count);
+    defer testing.allocator.free(muts);
+    var key_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer key_arena.deinit();
+    const a = key_arena.allocator();
+    for (muts, 0..) |*m, i| {
+        const key = try std.fmt.allocPrint(a, "job:{d:0>7}", .{i});
+        m.* = .{ .op = .set, .key = key, .value = "V" };
     }
-    defer for (entries) |e| freeEntry(testing.allocator, e);
-    const n = try env.fsm.applyMany(&entries);
-    try testing.expectEqual(@as(usize, 3), n);
-    try testing.expectEqual(@as(u64, 3), env.fsm.lastApplied());
+    const blob = oplog.encodeMutations(testing.allocator, muts);
+    defer testing.allocator.free(blob);
+
+    try env.fsm.loadSnapshot(blob, 9);
+    try testing.expectEqual(@as(u64, 9), env.fsm.lastApplied());
+    var buf: [4]u8 = undefined;
+    // Spot-check both ends and the chunk boundary.
+    const probes = [_]usize{ 0, max_snapshot_load_batch - 1, max_snapshot_load_batch, key_count - 1 };
+    for (probes) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "job:{d:0>7}", .{i}) catch unreachable;
+        try testing.expect((try env.db.getInto(key, &buf)) != null);
+    }
+    // r:applied persisted with the final chunk.
+    var fsm2 = try OplogFsm.init(testing.allocator, env.db);
+    defer fsm2.deinit();
+    try testing.expectEqual(@as(u64, 9), fsm2.lastApplied());
 }
 
 test "fsm: persistence across reopen" {

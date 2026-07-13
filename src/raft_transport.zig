@@ -86,6 +86,9 @@ pub const Transport = struct {
 
     /// Push incoming wire bytes for decoding. Drops on full ring (Raft
     /// retransmits on next tick). Returns true if accepted, false if dropped.
+    /// While a message is pinned (returned by the last recv() and still
+    /// referenced by the consumer), its slot is reserved: effective capacity
+    /// is max_inbound - 1 until the next recv() releases it.
     pub fn pushInboundBytes(self: *Transport, from: []const u8, bytes: []const u8) bool {
         if (from.len > codec.max_id_len) {
             self.drops += 1;
@@ -95,13 +98,25 @@ pub const Transport = struct {
             self.drops += 1;
             return false;
         }
+        if (self.pinned) |p| {
+            if (self.tail == p) {
+                // The tail slot still holds the message returned by the last
+                // recv(); overwriting it would free slices the consumer may
+                // still be stepping (use-after-free), and the next recv()
+                // would then deinit the fresh message in its place. Drop —
+                // Raft retransmits.
+                self.drops += 1;
+                return false;
+            }
+        }
         const d = codec.decode(bytes, self.allocator) catch {
             self.drops += 1;
             return false;
         };
         const slot = &self.slots[self.tail];
-        // Free anything stale in this slot (paranoia: should be null when count<max).
-        if (slot.decoded) |*old| old.deinit();
+        // Tail is never the pinned slot (guarded above) and every consumed
+        // slot was drained by recv(), so this slot must be empty.
+        check(slot.decoded == null, "inbound slot {d} not drained", .{self.tail});
         slot.decoded = d;
         @memcpy(slot.from_buf[0..from.len], from);
         slot.from_len = from.len;
@@ -202,10 +217,12 @@ pub const InMemRouter = struct {
 
 /// Cheap header-only parse to extract just the `from` string for routing.
 /// Skips: version(1) + type(1) + term(8) + from_uuid(16) + to_uuid(16) + cluster_id(8) = 50 bytes
+/// Mirrors raft_net.zig's decodeFromOnly — bounds checks must match.
 fn decodeFromOnly(bytes: []const u8) ![]const u8 {
     const skip: usize = 1 + 1 + 8 + 16 + 16 + 8;
     if (bytes.len < skip + 1) return error.Short;
     const from_len = bytes[skip];
+    if (from_len == 0 or from_len > codec.max_id_len) return error.Bad;
     if (bytes.len < skip + 1 + from_len) return error.Short;
     return bytes[skip + 1 .. skip + 1 + from_len];
 }
@@ -274,6 +291,33 @@ test "transport: drops on full ring" {
     // Next push should drop.
     try testing.expect(!t.pushInboundBytes("x", buf[0..n]));
     try testing.expectEqual(@as(u64, 1), t.drops);
+}
+
+test "transport: full ring never overwrites the pinned slot" {
+    var t = try Transport.init(testing.allocator);
+    defer t.deinit();
+    const msg = Message{ .type_ = .append_entries, .from = "n1", .to = "n2", .term = 11 };
+    var buf: [256]u8 = undefined;
+    const n = try codec.encode(msg, &buf);
+    var i: usize = 0;
+    while (i < max_inbound) : (i += 1) {
+        try testing.expect(t.pushInboundBytes("n1", buf[0..n]));
+    }
+    // Consume one — its slot stays pinned so the returned slices remain valid.
+    const got = t.transport().recv().?;
+    try testing.expectEqualStrings("n1", got.from);
+    try testing.expectEqual(@as(u64, 11), got.msg.term);
+    // The ring now has max_inbound - 1 entries, but the popped slot is the
+    // tail AND is pinned: the push that would land on it must drop instead of
+    // freeing the live message out from under the consumer.
+    try testing.expect(!t.pushInboundBytes("n1", buf[0..n]));
+    try testing.expectEqual(@as(u64, 1), t.drops);
+    // Pinned message slices are still intact after the rejected push.
+    try testing.expectEqualStrings("n1", got.from);
+    try testing.expectEqualStrings("n2", got.msg.to);
+    // The next recv() releases the pinned slot; the push then succeeds.
+    try testing.expect(t.transport().recv() != null);
+    try testing.expect(t.pushInboundBytes("n1", buf[0..n]));
 }
 
 test "transport: 3-node InMem election converges" {

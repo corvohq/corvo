@@ -74,11 +74,32 @@ pub fn buildEventPayload(buf: []u8, event: []const u8, job_id: []const u8, queue
 
 /// Reject webhook targets that would let a user-configured URL reach the host's
 /// own loopback or the cloud-metadata / link-local range (SSRF). RFC1918 private
-/// ranges are intentionally allowed — internal service webhooks are a normal use
-/// of a job system — so this blocks the clear-exfil cases without breaking that.
+/// (and ULA fc00::/7) ranges follow the same policy per family: v4 private is
+/// intentionally allowed — internal service webhooks are a normal use of a job
+/// system — so this blocks the clear-exfil cases without breaking that. IPv6 is
+/// covered explicitly (loopback, link-local, unique-local, and IPv4-mapped
+/// addresses, which would otherwise smuggle a blocked v4 target past the v4
+/// arm); any other address family cannot be a routable HTTP target — deny.
 pub fn isBlockedTarget(addr: std.net.Address) bool {
-    if (addr.any.family != std.posix.AF.INET) return false;
-    const octets = @as([4]u8, @bitCast(addr.in.sa.addr)); // network byte order
+    switch (addr.any.family) {
+        std.posix.AF.INET => return isBlockedV4(@bitCast(addr.in.sa.addr)), // network byte order
+        std.posix.AF.INET6 => {
+            const b = addr.in6.sa.addr; // 16 bytes, network byte order
+            // IPv4-mapped ::ffff:a.b.c.d — apply the IPv4 rules to the
+            // mapped bytes so v6 notation can't bypass the v4 blocklist.
+            if (std.mem.allEqual(u8, b[0..10], 0) and b[10] == 0xFF and b[11] == 0xFF)
+                return isBlockedV4(b[12..16].*);
+            if (std.mem.allEqual(u8, b[0..15], 0) and b[15] == 1) return true; // ::1 loopback
+            if (std.mem.allEqual(u8, &b, 0)) return true; // :: unspecified ("this host", like 0.0.0.0)
+            if (b[0] == 0xFE and (b[1] & 0xC0) == 0x80) return true; // fe80::/10 link-local
+            if ((b[0] & 0xFE) == 0xFC) return true; // fc00::/7 unique-local (host-scoped, like loopback for exfil)
+            return false;
+        },
+        else => return true, // not a routable HTTP target — default-deny
+    }
+}
+
+fn isBlockedV4(octets: [4]u8) bool {
     if (octets[0] == 127) return true; // 127.0.0.0/8 loopback
     if (octets[0] == 0) return true; // 0.0.0.0/8 "this host"
     if (octets[0] == 169 and octets[1] == 254) return true; // 169.254.0.0/16 link-local (incl. 169.254.169.254 IMDS)
@@ -145,4 +166,45 @@ test "nextRetryNs" {
     try std.testing.expectEqual(base + base, nextRetryNs(0, base)); // +1s
     try std.testing.expectEqual(base + 2 * base, nextRetryNs(1, base)); // +2s
     try std.testing.expectEqual(base + 4 * base, nextRetryNs(2, base)); // +4s
+}
+
+test "isBlockedTarget IPv4" {
+    const t = std.testing;
+    const blocked = [_][]const u8{ "127.0.0.1", "127.255.255.255", "0.0.0.0", "0.1.2.3", "169.254.169.254", "169.254.0.1" };
+    for (blocked) |ip| try t.expect(isBlockedTarget(try std.net.Address.parseIp(ip, 80)));
+    const allowed = [_][]const u8{ "10.0.0.1", "192.168.1.1", "93.184.216.34", "169.253.0.1" };
+    for (allowed) |ip| try t.expect(!isBlockedTarget(try std.net.Address.parseIp(ip, 80)));
+}
+
+test "isBlockedTarget IPv6" {
+    const t = std.testing;
+    const blocked = [_][]const u8{
+        "::1", // loopback
+        "::", // unspecified
+        "fe80::1", "febf::ffff", // fe80::/10 link-local
+        "fc00::1", "fdff::1", // fc00::/7 unique-local
+    };
+    for (blocked) |ip| try t.expect(isBlockedTarget(try std.net.Address.parseIp(ip, 80)));
+    const allowed = [_][]const u8{
+        "2001:db8::1", "2606:4700::1111",
+        "fe00::1", // fe00::/16 is NOT link-local (fe80::/10 starts at fe80)
+        "fec0::1", // deprecated site-local, outside fe80::/10 and fc00::/7
+    };
+    for (allowed) |ip| try t.expect(!isBlockedTarget(try std.net.Address.parseIp(ip, 80)));
+
+    // IPv4-mapped: the v4 rules apply to the mapped bytes.
+    const mapped = struct {
+        fn addr(v4: [4]u8) std.net.Address {
+            var b: [16]u8 = [_]u8{0} ** 16;
+            b[10] = 0xFF;
+            b[11] = 0xFF;
+            @memcpy(b[12..16], &v4);
+            return std.net.Address.initIp6(b, 80, 0, 0);
+        }
+    };
+    try t.expect(isBlockedTarget(mapped.addr(.{ 127, 0, 0, 1 })));
+    try t.expect(isBlockedTarget(mapped.addr(.{ 169, 254, 169, 254 })));
+    try t.expect(isBlockedTarget(mapped.addr(.{ 0, 0, 0, 0 })));
+    try t.expect(!isBlockedTarget(mapped.addr(.{ 93, 184, 216, 34 })));
+    try t.expect(!isBlockedTarget(mapped.addr(.{ 10, 0, 0, 1 })));
 }

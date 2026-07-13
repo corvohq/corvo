@@ -245,6 +245,10 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                     .pending => {
                         // Stale entry in old queue's index is lazily cleaned on fetch.
                         self.pending.push(move_to, job.priority, job.created_at_ns, job_id);
+                        // Wake subscribers on the destination queue — fetch is
+                        // subscribe-only, so without this the moved job strands
+                        // until unrelated activity touches move_to.
+                        self.recordPromoteQueue(move_to);
                     },
                     .scheduled => {
                         var sk_buf: keys.KeyBuf = undefined;
@@ -332,6 +336,10 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 if (job.state != .held) continue;
                 job.state = .pending;
                 self.pending.push(job.queue, job.priority, job.created_at_ns, job_id);
+                // Wake subscribers — fetch is subscribe-only, so an approved
+                // job strands until unrelated activity without this (matches
+                // .promote below).
+                self.recordPromoteQueue(job.queue);
                 if (job.expire_after_ms > 0) {
                     job.expire_at_ns = op.now_ns + @as(u64, job.expire_after_ms) * 1_000_000;
                     var xk_buf: keys.KeyBuf = undefined;

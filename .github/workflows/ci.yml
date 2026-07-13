@@ -35,7 +35,8 @@ jobs:
 
       - name: Run simulator
         run: zig build sim
-        timeout-minutes: 10
+        # The full sim suite takes ~13 min locally; GitHub runners are slower.
+        timeout-minutes: 25
 
   cross-build:
     runs-on: ubuntu-latest

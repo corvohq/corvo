@@ -122,8 +122,13 @@ pub fn applyCreateCron(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.CreateCr
         std.mem.indexOfScalar(u8, op.queue, 0) != null)
         return .{ .err = "invalid cron queue" };
     if (op.schedule.len == 0) return .{ .err = "invalid cron schedule" };
-    _ = cron_expr.parse(op.schedule) catch return .{ .err = "invalid cron schedule" };
+    const parsed_schedule = cron_expr.parse(op.schedule) catch return .{ .err = "invalid cron schedule" };
     if (op.created_at_ns == 0) return .{ .err = "invalid cron timestamp" };
+    // Syntactically valid schedules can still never fire (e.g. "0 0 30 2 *",
+    // Feb 30). Reject at the boundary rather than storing a cron that stalls
+    // forever after its first scan.
+    const first_fire_ns = cron_expr.nextFire(&parsed_schedule, @intCast(op.created_at_ns)) orelse
+        return .{ .err = "cron schedule never fires" };
     if (op.unique_key) |uk| {
         if (uk.len > 255 or std.mem.indexOfScalar(u8, uk, 0) != null)
             return .{ .err = "invalid cron unique_key" };
@@ -146,8 +151,8 @@ pub fn applyCreateCron(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.CreateCr
     // pre-computing the schedule.
     if (op.next_run_ns > 0) {
         cron.next_run_ns = op.next_run_ns;
-    } else if (cron.enabled and cron.schedule.len > 0) {
-        cron.next_run_ns = @intCast(computeInitialNextRun(cron.schedule, @intCast(op.created_at_ns)));
+    } else if (cron.enabled) {
+        cron.next_run_ns = @intCast(first_fire_ns);
     }
     if (op.unique_key) |uk| {
         if (uk.len > 0) cron.unique_key = uk;
@@ -206,7 +211,12 @@ pub fn applyUpdateCron(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.UpdateCr
     }
     if (op.schedule) |s| {
         if (s.len > 0) {
-            _ = cron_expr.parse(s) catch return .{ .err = "invalid cron schedule" };
+            const parsed = cron_expr.parse(s) catch return .{ .err = "invalid cron schedule" };
+            if (op.now_ns == 0) return .{ .err = "invalid cron timestamp" };
+            // Reject syntactically-valid-but-never-firing schedules (Feb 30)
+            // at the boundary, matching applyCreateCron.
+            if (cron_expr.nextFire(&parsed, op.now_ns) == null)
+                return .{ .err = "cron schedule never fires" };
             cron.schedule = s;
             reschedule = true;
         }
@@ -233,7 +243,11 @@ pub fn applyUpdateCron(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.UpdateCr
         cron.next_run_ns = op.next_run_ns;
     } else if (reschedule and cron.enabled) {
         if (op.now_ns == 0) return .{ .err = "invalid cron timestamp" };
-        cron.next_run_ns = @intCast(computeInitialNextRun(cron.schedule, op.now_ns));
+        // 0 = never fires. Reachable only when re-enabling a cron whose stored
+        // schedule predates the never-fires create/update rejection.
+        const next = computeInitialNextRun(cron.schedule, op.now_ns);
+        if (next == 0) return .{ .err = "cron schedule never fires" };
+        cron.next_run_ns = @intCast(next);
     } else if (!cron.enabled) {
         cron.next_run_ns = 0;
     }

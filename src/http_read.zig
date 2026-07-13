@@ -11,6 +11,7 @@ const kv_read = @import("kv_read.zig");
 const http_ui = @import("http_ui.zig");
 const metrics_mod = @import("metrics.zig");
 const version = @import("version.zig");
+const handler_mod = @import("handler.zig");
 
 /// Cluster info for /cluster/status. Set by main.zig at raft startup.
 /// is_leader points at the RaftHost's atomic — the raft thread owns it,
@@ -42,7 +43,8 @@ pub fn dispatch(
     send_buf: []u8,
     reader: ?*kv_read.Reader,
     server_metrics: ?*const metrics_mod.ServerMetrics,
-    store: *kv.Store,
+    stores: []kv.Store,
+    op_handler: *handler_mod.OpHandler,
     now_ns: u64,
 ) u32 {
     // Strip query string for route matching.
@@ -84,7 +86,7 @@ pub fn dispatch(
 
     // Backup/restore endpoints.
     if (std.mem.eql(u8, api, "/backup") and method == .POST)
-        return backupCreate(send_buf, store, now_ns);
+        return backupCreate(send_buf, &stores[0], now_ns);
     if (std.mem.startsWith(u8, api, "/backup/")) {
         const backup_id = api["/backup/".len..];
         if (backup_id.len > 0) {
@@ -98,7 +100,7 @@ pub fn dispatch(
         const rest = api["/restore/".len..];
         if (std.mem.endsWith(u8, rest, "/apply") and method == .POST) {
             const restore_id = rest[0 .. rest.len - "/apply".len];
-            if (restore_id.len > 0) return restoreApply(send_buf, store, restore_id);
+            if (restore_id.len > 0) return restoreApply(send_buf, stores, op_handler, restore_id);
         } else if (rest.len > 0 and method == .PUT) {
             return restoreUpload(send_buf, rest, body, path);
         }
@@ -979,13 +981,36 @@ fn restoreUpload(send_buf: []u8, restore_id: []const u8, body: []const u8, path:
 }
 
 /// POST /api/v1/restore/{id}/apply — live restore from uploaded files.
-fn restoreApply(send_buf: []u8, store: *kv.Store, restore_id: []const u8) u32 {
+/// Single-node only: replaces the whole local KV, then rebuilds the handler's
+/// in-memory state (PendingIndex, active counts, queue configs, lease
+/// counter, webhook cache) from the restored DB so it can't fulfill or count
+/// jobs that no longer exist (B3).
+fn restoreApply(send_buf: []u8, stores: []kv.Store, op_handler: *handler_mod.OpHandler, restore_id: []const u8) u32 {
+    // Cluster mode: a restore swaps the local DB underneath the raft log with
+    // no proposal and no leadership gate — guaranteed divergence on any node
+    // (even the leader; followers replay entries over unrelated state).
+    // Rejected outright: restore into a cluster means restoring a single node
+    // and re-seeding the cluster from it (B3).
+    if (g_cluster_info != null)
+        return writeError(send_buf, 409, "restore is not available in cluster mode");
+
     var dir_buf: [128]u8 = undefined;
     const restore_dir = std.fmt.bufPrint(&dir_buf, "/tmp/corvo-restore-{s}", .{restore_id}) catch
         return writeError(send_buf, 400, "invalid_restore_id");
 
-    store.db.restore(restore_dir) catch
+    stores[0].db.restore(restore_dir) catch
         return writeError(send_buf, 500, "restore_failed");
+
+    // The restored DB replaced every record; stale in-memory state would
+    // fulfill nonexistent jobs and mis-count queues. Same clear + rebuild a
+    // raft leader performs on acquisition.
+    op_handler.clearState();
+    op_handler.rebuildState(stores);
+    {
+        var wb = stores[0].newBatch();
+        defer wb.close();
+        op_handler.loadWebhookCache(&wb);
+    }
 
     // Cleanup temp files.
     std.fs.cwd().deleteTree(restore_dir) catch {};
@@ -1048,7 +1073,10 @@ test "backup and restore round-trip" {
     defer std.fs.cwd().deleteTree(db_path) catch {};
     const db = try talon.DB.open(allocator, db_path, .{ .sync = false });
     defer db.close();
-    var store = kv.Store.init(db);
+    var stores = [1]kv.Store{kv.Store.init(db)};
+    const store = &stores[0];
+    var op_handler = handler_mod.OpHandler.init(allocator);
+    defer op_handler.deinit();
 
     // Write a known key.
     var batch = store.newBatch();
@@ -1059,7 +1087,7 @@ test "backup and restore round-trip" {
     // Backup via HTTP handler with deterministic clock.
     var send_buf: [65536]u8 = undefined;
     const backup_ns: u64 = 1000000;
-    const create_len = backupCreate(&send_buf, &store, backup_ns);
+    const create_len = backupCreate(&send_buf, store, backup_ns);
     try testing.expect(create_len > 0);
 
     // Copy backup_id out of send_buf before it gets reused.
@@ -1128,8 +1156,9 @@ test "backup and restore round-trip" {
         try testing.expectEqual(src_stat.size, dst_stat.size);
     }
 
-    // Apply restore via HTTP handler.
-    const apply_len = restoreApply(&send_buf, &store, restore_id);
+    // Apply restore via HTTP handler (rebuilds handler state from the
+    // restored DB — B3).
+    const apply_len = restoreApply(&send_buf, &stores, &op_handler, restore_id);
     try testing.expect(apply_len > 0);
     try testing.expect(std.mem.startsWith(u8, send_buf[0..apply_len], "HTTP/1.1 200"));
 

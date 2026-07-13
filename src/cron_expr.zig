@@ -150,19 +150,46 @@ fn dayMatches(e: *const CronExpr, c: Civil) bool {
 /// Next fire time strictly after `from_ns`, aligned to the minute, in UTC ns.
 /// Returns null if no match within a bounded search window (~4 years), which
 /// only happens for an impossible schedule (e.g. Feb 30).
+///
+/// Skips by field granularity so the search stays cheap even for a valid-but-
+/// never-matching expression: an excluded month jumps to 00:00 on the 1st of
+/// the next month, an excluded day jumps to 00:00 the next day, and only a
+/// matching day is walked minute-by-minute. The iteration count is therefore
+/// bounded by ~(48 month jumps + 4*366 day jumps + 24*60 minute steps), never
+/// the ~2.1M minutes a naive scan of the whole window would take.
 pub fn nextFire(e: *const CronExpr, from_ns: u64) ?u64 {
+    const ns_per_day: u64 = 24 * 60 * ns_per_min;
     // Start at the beginning of the next minute after `from`.
     var t = (from_ns / ns_per_min + 1) * ns_per_min;
-    // Bound: 4 years of minutes. Covers leap-year Feb 29 schedules.
-    const max_iters: u64 = 4 * 366 * 24 * 60;
-    var i: u64 = 0;
-    while (i < max_iters) : (i += 1) {
+    // Same ~4-year horizon (4 * 366 days) as the old minute-by-minute scan, so
+    // the matched timestamp (and the null result for impossible schedules) is
+    // identical: every jump below only ever skips minutes the old scan would
+    // have rejected, so no earlier match can be stepped over.
+    const max_window_min: u64 = 4 * 366 * 24 * 60;
+    const deadline = t + max_window_min * ns_per_min;
+
+    while (t < deadline) {
         const c = civilFromNs(t);
-        if (e.month.has(@intCast(c.month)) and dayMatches(e, c) and
-            e.hour.has(@intCast(c.hour)) and e.minute.has(c.minute))
-        {
+        if (!e.month.has(@intCast(c.month))) {
+            // No minute in this month can match — jump to 00:00 on the 1st of
+            // the next month.
+            const days_in_month: u64 = std.time.epoch.getDaysInMonth(@intCast(c.year), @enumFromInt(c.month));
+            const day_start = t - (t % ns_per_day);
+            t = day_start + (days_in_month - @as(u64, c.day) + 1) * ns_per_day;
+            continue;
+        }
+        if (!dayMatches(e, c)) {
+            // dom/dow depend only on the date, so no minute today can match —
+            // jump to 00:00 tomorrow.
+            const day_start = t - (t % ns_per_day);
+            t = day_start + ns_per_day;
+            continue;
+        }
+        if (e.hour.has(@intCast(c.hour)) and e.minute.has(c.minute)) {
             return t;
         }
+        // Month and day match but this hour/minute doesn't. Both fields always
+        // have at least one value set, so a match is reached within this day.
         t += ns_per_min;
     }
     return null;
@@ -229,4 +256,57 @@ test "cron: invalid expressions rejected" {
     try testing.expectError(CronError.InvalidExpression, parse("60 * * * *"));
     try testing.expectError(CronError.InvalidExpression, parse("* 24 * * *"));
     try testing.expectError(CronError.InvalidExpression, parse("bad * * * *"));
+}
+
+test "cron: impossible schedules return null quickly" {
+    // Feb 30 and April 31 never exist; the skip-by-granularity search must
+    // reject them via ~day-count jumps, not a 2.1M-minute scan.
+    const feb30 = try parse("0 0 30 2 *");
+    try testing.expectEqual(@as(?u64, null), nextFire(&feb30, nsFor(2026, 3, 15, 10, 30)));
+    const apr31 = try parse("0 0 31 4 *");
+    try testing.expectEqual(@as(?u64, null), nextFire(&apr31, nsFor(2026, 1, 1, 0, 0)));
+}
+
+test "cron: leap-year Feb 29 found across year boundary" {
+    const e = try parse("0 0 29 2 *");
+    // From mid-2026 the next Feb 29 is in 2028 (2027 is not a leap year).
+    try testing.expectEqual(nsFor(2028, 2, 29, 0, 0), nextFire(&e, nsFor(2026, 3, 15, 10, 30)).?);
+    // From just before Feb 29 2028 it fires that same day.
+    try testing.expectEqual(nsFor(2028, 2, 29, 0, 0), nextFire(&e, nsFor(2028, 2, 28, 23, 59)).?);
+}
+
+test "cron: */5 matches hand-computed values" {
+    const e = try parse("*/5 * * * *");
+    // Strictly after 10:30 → 10:35 (10:30 itself matches but is excluded).
+    try testing.expectEqual(nsFor(2026, 3, 15, 10, 35), nextFire(&e, nsFor(2026, 3, 15, 10, 30)).?);
+    // 10:31 → 10:35; 10:57 → 11:00 (hour rollover).
+    try testing.expectEqual(nsFor(2026, 3, 15, 10, 35), nextFire(&e, nsFor(2026, 3, 15, 10, 31)).?);
+    try testing.expectEqual(nsFor(2026, 3, 15, 11, 0), nextFire(&e, nsFor(2026, 3, 15, 10, 57)).?);
+}
+
+test "cron: yearly Jan 1 matches hand-computed values" {
+    const e = try parse("0 0 1 1 *");
+    // Mid-year → next New Year's midnight, exercising the month-skip path.
+    try testing.expectEqual(nsFor(2027, 1, 1, 0, 0), nextFire(&e, nsFor(2026, 3, 15, 10, 30)).?);
+    // Exactly at the fire instant → strictly-after gives next year.
+    try testing.expectEqual(nsFor(2028, 1, 1, 0, 0), nextFire(&e, nsFor(2027, 1, 1, 0, 0)).?);
+    // One minute before → fires this New Year.
+    try testing.expectEqual(nsFor(2027, 1, 1, 0, 0), nextFire(&e, nsFor(2026, 12, 31, 23, 59)).?);
+}
+
+test "cron: dom/dow OR rule unchanged" {
+    // 2026-03-15 is a Sunday (dow=0). "at 12:00 on the 20th OR on Monday".
+    const both = try parse("0 12 20 * 1");
+    // From Sunday 2026-03-15: Monday 2026-03-16 12:00 comes before the 20th.
+    try testing.expectEqual(nsFor(2026, 3, 16, 12, 0), nextFire(&both, nsFor(2026, 3, 15, 10, 0)).?);
+    // From Tuesday 2026-03-17: the 20th (Friday) comes before next Monday.
+    try testing.expectEqual(nsFor(2026, 3, 20, 12, 0), nextFire(&both, nsFor(2026, 3, 17, 10, 0)).?);
+
+    // Only dom restricted: dow wildcard must not OR-in every day.
+    const dom_only = try parse("0 12 20 * *");
+    try testing.expectEqual(nsFor(2026, 3, 20, 12, 0), nextFire(&dom_only, nsFor(2026, 3, 15, 10, 0)).?);
+
+    // Only dow restricted: fires on Mondays regardless of dom.
+    const dow_only = try parse("0 12 * * 1");
+    try testing.expectEqual(nsFor(2026, 3, 16, 12, 0), nextFire(&dow_only, nsFor(2026, 3, 15, 10, 0)).?);
 }
