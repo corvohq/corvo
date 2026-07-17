@@ -4016,6 +4016,557 @@ test "bulk action updates counters for 256 distinct batches" {
     }
 }
 
+test "bulk move preserves an occupied destination uniqueness lock" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-bulk-move-unique");
+    defer ctx.destroy();
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const jobs = [_]ops_mod.EnqueueJob{
+            .{
+                .job_id = "move-source-job",
+                .queue = "move-source-q",
+                .unique_key = "shared-key",
+                .created_at_ns = 1,
+            },
+            .{
+                .job_id = "move-destination-job",
+                .queue = "move-destination-q",
+                .unique_key = "shared-key",
+                .created_at_ns = 1,
+            },
+        };
+        const enqueue = ops_mod.OpData{ .enqueue = .{ .jobs = &jobs, .now_ns = 1 } };
+        try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const ids = [_][]const u8{"move-source-job"};
+        const move = ops_mod.OpData{ .bulk_action = .{
+            .job_ids = &ids,
+            .action = .move,
+            .move_to_queue = "move-destination-q",
+            .now_ns = 2,
+        } };
+        const result = ctx.handler.apply(&b, .bulk_action, &move);
+        try testing.expect(result.err == null);
+        try testing.expectEqual(@as(u32, 0), result.affected);
+
+        var source_lock_buf: keys.KeyBuf = undefined;
+        var destination_lock_buf: keys.KeyBuf = undefined;
+        const source_owner = keys.decodeUniqueValue(b.get(keys.uniqueKey(&source_lock_buf, "move-source-q", "shared-key")).?);
+        const destination_owner = keys.decodeUniqueValue(b.get(keys.uniqueKey(&destination_lock_buf, "move-destination-q", "shared-key")).?);
+        try testing.expectEqualStrings("move-source-job", source_owner.job_id);
+        try testing.expectEqualStrings("move-destination-job", destination_owner.job_id);
+
+        var job_key_buf: keys.KeyBuf = undefined;
+        const source_job = codec.decodeJob(b.get(keys.jobKey(&job_key_buf, "move-source-job")).?);
+        try testing.expectEqualStrings("move-source-q", source_job.queue);
+    }
+}
+
+test "bulk move preserves a reused source uniqueness lock" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-bulk-move-reused-unique");
+    defer ctx.destroy();
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const jobs = [_]ops_mod.EnqueueJob{
+            .{
+                .job_id = "old-source-job",
+                .queue = "reused-source-q",
+                .unique_key = "reused-key",
+                .unique_period_s = 1,
+                .created_at_ns = 1,
+            },
+            .{
+                .job_id = "destination-seed-job",
+                .queue = "reused-destination-q",
+                .created_at_ns = 1,
+            },
+        };
+        const enqueue = ops_mod.OpData{ .enqueue = .{ .jobs = &jobs, .now_ns = 1 } };
+        try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const clean = ops_mod.OpData{ .maintenance = .{
+            .action = .unique,
+            .now_ns = 2_000_000_000,
+        } };
+        try testing.expect(ctx.handler.apply(&b, .maintenance, &clean).err == null);
+        b.commit();
+    }
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const jobs = [_]ops_mod.EnqueueJob{.{
+            .job_id = "new-source-owner",
+            .queue = "reused-source-q",
+            .unique_key = "reused-key",
+            .unique_period_s = 60,
+            .created_at_ns = 2_000_000_001,
+        }};
+        const enqueue = ops_mod.OpData{ .enqueue = .{
+            .jobs = &jobs,
+            .now_ns = 2_000_000_001,
+        } };
+        try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const ids = [_][]const u8{"old-source-job"};
+        const move = ops_mod.OpData{ .bulk_action = .{
+            .job_ids = &ids,
+            .action = .move,
+            .move_to_queue = "reused-destination-q",
+            .now_ns = 2_000_000_002,
+        } };
+        const result = ctx.handler.apply(&b, .bulk_action, &move);
+        try testing.expect(result.err == null);
+        try testing.expectEqual(@as(u32, 1), result.affected);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    var verify = ctx.stores[0].newBatch();
+    defer verify.close();
+    var source_lock_buf: keys.KeyBuf = undefined;
+    const source_owner = keys.decodeUniqueValue(verify.get(
+        keys.uniqueKey(&source_lock_buf, "reused-source-q", "reused-key"),
+    ).?);
+    try testing.expectEqualStrings("new-source-owner", source_owner.job_id);
+
+    var destination_lock_buf: keys.KeyBuf = undefined;
+    try testing.expect(verify.get(
+        keys.uniqueKey(&destination_lock_buf, "reused-destination-q", "reused-key"),
+    ) == null);
+
+    var job_key_buf: keys.KeyBuf = undefined;
+    const moved_job = codec.decodeJob(verify.get(keys.jobKey(&job_key_buf, "old-source-job")).?);
+    try testing.expectEqualStrings("reused-destination-q", moved_job.queue);
+}
+
+test "rejecting a held batch job records batch failure" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-bulk-reject-batch");
+    defer ctx.destroy();
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const create = ops_mod.OpData{ .batch_create = .{
+            .batch_id = "reject-batch",
+            .created_at_ns = 1,
+        } };
+        try testing.expect(ctx.handler.apply(&b, .batch_create, &create).err == null);
+        const jobs = [_]ops_mod.EnqueueJob{.{
+            .job_id = "reject-held-job",
+            .queue = "reject-held-q",
+            .batch_id = "reject-batch",
+            .created_at_ns = 1,
+        }};
+        const enqueue = ops_mod.OpData{ .enqueue = .{ .jobs = &jobs, .now_ns = 1 } };
+        try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    const ids = [_][]const u8{"reject-held-job"};
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const hold = ops_mod.OpData{ .bulk_action = .{
+            .job_ids = &ids,
+            .action = .hold,
+            .now_ns = 2,
+        } };
+        try testing.expectEqual(@as(u32, 1), ctx.handler.apply(&b, .bulk_action, &hold).affected);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const reject = ops_mod.OpData{ .bulk_action = .{
+            .job_ids = &ids,
+            .action = .reject,
+            .now_ns = 3,
+        } };
+        try testing.expectEqual(@as(u32, 1), ctx.handler.apply(&b, .bulk_action, &reject).affected);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    var verify = ctx.stores[0].newBatch();
+    defer verify.close();
+    var batch_key_buf: keys.KeyBuf = undefined;
+    const batch = codec.decodeBatch(verify.get(keys.batchKey(&batch_key_buf, "reject-batch")).?);
+    try testing.expectEqual(@as(u32, 1), batch.total);
+    try testing.expectEqual(@as(u32, 0), batch.pending);
+    try testing.expectEqual(@as(u32, 1), batch.failed);
+}
+
+test "batched fetch cannot overshoot queue or global rate limits" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fetch-rate-batch");
+    defer ctx.destroy();
+
+    const queue_jobs = [_]ops_mod.EnqueueJob{
+        .{ .job_id = "queue-rate-1", .queue = "queue-rate-q", .created_at_ns = 1 },
+        .{ .job_id = "queue-rate-2", .queue = "queue-rate-q", .created_at_ns = 1 },
+        .{ .job_id = "queue-rate-3", .queue = "queue-rate-q", .created_at_ns = 1 },
+        .{ .job_id = "queue-rate-4", .queue = "queue-rate-q", .created_at_ns = 1 },
+        .{ .job_id = "queue-rate-5", .queue = "queue-rate-q", .created_at_ns = 1 },
+    };
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const enqueue = ops_mod.OpData{ .enqueue = .{ .jobs = &queue_jobs, .now_ns = 1 } };
+        try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+        const throttle = ops_mod.OpData{ .queue_config = .{
+            .queue = "queue-rate-q",
+            .action = .throttle,
+            .rate_limit = 2,
+            .rate_window_ms = 1000,
+        } };
+        try testing.expect(ctx.handler.apply(&b, .queue_config, &throttle).err == null);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+    {
+        var verify = ctx.stores[0].newBatch();
+        defer verify.close();
+        var queue_config_buf: keys.KeyBuf = undefined;
+        const queue = codec.decodeQueue(verify.get(keys.queueConfigKey(&queue_config_buf, "queue-rate-q")).?);
+        try testing.expectEqual(@as(u32, 5), queue.pending_count);
+    }
+    const queue_names = [_][]const u8{"queue-rate-q"};
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const fetch = ops_mod.OpData{ .fetch = .{
+            .queues = &queue_names,
+            .worker_id = "queue-rate-worker",
+            .count = 5,
+            .now_ns = 2,
+        } };
+        try testing.expectEqual(@as(u32, 2), ctx.handler.apply(&b, .fetch, &fetch).affected);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const fetch = ops_mod.OpData{ .fetch = .{
+            .queues = &queue_names,
+            .worker_id = "queue-rate-worker",
+            .count = 5,
+            .now_ns = 3,
+        } };
+        try testing.expectEqual(@as(u32, 0), ctx.handler.apply(&b, .fetch, &fetch).affected);
+    }
+
+    const global_jobs = [_]ops_mod.EnqueueJob{
+        .{ .job_id = "global-rate-1", .queue = "global-rate-q", .created_at_ns = 4 },
+        .{ .job_id = "global-rate-2", .queue = "global-rate-q", .created_at_ns = 4 },
+        .{ .job_id = "global-rate-3", .queue = "global-rate-q", .created_at_ns = 4 },
+        .{ .job_id = "global-rate-4", .queue = "global-rate-q", .created_at_ns = 4 },
+    };
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const enqueue = ops_mod.OpData{ .enqueue = .{ .jobs = &global_jobs, .now_ns = 4 } };
+        try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+        const global = ops_mod.OpData{ .global_config = .{
+            .rate_limit = 2,
+            .rate_window_ms = 1000,
+        } };
+        try testing.expect(ctx.handler.apply(&b, .global_config, &global).err == null);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+    const global_queue_names = [_][]const u8{"global-rate-q"};
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const fetch = ops_mod.OpData{ .fetch = .{
+            .queues = &global_queue_names,
+            .worker_id = "global-rate-worker",
+            .count = 4,
+            .now_ns = 5,
+        } };
+        try testing.expectEqual(@as(u32, 2), ctx.handler.apply(&b, .fetch, &fetch).affected);
+    }
+}
+
+test "batched fetch cannot overshoot queue concurrency" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-fetch-concurrency-batch");
+    defer ctx.destroy();
+
+    const jobs = [_]ops_mod.EnqueueJob{
+        .{ .job_id = "concurrency-1", .queue = "concurrency-q", .created_at_ns = 1 },
+        .{ .job_id = "concurrency-2", .queue = "concurrency-q", .created_at_ns = 1 },
+        .{ .job_id = "concurrency-3", .queue = "concurrency-q", .created_at_ns = 1 },
+        .{ .job_id = "concurrency-4", .queue = "concurrency-q", .created_at_ns = 1 },
+    };
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const enqueue = ops_mod.OpData{ .enqueue = .{ .jobs = &jobs, .now_ns = 1 } };
+        try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+        const concurrency = ops_mod.OpData{ .queue_config = .{
+            .queue = "concurrency-q",
+            .action = .concurrency,
+            .max_concurrency = 2,
+        } };
+        try testing.expect(ctx.handler.apply(&b, .queue_config, &concurrency).err == null);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    const queue_names = [_][]const u8{"concurrency-q"};
+    var b = ctx.stores[0].newBatch();
+    defer b.close();
+    const fetch = ops_mod.OpData{ .fetch = .{
+        .queues = &queue_names,
+        .worker_id = "concurrency-worker",
+        .count = 4,
+        .now_ns = 2,
+    } };
+    try testing.expectEqual(@as(u32, 2), ctx.handler.apply(&b, .fetch, &fetch).affected);
+    try testing.expectEqual(@as(i32, 2), ctx.handler.getActiveCount("concurrency-q"));
+}
+
+test "same-tick enqueue and bulk delete keep queue counters exact" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-enqueue-bulk-delete-counters");
+    defer ctx.destroy();
+
+    var b = ctx.stores[0].newBatch();
+    defer b.close();
+    const jobs = [_]ops_mod.EnqueueJob{.{
+        .job_id = "same-tick-bulk-delete-job",
+        .queue = "same-tick-bulk-delete-q",
+        .created_at_ns = 1,
+    }};
+    const enqueue = ops_mod.OpData{ .enqueue = .{ .jobs = &jobs, .now_ns = 1 } };
+    try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+
+    const ids = [_][]const u8{"same-tick-bulk-delete-job"};
+    const delete = ops_mod.OpData{ .bulk_action = .{
+        .job_ids = &ids,
+        .action = .delete,
+        .now_ns = 2,
+    } };
+    try testing.expectEqual(@as(u32, 1), ctx.handler.apply(&b, .bulk_action, &delete).affected);
+    ctx.handler.indexer.flush(&b);
+
+    const cached = ctx.handler.queue_configs.get("same-tick-bulk-delete-q").?;
+    try testing.expectEqual(@as(u32, 0), cached.pending_count);
+    var queue_config_buf: keys.KeyBuf = undefined;
+    const durable = codec.decodeQueue(b.get(
+        keys.queueConfigKey(&queue_config_buf, "same-tick-bulk-delete-q"),
+    ).?);
+    try testing.expectEqual(@as(u32, 0), durable.pending_count);
+}
+
+test "ack auto-delete removes tag indexes before deleting job" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-ack-auto-delete-tags");
+    defer ctx.destroy();
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const jobs = [_]ops_mod.EnqueueJob{.{
+            .job_id = "auto-delete-tag-job",
+            .queue = "auto-delete-tag-q",
+            .tags = "{\"env\":\"test\"}",
+            .created_at_ns = 1,
+        }};
+        const enqueue = ops_mod.OpData{ .enqueue = .{ .jobs = &jobs, .now_ns = 1 } };
+        try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    const queue_names = [_][]const u8{"auto-delete-tag-q"};
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const fetch = ops_mod.OpData{ .fetch = .{
+            .queues = &queue_names,
+            .worker_id = "auto-delete-tag-worker",
+            .count = 1,
+            .now_ns = 2,
+        } };
+        try testing.expectEqual(@as(u32, 1), ctx.handler.apply(&b, .fetch, &fetch).affected);
+        const ack = ops_mod.OpData{ .ack = .{
+            .acks = &[_]ops_mod.AckJob{.{
+                .job_id = "auto-delete-tag-job",
+                .queue = "auto-delete-tag-q",
+            }},
+            .now_ns = 3,
+        } };
+        try testing.expectEqual(@as(u32, 1), ctx.handler.apply(&b, .ack, &ack).affected);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    var verify = ctx.stores[0].newBatch();
+    defer verify.close();
+    var tag_key_buf: keys.KeyBuf = undefined;
+    try testing.expect(verify.get(keys.tagQueueKey(
+        &tag_key_buf,
+        "auto-delete-tag-q",
+        "env",
+        "test",
+        "auto-delete-tag-job",
+    )) == null);
+}
+
+test "purge does not double-decrement an auto-deleted completion" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-purge-auto-delete");
+    defer ctx.destroy();
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const jobs = [_]ops_mod.EnqueueJob{.{
+            .job_id = "auto-delete-job",
+            .queue = "auto-delete-q",
+            .created_at_ns = 1,
+        }};
+        const enqueue = ops_mod.OpData{ .enqueue = .{ .jobs = &jobs, .now_ns = 1 } };
+        try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+    const queues = [_][]const u8{"auto-delete-q"};
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const fetch = ops_mod.OpData{ .fetch = .{
+            .queues = &queues,
+            .worker_id = "auto-delete-worker",
+            .count = 1,
+            .now_ns = 2,
+        } };
+        try testing.expectEqual(@as(u32, 1), ctx.handler.apply(&b, .fetch, &fetch).affected);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const acks = [_]ops_mod.AckJob{.{
+            .job_id = "auto-delete-job",
+            .queue = "auto-delete-q",
+        }};
+        const ack = ops_mod.OpData{ .ack = .{ .acks = &acks, .now_ns = 3 } };
+        try testing.expectEqual(@as(u32, 1), ctx.handler.apply(&b, .ack, &ack).affected);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+    try testing.expectEqual(@as(u32, 0), ctx.handler.total_jobs);
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const purge = ops_mod.OpData{ .maintenance = .{
+            .action = .purge,
+            .cutoff_ns = 4,
+        } };
+        try testing.expectEqual(@as(u32, 1), ctx.handler.apply(&b, .maintenance, &purge).affected);
+        try testing.expectEqual(@as(u32, 0), ctx.handler.total_jobs);
+        b.commit();
+    }
+}
+
+test "queue config rejects clear and delete actions without mutation" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-queue-config-action");
+    defer ctx.destroy();
+
+    var b = ctx.stores[0].newBatch();
+    defer b.close();
+    const clear = ops_mod.OpData{ .queue_config = .{
+        .queue = "wrong-clear-q",
+        .action = .clear,
+    } };
+    try testing.expect(ctx.handler.apply(&b, .queue_config, &clear).err != null);
+    var queue_name_buf: keys.KeyBuf = undefined;
+    var queue_config_buf: keys.KeyBuf = undefined;
+    try testing.expect(b.get(keys.queueNameKey(&queue_name_buf, "wrong-clear-q")) == null);
+    try testing.expect(b.get(keys.queueConfigKey(&queue_config_buf, "wrong-clear-q")) == null);
+}
+
+test "same-tick auto-delete and queue delete do not leave read indexes" {
+    const ctx = try TestContext.create("/tmp/corvo-pv2-delete-index-effects");
+    defer ctx.destroy();
+
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const jobs = [_]ops_mod.EnqueueJob{.{
+            .job_id = "same-tick-delete-job",
+            .queue = "same-tick-delete-q",
+            .created_at_ns = 1,
+        }};
+        const enqueue = ops_mod.OpData{ .enqueue = .{ .jobs = &jobs, .now_ns = 1 } };
+        try testing.expect(ctx.handler.apply(&b, .enqueue, &enqueue).err == null);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+    const queues = [_][]const u8{"same-tick-delete-q"};
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const fetch = ops_mod.OpData{ .fetch = .{
+            .queues = &queues,
+            .worker_id = "same-tick-delete-worker",
+            .count = 1,
+            .now_ns = 2,
+        } };
+        try testing.expectEqual(@as(u32, 1), ctx.handler.apply(&b, .fetch, &fetch).affected);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+    {
+        var b = ctx.stores[0].newBatch();
+        defer b.close();
+        const acks = [_]ops_mod.AckJob{.{
+            .job_id = "same-tick-delete-job",
+            .queue = "same-tick-delete-q",
+        }};
+        const ack = ops_mod.OpData{ .ack = .{ .acks = &acks, .now_ns = 3 } };
+        try testing.expectEqual(@as(u32, 1), ctx.handler.apply(&b, .ack, &ack).affected);
+        const delete = ops_mod.OpData{ .delete_queue = .{
+            .queue = "same-tick-delete-q",
+            .now_ns = 3,
+        } };
+        try testing.expect(ctx.handler.apply(&b, .delete_queue, &delete).err == null);
+        ctx.handler.indexer.flush(&b);
+        b.commit();
+    }
+
+    var verify = ctx.stores[0].newBatch();
+    defer verify.close();
+    var job_queue_buf: keys.KeyBuf = undefined;
+    try testing.expect(verify.get(keys.jobQueueKey(&job_queue_buf, "same-tick-delete-q", 1, "same-tick-delete-job")) == null);
+}
+
 test "multiple frames in one tick" {
     const ctx = try TestContext.create("/tmp/corvo-pv2-multi");
     defer ctx.destroy();

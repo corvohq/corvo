@@ -13,6 +13,8 @@ const OpHandler = handler.OpHandler;
 
 pub fn applyHeartbeat(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.HeartbeatOp) ops.OpResult {
     if (op.job_ids.len != op.job_ops.len) return .{ .err = "invalid heartbeat jobs" };
+    if (op.now_ns == 0 or op.now_ns > std.math.maxInt(u64) - 60 * 1_000_000_000)
+        return .{ .err = "invalid heartbeat timestamp" };
     if (op.worker_id.len > types.max_worker_id_len or
         std.mem.indexOfScalar(u8, op.worker_id, 0) != null)
         return .{ .err = "invalid worker_id" };

@@ -37,6 +37,8 @@ pub const SimClient = struct {
 
     // Pending action state (set during inject, read during processResponse)
     pending_msg_type: u8 = 0,
+    pending_enqueue_scheduled: bool = false,
+    pending_bulk_action: ?ops.BulkAction = null,
 
     // Worker ID
     worker_id_buf: [32]u8 = undefined,
@@ -72,10 +74,13 @@ pub const SimClient = struct {
 
     // Stats
     enqueued: u32 = 0,
+    scheduled_enqueued: u32 = 0,
     fetched: u32 = 0,
     acked: u32 = 0,
     failed: u32 = 0,
     bulk_ops: u32 = 0,
+    bulk_affected: u32 = 0,
+    bulk_action_mask: u16 = 0,
     maintenance_ops: u32 = 0,
     heartbeats: u32 = 0,
     queue_ops: u32 = 0,
@@ -174,9 +179,9 @@ pub const SimClient = struct {
             return;
         }
 
-        // Bulk action (on completed/dead jobs)
+        // Bulk action (on completed/dead jobs, or cancellation of an active job)
         threshold += self.config.bulk_rate;
-        if (r < threshold and self.completed_count > 0) {
+        if (r < threshold and (self.completed_count > 0 or self.active_count > 0)) {
             self.doBulkAction();
             return;
         }
@@ -274,6 +279,7 @@ pub const SimClient = struct {
                 rpc.MSG_BATCH_SEAL_RESP => {
                     if (genericResponseOk(payload)) self.batch_id_len = 0;
                 },
+                rpc.MSG_BULK_ACTION_RESP => self.parseBulkActionPayload(payload),
                 else => {},
             }
 
@@ -288,6 +294,7 @@ pub const SimClient = struct {
     // ====================================================================
 
     fn doEnqueue(self: *SimClient) void {
+        self.pending_enqueue_scheduled = false;
         const queue_idx = self.rng.intRangeAtMost(usize, 0, self.queues.len - 1);
         const q = self.queues[queue_idx];
 
@@ -355,9 +362,11 @@ pub const SimClient = struct {
 
         // Scheduled job
         const scheduled_at_ns: u64 = if (self.chance(self.config.scheduled_job_rate))
-            4070908800000000000 // ~2099-01-01
+            @as(u64, @intCast(clock_mod.globalClockNow())) +
+                self.rng.intRangeAtMost(u64, 500_000_000, 5_000_000_000)
         else
             0;
+        self.pending_enqueue_scheduled = scheduled_at_ns > 0;
         w.writeU64(scheduled_at_ns);
 
         // Job TTL — 10% chance of expiry (exercises x| key creation/cleanup)
@@ -433,7 +442,9 @@ pub const SimClient = struct {
 
         if (err_byte == 0) {
             self.enqueued += 1;
+            if (self.pending_enqueue_scheduled) self.scheduled_enqueued += 1;
         }
+        self.pending_enqueue_scheduled = false;
     }
 
     // ====================================================================
@@ -740,15 +751,24 @@ pub const SimClient = struct {
     // ====================================================================
 
     fn doBulkAction(self: *SimClient) void {
-        if (self.completed_count == 0) return;
+        if (self.completed_count == 0 and self.active_count == 0) return;
 
-        const count = @min(
-            self.rng.intRangeAtMost(usize, 1, 5),
-            self.completed_count,
-        );
+        // Most bulk actions use remembered terminal/retry IDs. Cancellation
+        // deliberately targets a currently leased job so the VOPR proves that
+        // at least one bulk path affected live state instead of merely sending
+        // syntactically valid no-op requests.
+        const cancel_active = self.active_count > 0 and
+            (self.completed_count == 0 or self.chance(0.25));
+        const count = if (cancel_active)
+            1
+        else
+            @min(self.rng.intRangeAtMost(usize, 1, 5), self.completed_count);
 
         const actions = [_]ops.BulkAction{ .requeue, .delete, .cancel, .hold, .approve, .reject, .promote, .move, .change_priority };
-        const action = actions[self.rng.intRangeAtMost(usize, 0, actions.len - 1)];
+        const action: ops.BulkAction = if (cancel_active)
+            .cancel
+        else
+            actions[self.rng.intRangeAtMost(usize, 0, actions.len - 1)];
 
         const now_ns: u64 = @intCast(clock_mod.globalClockNow());
 
@@ -757,9 +777,18 @@ pub const SimClient = struct {
         w.writePrefixed(""); // queue (handler looks up per job)
         w.writeU16(@intCast(count));
 
-        for (0..count) |_| {
-            const ci = self.rng.intRangeAtMost(usize, 0, self.completed_count - 1);
-            w.writePrefixed(self.completed_ids[ci].slice());
+        if (cancel_active) {
+            const active_idx = self.rng.intRangeAtMost(usize, 0, self.active_count - 1);
+            const entry = self.active_jobs[active_idx];
+            w.writePrefixed(entry.jobID());
+            self.trackCompleted(entry.jobID());
+            self.active_jobs[active_idx] = self.active_jobs[self.active_count - 1];
+            self.active_count -= 1;
+        } else {
+            for (0..count) |_| {
+                const ci = self.rng.intRangeAtMost(usize, 0, self.completed_count - 1);
+                w.writePrefixed(self.completed_ids[ci].slice());
+            }
         }
 
         // Flags: set move_to for .move action, priority for .change_priority.
@@ -775,8 +804,21 @@ pub const SimClient = struct {
         }
         w.writeU64(now_ns);
 
+        self.pending_bulk_action = action;
         self.sendFrame(rpc.MSG_BULK_ACTION, w.pos);
         self.bulk_ops += 1;
+    }
+
+    fn parseBulkActionPayload(self: *SimClient, payload: []const u8) void {
+        var r = BufReader{ .data = payload };
+        const affected = r.readU16() catch return;
+        const failed = r.readU8() catch return;
+        if (failed != 0 or affected == 0) return;
+
+        const action = self.pending_bulk_action orelse return;
+        const bit_index: u4 = @intCast(@intFromEnum(action));
+        self.bulk_affected += affected;
+        self.bulk_action_mask |= @as(u16, 1) << bit_index;
     }
 
     // ====================================================================

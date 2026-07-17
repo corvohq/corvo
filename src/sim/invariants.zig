@@ -122,6 +122,9 @@ pub fn checkAll(
     // Read index consistency: tq| keys point to existing jobs.
     if (checkTagIndexConsistency(store, tick, seed)) |err| return err;
 
+    // Durable job → index completeness, including expiry and terminal markers.
+    if (checkJobIndexCompleteness(store, tick, seed)) |err| return err;
+
     // No orphaned je| error log keys without a corresponding j| key.
     if (checkNoOrphanedErrorLogs(store, tick, seed)) |err| return err;
 
@@ -587,12 +590,11 @@ fn checkBatchCounters(store: *kv.Store, tick: u32, seed: u64) CheckResult {
         if (val.len > 0) {
             const b = codec.decodeBatch(val);
 
-            // For sealed batches (not open), verify arithmetic.
-            if (!b.open and b.total > 0) {
-                const sum = b.succeeded +| b.failed +| b.pending;
-                if (sum > b.total) {
-                    return makeErrorFmt("batch-counter-overflow", tick, seed, "batch {s}: succeeded({d})+failed({d})+pending({d})={d} > total({d})", .{ b.id, b.succeeded, b.failed, b.pending, sum, b.total });
-                }
+            // Every batch job is exactly one of pending, succeeded, or failed.
+            // Widen first so wrapped or saturated u32 arithmetic cannot hide.
+            const sum: u64 = @as(u64, b.succeeded) + b.failed + b.pending;
+            if (sum != b.total) {
+                return makeErrorFmt("batch-counter-arithmetic", tick, seed, "batch {s}: succeeded({d})+failed({d})+pending({d})={d} != total({d})", .{ b.id, b.succeeded, b.failed, b.pending, sum, b.total });
             }
 
             // Check for underflow: individual counters shouldn't be absurdly large.
@@ -831,29 +833,40 @@ fn checkQueueStateCounters(store: *kv.Store, handler: *OpHandler, tick: u32, see
                 if (val.len > 0) {
                     const job = codec.decodeJob(val);
                     const qi = findOrAddQueue(&queue_names, &queue_name_lens, &queue_count, job.queue);
-                    if (qi) |idx| {
-                        kv_counts[idx][@intFromEnum(job.state)] += 1;
-                    }
+                    const idx = qi orelse
+                        return makeError("queue-state-counter", "simulator queue accounting table exhausted", tick, seed);
+                    kv_counts[idx][@intFromEnum(job.state)] += 1;
                 }
             }
             if (!iter.next()) break;
         }
     }
 
-    // Compare with cached Queue counters.
-    for (0..queue_count) |qi| {
-        const qname = queue_names[qi][0..queue_name_lens[qi]];
-        const cached = handler.queue_configs.get(qname) orelse continue;
+    // Compare every cached queue, including queues with zero jobs. Restricting
+    // this to names found in j| misses a stale last-job counter.
+    var cached_iter = handler.queue_configs.iterator();
+    while (cached_iter.next()) |entry| {
+        const qname = entry.key_ptr.*;
+        const cached = entry.value_ptr.*;
+        var found_idx: ?usize = null;
+        for (0..queue_count) |qi| {
+            if (queue_name_lens[qi] == qname.len and
+                std.mem.eql(u8, queue_names[qi][0..queue_name_lens[qi]], qname))
+            {
+                found_idx = qi;
+                break;
+            }
+        }
 
         const expected = [num_states]u32{
-            kv_counts[qi][@intFromEnum(types.JobState.pending)],
-            kv_counts[qi][@intFromEnum(types.JobState.active)],
-            kv_counts[qi][@intFromEnum(types.JobState.retrying)],
-            kv_counts[qi][@intFromEnum(types.JobState.completed)],
-            kv_counts[qi][@intFromEnum(types.JobState.dead)],
-            kv_counts[qi][@intFromEnum(types.JobState.cancelled)],
-            kv_counts[qi][@intFromEnum(types.JobState.scheduled)],
-            kv_counts[qi][@intFromEnum(types.JobState.held)],
+            if (found_idx) |qi| kv_counts[qi][@intFromEnum(types.JobState.pending)] else 0,
+            if (found_idx) |qi| kv_counts[qi][@intFromEnum(types.JobState.active)] else 0,
+            if (found_idx) |qi| kv_counts[qi][@intFromEnum(types.JobState.retrying)] else 0,
+            if (found_idx) |qi| kv_counts[qi][@intFromEnum(types.JobState.completed)] else 0,
+            if (found_idx) |qi| kv_counts[qi][@intFromEnum(types.JobState.dead)] else 0,
+            if (found_idx) |qi| kv_counts[qi][@intFromEnum(types.JobState.cancelled)] else 0,
+            if (found_idx) |qi| kv_counts[qi][@intFromEnum(types.JobState.scheduled)] else 0,
+            if (found_idx) |qi| kv_counts[qi][@intFromEnum(types.JobState.held)] else 0,
         };
         const actual = [num_states]u32{
             cached.pending_count,
@@ -874,6 +887,10 @@ fn checkQueueStateCounters(store: *kv.Store, handler: *OpHandler, tick: u32, see
             if (actual[si] != expected[si]) {
                 return makeErrorFmt("queue-state-counter", tick, seed, "queue '{s}': {s}_count={d} but KV has {d}", .{ qname, labels[si], actual[si], expected[si] });
             }
+        }
+        const active_count = handler.getActiveCount(qname);
+        if (active_count < 0 or @as(u32, @intCast(active_count)) != expected[@intFromEnum(types.JobState.active)]) {
+            return makeErrorFmt("active-count-per-queue", tick, seed, "queue '{s}': active_counts={d} but KV has {d}", .{ qname, active_count, expected[@intFromEnum(types.JobState.active)] });
         }
     }
 
@@ -1318,6 +1335,60 @@ fn checkTagIndexConsistency(store: *kv.Store, tick: u32, seed: u64) CheckResult 
 }
 
 // ============================================================================
+// Durable job → read/expiry/terminal index completeness
+// ============================================================================
+
+fn checkJobIndexCompleteness(store: *kv.Store, tick: u32, seed: u64) CheckResult {
+    var batch = store.newBatch();
+    defer batch.close();
+
+    var upper_buf: keys.KeyBuf = undefined;
+    const upper = keys.prefixEnd(&upper_buf, keys.prefix_job) orelse return null;
+    var iter = batch.newIter(keys.prefix_job, upper);
+    defer iter.close();
+
+    if (!iter.first()) return null;
+    while (true) {
+        const key = iter.key();
+        if (key.len > keys.prefix_job.len and std.mem.startsWith(u8, key, keys.prefix_job)) {
+            const job = codec.decodeJob(iter.value());
+            const job_id = key[keys.prefix_job.len..];
+            const state = @intFromEnum(job.state);
+
+            var jt_buf: keys.KeyBuf = undefined;
+            var jq_buf: keys.KeyBuf = undefined;
+            var js_buf: keys.KeyBuf = undefined;
+            var jqs_buf: keys.KeyBuf = undefined;
+            if (batch.get(keys.jobTimeKey(&jt_buf, job.created_at_ns, job_id)) == null)
+                return makeErrorFmt("job-read-index-completeness", tick, seed, "job {s} missing jt| index", .{job_id});
+            if (batch.get(keys.jobQueueKey(&jq_buf, job.queue, job.created_at_ns, job_id)) == null)
+                return makeErrorFmt("job-read-index-completeness", tick, seed, "job {s} missing jq| index", .{job_id});
+            if (batch.get(keys.jobStateKey(&js_buf, state, job.created_at_ns, job_id)) == null)
+                return makeErrorFmt("job-read-index-completeness", tick, seed, "job {s} missing js| index", .{job_id});
+            if (batch.get(keys.jobQueueStateKey(&jqs_buf, job.queue, state, job.created_at_ns, job_id)) == null)
+                return makeErrorFmt("job-read-index-completeness", tick, seed, "job {s} missing jqs| index", .{job_id});
+
+            if (job.state == .pending and job.expire_after_ms > 0 and job.expire_at_ns > 0) {
+                var x_buf: keys.KeyBuf = undefined;
+                if (batch.get(keys.expireKey(&x_buf, job.expire_at_ns, job_id)) == null)
+                    return makeErrorFmt("expire-index-completeness", tick, seed, "pending job {s} missing x| index", .{job_id});
+            }
+
+            if (job.state.isTerminal()) {
+                if (job.completed_at_ns == 0)
+                    return makeErrorFmt("terminal-index-completeness", tick, seed, "terminal job {s} has no completion timestamp", .{job_id});
+                var d_buf: keys.KeyBuf = undefined;
+                if (batch.get(keys.deadKey(&d_buf, job.completed_at_ns, job_id)) == null)
+                    return makeErrorFmt("terminal-index-completeness", tick, seed, "terminal job {s} missing d| index", .{job_id});
+            }
+        }
+
+        if (!iter.next()) break;
+    }
+    return null;
+}
+
+// ============================================================================
 // No orphaned je| error log keys
 // ============================================================================
 
@@ -1455,6 +1526,23 @@ fn checkQueueConfigConsistency(store: *kv.Store, handler: *OpHandler, tick: u32,
                         {
                             return makeErrorFmt("queue-config-consistency", tick, seed, "queue '{s}': memory throttle={d}/{d}ms but KV throttle={d}/{d}ms", .{ queue_name, mem_queue.rate_limit, mem_queue.rate_window_ms, kv_queue.rate_limit, kv_queue.rate_window_ms });
                         }
+                        const mem_counts = [_]u32{
+                            mem_queue.pending_count,   mem_queue.active_count,
+                            mem_queue.retrying_count,  mem_queue.completed_count,
+                            mem_queue.dead_count,      mem_queue.cancelled_count,
+                            mem_queue.scheduled_count, mem_queue.held_count,
+                        };
+                        const kv_counts = [_]u32{
+                            kv_queue.pending_count,   kv_queue.active_count,
+                            kv_queue.retrying_count,  kv_queue.completed_count,
+                            kv_queue.dead_count,      kv_queue.cancelled_count,
+                            kv_queue.scheduled_count, kv_queue.held_count,
+                        };
+                        for (mem_counts, kv_counts, 0..) |mem_count, kv_count, state| {
+                            if (mem_count != kv_count) {
+                                return makeErrorFmt("queue-config-counter-consistency", tick, seed, "queue '{s}' state {d}: memory={d} KV={d}", .{ queue_name, state, mem_count, kv_count });
+                            }
+                        }
                     } else {
                         return makeErrorFmt("queue-config-consistency", tick, seed, "queue '{s}' exists in KV (qc|) but not in handler.queue_configs", .{queue_name});
                     }
@@ -1463,6 +1551,10 @@ fn checkQueueConfigConsistency(store: *kv.Store, handler: *OpHandler, tick: u32,
 
             if (!iter.next()) break;
         }
+    }
+
+    if (kv_queue_count != handler.queue_configs.count()) {
+        return makeErrorFmt("queue-config-count", tick, seed, "KV queue configs={d} but memory has {d}", .{ kv_queue_count, handler.queue_configs.count() });
     }
 
     return null;

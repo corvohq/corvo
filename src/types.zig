@@ -5,6 +5,7 @@
 //! KV storage is handled by codec.zig.
 
 const std = @import("std");
+const assert = @import("assert.zig");
 
 /// Identifiers are copied into fixed-size hot-path buffers (PendingEntry,
 /// FetchedJob, simulator state, and several response encoders). Keep the
@@ -187,11 +188,15 @@ pub const Queue = struct {
     held_count: u32 = 0,
 
     pub fn incrState(self: *Queue, state: JobState) void {
-        self.counterPtr(state).* +|= 1;
+        const counter = self.counterPtr(state);
+        assert.check(counter.* < std.math.maxInt(u32), "queue {s} {s} counter overflow", .{ self.name, state.toString() });
+        counter.* += 1;
     }
 
     pub fn decrState(self: *Queue, state: JobState) void {
-        self.counterPtr(state).* -|= 1;
+        const counter = self.counterPtr(state);
+        assert.check(counter.* > 0, "queue {s} {s} counter underflow", .{ self.name, state.toString() });
+        counter.* -= 1;
     }
 
     fn counterPtr(self: *Queue, state: JobState) *u32 {
@@ -208,8 +213,11 @@ pub const Queue = struct {
     }
 
     pub fn totalJobs(self: *const Queue) u32 {
-        return self.pending_count +| self.active_count +| self.retrying_count +|
-            self.completed_count +| self.dead_count +| self.cancelled_count +| self.scheduled_count +| self.held_count;
+        const total: u64 = @as(u64, self.pending_count) + self.active_count +
+            self.retrying_count + self.completed_count + self.dead_count +
+            self.cancelled_count + self.scheduled_count + self.held_count;
+        assert.check(total <= std.math.maxInt(u32), "queue {s} total counter overflow: {d}", .{ self.name, total });
+        return @intCast(total);
     }
 };
 

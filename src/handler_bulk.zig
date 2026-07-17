@@ -28,6 +28,8 @@ const BatchMod = struct {
 };
 
 pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkActionOp) ops.OpResult {
+    if (op.job_ids.len == 0) return .{ .err = "no jobs provided" };
+    if (op.now_ns == 0) return .{ .err = "invalid bulk timestamp" };
     for (op.job_ids) |job_id| {
         if (job_id.len == 0 or job_id.len > types.max_job_id_len or
             std.mem.indexOfScalar(u8, job_id, 0) != null)
@@ -68,6 +70,28 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
 
         var job = codec.decodeJob(job_bytes.?);
         const old_state = job.state;
+        var moved_unique_expires_ns: ?u64 = null;
+
+        // A move must never steal another job's destination uniqueness lock.
+        // Validate before changing indexes so a conflict leaves the source job
+        // and both locks byte-for-byte unchanged.
+        if (op.action == .move) {
+            if (job.unique_key) |unique_key| {
+                const move_to = op.move_to_queue.?;
+                var source_uk_buf: keys.KeyBuf = undefined;
+                if (b.get(keys.uniqueKey(&source_uk_buf, job.queue, unique_key))) |source_lock| {
+                    const source_owner = keys.decodeUniqueValue(source_lock);
+                    if (std.mem.eql(u8, source_owner.job_id, job.id)) {
+                        moved_unique_expires_ns = source_owner.expires_ns;
+                        var dest_uk_buf: keys.KeyBuf = undefined;
+                        if (b.get(keys.uniqueKey(&dest_uk_buf, move_to, unique_key))) |lock| {
+                            const owner = keys.decodeUniqueValue(lock);
+                            if (!std.mem.eql(u8, owner.job_id, job.id)) continue;
+                        }
+                    }
+                }
+            }
+        }
 
         switch (op.action) {
             .requeue => {
@@ -80,9 +104,11 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
 
                 // Generate new job ID using a global counter to avoid collisions
                 // when multiple bulk requeue operations share the same tick timestamp.
+                assert.check(self.requeue_counter < std.math.maxInt(u64), "bulk requeue counter exhausted", .{});
                 self.requeue_counter += 1;
                 var new_id_buf: [64]u8 = undefined;
-                const new_id = std.fmt.bufPrint(&new_id_buf, "rq_{x}_{x}", .{ op.now_ns, self.requeue_counter }) catch "rq_err";
+                const new_id = std.fmt.bufPrint(&new_id_buf, "rq_{x}_{x}", .{ op.now_ns, self.requeue_counter }) catch
+                    assert.fail("bulk requeue id exceeds sized buffer", .{});
 
                 // Build enqueue op from old job's config.
                 const enq_job = ops.EnqueueJob{
@@ -173,7 +199,8 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                     keys.prefixEnd(&jee_buf, keys.jobErrorPrefix(&jep_buf, job_id)) orelse "",
                 );
                 self.recordBulkResult(job_id, .delete, "", "", op.now_ns);
-                self.total_jobs -|= 1;
+                assert.check(self.total_jobs > 0, "bulk delete: total_jobs underflow", .{});
+                self.total_jobs -= 1;
                 affected += 1;
                 continue; // skip job write — it's deleted
             },
@@ -265,20 +292,17 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                     .active, .completed, .dead, .cancelled, .held => continue,
                 }
                 // Transfer unique lock
-                var uk_buf: keys.KeyBuf = undefined;
-                if (OpHandler.jobUniqueKey(&uk_buf, &job)) |old_ukey| {
-                    if (b.get(old_ukey)) |ub| {
-                        const decoded = keys.decodeUniqueValue(ub);
-                        if (std.mem.eql(u8, decoded.job_id, job.id)) {
-                            b.delete(old_ukey);
-                            var nuk_buf: keys.KeyBuf = undefined;
-                            var nuv_buf: keys.KeyBuf = undefined;
-                            b.set(
-                                keys.uniqueKey(&nuk_buf, move_to, job.unique_key.?),
-                                keys.encodeUniqueValue(&nuv_buf, job.id, decoded.expires_ns),
-                            );
-                        }
-                    }
+                if (moved_unique_expires_ns) |expires_ns| {
+                    var uk_buf: keys.KeyBuf = undefined;
+                    const old_ukey = OpHandler.jobUniqueKey(&uk_buf, &job) orelse
+                        assert.fail("bulk move: owned unique lock lost job unique key", .{});
+                    b.delete(old_ukey);
+                    var nuk_buf: keys.KeyBuf = undefined;
+                    var nuv_buf: keys.KeyBuf = undefined;
+                    b.set(
+                        keys.uniqueKey(&nuk_buf, move_to, job.unique_key.?),
+                        keys.encodeUniqueValue(&nuv_buf, job.id, expires_ns),
+                    );
                 }
                 // Delete tag indexes with old queue, then update queue, then rewrite
                 OpHandler.deleteTagIndexes(b, &job);
@@ -341,6 +365,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 // .promote below).
                 self.recordPromoteQueue(job.queue);
                 if (job.expire_after_ms > 0) {
+                    assert.check(op.now_ns <= std.math.maxInt(u64) - @as(u64, job.expire_after_ms) * 1_000_000, "bulk approve: expiry timestamp overflow for job {s}", .{job.id});
                     job.expire_at_ns = op.now_ns + @as(u64, job.expire_after_ms) * 1_000_000;
                     var xk_buf: keys.KeyBuf = undefined;
                     b.set(keys.expireKey(&xk_buf, job.expire_at_ns, job_id), "");
@@ -356,6 +381,7 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                 job.scheduled_at_ns = 0;
                 self.pending.push(job.queue, job.priority, job.created_at_ns, job_id);
                 if (job.expire_after_ms > 0) {
+                    assert.check(op.now_ns <= std.math.maxInt(u64) - @as(u64, job.expire_after_ms) * 1_000_000, "bulk promote: expiry timestamp overflow for job {s}", .{job.id});
                     job.expire_at_ns = op.now_ns + @as(u64, job.expire_after_ms) * 1_000_000;
                     var xk_buf: keys.KeyBuf = undefined;
                     b.set(keys.expireKey(&xk_buf, job.expire_at_ns, job_id), "");
@@ -366,6 +392,9 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
 
             .reject => {
                 if (job.state != .held) continue;
+                if (job.batch_id) |bid| {
+                    if (bid.len > 0) recordBatchMod(&batch_mods, &batch_mod_count, bid, -1, 1);
+                }
                 // Delete unique lock
                 var uk_buf: keys.KeyBuf = undefined;
                 if (OpHandler.jobUniqueKey(&uk_buf, &job)) |ukey| {
@@ -386,10 +415,8 @@ pub fn applyBulkAction(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.BulkA
                     var err_val_buf: [1024]u8 = undefined;
                     const err_json = std.fmt.bufPrint(&err_val_buf, "{{\"job_id\":{f},\"attempt\":{d},\"error\":\"rejected\",\"created_at_ns\":{d}}}", .{
                         std.json.fmt(job_id, .{}), job.attempt, op.now_ns,
-                    }) catch "";
-                    if (err_json.len > 0) {
-                        b.set(keys.jobErrorKey(&ek_buf, job_id, @intCast(job.attempt)), err_json);
-                    }
+                    }) catch assert.fail("bulk reject error entry exceeds sized buffer", .{});
+                    b.set(keys.jobErrorKey(&ek_buf, job_id, @intCast(job.attempt)), err_json);
                 }
                 self.recordBulkResult(job_id, .update_state, "dead", "", op.now_ns);
             },
@@ -427,12 +454,12 @@ fn recordBatchMod(mods: []BatchMod, count: *u32, batch_id: []const u8, pending_d
         }
     }
     // New entry.
-    if (count.* >= max_batch_mods) return; // safety cap
+    assert.check(count.* < max_batch_mods, "bulk batch modification table exhausted", .{});
+    assert.check(batch_id.len <= mods[count.*].batch_id_buf.len, "bulk batch_id exceeds modification buffer", .{});
     var m = &mods[count.*];
     m.* = .{};
-    const len = @min(batch_id.len, m.batch_id_buf.len);
-    @memcpy(m.batch_id_buf[0..len], batch_id[0..len]);
-    m.batch_id_len = @intCast(len);
+    @memcpy(m.batch_id_buf[0..batch_id.len], batch_id);
+    m.batch_id_len = @intCast(batch_id.len);
     m.pending_delta = pending_delta;
     m.failed_delta = failed_delta;
     count.* += 1;
@@ -446,7 +473,8 @@ fn applyBatchMods(self: *OpHandler, b: *kv.WriteBatch, mods: []const BatchMod, c
         var bk_buf: keys.KeyBuf = undefined;
         const bkey = keys.batchKey(&bk_buf, m.batchId());
         var batch_val_buf: [codec.max_batch_encoded_size]u8 = undefined;
-        const batch_bytes = b.getInto(bkey, &batch_val_buf) orelse continue;
+        const batch_bytes = b.getInto(bkey, &batch_val_buf) orelse
+            assert.fail("applyBatchMods: missing batch {s}", .{m.batchId()});
         var batch = codec.decodeBatch(batch_bytes);
 
         // Apply deltas.
@@ -457,7 +485,9 @@ fn applyBatchMods(self: *OpHandler, b: *kv.WriteBatch, mods: []const BatchMod, c
         assert.check(new_failed >= 0, "applyBatchMods: failed underflow for batch {s}", .{m.batchId()});
         batch.failed = @intCast(new_failed);
 
-        assert.check(batch.succeeded + batch.failed <= batch.total, "batch completed exceeds total", .{});
+        const completed: u64 = @as(u64, batch.succeeded) + batch.failed;
+        assert.check(completed <= batch.total, "batch completed exceeds total", .{});
+        assert.check(completed + batch.pending == batch.total, "batch arithmetic mismatch after bulk modification", .{});
 
         // Check if batch is now complete.
         if (batch.pending == 0 and !batch.open and batch.total > 0) {

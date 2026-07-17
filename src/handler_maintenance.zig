@@ -64,6 +64,8 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     const job_bytes = b.get(keys.jobKey(&jk_buf, job_id));
                     assert.check(job_bytes != null, "promote: scheduled key but no job", .{});
                     var job = codec.decodeJob(job_bytes.?);
+                    assert.check(job.state == .scheduled, "promote: scheduled key for job {s} in state {s}", .{ job_id, job.state.toString() });
+                    assert.check(job.scheduled_at_ns == scheduled_ns, "promote: scheduled timestamp mismatch for job {s}", .{job_id});
 
                     job.state = .pending;
                     job.scheduled_at_ns = 0;
@@ -73,6 +75,7 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     self.recordPromoteQueue(job.queue);
 
                     if (job.expire_after_ms > 0) {
+                        assert.check(now_ns <= std.math.maxInt(u64) - @as(u64, job.expire_after_ms) * 1_000_000, "promote: expiry timestamp overflow for job {s}", .{job.id});
                         job.expire_at_ns = now_ns + @as(u64, job.expire_after_ms) * 1_000_000;
                         var xk_buf: keys.KeyBuf = undefined;
                         b.set(keys.expireKey(&xk_buf, job.expire_at_ns, job_id), "");
@@ -118,6 +121,8 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     const job_bytes = b.get(keys.jobKey(&jk_buf, job_id));
                     assert.check(job_bytes != null, "promote: retrying key but no job", .{});
                     var job = codec.decodeJob(job_bytes.?);
+                    assert.check(job.state == .retrying, "promote: retrying key for job {s} in state {s}", .{ job_id, job.state.toString() });
+                    assert.check(job.scheduled_at_ns == retry_ns, "promote: retry timestamp mismatch for job {s}", .{job_id});
 
                     job.state = .pending;
                     job.scheduled_at_ns = 0;
@@ -127,6 +132,7 @@ fn applyPromote(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     self.recordPromoteQueue(job.queue);
 
                     if (job.expire_after_ms > 0) {
+                        assert.check(now_ns <= std.math.maxInt(u64) - @as(u64, job.expire_after_ms) * 1_000_000, "promote: expiry timestamp overflow for job {s}", .{job.id});
                         job.expire_at_ns = now_ns + @as(u64, job.expire_after_ms) * 1_000_000;
                         var xk_buf: keys.KeyBuf = undefined;
                         b.set(keys.expireKey(&xk_buf, job.expire_at_ns, job_id), "");
@@ -183,10 +189,9 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
                 // Parse job ID from active key: a|{queue}\x00{job_id}
                 const key_offset = keys.prefix_active.len;
-                const sep_pos = std.mem.indexOfScalarPos(u8, key, key_offset, 0x00) orelse {
-                    if (!iter.next()) break;
-                    continue;
-                };
+                const sep_pos = std.mem.indexOfScalarPos(u8, key, key_offset, 0x00) orelse
+                    assert.fail("reclaim: malformed active key", .{});
+                assert.check(sep_pos + 1 < key.len, "reclaim: active key has empty job id", .{});
                 const job_id = key[sep_pos + 1 ..];
 
                 var jk_buf: keys.KeyBuf = undefined;
@@ -272,6 +277,7 @@ fn applyReclaim(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
                     self.pending.push(job.queue, job.priority, job.created_at_ns, job_id);
                     self.recordPromoteQueue(job.queue);
                     if (job.expire_after_ms > 0) {
+                        assert.check(now_ns <= std.math.maxInt(u64) - @as(u64, job.expire_after_ms) * 1_000_000, "reclaim: expiry timestamp overflow for job {s}", .{job.id});
                         job.expire_at_ns = now_ns + @as(u64, job.expire_after_ms) * 1_000_000;
                         var xk_buf: keys.KeyBuf = undefined;
                         b.set(keys.expireKey(&xk_buf, job.expire_at_ns, job_id), "");
@@ -318,6 +324,7 @@ fn applyExpire(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
                 const key = iter.key();
                 const prefix_len = keys.prefix_expire.len;
+                assert.check(key.len > prefix_len + 8, "expire: malformed expire key", .{});
                 const expires_at = keys.getU64BE(key[prefix_len .. prefix_len + 8]);
                 // x| keys are globally sorted by expires_at (timestamp follows
                 // the prefix directly), so the first not-yet-expired key means
@@ -396,6 +403,7 @@ fn applyExpire(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
 
 fn applyPurge(self: *OpHandler, b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult {
     var affected: u32 = 0;
+    var deleted_jobs: u32 = 0;
 
     var dp_buf: keys.KeyBuf = undefined;
     var dpe_buf: keys.KeyBuf = undefined;
@@ -415,6 +423,7 @@ fn applyPurge(self: *OpHandler, b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult 
                 if (affected >= OpHandler.max_bulk_results) break;
                 const key = iter.key();
                 const prefix_len = keys.prefix_dead.len;
+                assert.check(key.len > prefix_len + 8, "purge: malformed terminal key", .{});
                 const completed_at = keys.getU64BE(key[prefix_len .. prefix_len + 8]);
                 if (completed_at >= cutoff_ns) break; // d| keys are time-sorted
 
@@ -439,6 +448,8 @@ fn applyPurge(self: *OpHandler, b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult 
                     OpHandler.deleteReadIndexes(b, &job);
                     OpHandler.deleteTagIndexes(b, &job);
                     self.decrQueueCounter(b, job.queue, job.state);
+                    assert.check(deleted_jobs < std.math.maxInt(u32), "purge: deleted job count overflow", .{});
+                    deleted_jobs += 1;
                 }
 
                 b.delete(keys.jobKey(&jk_buf, job_id));
@@ -461,7 +472,11 @@ fn applyPurge(self: *OpHandler, b: *kv.WriteBatch, cutoff_ns: u64) ops.OpResult 
         }
     }
 
-    self.total_jobs -|= affected;
+    // Auto-delete leaves a d| retention marker after removing j| immediately.
+    // Purging that marker is work (affected) but must not decrement total_jobs
+    // a second time. Only count records that still had a durable j| value.
+    assert.check(self.total_jobs >= deleted_jobs, "purge: total_jobs underflow ({d} - {d})", .{ self.total_jobs, deleted_jobs });
+    self.total_jobs -= deleted_jobs;
     return .{ .affected = affected };
 }
 

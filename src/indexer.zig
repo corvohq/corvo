@@ -100,6 +100,9 @@ pub const Indexer = struct {
         new_state: types.JobState = .pending,
 
         const Kind = enum {
+            /// A queue clear/delete removed this job and its indexes directly
+            /// before the deferred effect buffer flushed.
+            discard,
             /// New job: write jt|, jq|, js|, jqs|, tags.
             create,
             /// State change: delete old js|/jqs|, write new js|/jqs|.
@@ -192,6 +195,7 @@ pub const Indexer = struct {
 
         for (self.effects[0..self.effect_count]) |*e| {
             switch (e.kind) {
+                .discard => {},
                 .create => self.flushCreate(batch, e),
                 .transition => self.flushTransition(batch, e),
                 .delete_all => self.flushDeleteAll(batch, e),
@@ -202,7 +206,6 @@ pub const Indexer = struct {
         self.effect_count = 0;
         self.counter_delta_count = 0;
     }
-
 
     fn flushCreate(_: *const Indexer, b: *kv.WriteBatch, e: *const IndexEffect) void {
         const job_id = e.jobId();
@@ -271,11 +274,21 @@ pub const Indexer = struct {
 
     fn flushCounterDeltas(self: *Indexer, b: *kv.WriteBatch) void {
         for (self.counter_deltas[0..self.counter_delta_count]) |*cd| {
+            var has_delta = false;
+            for (cd.deltas) |delta| {
+                if (delta != 0) {
+                    has_delta = true;
+                    break;
+                }
+            }
+            if (!has_delta) continue;
+
             const queue = cd.queueSlice();
             var qc_buf: keys.KeyBuf = undefined;
             var qc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
             const qc_key = keys.queueConfigKey(&qc_buf, queue);
-            const qc_bytes = b.getInto(qc_key, &qc_val_buf) orelse continue;
+            const qc_bytes = b.getInto(qc_key, &qc_val_buf) orelse
+                assert.fail("indexer: counter delta references missing queue {s}", .{queue});
             var q = codec.decodeQueue(qc_bytes);
 
             for (cd.deltas, 0..) |delta, si| {
@@ -370,11 +383,13 @@ pub const Indexer = struct {
     }
 
     fn copyId(_: *const Indexer, e: *IndexEffect, job_id: []const u8, queue: []const u8) void {
-        const id_len: u8 = @intCast(@min(job_id.len, 64));
-        @memcpy(e.job_id_buf[0..id_len], job_id[0..id_len]);
+        assert.check(job_id.len <= e.job_id_buf.len, "indexer: job_id exceeds effect buffer", .{});
+        const id_len: u8 = @intCast(job_id.len);
+        @memcpy(e.job_id_buf[0..id_len], job_id);
         e.job_id_len = id_len;
-        const q_len: u8 = @intCast(@min(queue.len, 64));
-        @memcpy(e.queue_buf[0..q_len], queue[0..q_len]);
+        assert.check(queue.len <= e.queue_buf.len, "indexer: queue exceeds effect buffer", .{});
+        const q_len: u8 = @intCast(queue.len);
+        @memcpy(e.queue_buf[0..q_len], queue);
         e.queue_len = q_len;
     }
 
@@ -393,8 +408,9 @@ pub const Indexer = struct {
         assert.check(self.counter_delta_count < max_counter_deltas, "indexer: counter-delta buffer overflow ({d}) — pipeline must flush at nearFull()", .{self.counter_delta_count});
         var cd = &self.counter_deltas[self.counter_delta_count];
         cd.* = .{};
-        const q_len: u8 = @intCast(@min(queue.len, 64));
-        @memcpy(cd.queue_buf[0..q_len], queue[0..q_len]);
+        assert.check(queue.len <= cd.queue_buf.len, "indexer: queue exceeds counter-delta buffer", .{});
+        const q_len: u8 = @intCast(queue.len);
+        @memcpy(cd.queue_buf[0..q_len], queue);
         cd.queue_len = q_len;
         cd.deltas[@intFromEnum(state)] = delta;
         self.counter_delta_count += 1;
@@ -410,6 +426,23 @@ pub const Indexer = struct {
             if (cd.queue_len == queue.len and std.mem.eql(u8, cd.queueSlice(), queue)) {
                 for (states) |s| cd.deltas[@intFromEnum(s)] = 0;
                 return;
+            }
+        }
+    }
+
+    /// Clear/delete handlers remove read indexes inline. Mark any earlier
+    /// deferred effect for a now-deleted job in the same queue as consumed so
+    /// flush cannot recreate orphaned jq|/jt|/js|/jqs| entries afterward.
+    pub fn discardDeletedQueueEffects(self: *Indexer, b: *kv.WriteBatch, queue: []const u8) void {
+        for (self.effects[0..self.effect_count]) |*effect| {
+            // delete_all is still needed when an ack auto-deleted the job
+            // earlier in this batch: queue deletion cannot see the missing j|
+            // record to remove its pre-existing read indexes itself.
+            if (effect.kind == .discard or effect.kind == .delete_all) continue;
+            if (!std.mem.eql(u8, effect.queue(), queue)) continue;
+            var job_key_buf: keys.KeyBuf = undefined;
+            if (b.get(keys.jobKey(&job_key_buf, effect.jobId())) == null) {
+                effect.kind = .discard;
             }
         }
     }

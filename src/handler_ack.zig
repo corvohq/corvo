@@ -19,6 +19,7 @@ const chain_step_max: u16 = 0xFFFD; // max valid step index
 
 pub fn applyAck(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.AckOp) ops.OpResult {
     if (op.acks.len == 0) return .{ .err = "no jobs provided" };
+    if (op.now_ns == 0) return .{ .err = "invalid ack timestamp" };
 
     // Validate the complete batch before applying any completion side effects.
     // HTTP result/checkpoint bodies are not naturally limited by the u8 RPC
@@ -141,13 +142,17 @@ pub fn applyAck(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.AckOp) ops.O
 
         if (next_state == .completed and !self.persist_completed) {
             // Auto-delete: remove job + payload from hot-path batch.
-            // Read indexes + tags + error keys deferred to indexer + purge.
+            // Read indexes are deferred to the indexer. Tags must be removed
+            // while the job value is still available; error keys are retained
+            // with the d| marker until purge.
+            OpHandler.deleteTagIndexes(b, &job);
             b.delete(keys.jobKey(&jk_buf, ack.job_id));
             var jpk_buf: keys.KeyBuf = undefined;
             b.delete(keys.jobPayloadKey(&jpk_buf, ack.job_id));
             self.indexer.recordDeleteAll(job.id, job.queue, .active, job.created_at_ns);
             self.decrQueueCounterMem(job.queue, .active);
-            self.total_jobs -|= 1;
+            assert.check(self.total_jobs > 0, "ack auto-delete: total_jobs underflow", .{});
+            self.total_jobs -= 1;
         } else {
             // Write updated job
             var job_enc_buf: [codec.max_job_encoded_size]u8 = undefined;

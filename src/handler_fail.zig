@@ -2,6 +2,7 @@
 //! Ported from Go internal/ops/ops_ack_fail.go (fail portion).
 
 const std = @import("std");
+const assert = @import("assert.zig");
 const types = @import("types.zig");
 const ops = @import("ops.zig");
 const keys = @import("keys.zig");
@@ -17,6 +18,7 @@ const chain_step_max: u16 = 0xFFFD;
 
 pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops.OpResult {
     if (op.jobs.len == 0) return .{ .err = "no jobs provided" };
+    if (op.now_ns == 0) return .{ .err = "invalid fail timestamp" };
     for (op.jobs) |*fail_job| {
         if (fail_job.job_id.len == 0 or fail_job.job_id.len > types.max_job_id_len or
             std.mem.indexOfScalar(u8, fail_job.job_id, 0) != null)
@@ -66,17 +68,15 @@ pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops
                     std.json.fmt(fail_job.error_msg, .{}),
                     std.json.fmt(bt, .{}),
                     op.now_ns,
-                }) catch ""
+                }) catch assert.fail("fail error entry exceeds sized buffer", .{})
             else
                 std.fmt.bufPrint(&err_val_buf, "{{\"job_id\":{f},\"attempt\":{d},\"error\":{f},\"created_at_ns\":{d}}}", .{
                     std.json.fmt(fail_job.job_id, .{}),
                     job.attempt,
                     std.json.fmt(fail_job.error_msg, .{}),
                     op.now_ns,
-                }) catch "";
-            if (err_json.len > 0) {
-                b.set(keys.jobErrorKey(&ek_buf, fail_job.job_id, @intCast(job.attempt)), err_json);
-            }
+                }) catch assert.fail("fail error entry exceeds sized buffer", .{});
+            b.set(keys.jobErrorKey(&ek_buf, fail_job.job_id, @intCast(job.attempt)), err_json);
         }
 
         // Clear expire key
@@ -99,6 +99,7 @@ pub fn applyFail(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FailOp) ops
                 job.retry_base_delay_ms,
                 job.retry_max_delay_ms,
             );
+            assert.check(op.now_ns <= std.math.maxInt(u64) - delay_ns, "fail: retry timestamp overflow for job {s}", .{job.id});
             const next_attempt_ns = op.now_ns + delay_ns;
 
             job.state = .retrying;

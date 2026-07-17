@@ -12,6 +12,10 @@ const OpHandler = handler.OpHandler;
 
 pub fn applySetBudget(_: *OpHandler, b: *kv.WriteBatch, op: *const ops.SetBudgetOp) ops.OpResult {
     if (!validBudgetKey(op.scope, op.target)) return .{ .err = "invalid budget key" };
+    if (op.created_at_ns == 0) return .{ .err = "invalid budget timestamp" };
+    if (!std.math.isFinite(op.daily_usd) or !std.math.isFinite(op.per_job_usd) or
+        op.daily_usd < 0 or op.per_job_usd < 0)
+        return .{ .err = "invalid budget amount" };
     const budget = types.Budget{
         .scope = op.scope,
         .target = op.target,

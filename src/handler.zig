@@ -387,7 +387,7 @@ pub const OpHandler = struct {
                     const qc_val = qc_iter.value();
                     const queue = codec.decodeQueue(qc_val);
                     if (queue.name.len > 0) {
-                        _ = self.putQueueConfig(queue.name, queue);
+                        assert.check(self.putQueueConfig(queue.name, queue), "rebuildState: failed to cache queue {s}", .{queue.name});
                     }
                     if (!qc_iter.next()) break;
                 }
@@ -445,8 +445,9 @@ pub const OpHandler = struct {
         }
         if (self.promote_queue_count >= max_promote_queues) return; // saturate
         const idx = self.promote_queue_count;
-        const len: u8 = @intCast(@min(queue.len, 64));
-        @memcpy(self.promote_queue_bufs[idx][0..len], queue[0..len]);
+        assert.check(queue.len <= self.promote_queue_bufs[idx].len, "promote queue exceeds sized buffer", .{});
+        const len: u8 = @intCast(queue.len);
+        @memcpy(self.promote_queue_bufs[idx][0..len], queue);
         self.promote_queue_lens[idx] = len;
         self.promote_queue_count += 1;
     }
@@ -477,11 +478,13 @@ pub const OpHandler = struct {
     pub fn recordCancelSignal(self: *OpHandler, job_id: []const u8, worker_id: []const u8) void {
         if (self.cancel_signal_count >= max_cancel_signals) return;
         var sig = CancelSignal{};
-        const il: u8 = @intCast(@min(job_id.len, sig.job_id.len));
-        @memcpy(sig.job_id[0..il], job_id[0..il]);
+        assert.check(job_id.len <= sig.job_id.len, "cancel signal job_id exceeds sized buffer", .{});
+        const il: u8 = @intCast(job_id.len);
+        @memcpy(sig.job_id[0..il], job_id);
         sig.job_id_len = il;
-        const wl: u8 = @intCast(@min(worker_id.len, sig.worker_id.len));
-        @memcpy(sig.worker_id[0..wl], worker_id[0..wl]);
+        assert.check(worker_id.len <= sig.worker_id.len, "cancel signal worker_id exceeds sized buffer", .{});
+        const wl: u8 = @intCast(worker_id.len);
+        @memcpy(sig.worker_id[0..wl], worker_id);
         sig.worker_id_len = wl;
         self.cancel_signals[self.cancel_signal_count] = sig;
         self.cancel_signal_count += 1;
@@ -622,10 +625,10 @@ pub const OpHandler = struct {
     // ========================================================================
 
     pub fn decrActiveCount(self: *OpHandler, queue: []const u8) void {
-        if (self.active_counts.getPtr(queue)) |count| {
-            count.* -= 1;
-            assert.check(count.* >= 0, "active count negative for queue", .{});
-        }
+        const count = self.active_counts.getPtr(queue) orelse
+            assert.fail("decrActiveCount: missing queue {s}", .{queue});
+        assert.check(count.* > 0, "decrActiveCount: zero count for queue {s}", .{queue});
+        count.* -= 1;
     }
 
     pub fn incrActiveCount(self: *OpHandler, queue: []const u8) void {
@@ -713,7 +716,7 @@ pub const OpHandler = struct {
         if (qc_bytes == null) return null;
 
         const queue = codec.decodeQueue(qc_bytes.?);
-        _ = self.putQueueConfig(queue_name, queue);
+        assert.check(self.putQueueConfig(queue_name, queue), "getQueueConfig: failed to cache queue {s}", .{queue_name});
         // Return from cache — putQueueConfig fixes up the name slice to
         // point at the owned HashMap key. The local `queue` has name
         // pointing into qc_val_buf which dies when this function returns.
@@ -909,69 +912,63 @@ pub const OpHandler = struct {
     }
 
     /// Increment counter for new_state, decrement for old_state on a queue.
-    /// Updates KV from the batch overlay and in-memory cache independently.
-    /// The KV path reads from the batch (which may lag behind the cache when
-    /// indexer deltas are still deferred), so we must NOT putQueueConfig here —
-    /// that would overwrite in-memory deltas from the same batch.
+    /// The cache is authoritative within a batch because it already includes
+    /// deferred indexer deltas from earlier operations in the same tick.
     fn updateQueueCounter(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, old_state: types.JobState, new_state: types.JobState) void {
-        var qc_buf: keys.KeyBuf = undefined;
-        var qc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
-        const qc_key = keys.queueConfigKey(&qc_buf, queue);
-        const qc_bytes = b.getInto(qc_key, &qc_val_buf) orelse return;
-        var q = codec.decodeQueue(qc_bytes);
+        const q = self.queue_configs.getPtr(queue) orelse
+            assert.fail("updateQueueCounter: missing queue config {s}", .{queue});
         q.decrState(old_state);
         q.incrState(new_state);
-        var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
-        b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
-        self.updateQueueCounterMem(queue, old_state, new_state);
+        self.materializeQueueCounters(b, queue, q);
     }
 
     /// Increment a single state counter on a queue (for enqueue).
     pub fn incrQueueCounter(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, state: types.JobState) void {
-        var qc_buf: keys.KeyBuf = undefined;
-        var qc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
-        const qc_key = keys.queueConfigKey(&qc_buf, queue);
-        const qc_bytes = b.getInto(qc_key, &qc_val_buf) orelse return;
-        var q = codec.decodeQueue(qc_bytes);
+        const q = self.queue_configs.getPtr(queue) orelse
+            assert.fail("incrQueueCounter: missing queue config {s}", .{queue});
         q.incrState(state);
-        var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
-        b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
-        self.incrQueueCounterMem(queue, state);
+        self.materializeQueueCounters(b, queue, q);
     }
 
     /// Decrement a single state counter on a queue (for purge).
     pub fn decrQueueCounter(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, state: types.JobState) void {
-        var qc_buf: keys.KeyBuf = undefined;
-        var qc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
-        const qc_key = keys.queueConfigKey(&qc_buf, queue);
-        const qc_bytes = b.getInto(qc_key, &qc_val_buf) orelse return;
-        var q = codec.decodeQueue(qc_bytes);
+        const q = self.queue_configs.getPtr(queue) orelse
+            assert.fail("decrQueueCounter: missing queue config {s}", .{queue});
         q.decrState(state);
+        self.materializeQueueCounters(b, queue, q);
+    }
+
+    fn materializeQueueCounters(self: *OpHandler, b: *kv.WriteBatch, queue: []const u8, q: *const types.Queue) void {
+        var qc_buf: keys.KeyBuf = undefined;
+        const qc_key = keys.queueConfigKey(&qc_buf, queue);
         var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
-        b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &q));
-        self.decrQueueCounterMem(queue, state);
+        b.set(qc_key, codec.encodeQueue(&qc_enc_buf, q));
+        self.indexer.resetQueueStateDeltas(queue, &.{
+            .pending, .active,    .retrying,  .completed,
+            .dead,    .cancelled, .scheduled, .held,
+        });
     }
 
     /// In-memory-only counter increment. KV write deferred to indexer.
     pub fn incrQueueCounterMem(self: *OpHandler, queue: []const u8, state: types.JobState) void {
-        if (self.queue_configs.getPtr(queue)) |q| {
-            q.incrState(state);
-        }
+        const q = self.queue_configs.getPtr(queue) orelse
+            assert.fail("incrQueueCounterMem: missing queue config {s}", .{queue});
+        q.incrState(state);
     }
 
     /// In-memory-only counter decrement. KV write deferred to indexer.
     pub fn decrQueueCounterMem(self: *OpHandler, queue: []const u8, state: types.JobState) void {
-        if (self.queue_configs.getPtr(queue)) |q| {
-            q.decrState(state);
-        }
+        const q = self.queue_configs.getPtr(queue) orelse
+            assert.fail("decrQueueCounterMem: missing queue config {s}", .{queue});
+        q.decrState(state);
     }
 
     /// In-memory-only counter transition. KV write deferred to indexer.
     pub fn updateQueueCounterMem(self: *OpHandler, queue: []const u8, old_state: types.JobState, new_state: types.JobState) void {
-        if (self.queue_configs.getPtr(queue)) |q| {
-            q.decrState(old_state);
-            q.incrState(new_state);
-        }
+        const q = self.queue_configs.getPtr(queue) orelse
+            assert.fail("updateQueueCounterMem: missing queue config {s}", .{queue});
+        q.decrState(old_state);
+        q.incrState(new_state);
     }
 
     // ========================================================================
@@ -1066,15 +1063,19 @@ pub const OpHandler = struct {
 
     // Global config
     pub fn applyGlobalConfig(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.GlobalConfigOp) ops.OpResult {
+        const rate_window_ms: u32 = if (op.rate_limit > 0 and op.rate_window_ms == 0)
+            1000
+        else
+            op.rate_window_ms;
         self.global_rate_limit = op.rate_limit;
-        self.global_rate_window_ms = op.rate_window_ms;
+        self.global_rate_window_ms = rate_window_ms;
 
         var key_buf: keys.KeyBuf = undefined;
         const key = keys.globalConfigKey(&key_buf);
         if (op.rate_limit > 0) {
             var val_buf: [8]u8 = undefined;
             std.mem.writeInt(u32, val_buf[0..4], op.rate_limit, .little);
-            std.mem.writeInt(u32, val_buf[4..8], op.rate_window_ms, .little);
+            std.mem.writeInt(u32, val_buf[4..8], rate_window_ms, .little);
             b.set(key, &val_buf);
         } else {
             b.delete(key);
@@ -1089,7 +1090,8 @@ pub const OpHandler = struct {
         var bk_buf: keys.KeyBuf = undefined;
         const bkey = keys.batchKey(&bk_buf, batch_id);
         var batch_val_buf: [codec.max_batch_encoded_size]u8 = undefined;
-        const batch_bytes = b.getInto(bkey, &batch_val_buf) orelse return;
+        const batch_bytes = b.getInto(bkey, &batch_val_buf) orelse
+            assert.fail("handleBatchJobComplete: missing batch {s}", .{batch_id});
         var batch = codec.decodeBatch(batch_bytes);
 
         assert.check(batch.pending > 0, "handleBatchJobComplete: pending underflow for batch {s}", .{batch_id});
@@ -1099,7 +1101,9 @@ pub const OpHandler = struct {
         } else {
             batch.failed += 1;
         }
-        assert.check(batch.succeeded + batch.failed <= batch.total, "handleBatchJobComplete: completed ({d}+{d}) exceeds total ({d}) for batch {s}", .{ batch.succeeded, batch.failed, batch.total, batch_id });
+        const completed: u64 = @as(u64, batch.succeeded) + batch.failed;
+        assert.check(completed <= batch.total, "handleBatchJobComplete: completed ({d}+{d}) exceeds total ({d}) for batch {s}", .{ batch.succeeded, batch.failed, batch.total, batch_id });
+        assert.check(completed + batch.pending == batch.total, "handleBatchJobComplete: arithmetic mismatch for batch {s}", .{batch_id});
 
         // Check if batch is complete (sealed + no pending jobs).
         if (batch.pending == 0 and !batch.open) {

@@ -32,20 +32,33 @@ pub fn fetchedJobWireSize(id_len: usize, queue_len: usize, payload_len: usize) u
 
 pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) ops.OpResult {
     if (op.count == 0) return .{ .err = "invalid fetch count: 0" };
+    if (op.now_ns == 0) return .{ .err = "invalid fetch timestamp" };
     if (op.worker_id.len > types.max_worker_id_len or
         std.mem.indexOfScalar(u8, op.worker_id, 0) != null)
         return .{ .err = "invalid worker_id" };
-    if (op.hostname.len > types.max_hostname_len)
+    if (op.hostname.len > types.max_hostname_len or
+        std.mem.indexOfScalar(u8, op.hostname, 0) != null)
         return .{ .err = "invalid hostname" };
+    var worker_queues_len: usize = 0;
     for (op.queues) |queue_name| {
         if (queue_name.len == 0 or queue_name.len > types.max_queue_name_len or
             std.mem.indexOfScalar(u8, queue_name, 0) != null)
             return .{ .err = "invalid fetch queue" };
+        worker_queues_len += queue_name.len;
+    }
+    if (op.queues.len > 0) worker_queues_len += op.queues.len - 1;
+    if (op.worker_id.len > 0) {
+        const worker_encoded_size = 23 + op.worker_id.len + op.hostname.len + worker_queues_len;
+        if (worker_encoded_size > codec.max_worker_encoded_size)
+            return .{ .err = "worker metadata too large" };
     }
 
     const lease_duration_ms: u32 = if (op.lease_duration_ms == 0) 60_000 else op.lease_duration_ms;
-    const lease_expires_ns = op.now_ns + @as(u64, lease_duration_ms) * 1_000_000;
-    const max_fetch: u32 = @min(op.count, ops.OpResult.max_inline_fetch);
+    const lease_duration_ns = @as(u64, lease_duration_ms) * 1_000_000;
+    if (op.now_ns > std.math.maxInt(u64) - lease_duration_ns)
+        return .{ .err = "fetch lease timestamp overflow" };
+    const lease_expires_ns = op.now_ns + lease_duration_ns;
+    var max_fetch: u32 = @min(op.count, ops.OpResult.max_inline_fetch);
 
     var result: ops.OpResult = .{};
     // Running total of encoded response bytes, shared across queues so a
@@ -73,10 +86,12 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             while (gl_count < self.global_rate_limit and gl_iter.next()) gl_count += 1;
         }
         if (gl_count >= self.global_rate_limit) return result;
+        max_fetch = @min(max_fetch, self.global_rate_limit - gl_count);
     }
 
     for (op.queues) |queue_name| {
         if (result.affected >= max_fetch) break;
+        var queue_max_fetch = max_fetch;
 
         // Load queue config (cached in-memory, avoids KV read on hot path)
         const queue = self.getQueueConfig(b, queue_name) orelse continue;
@@ -84,7 +99,14 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
 
         // Check concurrency limit
         if (queue.max_concurrency > 0) {
-            if (self.getActiveCount(queue_name) >= @as(i32, @intCast(queue.max_concurrency))) continue;
+            const active_count = self.getActiveCount(queue_name);
+            assert.check(active_count >= 0, "fetch: negative active count for queue {s}", .{queue_name});
+            const active: u32 = @intCast(active_count);
+            if (active >= queue.max_concurrency) continue;
+            const remaining_concurrency = queue.max_concurrency - active;
+            if (remaining_concurrency < queue_max_fetch - result.affected) {
+                queue_max_fetch = result.affected + remaining_concurrency;
+            }
         }
 
         // Check per-queue rate limit
@@ -106,22 +128,27 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
                 while (rate_count < queue.rate_limit and rl_iter.next()) rate_count += 1;
             }
             if (rate_count >= queue.rate_limit) continue;
+            const remaining_rate = queue.rate_limit - rate_count;
+            const remaining_fetch = queue_max_fetch - result.affected;
+            if (remaining_rate < remaining_fetch) {
+                queue_max_fetch = result.affected + remaining_rate;
+            }
         }
 
-        const has_rl = queue.rate_limit > 0;
+        const has_rl = queue.rate_limit > 0 and queue.rate_window_ms > 0;
 
         // Fairness path: score candidates by served+active, pick lowest score.
         // Separate from the normal pop loop to avoid any overhead on non-fairness queues.
         if (queue.fairness) {
-            var fairness_budget: u32 = @max((@min(op.count, ops.OpResult.max_inline_fetch) - result.affected) * 2, 64);
-            fetchWithFairness(self, b, &result, queue_name, &fairness_budget, max_fetch, lease_expires_ns, lease_duration_ms, op, has_rl, has_global_rl, queue.max_concurrency, &bytes_used);
+            var fairness_budget: u32 = @max((queue_max_fetch - result.affected) * 2, 64);
+            fetchWithFairness(self, b, &result, queue_name, &fairness_budget, queue_max_fetch, lease_expires_ns, lease_duration_ms, op, has_rl, has_global_rl, queue.max_concurrency, &bytes_used);
             continue; // next queue
         }
 
         // Non-fairness path: pop in priority order (hot path, unchanged).
-        const remaining = max_fetch - result.affected;
+        const remaining = queue_max_fetch - result.affected;
         var pop_budget: u32 = @max(remaining * 2, 64); // Min budget for skipping stale entries.
-        while (pop_budget > 0 and result.affected < max_fetch) {
+        while (pop_budget > 0 and result.affected < queue_max_fetch) {
             const entry = self.pending.pop(queue_name) orelse break;
             pop_budget -= 1;
 
@@ -167,6 +194,7 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             job.state = .active;
             job.worker_id = op.worker_id;
             job.hostname = op.hostname;
+            assert.check(job.attempt < std.math.maxInt(u16), "fetch: attempt counter exhausted for job {s}", .{job.id});
             job.attempt += 1;
             job.started_at_ns = op.now_ns;
             job.lease_expires_at_ns = lease_expires_ns;
@@ -227,11 +255,13 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
             // Store fetch result inline (no allocation).
             assert.check(result.affected < ops.OpResult.max_inline_fetch, "fetch: result.affected ({d}) >= max_inline_fetch", .{result.affected});
             var f = &result.fetched[result.affected];
-            const il = @min(job_id.len, f.id_buf.len);
-            @memcpy(f.id_buf[0..il], job_id[0..il]);
+            assert.check(job_id.len <= f.id_buf.len, "fetch: validated job_id exceeds response buffer", .{});
+            const il = job_id.len;
+            @memcpy(f.id_buf[0..il], job_id);
             f.id_len = @intCast(il);
-            const ql = @min(queue_name.len, f.queue_buf.len);
-            @memcpy(f.queue_buf[0..ql], queue_name[0..ql]);
+            assert.check(queue_name.len <= f.queue_buf.len, "fetch: validated queue exceeds response buffer", .{});
+            const ql = queue_name.len;
+            @memcpy(f.queue_buf[0..ql], queue_name);
             f.queue_len = @intCast(ql);
             f.attempt = job.attempt;
             f.max_retries = job.max_retries;
@@ -253,19 +283,19 @@ pub fn applyFetch(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.FetchOp) o
         if (op.hostname.len > 0) w.hostname = op.hostname;
 
         // Format queue names as comma-separated list.
-        var q_buf: [512]u8 = undefined;
+        var q_buf: [codec.max_worker_encoded_size]u8 = undefined;
         var q_len: usize = 0;
         for (op.queues, 0..) |qname, i| {
             if (i > 0) {
-                if (q_len < q_buf.len) {
-                    q_buf[q_len] = ',';
-                    q_len += 1;
-                }
+                assert.check(q_len < q_buf.len, "fetch: validated worker queue list overflow", .{});
+                q_buf[q_len] = ',';
+                q_len += 1;
             }
-            const copy_len = @min(qname.len, q_buf.len - q_len);
-            @memcpy(q_buf[q_len..][0..copy_len], qname[0..copy_len]);
-            q_len += copy_len;
+            assert.check(qname.len <= q_buf.len - q_len, "fetch: validated worker queue list overflow", .{});
+            @memcpy(q_buf[q_len..][0..qname.len], qname);
+            q_len += qname.len;
         }
+        assert.check(q_len == worker_queues_len, "fetch: worker queue list length mismatch", .{});
         if (q_len > 0) w.queues = q_buf[0..q_len];
         assert.check(codec.workerEncodedSize(&w) <= codec.max_worker_encoded_size, "fetch: validated worker exceeds codec buffer", .{});
 
@@ -323,8 +353,9 @@ fn fetchWithFairness(
             assert.check(num_candidates < max_candidates, "fetch-fairness: num_candidates ({d}) >= max_candidates", .{num_candidates});
             candidates[num_candidates] = entry;
             if (job.group) |g| {
-                const gl: u8 = @intCast(@min(g.len, 64));
-                @memcpy(candidate_group_bufs[num_candidates][0..gl], g[0..gl]);
+                assert.check(g.len <= candidate_group_bufs[num_candidates].len, "fetch-fairness: validated group exceeds candidate buffer", .{});
+                const gl: u8 = @intCast(g.len);
+                @memcpy(candidate_group_bufs[num_candidates][0..gl], g);
                 candidate_group_lens[num_candidates] = gl;
             } else {
                 candidate_group_lens[num_candidates] = 0;
@@ -391,6 +422,7 @@ fn fetchWithFairness(
         job.state = .active;
         job.worker_id = op.worker_id;
         job.hostname = op.hostname;
+        assert.check(job.attempt < std.math.maxInt(u16), "fetch-fairness: attempt counter exhausted for job {s}", .{job.id});
         job.attempt += 1;
         job.started_at_ns = op.now_ns;
         job.lease_expires_at_ns = lease_expires_ns;
@@ -444,11 +476,13 @@ fn fetchWithFairness(
 
         assert.check(result.affected < ops.OpResult.max_inline_fetch, "fetch-fairness: result.affected ({d}) >= max_inline_fetch", .{result.affected});
         var f = &result.fetched[result.affected];
-        const il = @min(sel_job_id.len, f.id_buf.len);
-        @memcpy(f.id_buf[0..il], sel_job_id[0..il]);
+        assert.check(sel_job_id.len <= f.id_buf.len, "fetch-fairness: validated job_id exceeds response buffer", .{});
+        const il = sel_job_id.len;
+        @memcpy(f.id_buf[0..il], sel_job_id);
         f.id_len = @intCast(il);
-        const ql = @min(queue_name.len, f.queue_buf.len);
-        @memcpy(f.queue_buf[0..ql], queue_name[0..ql]);
+        assert.check(queue_name.len <= f.queue_buf.len, "fetch-fairness: validated queue exceeds response buffer", .{});
+        const ql = queue_name.len;
+        @memcpy(f.queue_buf[0..ql], queue_name);
         f.queue_len = @intCast(ql);
         f.attempt = job.attempt;
         f.max_retries = job.max_retries;

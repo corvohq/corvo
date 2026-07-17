@@ -38,10 +38,13 @@ const Pipeline = pipeline_mod.Pipeline(SimBackend);
 
 pub const Stats = struct {
     enqueued: u32 = 0,
+    scheduled_enqueued: u32 = 0,
     fetched: u32 = 0,
     acked: u32 = 0,
     failed: u32 = 0,
     bulk: u32 = 0,
+    bulk_affected: u32 = 0,
+    bulk_action_mask: u16 = 0,
     maintenance: u32 = 0,
     heartbeats: u32 = 0,
     queue_ops: u32 = 0,
@@ -52,6 +55,14 @@ pub const Stats = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, config: Config) !Stats {
+    if (config.clients == 0 or config.clients > max_clients or
+        config.queues == 0 or config.queues > max_queues or
+        config.ticks == 0 or config.check_interval == 0 or
+        config.tick_duration_ns <= 0 or config.time_jump_max_ns < 1_000_000)
+    {
+        return error.InvalidSimulationConfig;
+    }
+
     const seed: u64 = if (config.seed == 0)
         @intCast(@as(u128, @bitCast(std.time.nanoTimestamp())) & 0xFFFFFFFFFFFFFFFF)
     else
@@ -122,7 +133,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !Stats {
     defer pipeline.deinit();
 
     // --- Queue names ---
-    const num_queues: usize = @min(config.queues, max_queues);
+    const num_queues: usize = @intCast(config.queues);
     var queue_name_bufs: [max_queues][32]u8 = undefined;
     var queue_slices: [max_queues][]const u8 = undefined;
 
@@ -139,7 +150,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !Stats {
     var client_config = config;
     client_config.maintenance_rate = 0;
 
-    const num_clients: usize = @min(config.clients, max_clients);
+    const num_clients: usize = @intCast(config.clients);
     var clients: [max_clients]SimClient = undefined;
 
     for (0..num_clients) |i| {
@@ -222,10 +233,13 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !Stats {
 
     // --- Stats ---
     var total_enqueued: u32 = 0;
+    var total_scheduled_enqueued: u32 = 0;
     var total_fetched: u32 = 0;
     var total_acked: u32 = 0;
     var total_failed: u32 = 0;
     var total_bulk: u32 = 0;
+    var total_bulk_affected: u32 = 0;
+    var bulk_action_mask: u16 = 0;
     var total_maintenance: u32 = 0;
     var total_heartbeats: u32 = 0;
     var total_queue_ops: u32 = 0;
@@ -236,10 +250,13 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !Stats {
 
     for (clients[0..num_clients]) |c| {
         total_enqueued += c.enqueued;
+        total_scheduled_enqueued += c.scheduled_enqueued;
         total_fetched += c.fetched;
         total_acked += c.acked;
         total_failed += c.failed;
         total_bulk += c.bulk_ops;
+        total_bulk_affected += c.bulk_affected;
+        bulk_action_mask |= c.bulk_action_mask;
         total_maintenance += c.maintenance_ops;
         total_heartbeats += c.heartbeats;
         total_queue_ops += c.queue_ops;
@@ -250,21 +267,25 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !Stats {
     }
 
     std.debug.print(
-        "OK seed={d} ticks={d} clients={d} queues={d} | enq={d} fetch={d} ack={d} fail={d} bulk={d} maint={d} hb={d} qop={d} stale={d} cron={d} batch={d} chain={d}\n",
+        "OK seed={d} ticks={d} clients={d} queues={d} | enq={d} scheduled={d} fetch={d} ack={d} fail={d} bulk={d}/{d} maint={d} hb={d} qop={d} stale={d} cron={d} batch={d} chain={d}\n",
         .{
-            seed,             config.ticks,      num_clients,         num_queues,
-            total_enqueued,   total_fetched,     total_acked,         total_failed,
-            total_bulk,       total_maintenance, total_heartbeats,    total_queue_ops,
-            total_stale_acks, total_cron_ops,    total_batch_creates, total_chain_enqueues,
+            seed,                config.ticks,             num_clients,      num_queues,
+            total_enqueued,      total_scheduled_enqueued, total_fetched,    total_acked,
+            total_failed,        total_bulk_affected,      total_bulk,       total_maintenance,
+            total_heartbeats,    total_queue_ops,          total_stale_acks, total_cron_ops,
+            total_batch_creates, total_chain_enqueues,
         },
     );
 
     return .{
         .enqueued = total_enqueued,
+        .scheduled_enqueued = total_scheduled_enqueued,
         .fetched = total_fetched,
         .acked = total_acked,
         .failed = total_failed,
         .bulk = total_bulk,
+        .bulk_affected = total_bulk_affected,
+        .bulk_action_mask = bulk_action_mask,
         .maintenance = total_maintenance,
         .heartbeats = total_heartbeats,
         .queue_ops = total_queue_ops,
@@ -300,10 +321,13 @@ test "sim stress" {
     // actually fired. These assertions caught malformed chain frames and the
     // empty-ID cron/batch simulator that previously reported false coverage.
     try std.testing.expect(stats.enqueued > 0);
+    try std.testing.expect(stats.scheduled_enqueued > 0);
     try std.testing.expect(stats.fetched > 0);
     try std.testing.expect(stats.acked > 0);
     try std.testing.expect(stats.failed > 0);
     try std.testing.expect(stats.bulk > 0);
+    try std.testing.expect(stats.bulk_affected > 0);
+    try std.testing.expect(@popCount(stats.bulk_action_mask) >= 2);
     try std.testing.expect(stats.heartbeats > 0);
     try std.testing.expect(stats.queue_ops > 0);
     try std.testing.expect(stats.stale_acks > 0);
@@ -329,10 +353,13 @@ test "sim seed sweep — time jumps and feature interleavings" {
             .check_interval = 5,
         });
         aggregate.enqueued += stats.enqueued;
+        aggregate.scheduled_enqueued += stats.scheduled_enqueued;
         aggregate.fetched += stats.fetched;
         aggregate.acked += stats.acked;
         aggregate.failed += stats.failed;
         aggregate.bulk += stats.bulk;
+        aggregate.bulk_affected += stats.bulk_affected;
+        aggregate.bulk_action_mask |= stats.bulk_action_mask;
         aggregate.heartbeats += stats.heartbeats;
         aggregate.queue_ops += stats.queue_ops;
         aggregate.cron_ops += stats.cron_ops;
@@ -340,8 +367,11 @@ test "sim seed sweep — time jumps and feature interleavings" {
         aggregate.chain_enqueues += stats.chain_enqueues;
     }
     try std.testing.expect(aggregate.enqueued > 0 and aggregate.fetched > 0);
+    try std.testing.expect(aggregate.scheduled_enqueued > 0);
     try std.testing.expect(aggregate.acked > 0 and aggregate.failed > 0);
     try std.testing.expect(aggregate.bulk > 0 and aggregate.queue_ops > 0);
+    try std.testing.expect(aggregate.bulk_affected > 0);
+    try std.testing.expect(@popCount(aggregate.bulk_action_mask) >= 2);
     try std.testing.expect(aggregate.cron_ops > 0 and aggregate.batch_creates > 0);
     try std.testing.expect(aggregate.chain_enqueues > 0);
 }

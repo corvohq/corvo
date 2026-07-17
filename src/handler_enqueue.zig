@@ -72,14 +72,15 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
                 const default_q = types.Queue{ .name = enq.queue };
                 const qc_data = codec.encodeQueue(&qc_enc_buf, &default_q);
                 b.set(keys.queueConfigKey(&qc_buf, enq.queue), qc_data);
-                _ = self.putQueueConfig(enq.queue, default_q);
+                assert.check(self.putQueueConfig(enq.queue, default_q), "enqueue: failed to cache validated queue {s}", .{enq.queue});
             }
 
             var qn_buf: keys.KeyBuf = undefined;
             b.set(keys.queueNameKey(&qn_buf, enq.queue), "");
 
-            const ql = @min(enq.queue.len, last_queue_buf.len);
-            @memcpy(last_queue_buf[0..ql], enq.queue[0..ql]);
+            assert.check(enq.queue.len <= last_queue_buf.len, "enqueue: validated queue exceeds cache buffer", .{});
+            const ql = enq.queue.len;
+            @memcpy(last_queue_buf[0..ql], enq.queue);
             last_queue_len = @intCast(ql);
         }
 
@@ -162,6 +163,7 @@ pub fn applyEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueO
         affected += 1;
     }
 
+    assert.check(self.total_jobs <= std.math.maxInt(u32) - affected, "enqueue: total_jobs overflow", .{});
     self.total_jobs += affected;
     return .{ .affected = affected };
 }
@@ -196,6 +198,12 @@ fn validateEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueOp
             return .{ .err = "invalid job state" };
         if (enq.state == .scheduled and enq.scheduled_at_ns == 0)
             return .{ .err = "invalid scheduled time" };
+        if (enq.expire_after_ms > 0 and
+            op.now_ns > std.math.maxInt(u64) - @as(u64, enq.expire_after_ms) * 1_000_000)
+            return .{ .err = "job expiry timestamp overflow" };
+        if (enq.unique_period_s > 0 and
+            op.now_ns > std.math.maxInt(u64) - @as(u64, enq.unique_period_s) * 1_000_000_000)
+            return .{ .err = "unique timestamp overflow" };
         if (enq.unique_key) |value| {
             if (value.len > 255 or std.mem.indexOfScalar(u8, value, 0) != null)
                 return .{ .err = "invalid unique_key" };
@@ -277,8 +285,9 @@ fn validateEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueOp
                         std.mem.eql(u8, prior_key, unique_key))
                     {
                         var result: ops.OpResult = .{ .err = "unique_existing" };
-                        const n = @min(prior.job_id.len, result.unique_job_id_buf.len);
-                        @memcpy(result.unique_job_id_buf[0..n], prior.job_id[0..n]);
+                        assert.check(prior.job_id.len <= result.unique_job_id_buf.len, "enqueue: validated unique owner exceeds response buffer", .{});
+                        const n = prior.job_id.len;
+                        @memcpy(result.unique_job_id_buf[0..n], prior.job_id);
                         result.unique_job_id_len = @intCast(n);
                         return result;
                     }
@@ -297,8 +306,9 @@ fn validateEnqueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.EnqueueOp
 fn uniqueConflict(existing: []const u8) ops.OpResult {
     const decoded = keys.decodeUniqueValue(existing);
     var result: ops.OpResult = .{ .err = "unique_existing" };
-    const n = @min(decoded.job_id.len, result.unique_job_id_buf.len);
-    @memcpy(result.unique_job_id_buf[0..n], decoded.job_id[0..n]);
+    assert.check(decoded.job_id.len <= result.unique_job_id_buf.len, "enqueue: stored unique owner exceeds response buffer", .{});
+    const n = decoded.job_id.len;
+    @memcpy(result.unique_job_id_buf[0..n], decoded.job_id);
     result.unique_job_id_len = @intCast(n);
     return result;
 }

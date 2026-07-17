@@ -25,9 +25,11 @@ pub fn computeInitialNextRun(schedule: []const u8, now_ns: u64) u64 {
 /// then fire) so enqueue writes don't invalidate the scan iterator.
 pub fn applyCronScan(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpResult {
     const max_fire_per_scan = 64;
+    const max_scan_per_tick = 4096;
     var due_ids: [max_fire_per_scan][64]u8 = undefined;
     var due_lens: [max_fire_per_scan]u8 = undefined;
     var due_count: usize = 0;
+    var scanned: usize = 0;
 
     // Phase 1: collect due cron ids.
     {
@@ -39,13 +41,15 @@ pub fn applyCronScan(self: *OpHandler, b: *kv.WriteBatch, now_ns: u64) ops.OpRes
             var iter = b.newIter(sp_buf[0..sp.len], end);
             defer iter.close();
             if (iter.first()) {
-                while (due_count < max_fire_per_scan) {
+                while (due_count < max_fire_per_scan and scanned < max_scan_per_tick) {
+                    scanned += 1;
                     const cron = codec.decodeCron(iter.value());
                     if (cron.enabled and cron.next_run_ns > 0 and
                         @as(u64, @intCast(cron.next_run_ns)) <= now_ns)
                     {
-                        const l: u8 = @intCast(@min(cron.id.len, 64));
-                        @memcpy(due_ids[due_count][0..l], cron.id[0..l]);
+                        assert.check(cron.id.len <= due_ids[due_count].len, "cron scan: stored cron id too large", .{});
+                        const l: u8 = @intCast(cron.id.len);
+                        @memcpy(due_ids[due_count][0..l], cron.id);
                         due_lens[due_count] = l;
                         due_count += 1;
                     }

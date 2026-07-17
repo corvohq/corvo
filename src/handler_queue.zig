@@ -57,27 +57,37 @@ const StateCounts = struct {
     counts: [8]u32 = [_]u32{0} ** 8,
 
     fn add(self: *StateCounts, state: types.JobState) void {
-        self.counts[@intFromEnum(state)] += 1;
+        const count = &self.counts[@intFromEnum(state)];
+        assert.check(count.* < std.math.maxInt(u32), "queue deletion state counter overflow", .{});
+        count.* += 1;
     }
     fn addN(self: *StateCounts, state: types.JobState, n: u32) void {
-        self.counts[@intFromEnum(state)] += n;
+        const count = &self.counts[@intFromEnum(state)];
+        assert.check(count.* <= std.math.maxInt(u32) - n, "queue deletion state counter overflow", .{});
+        count.* += n;
     }
     fn total(self: *const StateCounts) u32 {
-        var sum: u32 = 0;
+        var sum: u64 = 0;
         for (self.counts) |c| sum += c;
-        return sum;
+        assert.check(sum <= std.math.maxInt(u32), "queue deletion total state counter overflow", .{});
+        return @intCast(sum);
     }
     fn subtractFrom(self: *const StateCounts, q: *types.Queue) void {
-        q.pending_count -|= self.counts[@intFromEnum(types.JobState.pending)];
-        q.active_count -|= self.counts[@intFromEnum(types.JobState.active)];
-        q.retrying_count -|= self.counts[@intFromEnum(types.JobState.retrying)];
-        q.completed_count -|= self.counts[@intFromEnum(types.JobState.completed)];
-        q.dead_count -|= self.counts[@intFromEnum(types.JobState.dead)];
-        q.cancelled_count -|= self.counts[@intFromEnum(types.JobState.cancelled)];
-        q.scheduled_count -|= self.counts[@intFromEnum(types.JobState.scheduled)];
-        q.held_count -|= self.counts[@intFromEnum(types.JobState.held)];
+        subtractCounter(&q.pending_count, self.counts[@intFromEnum(types.JobState.pending)], q.name, .pending);
+        subtractCounter(&q.active_count, self.counts[@intFromEnum(types.JobState.active)], q.name, .active);
+        subtractCounter(&q.retrying_count, self.counts[@intFromEnum(types.JobState.retrying)], q.name, .retrying);
+        subtractCounter(&q.completed_count, self.counts[@intFromEnum(types.JobState.completed)], q.name, .completed);
+        subtractCounter(&q.dead_count, self.counts[@intFromEnum(types.JobState.dead)], q.name, .dead);
+        subtractCounter(&q.cancelled_count, self.counts[@intFromEnum(types.JobState.cancelled)], q.name, .cancelled);
+        subtractCounter(&q.scheduled_count, self.counts[@intFromEnum(types.JobState.scheduled)], q.name, .scheduled);
+        subtractCounter(&q.held_count, self.counts[@intFromEnum(types.JobState.held)], q.name, .held);
     }
 };
+
+fn subtractCounter(counter: *u32, amount: u32, queue: []const u8, state: types.JobState) void {
+    assert.check(counter.* >= amount, "queue {s} {s} counter underflow: {d} - {d}", .{ queue, state.toString(), counter.*, amount });
+    counter.* -= amount;
+}
 
 /// Over-estimate of the recorded-mutation bytes deleting ONE job produces:
 /// ≤ 12 fixed-shape keys (the triggering index entry or dead key, expire,
@@ -107,6 +117,8 @@ pub fn applyQueueConfig(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Queu
     if (op.queue.len == 0 or op.queue.len > types.max_queue_name_len or
         std.mem.indexOfScalar(u8, op.queue, 0) != null)
         return .{ .err = "invalid queue" };
+    if (op.action == .clear or op.action == .delete)
+        return .{ .err = "clear/delete require dedicated operation" };
     var qn_buf: keys.KeyBuf = undefined;
     var qc_buf: keys.KeyBuf = undefined;
     const qc_key = keys.queueConfigKey(&qc_buf, op.queue);
@@ -150,19 +162,28 @@ pub fn applyQueueConfig(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Queu
         },
         .throttle => {
             queue.rate_limit = op.rate_limit;
-            queue.rate_window_ms = op.rate_window_ms;
-            self.recomputeMaxRateWindow();
+            queue.rate_window_ms = if (op.rate_limit > 0 and op.rate_window_ms == 0)
+                1000
+            else
+                op.rate_window_ms;
         },
-        .clear, .delete => {
-            assert.fail("clear/delete should not use applyQueueConfig", .{});
-        },
+        .clear, .delete => unreachable,
     }
 
     var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
     b.set(qc_key, codec.encodeQueue(&qc_enc_buf, &queue));
 
     // Update in-memory cache.
-    _ = self.putQueueConfig(op.queue, queue);
+    assert.check(self.putQueueConfig(op.queue, queue), "queue config: failed to cache validated queue {s}", .{op.queue});
+    // `queue` came from the cache and already includes every state delta
+    // accumulated earlier in this tick. The durable rewrite above therefore
+    // materializes those deltas; prevent indexer.flush from applying them a
+    // second time. Operations later in the tick accumulate fresh deltas.
+    self.indexer.resetQueueStateDeltas(op.queue, &.{
+        .pending, .active,    .retrying,  .completed,
+        .dead,    .cancelled, .scheduled, .held,
+    });
+    self.recomputeMaxRateWindow();
     return .{ .affected = 1 };
 }
 
@@ -179,7 +200,8 @@ pub fn applyClearQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Clear
     var counts = StateCounts{};
     deleteAllQueueJobs(self, b, op.queue, op.now_ns, &budget, &counts);
     const deleted = counts.total();
-    self.total_jobs -|= deleted;
+    assert.check(self.total_jobs >= deleted, "clear queue: total_jobs underflow ({d} - {d})", .{ self.total_jobs, deleted });
+    self.total_jobs -= deleted;
     // PendingIndex already drained inside deleteAllQueueJobs.
 
     if (budget.exhausted) {
@@ -188,16 +210,18 @@ pub fn applyClearQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Clear
         // what was deleted from the counters (memory + KV); the completing
         // pass below hard-resets them. The client repeats until affected
         // reaches zero.
-        if (self.queue_configs.getPtr(op.queue)) |q| counts.subtractFrom(q);
+        const cached = self.queue_configs.getPtr(op.queue) orelse
+            assert.fail("clear queue: missing cached queue config {s}", .{op.queue});
+        counts.subtractFrom(cached);
         var pqc_buf: keys.KeyBuf = undefined;
-        var pqc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
         const pqc_key = keys.queueConfigKey(&pqc_buf, op.queue);
-        if (b.getInto(pqc_key, &pqc_val_buf)) |qc_bytes| {
-            var q = codec.decodeQueue(qc_bytes);
-            counts.subtractFrom(&q);
-            var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
-            b.set(pqc_key, codec.encodeQueue(&qc_enc_buf, &q));
-        }
+        var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
+        b.set(pqc_key, codec.encodeQueue(&qc_enc_buf, cached));
+        self.indexer.resetQueueStateDeltas(op.queue, &.{
+            .pending, .active,    .retrying,  .completed,
+            .dead,    .cancelled, .scheduled, .held,
+        });
+        self.indexer.discardDeletedQueueEffects(b, op.queue);
         return .{
             .affected = deleted,
             .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
@@ -233,6 +257,7 @@ pub fn applyClearQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Clear
     // non-zero while memory says zero (M11). Post-clear enqueues in the same
     // tick re-accumulate their own deltas and flush correctly on top of zero.
     self.indexer.resetQueueStateDeltas(op.queue, &.{ .pending, .scheduled, .retrying });
+    self.indexer.discardDeletedQueueEffects(b, op.queue);
 
     return .{
         .affected = deleted,
@@ -254,7 +279,8 @@ pub fn applyDeleteQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Dele
     deleteAllQueueJobs(self, b, op.queue, op.now_ns, &budget, &counts);
     if (!budget.exhausted) deleteTerminalQueueJobs(self, b, op.queue, op.now_ns, &budget, &counts);
     const deleted = counts.total();
-    self.total_jobs -|= deleted;
+    assert.check(self.total_jobs >= deleted, "delete queue: total_jobs underflow ({d} - {d})", .{ self.total_jobs, deleted });
+    self.total_jobs -= deleted;
     // PendingIndex already drained inside deleteAllQueueJobs.
 
     if (budget.exhausted) {
@@ -262,22 +288,29 @@ pub fn applyDeleteQueue(self: *OpHandler, b: *kv.WriteBatch, op: *const ops.Dele
         // the client repeats the delete until the metadata pass below runs;
         // subtract the deleted jobs from the counters so reads stay sane
         // meanwhile.
-        if (self.queue_configs.getPtr(op.queue)) |q| counts.subtractFrom(q);
+        const cached = self.queue_configs.getPtr(op.queue) orelse
+            assert.fail("delete queue: missing cached queue config {s}", .{op.queue});
+        counts.subtractFrom(cached);
         var pqc_buf: keys.KeyBuf = undefined;
-        var pqc_val_buf: [codec.max_queue_encoded_size]u8 = undefined;
         const pqc_key = keys.queueConfigKey(&pqc_buf, op.queue);
-        if (b.getInto(pqc_key, &pqc_val_buf)) |qc_bytes| {
-            var q = codec.decodeQueue(qc_bytes);
-            counts.subtractFrom(&q);
-            var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
-            b.set(pqc_key, codec.encodeQueue(&qc_enc_buf, &q));
-        }
+        var qc_enc_buf: [codec.max_queue_encoded_size]u8 = undefined;
+        b.set(pqc_key, codec.encodeQueue(&qc_enc_buf, cached));
+        self.indexer.resetQueueStateDeltas(op.queue, &.{
+            .pending, .active,    .retrying,  .completed,
+            .dead,    .cancelled, .scheduled, .held,
+        });
+        self.indexer.discardDeletedQueueEffects(b, op.queue);
         return .{
             .affected = deleted,
             .notify_queues = if (self.promote_queue_count > 0) self.promoteQueueSlices() else null,
         };
     }
 
+    self.indexer.resetQueueStateDeltas(op.queue, &.{
+        .pending, .active,    .retrying,  .completed,
+        .dead,    .cancelled, .scheduled, .held,
+    });
+    self.indexer.discardDeletedQueueEffects(b, op.queue);
     self.removeQueueConfig(op.queue);
 
     // Remove queue metadata and auxiliary data.
@@ -590,16 +623,18 @@ fn deleteJobsByPrefix(
 fn adjustBatchForDeletedJob(self: *OpHandler, b: *kv.WriteBatch, batch_id: []const u8, now_ns: u64) void {
     var bk_buf: keys.KeyBuf = undefined;
     const bkey = keys.batchKey(&bk_buf, batch_id);
-    const batch_bytes = b.get(bkey);
-    if (batch_bytes == null) return;
+    const batch_bytes = b.get(bkey) orelse
+        assert.fail("adjustBatchForDeletedJob: missing batch {s}", .{batch_id});
 
-    var batch = codec.decodeBatch(batch_bytes.?);
-    if (batch.total == 0) return;
+    var batch = codec.decodeBatch(batch_bytes);
+    assert.check(batch.total > 0, "adjustBatchForDeletedJob: empty batch {s} owns a job", .{batch_id});
 
     assert.check(batch.pending > 0, "adjustBatchForDeletedJob: pending underflow for batch {s} (pending={d} failed={d} total={d})", .{ batch_id, batch.pending, batch.failed, batch.total });
     batch.pending -= 1;
     batch.failed += 1;
-    assert.check(batch.succeeded + batch.failed <= batch.total, "adjustBatchForDeletedJob: completed ({d}+{d}) exceeds total ({d}) for batch {s}", .{ batch.succeeded, batch.failed, batch.total, batch_id });
+    const completed: u64 = @as(u64, batch.succeeded) + batch.failed;
+    assert.check(completed <= batch.total, "adjustBatchForDeletedJob: completed ({d}+{d}) exceeds total ({d}) for batch {s}", .{ batch.succeeded, batch.failed, batch.total, batch_id });
+    assert.check(completed + batch.pending == batch.total, "adjustBatchForDeletedJob: arithmetic mismatch for batch {s}", .{batch_id});
 
     if (batch.pending == 0 and !batch.open and batch.total > 0) {
         if (self.enqueueBatchCallback(b, &batch, now_ns)) batch.completed_at_ns = now_ns;
