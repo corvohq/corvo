@@ -15,6 +15,7 @@
 //!   --node-id <id>            Node ID (enables cluster mode)
 //!   --peers <spec>            Peer list: id[:uuidhex]@host:port,... (client addrs)
 //!   --cluster-id <n>          Cluster identifier (u64, required in cluster mode)
+//!   --max-snapshot-size <n>   Max raft snapshot bytes (default: 1 GiB)
 //!   --max-payload-size <n>    Max payload size in bytes (default: 65536)
 //!   --max-conns <n>           Max concurrent connections (default: 4096)
 //!   --max-queues <n>          Max number of queues (default: 100)
@@ -166,6 +167,8 @@ fn printHelp() void {
         \\  --peers <spec>            Peers: id[:uuidhex]@host:port,... (client addrs;
         \\                            raft transport uses port + 1000)
         \\  --cluster-id <n>          Cluster identifier (u64, required in cluster mode)
+        \\  --max-snapshot-size <n>   Max raft snapshot bytes — must exceed the largest
+        \\                            expected DB serialization (default: 1073741824)
         \\  --admin-password <pw>     Admin password (locks UI + API)
         \\  --cluster-secret <s>      Shared secret authenticating peer connections
         \\                            (or set CORVO_CLUSTER_SECRET)
@@ -300,6 +303,19 @@ pub fn main() !void {
                 std.debug.print("invalid max-payload-size: {s}\n", .{val});
                                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, arg, "--max-snapshot-size")) {
+            const val = args.next() orelse {
+                std.debug.print("--max-snapshot-size requires an argument\n", .{});
+                                std.process.exit(1);
+            };
+            config.max_snapshot_size = std.fmt.parseInt(u32, val, 10) catch {
+                std.debug.print("invalid max-snapshot-size: {s}\n", .{val});
+                                std.process.exit(1);
+            };
+            if (config.max_snapshot_size == 0) {
+                std.debug.print("max-snapshot-size must be > 0\n", .{});
+                                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, arg, "--max-conns")) {
             const val = args.next() orelse {
                 std.debug.print("--max-conns requires an argument\n", .{});
@@ -466,13 +482,19 @@ pub fn main() !void {
         // of encoded mutations).
         const raft_buf_size: u32 = 2 * 1024 * 1024;
 
+        // Snapshot capacity is operator-sized (--max-snapshot-size): the raft
+        // node reserves it once at startup, and a snapshot bigger than any
+        // node's cap cannot replicate.
+        var raft_cfg = raft_runtime_mod.defaultConfig();
+        raft_cfg.max_snapshot_bytes = config.max_snapshot_size;
+
         const host = try RaftHost.create(allocator, db, .{
             .runtime = .{
                 .node_id = config.node_id,
                 .instance_uuid = raft_host_mod.deriveUuid(config.node_id),
                 .cluster_id = config.cluster_id,
                 .peers = peer_specs[0..peer_count],
-                .raft_config = raft_runtime_mod.defaultConfig(),
+                .raft_config = raft_cfg,
             },
             .peer_net = .{
                 .self_id = config.node_id,
@@ -585,6 +607,7 @@ pub fn main() !void {
             .node_id = config.node_id,
             .is_leader = &host.is_leader,
             .peer_count = cluster_peer_count,
+            .events = &host.events,
         };
         http_read.g_cluster_info = &cluster_info;
     }

@@ -20,6 +20,9 @@ pub const ClusterInfo = struct {
     node_id: []const u8,
     is_leader: *const std.atomic.Value(bool),
     peer_count: u8,
+    /// Leadership transition ring owned by the RaftHost; the raft thread
+    /// pushes, /cluster/events snapshots under the ring's mutex.
+    events: *metrics_mod.ClusterEventRing,
 };
 
 pub var g_cluster_info: ?*const ClusterInfo = null;
@@ -358,14 +361,22 @@ fn clusterStatus(send_buf: []u8) u32 {
 
 
 fn clusterEvents(send_buf: []u8) u32 {
-    // Raft leadership events are not surfaced yet (the PBR event ring's
-    // producer was removed with the PBR stack). Keep the endpoint shape so
-    // UI/Console clients don't break; events return once the raft host
-    // publishes transitions.
-    var body_buf: [256]u8 = undefined;
+    var body_buf: [8192]u8 = undefined;
     var w = json.JsonWriter.init(&body_buf);
     w.beginObject();
     w.beginArrayField("events");
+    // Standalone mode has no raft host and no transitions — empty list.
+    if (g_cluster_info) |ci| {
+        var event_buf: [metrics_mod.ClusterEventRing.capacity]metrics_mod.ClusterEvent = undefined;
+        const count = ci.events.snapshot(&event_buf);
+        for (event_buf[0..count]) |*ev| {
+            w.beginObject();
+            w.fieldStr("type", ev.typeStr());
+            w.fieldInt("term", ev.term);
+            w.fieldInt("timestamp_ns", ev.timestamp_ns);
+            w.endObject();
+        }
+    }
     w.endArray();
     w.endObject();
     return http.writeResponse(send_buf, 200, w.getWritten());

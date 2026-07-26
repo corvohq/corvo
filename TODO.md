@@ -22,7 +22,7 @@
 - [x] **KV-only reads — eliminate SQLite mirror** — `kv_read.zig` reads directly from Talon KV via prefix scans. New read indexes (jt|, jq|, js|, jqs|, tq|). Queue stats via counters in qc| codec. SQLite dependency removed entirely. Tag search replaces FTS5.
 - [x] **Tag search** — `tq|{queue}\x00{tag_key}\x00{tag_value}\x00{job_id}` index, queue-first for locality. `searchByTag()` with queue+state filtering. HTTP endpoint `GET /api/v1/jobs/search-by-tag`. UI tag search on queue detail page. Payload search kept as API-only (`searchPayload`). Dead wrappers removed.
 - [x] Throughput metrics (`/metrics/throughput`) — rolling 60-second window, per-second ops/sec for enqueued/completed/failed
-- [x] Cluster events (`/cluster/events`) — ring buffer of last 64 state transitions (leader elected, stepped down, follower started, snapshots)
+- [x] Cluster events (`/cluster/events`) — ring buffer of last 64 state transitions. Re-wired post-raft: RaftHost owns the ring, leadership flips (leader_elected/leader_stepped_down/follower_started) pushed from the raft thread with the raft term.
 - [x] Cluster Prometheus metrics — `corvo_cluster_state`, `corvo_cluster_epoch`, `corvo_cluster_lease_valid`, `corvo_cluster_peers_total` on `/metrics`
 - [x] Purge: limit-based trigger — `purge_threshold` config (default 10k); handler tracks `dead_since_purge`, pipeline triggers early purge when exceeded
 - [x] Explicit `--cluster-port` flag — overrides default (server port + 1000); peer spec port is now the cluster transport port directly
@@ -126,7 +126,7 @@ Management operations only — cancel, delete, pause, promote, requeue, queue cr
 - [ ] GitHub OAuth, SSO/SAML
 - [ ] Aggregate cluster audit logs — enrich with Console user identity
 - [ ] Cloud mode: Stripe billing, auto-provisioning, billing page
-- [ ] Full node auto-discovery (needs Corvo to expose peer endpoints)
+- [ ] Full node auto-discovery (needs Corvo to expose peer endpoints) — **regressed in the raft rewrite (74efe39)**: PBR-era `/cluster/status` returned `peers: [{id, addr}]` + `epoch`; the raft version returns only `peer_count`, and `leader` is "" on followers. Fix: plumb peer id+addr and leader identity out of the zig-raft host into `clusterStatus` (src/http_read.zig), and re-wire `/cluster/events` to raft leadership transitions. Console already auto-registers whatever `peers` returns — no Console change needed.
 
 ## V2
 

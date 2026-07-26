@@ -59,6 +59,14 @@ pub const ServerConfig = struct {
     /// on the cluster port). Empty = unauthenticated (single-node / trusted net).
     /// Set via --cluster-secret or the CORVO_CLUSTER_SECRET env var.
     cluster_secret: []const u8 = "",
+    /// Upper bound in bytes for a complete raft snapshot (a serialization of
+    /// the whole KV). The raft node reserves this once at startup (pages
+    /// commit lazily); a snapshot larger than this cannot replicate, so size
+    /// it above the largest expected DB. Node-local capacity — excluded from
+    /// clusterHash — but keep it uniform across voters: a leader snapshot
+    /// bigger than a follower's cap is refused loudly and that follower can
+    /// never catch up past a compaction.
+    max_snapshot_size: u32 = 1024 * 1024 * 1024, // 1 GiB
 
     // ================================================================
     // Shared settings (included in cluster hash — must match across nodes)
@@ -281,6 +289,9 @@ pub const ServerConfig = struct {
             self.cluster_port = parseInt(u16, val) orelse return error.InvalidValue;
         } else if (eql(key, "cluster-id")) {
             self.cluster_id = parseInt(u64, val) orelse return error.InvalidValue;
+        } else if (eql(key, "max-snapshot-size")) {
+            self.max_snapshot_size = parseInt(u32, val) orelse return error.InvalidValue;
+            if (self.max_snapshot_size == 0) return error.InvalidValue;
         } else if (eql(key, "admin-password")) {
             self.admin_password = val;
         } else {

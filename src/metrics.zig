@@ -121,6 +121,81 @@ pub const ThroughputRing = struct {
 };
 
 // ============================================================================
+// Cluster event ring — recent leadership transitions
+// ============================================================================
+
+pub const ClusterEventType = enum(u8) {
+    leader_elected = 1,
+    leader_stepped_down = 2,
+    follower_started = 3,
+};
+
+pub const ClusterEvent = struct {
+    type_: ClusterEventType = .follower_started,
+    term: u64 = 0,
+    timestamp_ns: u64 = 0,
+
+    pub fn typeStr(self: *const ClusterEvent) []const u8 {
+        return switch (self.type_) {
+            .leader_elected => "leader_elected",
+            .leader_stepped_down => "leader_stepped_down",
+            .follower_started => "follower_started",
+        };
+    }
+};
+
+/// Mutex-protected ring of the last `capacity` cluster state transitions.
+/// Producer is the raft thread (leadership flips are rare — not hot path);
+/// consumer is the pipeline thread serving /cluster/events.
+pub const ClusterEventRing = struct {
+    pub const capacity = 64;
+
+    events: [capacity]ClusterEvent = [_]ClusterEvent{.{}} ** capacity,
+    count: u32 = 0,
+    head: u32 = 0,
+    mu: std.Thread.Mutex = .{},
+
+    pub fn push(self: *ClusterEventRing, event: ClusterEvent) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.events[self.head] = event;
+        self.head = (self.head + 1) % capacity;
+        if (self.count < capacity) self.count += 1;
+    }
+
+    /// Copy recent events into `out` in chronological order (oldest first).
+    /// Returns the number of events written.
+    pub fn snapshot(self: *ClusterEventRing, out: []ClusterEvent) u32 {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const n = @min(self.count, @as(u32, @intCast(out.len)));
+        if (n == 0) return 0;
+        // Oldest event is at (head - count) % capacity; skip to the last n.
+        const start = (self.head + capacity - self.count) % capacity;
+        const offset = self.count - n;
+        for (0..n) |i| {
+            out[i] = self.events[(start + offset + i) % capacity];
+        }
+        return n;
+    }
+};
+
+test "ClusterEventRing: wraps and snapshots in chronological order" {
+    var ring = ClusterEventRing{};
+    var out: [ClusterEventRing.capacity]ClusterEvent = undefined;
+    try std.testing.expectEqual(@as(u32, 0), ring.snapshot(&out));
+
+    for (0..ClusterEventRing.capacity + 10) |i| {
+        ring.push(.{ .type_ = .leader_elected, .term = i, .timestamp_ns = i });
+    }
+    const n = ring.snapshot(&out);
+    try std.testing.expectEqual(@as(u32, ClusterEventRing.capacity), n);
+    // Oldest surviving event is #10; newest is #73.
+    try std.testing.expectEqual(@as(u64, 10), out[0].term);
+    try std.testing.expectEqual(@as(u64, ClusterEventRing.capacity + 9), out[n - 1].term);
+}
+
+// ============================================================================
 // Latency histogram — fixed Prometheus-style buckets
 // ============================================================================
 

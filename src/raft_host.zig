@@ -58,6 +58,7 @@ const PeerNet = @import("raft_net.zig").PeerNet;
 const PeerNetConfig = @import("raft_net.zig").Config;
 const Mutation = @import("kv.zig").Mutation;
 const Completion = @import("raft_batcher.zig").Completion;
+const metrics_mod = @import("metrics.zig");
 
 // ============================================================================
 // Configuration
@@ -204,6 +205,10 @@ pub const RaftHost = struct {
     // without the process crashing on a single transient hiccup.
     tick_errors: std.atomic.Value(u64) = .init(0),
 
+    /// Recent leadership transitions for /cluster/events. Pushed by the raft
+    /// thread on is_leader flips; snapshotted by the pipeline thread.
+    events: metrics_mod.ClusterEventRing = .{},
+
     tick_interval_ns: u64 = default_tick_interval_ns,
 
     /// Serializes talon access with the pipeline thread (talon's batch pool
@@ -240,6 +245,11 @@ pub const RaftHost = struct {
         self.peer_net.install(&self.runtime.transport);
         // Seed leader-state atomic from initial role (typically follower).
         self.is_leader.store(self.runtime.node.isLeader(), .release);
+        self.events.push(.{
+            .type_ = .follower_started,
+            .term = self.runtime.node.term,
+            .timestamp_ns = @intCast(std.time.nanoTimestamp()),
+        });
         return self;
     }
 
@@ -357,8 +367,18 @@ pub const RaftHost = struct {
         }
     }
 
+    /// Monotonic nanoseconds (boot-relative, strictly positive). Raft time
+    /// must never step backwards — the library asserts monotonicity — and
+    /// the wall clock can (NTP). Wall-clock time is only for observability
+    /// (event timestamps), never for raft's `now`.
+    fn monotonicNowNs() i64 {
+        const ts = std.posix.clock_gettime(.MONOTONIC) catch |err|
+            assert_mod.fail("monotonic clock unavailable: {s}", .{@errorName(err)});
+        return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec);
+    }
+
     fn doOneTick(self: *RaftHost) void {
-        const now: i64 = @intCast(std.time.nanoTimestamp());
+        const now: i64 = monotonicNowNs();
         // Peer socket I/O (reconnects, HMAC handshakes, frame decode) never
         // touches the DB — run it OUTSIDE the db_lock so client traffic on
         // the pipeline thread doesn't stall behind peer-socket work.
@@ -482,7 +502,20 @@ pub const RaftHost = struct {
         const applied = self.runtime.fsm.lastApplied();
         const prev = self.last_committed_index.load(.acquire);
         if (applied > prev) self.last_committed_index.store(applied, .release);
-        self.is_leader.store(self.runtime.node.isLeader(), .release);
+        // Leadership flip → event ring. The node is owned by this thread, so
+        // reading role/term here is race-free; only the atomic is shared.
+        // Events are stamped with WALL-clock time (operator-facing), unlike
+        // raft's monotonic `now` — flips are rare, the extra read is fine.
+        const was_leader = self.is_leader.load(.acquire);
+        const leads_now = self.runtime.node.isLeader();
+        if (leads_now != was_leader) {
+            self.events.push(.{
+                .type_ = if (leads_now) .leader_elected else .leader_stepped_down,
+                .term = self.runtime.node.term,
+                .timestamp_ns = @intCast(std.time.nanoTimestamp()),
+            });
+        }
+        self.is_leader.store(leads_now, .release);
     }
 
     fn drainInboxOnShutdown(self: *RaftHost) void {
